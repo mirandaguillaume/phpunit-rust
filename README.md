@@ -2,19 +2,26 @@
 
 A Rust test runner that orchestrates FrankenPHP to execute PHPUnit tests.
 
-## Status: MVP (early)
+## Status: v0.2.0 — real PHPUnit runner integration
 
-Sequential execution only. Direct test-method invocation — **does not** use PHPUnit's full `TestRunner`, so the following are NOT yet supported:
+phpunit-rust now drives PHPUnit's actual `TestRunner` and Event Facade.
+Supported in this release:
 
-- `expectException` / `@expectedException` (tests using these will report as `error`)
-- Data providers (`#[DataProvider]`, `@dataProvider`)
-- Test dependencies (`@depends`)
+- `expectException`, `expectExceptionMessage`, `expectExceptionCode`
+- Data providers (`#[DataProvider]`, `@dataProvider`) — each row reported separately
+- Test dependencies (`#[Depends]`, `@depends`) — value passing across tests
+- `markTestSkipped`, `markTestIncomplete`, "risky" detection
+- `phpunit.xml` auto-detection (or `--configuration` flag) with `bootstrap`
+  file loading and `<php>` block application
+
+Still deferred to follow-up plans:
+
+- Parallel execution (worker pool + work-stealing scheduler)
 - `@runInSeparateProcess`
-- Code coverage
-- `phpunit.xml` configuration
-- Custom listeners/extensions
-
-All of these are scoped to follow-up work. See `docs/superpowers/plans/`.
+- Code coverage (PCOV/Xdebug)
+- JUnit XML / TAP / TestDox reporters for CI
+- Watch mode
+- Custom PHPUnit extensions and listeners
 
 ## Requirements
 
@@ -29,21 +36,49 @@ All of these are scoped to follow-up work. See `docs/superpowers/plans/`.
 cargo build --release
 ./target/release/phpunit-rust --project /path/to/php/project
 ./target/release/phpunit-rust --project /path/to/php/project --filter MyClass
+./target/release/phpunit-rust --project /path/to/php/project --configuration phpunit.ci.xml
 ```
+
+If `--configuration` is omitted, the runner auto-detects `phpunit.xml` then
+`phpunit.xml.dist` at the project root.
 
 ## Architecture
 
-```
-phpunit-rust (Rust binary)
-  ├─ discovery   : tree-sitter-php parses test files
-  ├─ frankenphp  : spawns FrankenPHP child process in worker mode
-  ├─ client      : HTTP/JSON to worker.php
-  ├─ runner      : sequential orchestration
-  └─ reporter    : TTY output
+The Rust binary spawns FrankenPHP as a long-running worker, then makes HTTP POST requests to `/worker.php` with a JSON body containing:
 
-worker.php (long-lived, in FrankenPHP worker mode)
-  ├─ loads project autoloader once (cached across requests)
-  ├─ for each request: requires test file, instantiates test class,
-  │  invokes method, captures assertions/exceptions
-  └─ returns JSON outcome
+1. Autoload path (vendor/autoload.php)
+2. PHPUnit configuration (phpunit.xml, bootstrap)
+3. Test file, class, and methods to run
+
+The worker:
+
+1. Bootstraps PHP and loads PHPUnit
+2. Registers a custom `ResultCollector` subscriber on the Event Facade
+3. Calls `TestRunner::run()` with a test suite containing only the requested methods
+4. Collects test outcomes (pass, fail, skipped, incomplete, risky) including exception messages and dataset info
+5. Returns JSON-encoded outcomes to the Rust runner
+
+The Rust runner aggregates outcomes by status, formats them, and prints a summary.
+
+## Wire protocol
+
+Request (`POST /worker.php`):
+```json
+{
+  "autoload": "/path/to/project/vendor/autoload.php",
+  "phpunit_xml": "/path/to/project/phpunit.xml",
+  "file": "/path/to/project/tests/FooTest.php",
+  "class": "App\\Tests\\FooTest",
+  "methods": ["testBar", "testBaz"]
+}
+```
+
+Response:
+```json
+{
+  "outcomes": [
+    {"class":"App\\Tests\\FooTest","method":"testBar","dataset":null,"status":"pass","message":null,"trace":null,"duration_ms":1.2},
+    {"class":"App\\Tests\\FooTest","method":"testBaz","dataset":"#0","status":"fail","message":"…","trace":"…","duration_ms":0.3}
+  ]
+}
 ```
