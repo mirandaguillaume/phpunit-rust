@@ -6,29 +6,96 @@ require_once __DIR__ . '/vendor/autoload.php';
 
 ignore_user_abort(true);
 
-$handler = static function (): void {
+use PHPUnit\Framework\AssertionFailedError;
+use PHPUnit\Framework\ExpectationFailedException;
+use PHPUnit\Framework\TestCase;
+
+$loadedProjects = [];
+
+$handler = static function () use (&$loadedProjects): void {
     $raw = file_get_contents('php://input');
     $req = json_decode($raw, true);
 
     header('Content-Type: application/json');
 
-    if (!is_array($req)) {
+    if (!is_array($req) || !isset($req['autoload'], $req['file'], $req['class'], $req['method'])) {
         http_response_code(400);
-        echo json_encode(['error' => 'request body must be a JSON object']);
+        echo json_encode(['error' => 'missing autoload, file, class, or method']);
         return;
     }
 
+    $autoload = $req['autoload'];
+    if (!isset($loadedProjects[$autoload])) {
+        if (!is_file($autoload)) {
+            http_response_code(400);
+            echo json_encode(['error' => "autoload not found: $autoload"]);
+            return;
+        }
+        require_once $autoload;
+        $loadedProjects[$autoload] = true;
+    }
+
+    if (!is_file($req['file'])) {
+        http_response_code(400);
+        echo json_encode(['error' => "test file not found: " . $req['file']]);
+        return;
+    }
+    require_once $req['file'];
+
+    $class = $req['class'];
+    $method = $req['method'];
+
+    if (!class_exists($class)) {
+        http_response_code(404);
+        echo json_encode(['error' => "class $class not found after loading " . $req['file']]);
+        return;
+    }
+
+    if (!is_subclass_of($class, TestCase::class)) {
+        http_response_code(400);
+        echo json_encode(['error' => "$class does not extend PHPUnit\\Framework\\TestCase"]);
+        return;
+    }
+
+    $test = new $class($method);
+
+    $status = 'pass';
+    $message = null;
+    $trace = null;
+    $startedAt = microtime(true);
+
+    try {
+        Closure::bind(fn () => $this->setUp(), $test, $test)();
+        $test->{$method}();
+        Closure::bind(fn () => $this->tearDown(), $test, $test)();
+    } catch (ExpectationFailedException $e) {
+        $status = 'fail';
+        $message = $e->getMessage();
+        $trace = $e->getTraceAsString();
+    } catch (AssertionFailedError $e) {
+        $status = 'fail';
+        $message = $e->getMessage();
+        $trace = $e->getTraceAsString();
+    } catch (\Throwable $e) {
+        $status = 'error';
+        $message = get_class($e) . ': ' . $e->getMessage();
+        $trace = $e->getTraceAsString();
+    }
+
     echo json_encode([
-        'ok' => true,
-        'echo' => $req,
-        'phpunit_version' => \PHPUnit\Runner\Version::id(),
+        'class' => $class,
+        'method' => $method,
+        'status' => $status,
+        'message' => $message,
+        'trace' => $trace,
+        'duration_ms' => (microtime(true) - $startedAt) * 1000.0,
     ]);
 };
 
-for ($nbHandledRequests = 0; $nbHandledRequests < 1000; ++$nbHandledRequests) {
-    $keepRunning = \frankenphp_handle_request($handler);
+for ($n = 0; $n < 10000; ++$n) {
+    $keep = \frankenphp_handle_request($handler);
     gc_collect_cycles();
-    if (!$keepRunning) {
+    if (!$keep) {
         break;
     }
 }
