@@ -1,45 +1,52 @@
 use phpunit_rust::client::WorkerClient;
 use phpunit_rust::frankenphp::{find_worker_script, FrankenPhp};
-use phpunit_rust::types::{TestRequest, TestStatus};
+use phpunit_rust::types::{TestRunRequest, TestStatus};
 use std::path::PathBuf;
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project")
 }
 
-#[test]
-fn runs_a_passing_test_end_to_end() {
-    let worker = find_worker_script().expect("worker.php must exist");
-    let fph = FrankenPhp::spawn(&worker).expect("frankenphp must spawn");
-    let client = WorkerClient::new(fph.worker_url());
-
+fn request(file: &str, class: &str) -> TestRunRequest {
     let root = fixture_root();
-    let req = TestRequest {
+    TestRunRequest {
         autoload: root.join("vendor/autoload.php"),
-        file: root.join("tests/CalculatorTest.php"),
-        class: "Sample\\Tests\\CalculatorTest".into(),
-        method: "testAddsTwoPositiveIntegers".into(),
-    };
-
-    let outcome = client.run_test(&req).expect("worker call must succeed");
-    assert_eq!(outcome.status, TestStatus::Pass, "outcome was: {outcome:?}");
+        phpunit_xml: None,
+        file: root.join(file),
+        class: class.into(),
+        methods: vec![],
+    }
 }
 
 #[test]
-fn reports_a_failing_test_as_fail() {
+fn calculator_class_all_three_methods_pass() {
     let worker = find_worker_script().expect("worker.php must exist");
     let fph = FrankenPhp::spawn(&worker).expect("frankenphp must spawn");
     let client = WorkerClient::new(fph.worker_url());
 
-    let root = fixture_root();
-    let req = TestRequest {
-        autoload: root.join("vendor/autoload.php"),
-        file: root.join("tests/FailingTest.php"),
-        class: "Sample\\Tests\\FailingTest".into(),
-        method: "testThisDeliberatelyFails".into(),
-    };
+    let req = request("tests/CalculatorTest.php", "Sample\\Tests\\CalculatorTest");
+    let outcomes = client.run_class(&req).expect("worker call must succeed");
 
-    let outcome = client.run_test(&req).expect("worker call must succeed");
-    assert_eq!(outcome.status, TestStatus::Fail);
-    assert!(outcome.message.as_deref().unwrap_or("").contains("intentional"));
+    // Including testDivisionByZeroThrows — now passes because PHPUnit's
+    // real runner handles expectException correctly.
+    assert_eq!(outcomes.len(), 3, "outcomes: {outcomes:?}");
+    for o in &outcomes {
+        assert_eq!(o.status, TestStatus::Pass, "{}::{} was {:?}: {:?}", o.class, o.method, o.status, o.message);
+    }
+}
+
+#[test]
+fn failing_class_mixed_results() {
+    let worker = find_worker_script().expect("worker.php must exist");
+    let fph = FrankenPhp::spawn(&worker).expect("frankenphp must spawn");
+    let client = WorkerClient::new(fph.worker_url());
+
+    let req = request("tests/FailingTest.php", "Sample\\Tests\\FailingTest");
+    let outcomes = client.run_class(&req).expect("worker call must succeed");
+
+    assert_eq!(outcomes.len(), 2);
+    let by_method: std::collections::HashMap<_, _> = outcomes.iter().map(|o| (o.method.clone(), o)).collect();
+    assert_eq!(by_method["testThisPasses"].status, TestStatus::Pass);
+    assert_eq!(by_method["testThisDeliberatelyFails"].status, TestStatus::Fail);
+    assert!(by_method["testThisDeliberatelyFails"].message.as_deref().unwrap_or("").contains("intentional"));
 }
