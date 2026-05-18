@@ -248,7 +248,7 @@ class BareTest extends TestCase {
         let methods: Vec<_> = cases.iter().map(|c| (c.class.as_str(), c.method.as_str())).collect();
         assert!(methods.contains(&("Sample\\Tests\\CalculatorTest", "testAddsTwoPositiveIntegers")));
         assert!(methods.contains(&("Sample\\Tests\\FailingTest", "testThisDeliberatelyFails")));
-        assert_eq!(cases.len(), 5);
+        assert_eq!(cases.len(), 12);
     }
 
     #[test]
