@@ -160,7 +160,7 @@ function self_filter_suite_to_methods(TestSuite $suite, array $methodNames): voi
         if ($test instanceof TestSuite) {
             // Data-provider wrapper: name is "ClassName::methodName" — keep
             // the whole sub-suite if its method base is in keep.
-            $name       = $test->getName();
+            $name       = $test->name();
             $baseMethod = strpos($name, '::') !== false
                 ? substr($name, strrpos($name, '::') + 2)
                 : $name;
