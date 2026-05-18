@@ -145,7 +145,8 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
         if p.extension().and_then(|s| s.to_str()) != Some("php") {
             continue;
         }
-        if !p.to_string_lossy().contains("Test") {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.contains("Test") {
             continue;
         }
         all.extend(discover_in_file(p)?);

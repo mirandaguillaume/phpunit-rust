@@ -85,11 +85,18 @@ fn find_free_port() -> Result<u16> {
 }
 
 pub fn find_worker_script() -> Result<PathBuf> {
-    // Try common locations relative to the binary's working dir.
-    let candidates = [
-        PathBuf::from("php/worker.php"),
-        PathBuf::from("/home/gumiranda/PHPUnit_rust/php/worker.php"),
-    ];
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.push(PathBuf::from("php/worker.php"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // release build: target/release/phpunit-rust → ../../php/worker.php
+            candidates.push(dir.join("../../php/worker.php"));
+            // debug build: target/debug/phpunit-rust → ../../php/worker.php
+            // (same relative path, covered above)
+            // installed alongside binary
+            candidates.push(dir.join("php/worker.php"));
+        }
+    }
     for c in &candidates {
         if c.is_file() {
             return Ok(c.canonicalize()?);
