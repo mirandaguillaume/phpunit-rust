@@ -60,7 +60,7 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("phpunit_xml").is_none());
-        assert_eq!(json["class"], "App\\\\Tests\\\\FooTest");
+        assert_eq!(json["class"], "App\\Tests\\FooTest");
     }
 
     #[test]
