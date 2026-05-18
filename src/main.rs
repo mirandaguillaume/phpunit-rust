@@ -10,7 +10,7 @@ use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner via FrankenPHP (MVP)")]
+#[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner via FrankenPHP")]
 struct Cli {
     /// Path to the project under test (must contain composer.json + vendor/).
     #[arg(long, default_value = ".")]
@@ -23,6 +23,10 @@ struct Cli {
     /// Run only tests whose `Class::method` contains this substring.
     #[arg(long)]
     filter: Option<String>,
+
+    /// Path to phpunit.xml. Defaults to <project>/phpunit.xml if it exists.
+    #[arg(long)]
+    configuration: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -51,15 +55,38 @@ fn real_main() -> Result<ExitCode> {
         return Err(anyhow!("tests directory not found: {}", tests_dir.display()));
     }
 
+    // Auto-detect phpunit.xml if --configuration wasn't supplied.
+    let phpunit_xml = match cli.configuration {
+        Some(p) => {
+            let abs = if p.is_absolute() { p } else { project.join(p) };
+            Some(abs.canonicalize().context("invalid --configuration path")?)
+        }
+        None => {
+            let auto = project.join("phpunit.xml");
+            if auto.is_file() {
+                Some(auto)
+            } else {
+                let dist = project.join("phpunit.xml.dist");
+                if dist.is_file() { Some(dist) } else { None }
+            }
+        }
+    };
+    if let Some(p) = &phpunit_xml {
+        eprintln!("Using configuration: {}", p.display());
+    }
+
     eprintln!("Discovering tests in {}...", tests_dir.display());
     let cases = discover_in_dir(&tests_dir)?;
-    eprintln!("Found {} tests.", cases.len());
+    eprintln!("Found {} test methods across {} classes.",
+        cases.len(),
+        cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
+    );
 
     let worker = find_worker_script()?;
     let fph = FrankenPhp::spawn(&worker)?;
     let client = WorkerClient::new(fph.worker_url());
 
-    let cfg = RunConfig { autoload, filter: cli.filter };
+    let cfg = RunConfig { autoload, phpunit_xml, filter: cli.filter };
     let report = run(&client, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
 
