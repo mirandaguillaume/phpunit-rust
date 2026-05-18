@@ -1,0 +1,232 @@
+use crate::types::TestCase;
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
+use tree_sitter::{Node, Parser, Query, QueryCursor};
+use walkdir::WalkDir;
+
+/// Parse one PHP file and return any test classes + methods it declares.
+pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
+    let src = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_php::language_php())
+        .context("setting tree-sitter-php language")?;
+    let tree = parser
+        .parse(&src, None)
+        .ok_or_else(|| anyhow!("tree-sitter failed to parse {}", path.display()))?;
+
+    let root = tree.root_node();
+    let bytes = src.as_bytes();
+
+    let namespace = find_namespace(root, bytes);
+
+    let mut cases = Vec::new();
+    collect_test_classes(root, bytes, namespace.as_deref(), path, &mut cases)?;
+    Ok(cases)
+}
+
+fn find_namespace(root: Node, bytes: &[u8]) -> Option<String> {
+    // PHP: `namespace Foo\Bar;` produces a `namespace_definition` node.
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "namespace_definition" {
+            if let Some(name) = child.child_by_field_name("name") {
+                return name.utf8_text(bytes).ok().map(String::from);
+            }
+        }
+    }
+    None
+}
+
+fn collect_test_classes(
+    root: Node,
+    bytes: &[u8],
+    namespace: Option<&str>,
+    path: &Path,
+    out: &mut Vec<TestCase>,
+) -> Result<()> {
+    let query_src = r#"
+        (class_declaration
+          name: (name) @class_name
+          (base_clause (name) @base)?
+          body: (declaration_list) @body)
+    "#;
+    let lang = tree_sitter_php::language_php();
+    let query = Query::new(&lang, query_src).context("compiling class query")?;
+    let mut cursor = QueryCursor::new();
+    let captures = query.capture_names();
+    let class_name_idx = captures.iter().position(|n| *n == "class_name").unwrap();
+    let base_idx = captures.iter().position(|n| *n == "base").unwrap();
+    let body_idx = captures.iter().position(|n| *n == "body").unwrap();
+
+    for m in cursor.matches(&query, root, bytes) {
+        let mut class_name: Option<&str> = None;
+        let mut base_name: Option<&str> = None;
+        let mut body_node: Option<Node> = None;
+        for cap in m.captures {
+            let idx = cap.index as usize;
+            if idx == class_name_idx {
+                class_name = cap.node.utf8_text(bytes).ok();
+            } else if idx == base_idx {
+                base_name = cap.node.utf8_text(bytes).ok();
+            } else if idx == body_idx {
+                body_node = Some(cap.node);
+            }
+        }
+
+        let (Some(name), Some(body)) = (class_name, body_node) else { continue };
+        let base = base_name.unwrap_or("");
+        if !is_testcase_subclass(base) {
+            continue;
+        }
+
+        let fqcn = match namespace {
+            Some(ns) => format!("{ns}\\{name}"),
+            None => name.to_string(),
+        };
+
+        for method in collect_test_methods(body, bytes) {
+            out.push(TestCase {
+                file: path.to_path_buf(),
+                class: fqcn.clone(),
+                method,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_testcase_subclass(base: &str) -> bool {
+    // MVP heuristic: anything named TestCase or ending in TestCase.
+    // Real PHPUnit-compat would resolve `use` aliases. Tracked in follow-up plan.
+    base == "TestCase" || base.ends_with("\\TestCase")
+}
+
+fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<String> {
+    let mut methods = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "method_declaration" {
+            continue;
+        }
+        // Skip non-public for MVP — PHPUnit only runs public methods.
+        let is_public = method_is_public(child, bytes);
+        if !is_public {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else { continue };
+        let Ok(name) = name_node.utf8_text(bytes) else { continue };
+        if name.starts_with("test") {
+            methods.push(name.to_string());
+        }
+        // #[Test] attribute support is deferred to a follow-up plan.
+    }
+    methods
+}
+
+fn method_is_public(method: Node, bytes: &[u8]) -> bool {
+    let mut cursor = method.walk();
+    let mut saw_visibility = false;
+    for child in method.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            saw_visibility = true;
+            if let Ok(text) = child.utf8_text(bytes) {
+                if text == "public" {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    // PHP defaults to public when no modifier is present.
+    !saw_visibility || true
+}
+
+/// Walk a directory, returning all discovered test cases.
+pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
+    let mut all = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("php") {
+            continue;
+        }
+        if !p.to_string_lossy().contains("Test") {
+            continue;
+        }
+        all.extend(discover_in_file(p)?);
+    }
+    Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_tmp(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SomeTest.php");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn discovers_a_namespaced_test_class() {
+        let src = r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+final class FooTest extends TestCase {
+    public function testOne(): void {}
+    public function testTwo(): void {}
+    public function helper(): void {}
+    private function testIsPrivateSoSkipped(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let methods: Vec<_> = cases.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(methods, vec!["testOne", "testTwo"]);
+        assert_eq!(cases[0].class, "App\\Tests\\FooTest");
+    }
+
+    #[test]
+    fn skips_classes_not_extending_testcase() {
+        let src = r#"<?php
+namespace App;
+final class NotATest {
+    public function testNothing(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert!(cases.is_empty());
+    }
+
+    #[test]
+    fn handles_file_without_namespace() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class BareTest extends TestCase {
+    public function testStuff(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].class, "BareTest");
+    }
+
+    #[test]
+    fn discovers_fixture_project_tests() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/sample_project/tests");
+        let cases = discover_in_dir(&fixture).unwrap();
+        let methods: Vec<_> = cases.iter().map(|c| (c.class.as_str(), c.method.as_str())).collect();
+        assert!(methods.contains(&("Sample\\Tests\\CalculatorTest", "testAddsTwoPositiveIntegers")));
+        assert!(methods.contains(&("Sample\\Tests\\FailingTest", "testThisDeliberatelyFails")));
+        assert_eq!(cases.len(), 5);
+    }
+}
