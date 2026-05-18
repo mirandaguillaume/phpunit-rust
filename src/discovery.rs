@@ -1,8 +1,34 @@
 use crate::types::TestCase;
 use anyhow::{anyhow, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 use walkdir::WalkDir;
+
+/// A discovered test class with all of its methods, grouped for batched
+/// dispatch (one request per class to the worker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestClass {
+    pub file: PathBuf,
+    pub class: String,
+    pub methods: Vec<String>,
+}
+
+/// Group a flat list of TestCases by class. Preserves discovery order.
+pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
+    let mut groups: Vec<TestClass> = Vec::new();
+    for case in cases {
+        if let Some(existing) = groups.iter_mut().find(|g| g.class == case.class) {
+            existing.methods.push(case.method);
+        } else {
+            groups.push(TestClass {
+                file: case.file,
+                class: case.class,
+                methods: vec![case.method],
+            });
+        }
+    }
+    groups
+}
 
 /// Parse one PHP file and return any test classes + methods it declares.
 pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
@@ -223,5 +249,20 @@ class BareTest extends TestCase {
         assert!(methods.contains(&("Sample\\Tests\\CalculatorTest", "testAddsTwoPositiveIntegers")));
         assert!(methods.contains(&("Sample\\Tests\\FailingTest", "testThisDeliberatelyFails")));
         assert_eq!(cases.len(), 5);
+    }
+
+    #[test]
+    fn group_by_class_collapses_per_method_cases() {
+        let cases = vec![
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into() },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into() },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into() },
+        ];
+        let grouped = group_by_class(cases);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].class, "A");
+        assert_eq!(grouped[0].methods, vec!["testOne".to_string(), "testTwo".to_string()]);
+        assert_eq!(grouped[1].class, "B");
+        assert_eq!(grouped[1].methods, vec!["testThree".to_string()]);
     }
 }
