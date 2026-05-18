@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -42,12 +42,23 @@ impl FrankenPhp {
     }
 
     fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<()> {
+        // Use an HTTP probe rather than a bare TCP probe. The TCP port opens
+        // as soon as Caddy binds, but the PHP worker may not be ready to
+        // handle requests until slightly later. We send a lightweight GET
+        // probe; the worker returns 400 (missing fields) or 200 — either
+        // way it proves the worker is alive and responsive.
         let deadline = Instant::now() + timeout;
+        let probe_url = format!("http://127.0.0.1:{port}/worker.php");
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(500))
+            .build();
         while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Ok(());
+            match agent.get(&probe_url).call() {
+                Ok(_) => return Ok(()),
+                Err(ureq::Error::Status(_, _)) => return Ok(()), // any HTTP status = worker ready
+                Err(_) => {}                                      // connection refused or transport error → retry
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(100));
         }
         Err(anyhow!("frankenphp did not become ready within {timeout:?}"))
     }
