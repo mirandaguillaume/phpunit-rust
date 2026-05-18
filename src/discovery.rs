@@ -1,6 +1,6 @@
 use crate::types::TestCase;
 use anyhow::{anyhow, Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 use walkdir::WalkDir;
 
@@ -128,20 +128,13 @@ fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<String> {
 
 fn method_is_public(method: Node, bytes: &[u8]) -> bool {
     let mut cursor = method.walk();
-    let mut saw_visibility = false;
     for child in method.children(&mut cursor) {
         if child.kind() == "visibility_modifier" {
-            saw_visibility = true;
-            if let Ok(text) = child.utf8_text(bytes) {
-                if text == "public" {
-                    return true;
-                }
-            }
-            return false;
+            return child.utf8_text(bytes).map(|t| t == "public").unwrap_or(false);
         }
     }
-    // PHP defaults to public when no modifier is present.
-    !saw_visibility || true
+    // PHP defaults to public when no visibility modifier is present.
+    true
 }
 
 /// Walk a directory, returning all discovered test cases.
@@ -164,6 +157,7 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn write_tmp(content: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
