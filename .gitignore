@@ -1,0 +1,6 @@
+/target
+**/vendor/
+**/.phpunit.cache/
+**/composer.lock
+*.swp
+.DS_Store
