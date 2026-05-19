@@ -357,7 +357,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
 /// around `discover_in_dirs` for the single-root + no-excludes case.
 pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
     let roots = [root.to_path_buf()];
-    discover_in_dirs(&roots, &[])
+    discover_in_dirs(&roots, &[], &[])
 }
 
 /// Walk multiple roots and union their tests, honoring an exclude list.
@@ -374,14 +374,24 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
 /// `excludes` are checked as path prefixes (canonicalized) — a path under an
 /// excluded directory is skipped. Matches phpunit.xml's `<testsuite>` /
 /// `<exclude>` semantics.
-pub fn discover_in_dirs(roots: &[PathBuf], excludes: &[PathBuf]) -> Result<Vec<TestCase>> {
+/// Walk multiple roots and union their tests, honoring an exclude list.
+///
+/// `graph_supplement_dirs` are additional directories (e.g. from composer.json
+/// `autoload-dev`) scanned to build a complete class graph — they contribute
+/// abstract base classes to the inheritance chain but never emit test cases
+/// themselves. Pass an empty slice when not needed.
+pub fn discover_in_dirs(
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    graph_supplement_dirs: &[PathBuf],
+) -> Result<Vec<TestCase>> {
     // Canonicalize excludes once so prefix checks are robust.
     let canon_excludes: Vec<PathBuf> = excludes
         .iter()
         .filter_map(|p| p.canonicalize().ok())
         .collect();
 
-    // Pass 1: parse every relevant file across all roots.
+    // Pass 1: parse every *Test*.php file across all testsuite roots.
     let mut parsed: Vec<ParsedClass> = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -402,26 +412,15 @@ pub fn discover_in_dirs(roots: &[PathBuf], excludes: &[PathBuf]) -> Result<Vec<T
             parsed.extend(parse_file_classes(p)?);
         }
     }
+    let emit_count = parsed.len(); // classes from roots — those we'll emit TestCases for
 
-    // Supplement pass: scan the immediate parent directory of each root (depth=1
-    // only) for *Test*.php files. Picks up abstract base classes that sit one
-    // level above the phpunit.xml testsuite dirs — e.g. Carbon's
-    // tests/AbstractTestCase.php when the roots list tests/Carbon/, etc.
+    // Supplement: parse *Test*.php files from autoload-dev dirs to enrich the
+    // class graph with abstract base classes that live outside the testsuite
+    // directories (e.g. Carbon's tests/AbstractTestCase.php).
     let parsed_paths: HashSet<PathBuf> = parsed.iter().map(|c| c.file.clone()).collect();
-    let mut seen_parents: HashSet<PathBuf> = HashSet::new();
-    for root in roots {
-        let Some(parent) = root.parent() else { continue };
-        let parent = parent.to_path_buf();
-        if !seen_parents.insert(parent.clone()) {
-            continue;
-        }
-        // Don't re-scan a directory that is itself one of the discovery roots.
-        if roots.iter().any(|r| r == &parent) {
-            continue;
-        }
-        for entry in WalkDir::new(&parent).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+    for dir in graph_supplement_dirs {
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.is_dir() { continue; }
             if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.contains("Test") { continue; }
@@ -436,8 +435,8 @@ pub fn discover_in_dirs(roots: &[PathBuf], excludes: &[PathBuf]) -> Result<Vec<T
         .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
         .collect();
 
-    // Pass 3: emit test methods for every non-abstract class reaching TestCase.
-    emit_test_cases(&parsed, &graph)
+    // Pass 3: emit test methods only for classes from the testsuite roots.
+    emit_test_cases(&parsed[..emit_count], &graph)
 }
 
 /// Returns true if `start_fqcn` is (transitively) a subclass of PHPUnit's

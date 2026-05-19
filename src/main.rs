@@ -4,6 +4,47 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use phpunit_rust::discovery::{discover_in_dir, discover_in_dirs};
+
+/// Parse composer.json's `autoload-dev.psr-4` and `autoload-dev.classmap`
+/// entries into a list of directories, resolved relative to `project`.
+/// Returns an empty Vec if the file is absent or has no autoload-dev.
+fn parse_autoload_dev_dirs(project: &std::path::Path) -> Vec<PathBuf> {
+    let path = project.join("composer.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return vec![]; };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![]; };
+    let Some(dev) = val.get("autoload-dev") else { return vec![]; };
+    let mut dirs = Vec::new();
+    // psr-4: { "Ns\\" : "src/" }  — values can be a string or an array of strings
+    if let Some(psr4) = dev.get("psr-4").and_then(|v| v.as_object()) {
+        for v in psr4.values() {
+            match v {
+                serde_json::Value::String(s) => {
+                    let p = project.join(s);
+                    if p.is_dir() { dirs.push(p); }
+                }
+                serde_json::Value::Array(arr) => {
+                    for s in arr {
+                        if let Some(s) = s.as_str() {
+                            let p = project.join(s);
+                            if p.is_dir() { dirs.push(p); }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // classmap: ["tests/", ...]
+    if let Some(arr) = dev.get("classmap").and_then(|v| v.as_array()) {
+        for s in arr {
+            if let Some(s) = s.as_str() {
+                let p = project.join(s);
+                if p.is_dir() { dirs.push(p); }
+            }
+        }
+    }
+    dirs
+}
 use phpunit_rust::php_worker::{check_php_version, find_worker_script, PhpWorkerPool};
 use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
@@ -165,16 +206,20 @@ fn real_main() -> Result<ExitCode> {
         .build_global()
         .context("initializing rayon thread pool")?;
 
+    // Read composer.json autoload-dev dirs to enrich the class graph with
+    // abstract base classes that live outside the phpunit.xml testsuite dirs.
+    let graph_supplement_dirs = parse_autoload_dev_dirs(&project);
+
     if test_roots.len() == 1 {
         eprintln!("Discovering tests in {}...", test_roots[0].display());
     } else {
         eprintln!("Discovering tests across {} roots ({} excludes)...",
             test_roots.len(), excludes.len());
     }
-    let cases = if test_roots.len() == 1 && excludes.is_empty() {
+    let cases = if test_roots.len() == 1 && excludes.is_empty() && graph_supplement_dirs.is_empty() {
         discover_in_dir(&test_roots[0])?
     } else {
-        discover_in_dirs(&test_roots, &excludes)?
+        discover_in_dirs(&test_roots, &excludes, &graph_supplement_dirs)?
     };
     eprintln!("Found {} test methods across {} classes.",
         cases.len(),
