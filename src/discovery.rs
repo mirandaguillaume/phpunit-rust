@@ -1,8 +1,33 @@
 use crate::types::TestCase;
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 use walkdir::WalkDir;
+
+/// One class discovered during the pass-1 scan: enough information to build
+/// the inheritance graph (pass 2) and emit test cases (pass 3) without
+/// re-parsing the source.
+#[derive(Debug, Clone)]
+struct ParsedClass {
+    file: PathBuf,
+    /// Fully-qualified class name (namespace + "\\" + short name).
+    fqcn: String,
+    /// Resolved FQCN of the parent (post namespace + use-alias resolution),
+    /// or `None` if the class has no `extends` clause.
+    parent_fqcn: Option<String>,
+    /// All public methods whose name starts with "test". Already filtered;
+    /// pass 3 just emits them if the class is determined to be a test.
+    test_methods: Vec<String>,
+    /// `true` if the class is `abstract`. Abstract classes can never be
+    /// instantiated by PHPUnit; we skip emitting test cases for them even
+    /// when their chain reaches TestCase.
+    is_abstract: bool,
+}
+
+/// Maps every discovered class FQCN to its resolved parent FQCN (or None).
+/// Used by the BFS to decide whether a class reaches TestCase.
+type ClassGraph = HashMap<String, Option<String>>;
 
 /// A discovered test class with all of its methods, grouped for batched
 /// dispatch (one request per class to the worker).
@@ -30,8 +55,12 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     groups
 }
 
-/// Parse one PHP file and return any test classes + methods it declares.
-pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
+/// Pass 1 (per file): parse a PHP source file and return every class
+/// declaration in it, with its resolved parent FQCN and test methods.
+///
+/// "Resolved parent FQCN" applies the file's namespace + use-alias context so
+/// the BFS in pass 3 can compare on FQCN strings alone.
+fn parse_file_classes(path: &Path) -> Result<Vec<ParsedClass>> {
     let src = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
 
@@ -47,10 +76,89 @@ pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
     let bytes = src.as_bytes();
 
     let namespace = find_namespace(root, bytes);
+    let aliases = parse_use_aliases(root, bytes);
 
-    let mut cases = Vec::new();
-    collect_test_classes(root, bytes, namespace.as_deref(), path, &mut cases)?;
-    Ok(cases)
+    let mut out = Vec::new();
+    collect_parsed_classes(root, bytes, namespace.as_deref(), &aliases, path, &mut out)?;
+    Ok(out)
+}
+
+/// Parse `use Foo\Bar;` and `use Foo\Bar as Baz;` into a local-name → FQCN map.
+/// Grouped uses (`use Foo\{Bar, Baz};`) are best-effort: tree-sitter-php
+/// represents them with multiple `qualified_name` children we walk in order.
+fn parse_use_aliases(root: Node, bytes: &[u8]) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        // Top-level `namespace_use_declaration` per PHP grammar.
+        if child.kind() != "namespace_use_declaration" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for clause in child.children(&mut inner) {
+            if clause.kind() != "namespace_use_clause" {
+                continue;
+            }
+            // The clause's first qualified_name (or name) is the imported FQCN;
+            // an optional namespace_aliasing_clause supplies the alias.
+            let mut imported: Option<String> = None;
+            let mut alias: Option<String> = None;
+            let mut clause_cur = clause.walk();
+            for cc in clause.children(&mut clause_cur) {
+                match cc.kind() {
+                    "qualified_name" | "name" if imported.is_none() => {
+                        imported = cc.utf8_text(bytes).ok().map(|s| s.trim_start_matches('\\').to_string());
+                    }
+                    "namespace_aliasing_clause" => {
+                        // Child is the alias name.
+                        let mut acur = cc.walk();
+                        for ac in cc.children(&mut acur) {
+                            if ac.kind() == "name" {
+                                alias = ac.utf8_text(bytes).ok().map(String::from);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(fqcn) = imported {
+                // Default local name is the last segment of the FQCN.
+                let local = alias.unwrap_or_else(|| {
+                    fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string()
+                });
+                aliases.insert(local, fqcn);
+            }
+        }
+    }
+    aliases
+}
+
+/// Resolve a parent class name (as written after `extends`) into a FQCN,
+/// using PHP's name-resolution rules: absolute names start with `\`;
+/// relative names check use-aliases on their first segment, else prefix
+/// with the current namespace.
+fn resolve_class_reference(
+    raw: &str,
+    namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
+) -> String {
+    // Absolute: `\Foo\Bar` → `Foo\Bar`.
+    if let Some(stripped) = raw.strip_prefix('\\') {
+        return stripped.to_string();
+    }
+    let mut segments = raw.splitn(2, '\\');
+    let first = segments.next().unwrap_or("");
+    let rest = segments.next();
+    if let Some(aliased_fqcn) = aliases.get(first) {
+        match rest {
+            Some(tail) => format!("{aliased_fqcn}\\{tail}"),
+            None => aliased_fqcn.clone(),
+        }
+    } else if let Some(ns) = namespace {
+        format!("{ns}\\{raw}")
+    } else {
+        raw.to_string()
+    }
 }
 
 fn find_namespace(root: Node, bytes: &[u8]) -> Option<String> {
@@ -66,34 +174,39 @@ fn find_namespace(root: Node, bytes: &[u8]) -> Option<String> {
     None
 }
 
-fn collect_test_classes(
+fn collect_parsed_classes(
     root: Node,
     bytes: &[u8],
     namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
     path: &Path,
-    out: &mut Vec<TestCase>,
+    out: &mut Vec<ParsedClass>,
 ) -> Result<()> {
     let query_src = r#"
         (class_declaration
           name: (name) @class_name
           (base_clause (name) @base)?
-          body: (declaration_list) @body)
+          body: (declaration_list) @body) @class
     "#;
     let lang = tree_sitter_php::language_php();
     let query = Query::new(&lang, query_src).context("compiling class query")?;
     let mut cursor = QueryCursor::new();
     let captures = query.capture_names();
+    let class_idx = captures.iter().position(|n| *n == "class").unwrap();
     let class_name_idx = captures.iter().position(|n| *n == "class_name").unwrap();
     let base_idx = captures.iter().position(|n| *n == "base").unwrap();
     let body_idx = captures.iter().position(|n| *n == "body").unwrap();
 
     for m in cursor.matches(&query, root, bytes) {
+        let mut class_node: Option<Node> = None;
         let mut class_name: Option<&str> = None;
         let mut base_name: Option<&str> = None;
         let mut body_node: Option<Node> = None;
         for cap in m.captures {
             let idx = cap.index as usize;
-            if idx == class_name_idx {
+            if idx == class_idx {
+                class_node = Some(cap.node);
+            } else if idx == class_name_idx {
                 class_name = cap.node.utf8_text(bytes).ok();
             } else if idx == base_idx {
                 base_name = cap.node.utf8_text(bytes).ok();
@@ -102,32 +215,42 @@ fn collect_test_classes(
             }
         }
 
-        let (Some(name), Some(body)) = (class_name, body_node) else { continue };
-        let base = base_name.unwrap_or("");
-        if !is_testcase_subclass(base) {
-            continue;
-        }
+        let (Some(name), Some(body), Some(decl)) = (class_name, body_node, class_node) else { continue };
 
         let fqcn = match namespace {
             Some(ns) => format!("{ns}\\{name}"),
             None => name.to_string(),
         };
+        let parent_fqcn = base_name.map(|b| resolve_class_reference(b, namespace, aliases));
+        let test_methods = collect_test_methods(body, bytes);
+        let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
-        for method in collect_test_methods(body, bytes) {
-            out.push(TestCase {
-                file: path.to_path_buf(),
-                class: fqcn.clone(),
-                method,
-            });
-        }
+        out.push(ParsedClass {
+            file: path.to_path_buf(),
+            fqcn,
+            parent_fqcn,
+            test_methods,
+            is_abstract,
+        });
     }
     Ok(())
 }
 
-fn is_testcase_subclass(base: &str) -> bool {
-    // MVP heuristic: anything named TestCase or ending in TestCase.
-    // Real PHPUnit-compat would resolve `use` aliases. Tracked in follow-up plan.
-    base == "TestCase" || base.ends_with("\\TestCase")
+/// Returns true if the class declaration has the named modifier (e.g. "abstract", "final").
+/// Tree-sitter-php represents modifiers as plain `name`-like children of the class_declaration.
+fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
+    let mut cursor = class_decl.walk();
+    for child in class_decl.children(&mut cursor) {
+        let kind = child.kind();
+        if kind == "abstract_modifier" || kind == "final_modifier" || kind == "readonly_modifier" {
+            if let Ok(text) = child.utf8_text(bytes) {
+                if text.eq_ignore_ascii_case(wanted) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<String> {
@@ -163,9 +286,55 @@ fn method_is_public(method: Node, bytes: &[u8]) -> bool {
     true
 }
 
+/// Convenience wrapper: discover tests in a single PHP file. Equivalent to
+/// `discover_in_dir` on a directory containing only this file — useful for
+/// unit tests and for cases where inheritance chains live entirely in one
+/// file. Cross-file inheritance won't resolve (use `discover_in_dir`).
+pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
+    let parsed = parse_file_classes(path)?;
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+    emit_test_cases(&parsed, &graph)
+}
+
+/// Pass 3: walk the parsed classes, filter by the BFS, emit TestCases.
+/// Shared between `discover_in_file` and `discover_in_dir`.
+fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<TestCase>> {
+    let mut cases = Vec::new();
+    for class in parsed {
+        if class.is_abstract {
+            continue;
+        }
+        if !is_test_class_via_chain(&class.fqcn, graph) {
+            continue;
+        }
+        for method in &class.test_methods {
+            cases.push(TestCase {
+                file: class.file.clone(),
+                class: class.fqcn.clone(),
+                method: method.clone(),
+            });
+        }
+    }
+    Ok(cases)
+}
+
 /// Walk a directory, returning all discovered test cases.
+///
+/// Three-pass algorithm:
+///   1. Parse every `*Test*.php` file under `root` into a flat `Vec<ParsedClass>`.
+///      Each class carries its resolved-FQCN parent + its test methods + abstract bit.
+///   2. Build a `ClassGraph`: FQCN → resolved parent FQCN (or None).
+///   3. For each non-abstract class: if `is_test_class_via_chain(fqcn, &graph)`
+///      returns true, emit one `TestCase` per test method.
+///
+/// This catches projects with intermediate base classes (`AbstractTestCase`,
+/// `KernelTestCase`, etc.) that the old single-pass discovery missed.
 pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
-    let mut all = Vec::new();
+    // Pass 1: parse every relevant file.
+    let mut parsed: Vec<ParsedClass> = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) != Some("php") {
@@ -175,9 +344,63 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
         if !name.contains("Test") {
             continue;
         }
-        all.extend(discover_in_file(p)?);
+        parsed.extend(parse_file_classes(p)?);
     }
-    Ok(all)
+
+    // Pass 2: build the inheritance graph (FQCN -> parent FQCN or None).
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+
+    // Pass 3: emit test methods for every non-abstract class reaching TestCase.
+    emit_test_cases(&parsed, &graph)
+}
+
+/// Returns true if `start_fqcn` is (transitively) a subclass of PHPUnit's
+/// `TestCase`.
+///
+/// **Inputs:**
+/// - `start_fqcn`: the class to check (already a key in `graph`).
+/// - `graph`: maps every discovered FQCN → its resolved parent FQCN (or `None`
+///   when the class has no `extends` clause).
+///
+/// **Terminal rules** (return `true`):
+/// - Any parent FQCN we visit equals `"PHPUnit\\Framework\\TestCase"`.
+/// - Any parent FQCN we visit ends with `"\\TestCase"` (catches re-exports
+///   or projects using a custom namespace for what is actually PHPUnit's class
+///   — false positives are tolerable; the worker rejects non-TestCase classes
+///   at runtime).
+///
+/// **Termination (return `false`):**
+/// - The chain ends at a class with no parent (`None`).
+///
+/// **Safety:**
+/// - Guard against cycles in the graph (malformed but defensible input).
+///   Either bound iteration depth (e.g. 32) or maintain a visited set.
+///
+/// **Out of graph:**
+/// - If a parent FQCN is *not* a key in `graph` (e.g. PHPUnit's own `TestCase`
+///   defined in vendor/, outside our scanned tests/ directory), apply the
+///   terminal name check to that string and stop. Returning `false` when the
+///   parent is unknown AND doesn't match terminal patterns is correct: we
+///   simply don't have enough information to claim it's a TestCase.
+fn is_test_class_via_chain(start_fqcn: &str, graph: &ClassGraph) -> bool {
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut current = start_fqcn;
+    while visited.insert(current) {
+        let parent = match graph.get(current) {
+            Some(Some(p)) => p.as_str(),
+            // No parent (no `extends` clause) OR class not in graph — stop walking.
+            _ => return false,
+        };
+        if parent == "PHPUnit\\Framework\\TestCase" || parent.ends_with("\\TestCase") {
+            return true;
+        }
+        current = parent;
+    }
+    // visited.insert returned false → we've already seen `current` → cycle.
+    false
 }
 
 #[cfg(test)]
@@ -249,6 +472,61 @@ class BareTest extends TestCase {
         assert!(methods.contains(&("Sample\\Tests\\CalculatorTest", "testAddsTwoPositiveIntegers")));
         assert!(methods.contains(&("Sample\\Tests\\FailingTest", "testThisDeliberatelyFails")));
         assert_eq!(cases.len(), 12);
+    }
+
+    /// The brick/math-style case: a project-local abstract base class extends
+    /// PHPUnit\Framework\TestCase, and concrete tests extend that base. The
+    /// old single-pass discovery missed these. After fix #4, `discover_in_dir`
+    /// must walk the chain and discover the concrete subclass.
+    #[test]
+    fn discovers_class_extending_intermediate_base_class() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("AbstractBaseTest.php"),
+            r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+abstract class AbstractBaseTest extends TestCase {
+    protected function helper(): void {}
+}
+"#,
+        ).unwrap();
+        std::fs::write(
+            dir.path().join("ConcreteTest.php"),
+            r#"<?php
+namespace App\Tests;
+final class ConcreteTest extends AbstractBaseTest {
+    public function testActual(): void {}
+    public function testAnother(): void {}
+}
+"#,
+        ).unwrap();
+
+        let cases = discover_in_dir(dir.path()).unwrap();
+        let methods: Vec<_> = cases
+            .iter()
+            .map(|c| (c.class.as_str(), c.method.as_str()))
+            .collect();
+        // The abstract base class itself must NOT contribute tests.
+        assert!(!methods.iter().any(|(c, _)| *c == "App\\Tests\\AbstractBaseTest"),
+            "abstract base class leaked into discovery: {methods:?}");
+        // The concrete subclass's two tests must appear.
+        assert!(methods.contains(&("App\\Tests\\ConcreteTest", "testActual")));
+        assert!(methods.contains(&("App\\Tests\\ConcreteTest", "testAnother")));
+        assert_eq!(cases.len(), 2, "unexpected outcomes: {methods:?}");
+    }
+
+    /// Defense against malformed input: a class graph with a cycle must not
+    /// cause `is_test_class_via_chain` to infinite-loop. Hand-build a graph
+    /// where A → B → A and assert the call returns (false) within reasonable
+    /// time. (If your BFS is unguarded, this test hangs.)
+    #[test]
+    fn bfs_handles_cyclic_graph_without_hanging() {
+        let mut graph: ClassGraph = HashMap::new();
+        graph.insert("App\\A".into(), Some("App\\B".into()));
+        graph.insert("App\\B".into(), Some("App\\A".into()));
+        // Neither class is a TestCase; the chain cycles back without reaching one.
+        assert!(!is_test_class_via_chain("App\\A", &graph));
     }
 
     #[test]
