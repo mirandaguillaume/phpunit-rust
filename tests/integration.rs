@@ -11,7 +11,7 @@ fn request(file: &str, class: &str) -> TestRunRequest {
     let root = fixture_root();
     TestRunRequest {
         autoload: root.join("vendor/autoload.php"),
-        phpunit_xml: None,
+        bootstrap: None,
         file: root.join(file),
         class: class.into(),
         methods: vec![],

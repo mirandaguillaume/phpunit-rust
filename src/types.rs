@@ -11,9 +11,8 @@ pub struct TestCase {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TestRunRequest {
     pub autoload: PathBuf,
-    /// Path to phpunit.xml if the user has one. None → use PHPUnit defaults.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub phpunit_xml: Option<PathBuf>,
+    pub bootstrap: Option<PathBuf>,
     pub file: PathBuf,
     pub class: String,
     /// Empty vec means "run all test methods in the class".
@@ -50,30 +49,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_request_omits_phpunit_xml_when_none() {
+    fn run_request_omits_bootstrap_when_none() {
         let req = TestRunRequest {
             autoload: PathBuf::from("/p/vendor/autoload.php"),
-            phpunit_xml: None,
+            bootstrap: None,
             file: PathBuf::from("/p/tests/Foo.php"),
             class: "App\\Tests\\FooTest".into(),
             methods: vec![],
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("phpunit_xml").is_none());
+        assert!(json.get("bootstrap").is_none());
         assert_eq!(json["class"], "App\\Tests\\FooTest");
     }
 
     #[test]
-    fn run_request_includes_phpunit_xml_when_present() {
+    fn run_request_includes_bootstrap_when_present() {
         let req = TestRunRequest {
             autoload: PathBuf::from("/p/vendor/autoload.php"),
-            phpunit_xml: Some(PathBuf::from("/p/phpunit.xml")),
+            bootstrap: Some(PathBuf::from("/p/phpunit.php")),
             file: PathBuf::from("/p/tests/Foo.php"),
             class: "FooTest".into(),
             methods: vec!["testBar".into()],
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["phpunit_xml"], "/p/phpunit.xml");
+        assert_eq!(json["bootstrap"], "/p/phpunit.php");
         assert_eq!(json["methods"][0], "testBar");
     }
 

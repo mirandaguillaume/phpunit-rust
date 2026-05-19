@@ -6,25 +6,25 @@ use std::process::ExitCode;
 use phpunit_rust::client::WorkerClient;
 use phpunit_rust::discovery::discover_in_dir;
 use phpunit_rust::frankenphp::{find_worker_script, FrankenPhp};
+use phpunit_rust::phpunit_xml::parse_bootstrap;
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner via FrankenPHP")]
 struct Cli {
-    /// Path to the project under test (must contain composer.json + vendor/).
     #[arg(long, default_value = ".")]
     project: PathBuf,
-
-    /// Subdirectory (relative to --project) containing test files.
     #[arg(long, default_value = "tests")]
     tests_dir: PathBuf,
-
-    /// Run only tests whose `Class::method` contains this substring.
     #[arg(long)]
     filter: Option<String>,
-
-    /// Path to phpunit.xml. Defaults to <project>/phpunit.xml if it exists.
+    /// Bootstrap file to require before any tests. Overrides phpunit.xml's
+    /// <bootstrap> attribute if both are present.
+    #[arg(long)]
+    bootstrap: Option<PathBuf>,
+    /// Path to phpunit.xml (only used to extract its `bootstrap` attribute).
+    /// Defaults to <project>/phpunit.xml or phpunit.xml.dist if found.
     #[arg(long)]
     configuration: Option<PathBuf>,
 }
@@ -55,12 +55,8 @@ fn real_main() -> Result<ExitCode> {
         return Err(anyhow!("tests directory not found: {}", tests_dir.display()));
     }
 
-    // Auto-detect phpunit.xml if --configuration wasn't supplied.
-    let phpunit_xml = match cli.configuration {
-        Some(p) => {
-            let abs = if p.is_absolute() { p } else { project.join(p) };
-            Some(abs.canonicalize().context("invalid --configuration path")?)
-        }
+    let xml_path = match cli.configuration {
+        Some(p) => Some(if p.is_absolute() { p } else { project.join(p) }),
         None => {
             let auto = project.join("phpunit.xml");
             if auto.is_file() {
@@ -71,8 +67,20 @@ fn real_main() -> Result<ExitCode> {
             }
         }
     };
-    if let Some(p) = &phpunit_xml {
-        eprintln!("Using configuration: {}", p.display());
+    let bootstrap = match (cli.bootstrap, xml_path) {
+        (Some(b), _) => Some(if b.is_absolute() { b } else { project.join(b) }),
+        (None, Some(xml)) => {
+            let xml_str = std::fs::read_to_string(&xml)
+                .with_context(|| format!("reading {}", xml.display()))?;
+            parse_bootstrap(&xml_str).map(|rel| {
+                let p = PathBuf::from(&rel);
+                if p.is_absolute() { p } else { project.join(p) }
+            })
+        }
+        (None, None) => None,
+    };
+    if let Some(b) = &bootstrap {
+        eprintln!("Using bootstrap: {}", b.display());
     }
 
     eprintln!("Discovering tests in {}...", tests_dir.display());
@@ -86,13 +94,9 @@ fn real_main() -> Result<ExitCode> {
     let fph = FrankenPhp::spawn(&worker)?;
     let client = WorkerClient::new(fph.worker_url());
 
-    let cfg = RunConfig { autoload, phpunit_xml, filter: cli.filter };
+    let cfg = RunConfig { autoload, bootstrap, filter: cli.filter };
     let report = run(&client, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
 
-    if report.is_success() {
-        Ok(ExitCode::SUCCESS)
-    } else {
-        Ok(ExitCode::from(1))
-    }
+    if report.is_success() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::from(1)) }
 }

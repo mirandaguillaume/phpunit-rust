@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub autoload: PathBuf,
-    pub phpunit_xml: Option<PathBuf>,
+    pub bootstrap: Option<PathBuf>,
     pub filter: Option<String>,
 }
 
@@ -56,7 +56,7 @@ pub fn run(
     for TestClass { file, class, methods } in groups {
         let req = TestRunRequest {
             autoload: cfg.autoload.clone(),
-            phpunit_xml: cfg.phpunit_xml.clone(),
+            bootstrap: cfg.bootstrap.clone(),
             file,
             class,
             methods,
