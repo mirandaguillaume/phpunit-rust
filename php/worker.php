@@ -31,12 +31,13 @@ $handler = static function () use (&$loadedAutoloads): void {
             return;
         }
     }
-    $autoload  = (string) $req['autoload'];
-    $file      = (string) $req['file'];
-    $class     = (string) $req['class'];
-    $methods   = (array)  $req['methods'];
-    $bootstrap = isset($req['bootstrap']) ? (string) $req['bootstrap'] : null;
-    $defines   = isset($req['defines']) && is_array($req['defines']) ? $req['defines'] : [];
+    $autoload     = (string) $req['autoload'];
+    $file         = (string) $req['file'];
+    $class        = (string) $req['class'];
+    $methods      = (array)  $req['methods'];
+    $bootstrap    = isset($req['bootstrap']) ? (string) $req['bootstrap'] : null;
+    $defines      = isset($req['defines']) && is_array($req['defines']) ? $req['defines'] : [];
+    $describeOnly = isset($req['describe_only']) && (bool) $req['describe_only'];
 
     if (!is_file($autoload)) {
         http_response_code(400);
@@ -95,6 +96,22 @@ $handler = static function () use (&$loadedAutoloads): void {
             ob_end_clean();
             http_response_code(404);
             echo json_encode(['error' => "class {$class} not found after loading {$file}"]);
+            return;
+        }
+        if ($describeOnly) {
+            // Reflection-only: enumerate methods + their depends, no run.
+            $ref = new \ReflectionClass($class);
+            $description = [];
+            foreach ($ref->getMethods(\ReflectionMethod::IS_PUBLIC) as $m) {
+                if ($m->getDeclaringClass()->isAbstract()) continue;
+                if (!str_starts_with($m->getName(), 'test')) continue;
+                $description[] = [
+                    'name' => $m->getName(),
+                    'depends' => \PhpunitRust\MethodPlanner::dependsOf($m),
+                ];
+            }
+            ob_end_clean();
+            echo json_encode(['description' => $description]);
             return;
         }
         $outcomes = TestExecutor::runClass($class, $methods);

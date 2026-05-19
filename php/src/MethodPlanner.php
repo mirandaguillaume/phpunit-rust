@@ -73,7 +73,7 @@ final class MethodPlanner
     }
 
     /** @return list<string> */
-    private static function dependsOf(\ReflectionMethod $m): array
+    public static function dependsOf(\ReflectionMethod $m): array
     {
         $out = [];
         // PHPUnit 10+ attribute style.
