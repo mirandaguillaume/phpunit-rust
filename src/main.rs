@@ -4,13 +4,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use phpunit_rust::discovery::{discover_in_dir, discover_in_dirs};
-use phpunit_rust::frankenphp::{find_worker_script, WorkerPool};
+use phpunit_rust::php_worker::{check_php_version, find_worker_script, PhpWorkerPool};
 use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
 #[derive(Parser, Debug)]
-#[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner via FrankenPHP")]
+#[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner")]
 struct Cli {
     #[arg(long, default_value = ".")]
     project: PathBuf,
@@ -28,10 +28,14 @@ struct Cli {
     /// and `<php><const>` declarations (passed to the worker as `define()`s).
     #[arg(long)]
     configuration: Option<PathBuf>,
-    /// Number of parallel FrankenPHP workers. Defaults to the number of CPU
+    /// Number of parallel PHP workers. Defaults to the number of CPU
     /// cores detected on this machine. Use --workers 1 for sequential mode.
     #[arg(long)]
     workers: Option<usize>,
+    /// Minimum row count for a data-provider method to be split into per-row
+    /// chunks. Below this, methods are dispatched whole. Default 50.
+    #[arg(long)]
+    row_chunk_min: Option<usize>,
 }
 
 fn main() -> ExitCode {
@@ -177,11 +181,24 @@ fn real_main() -> Result<ExitCode> {
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
     );
 
-    eprintln!("Spawning {} FrankenPHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
-    let worker_script = find_worker_script()?;
-    let pool = WorkerPool::spawn(&worker_script, worker_count)?;
+    // Verify a usable PHP is on PATH. We require ≥ 8.1; some projects need
+    // newer (brick/math: 8.2; doctrine/collections: 8.4). The user is on
+    // the hook for installing a sufficiently-new PHP.
+    let php_id = check_php_version(80100)
+        .context("PHP version check failed (need ≥ 8.1 on PATH)")?;
+    eprintln!("PHP version id: {php_id}");
 
-    let cfg = RunConfig { autoload, bootstrap, filter: cli.filter, defines };
+    eprintln!("Spawning {} PHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
+    let worker_script = find_worker_script()?;
+    let pool = PhpWorkerPool::spawn(&worker_script, worker_count)?;
+
+    let cfg = RunConfig {
+        autoload,
+        bootstrap,
+        filter: cli.filter,
+        defines,
+        row_chunk_min: cli.row_chunk_min.unwrap_or(50),
+    };
     let report = run(&pool, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
 
