@@ -3,13 +3,18 @@
 //! lines instead of ureq HTTP.
 
 use crate::php_worker::PhpWorker;
-use crate::types::{ClassDescriptor, TestOutcome, TestRunRequest};
-use anyhow::{anyhow, Context, Result};
+use crate::types::{ClassDescriptor, TestOutcome, TestRunRequest, TestStatus};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Worker can send back either successful outcomes or a class-level error.
+/// `#[serde(untagged)]` tries Success first (requires `outcomes` key), then
+/// falls back to Failure for any JSON object that lacks `outcomes`.
 #[derive(Deserialize)]
-struct WorkerResponse {
-    outcomes: Vec<TestOutcome>,
+#[serde(untagged)]
+enum WorkerRunReply {
+    Success { outcomes: Vec<TestOutcome> },
+    Failure { detail: Option<String>, trace: Option<String> },
 }
 
 /// Borrowed handle: holds a reference to one worker in the pool. The pool
@@ -31,22 +36,37 @@ impl<'a> PhpWorkerClient<'a> {
         Ok(response)
     }
 
+    /// Run a class on the worker. Worker errors (exceptions in setUp/tearDown,
+    /// etc.) are converted to error-status TestOutcomes instead of propagating
+    /// as Err — the run continues for all other classes.
     pub fn run_class(&self, req: &TestRunRequest) -> Result<Vec<TestOutcome>> {
         let line = self.raw_round_trip(req)?;
-        // Worker can return either {outcomes:[...]} or {error:"..."}.
-        if line.contains("\"error\"") && !line.contains("\"outcomes\"") {
-            return Err(anyhow!("worker error: {}", line.trim()));
+        match serde_json::from_str::<WorkerRunReply>(&line)
+            .with_context(|| format!("worker response was not valid JSON: {}", line.trim()))?
+        {
+            WorkerRunReply::Success { outcomes } => Ok(outcomes),
+            WorkerRunReply::Failure { detail, trace } => {
+                let msg = detail.unwrap_or_else(|| "worker error (no detail)".into());
+                let targets = if req.methods.is_empty() {
+                    vec!["<class>".to_string()]
+                } else {
+                    req.methods.clone()
+                };
+                Ok(targets.into_iter().map(|m| TestOutcome {
+                    class: req.class.clone(),
+                    method: m,
+                    dataset: None,
+                    status: TestStatus::Error,
+                    message: Some(msg.clone()),
+                    trace: trace.clone(),
+                    duration_ms: 0.0,
+                }).collect())
+            }
         }
-        let body: WorkerResponse = serde_json::from_str(&line)
-            .with_context(|| format!("worker response was not valid JSON: {}", line.trim()))?;
-        Ok(body.outcomes)
     }
 
     pub fn describe_class(&self, req: &TestRunRequest) -> Result<ClassDescriptor> {
         let line = self.raw_round_trip(req)?;
-        if line.contains("\"error\"") && !line.contains("\"description\"") {
-            return Err(anyhow!("worker error: {}", line.trim()));
-        }
         let body: ClassDescriptor = serde_json::from_str(&line)
             .with_context(|| format!("describe response was not valid JSON: {}", line.trim()))?;
         Ok(body)

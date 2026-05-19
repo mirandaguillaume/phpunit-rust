@@ -20,29 +20,32 @@ REPO=/home/gumiranda/PHPUnit_rust
 SMOKE=/tmp/phpunit-rust-smoke
 BINARY="$REPO/target/release/phpunit-rust"
 
-# Project entries: "name|host_path|min_php_ver|extra_env|phpunit_args"
+# Project entries: "name|host_path|min_php_ver|extra_env|phpunit_args|php_flags|phpunit_bin"
 #
 #   name          — label shown in the table
 #   host_path     — absolute path on the host (mounted read-only as /proj)
 #   min_php_ver   — minimum PHP version required; skip older containers
 #   extra_env     — optional env var(s) prepended to both commands (e.g. CALCULATOR=Native)
-#   phpunit_args  — extra args appended to vanilla ./vendor/bin/phpunit
+#   phpunit_args  — extra args appended to the vanilla phpunit invocation
 #                   (use "tests/" for projects that have no phpunit.xml)
+#   php_flags     — extra flags passed to the `php` CLI for the vanilla run
+#                   (e.g. "-d memory_limit=-1" for memory-hungry suites)
+#   phpunit_bin   — path to the vanilla phpunit binary inside the container
+#                   (default: ./vendor/bin/phpunit)
 PHP_VERSIONS=(8.1 8.2 8.3 8.4 8.5)
 PROJECTS=(
-    "fixture|$REPO/fixtures/sample_project|8.1||tests/"
-    "guzzle-psr7|$SMOKE/guzzle-psr7|7.2||"
-    "php-parser|$SMOKE/php-parser|7.4||"
-    "mockery|$SMOKE/mockery|8.1||"
-    "faker|$SMOKE/faker|8.1||"
-    "psalm|$SMOKE/psalm|8.1||"
-    "doctrine-orm|$SMOKE/doctrine-orm|8.1||"
-    "ramsey-uuid|$SMOKE/ramsey-uuid|8.2||"
-    "carbon|$SMOKE/carbon|8.1||"
-    "doctrine-collections|$SMOKE/doctrine-collections|8.4||"
-    "phpunit-itself|$SMOKE/phpunit-itself|8.4||"
-    "symfony-validator|$SMOKE/symfony-validator|8.4||"
-    "brick-math|$SMOKE/brick-math|8.2|CALCULATOR=Native|"
+    "fixture|$REPO/fixtures/sample_project|8.1||tests/||"
+    "guzzle-psr7|$SMOKE/guzzle-psr7|7.2||||"
+    "php-parser|$SMOKE/php-parser|7.4||||"
+    "mockery|$SMOKE/mockery|8.1||--no-configuration --bootstrap tests/Bootstrap.php tests/||"
+    "faker|$SMOKE/faker|8.1||||"
+    "psalm|$SMOKE/psalm|8.1|||-d memory_limit=-1|"
+    "doctrine-orm|$SMOKE/doctrine-orm|8.1||||"
+    "ramsey-uuid|$SMOKE/ramsey-uuid|8.2||||"
+    "carbon|$SMOKE/carbon|8.1||||"
+    "doctrine-collections|$SMOKE/doctrine-collections|8.4||||"
+    "phpunit-itself|$SMOKE/phpunit-itself|8.4||||./phpunit"
+    "brick-math|$SMOKE/brick-math|8.2|CALCULATOR=Native|||"
 )
 WORKERS=(1 4 22)
 
@@ -130,11 +133,18 @@ run_in_container() {
     # Test count: phpunit-rust   → "Tests: N total, P passed, ..."
     #             vanilla PHPUnit → "Tests: N, Assertions: ..."  or
     #                               "OK (N tests, ...)"
+    #             PHPUnit 9 verbose → "N / M (P%)" progress lines (Symfony
+    #                                  bridge suppresses the final summary line)
     G_TESTS=$(grep -oE "Tests: [0-9]+" "$stdout_file" 2>/dev/null \
         | head -1 | awk '{print $2}' || true)
     if [ -z "${G_TESTS:-}" ]; then
         G_TESTS=$(grep -oE "OK \([0-9]+ tests?" "$stdout_file" 2>/dev/null \
             | head -1 | grep -oE "[0-9]+" | head -1 || true)
+    fi
+    if [ -z "${G_TESTS:-}" ]; then
+        # Progress-line fallback: "  488 / 1416 ( 34%)" — last line's total.
+        G_TESTS=$(grep -oE "[0-9]+ / [0-9]+" "$stdout_file" 2>/dev/null \
+            | tail -1 | grep -oE "[0-9]+" | tail -1 || true)
     fi
     [ -z "${G_TESTS:-}" ] && G_TESTS="?"
 
@@ -143,7 +153,7 @@ run_in_container() {
 
 for php_ver in "${PHP_VERSIONS[@]}"; do
     for project_entry in "${PROJECTS[@]}"; do
-        IFS="|" read -r name path min_php extra_env phpunit_args <<< "$project_entry"
+        IFS="|" read -r name path min_php extra_env phpunit_args php_flags phpunit_bin <<< "$project_entry"
 
         # Skip if PHP version is too old for the project.
         if [ "$(printf '%s\n' "$min_php" "$php_ver" | sort -V | head -1)" != "$min_php" ]; then
@@ -161,11 +171,12 @@ for php_ver in "${PHP_VERSIONS[@]}"; do
             env_prefix="$extra_env "
         fi
 
+        # Resolve phpunit binary (default: ./vendor/bin/phpunit).
+        bin="${phpunit_bin:-./vendor/bin/phpunit}"
+
         # --- Vanilla PHPUnit baseline (one run per PHP×project) ---
-        # phpunit_args is empty for projects that have a phpunit.xml,
-        # "tests/" for the bundled fixture which has no config file.
         run_in_container "$php_ver" "$path" \
-            "${env_prefix}./vendor/bin/phpunit ${phpunit_args:-}"
+            "${env_prefix}php ${php_flags:-} ${bin} ${phpunit_args:-}"
         echo "| $php_ver | $name | vanilla-phpunit | 1 | $G_TESTS | $G_WALL | $G_RSS_MB | $G_CPU |"
 
         # --- phpunit-rust at each worker count ---

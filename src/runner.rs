@@ -76,6 +76,10 @@ pub fn run(
     // (file, class, methods_subset, row_filter)
     let mut dispatch_units: Vec<(PathBuf, String, Vec<String>, Option<RowFilter>)> = Vec::new();
 
+    // Error outcomes from classes whose describe probe failed (PHP OOM, etc.).
+    // Collected here and merged with Phase-B outcomes at the end.
+    let mut describe_errors: Vec<TestOutcome> = Vec::new();
+
     for TestClass { file, class, methods } in &groups {
         let probe_req = TestRunRequest {
             autoload: cfg.autoload.clone(),
@@ -87,7 +91,26 @@ pub fn run(
             describe_only: true,
             row_filter: None,
         };
-        let descriptor: ClassDescriptor = probe_client.describe_class(&probe_req)?;
+        let descriptor: ClassDescriptor = match probe_client.describe_class(&probe_req) {
+            Ok(d) => d,
+            Err(e) => {
+                // Worker crashed (OOM, fatal error) — can't know method list.
+                // Use the methods we discovered statically as best-effort.
+                let msg = format!("{e:#}");
+                for method in methods {
+                    describe_errors.push(TestOutcome {
+                        class: class.clone(),
+                        method: method.clone(),
+                        dataset: None,
+                        status: TestStatus::Error,
+                        message: Some(msg.clone()),
+                        trace: None,
+                        duration_ms: 0.0,
+                    });
+                }
+                continue;
+            }
+        };
 
         // Build the depends map AND row-count map from the descriptor.
         let depends: HashMap<String, Vec<String>> = descriptor
@@ -155,8 +178,10 @@ pub fn run(
         })
         .collect();
 
-    // Aggregate. Short-circuit on the first transport error.
-    let mut outcomes = Vec::new();
+    // Aggregate. Short-circuit on the first transport error (process died).
+    // Worker-level class errors were already converted to error outcomes inside
+    // run_class, so they arrive as Ok(outcomes) and are counted normally.
+    let mut outcomes: Vec<TestOutcome> = describe_errors;
     let mut total = 0.0;
     for batch in results {
         let batch = batch?;
