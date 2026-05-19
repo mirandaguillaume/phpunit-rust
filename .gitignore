@@ -8,3 +8,7 @@
 # Plan/spec docs and tooling caches stay local (do not commit)
 docs/
 .serena/
+
+# Benchmark output (machine-dependent, not committed)
+bench/results.md
+bench/results/
