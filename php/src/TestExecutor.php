@@ -34,11 +34,39 @@ final class TestExecutor
         $outcomes = [];
         $passedReturns = [];  // method -> return value, for @depends injection
 
+        // Check the CLASS-level @requires once; it applies to every step.
+        $classSkipReason = self::checkRequires((string) $ref->getDocComment());
+
         foreach ($steps as $step) {
             $method  = $step['method'];
             $dataset = $step['dataset'];
             $userArgs = $step['args'];
             $depends = $step['depends'];
+
+            // Method-level @requires takes precedence over class-level (PHPUnit
+            // semantics: any failing @requires at either scope means skip).
+            $methodRef = $ref->getMethod($method);
+            $skipReason = $classSkipReason
+                ?: self::checkRequires((string) $methodRef->getDocComment());
+            if ($skipReason !== null) {
+                $outcomes[] = OutcomeBuilder::build(
+                    $class, $method, $dataset, 0.0,
+                    new \PHPUnit\Framework\IncompleteTestError($skipReason)
+                );
+                // Actually we want this as "skipped", not "incomplete". Build
+                // the outcome array manually to ensure the right status.
+                array_pop($outcomes);
+                $outcomes[] = [
+                    'class'       => $class,
+                    'method'      => $method,
+                    'dataset'     => $dataset,
+                    'status'      => 'skipped',
+                    'message'     => $skipReason,
+                    'trace'       => null,
+                    'duration_ms' => 0.0,
+                ];
+                continue;
+            }
 
             // Build args = depends-return-values ++ data-provider-args.
             $args = [];
@@ -136,6 +164,64 @@ final class TestExecutor
         if (!$m->isStatic()) return;
         $m->setAccessible(true);
         $m->invoke(null);
+    }
+
+    /**
+     * Evaluate `@requires` annotations in a PHPDoc block. Returns null if all
+     * requirements are satisfied (or there are none), or a human-readable
+     * "skip" message if any requirement fails.
+     *
+     * Supported requirement kinds (the common subset; PHPUnit has more):
+     *   - `@requires PHP <op><version>`     e.g. `@requires PHP >= 8.0`
+     *   - `@requires PHP <version>`          (no operator → ">=")
+     *   - `@requires PHP < 7.4` etc.
+     *   - `@requires extension <name>`       skip if extension not loaded
+     *   - `@requires function <name>`        skip if function not declared
+     *   - `@requires OS <regex>`             skip if `php_uname('s')` doesn't match
+     */
+    private static function checkRequires(string $doc): ?string
+    {
+        if ($doc === '') return null;
+        if (!preg_match_all('/@requires\s+(\S+)\s+(.+)/', $doc, $matches, PREG_SET_ORDER)) {
+            return null;
+        }
+        foreach ($matches as $m) {
+            $kind = $m[1];
+            $spec = trim($m[2]);
+            switch ($kind) {
+                case 'PHP':
+                    // Allow leading operator, default to `>=`.
+                    if (!preg_match('/^(<=|>=|<>|!=|==|=|<|>)?\s*(.+)$/', $spec, $vm)) {
+                        continue 2;
+                    }
+                    $op = $vm[1] !== '' ? $vm[1] : '>=';
+                    if ($op === '=') $op = '==';
+                    $required = $vm[2];
+                    if (!version_compare(PHP_VERSION, $required, $op)) {
+                        return "PHP {$op} {$required} (have " . PHP_VERSION . ')';
+                    }
+                    break;
+                case 'extension':
+                    $ext = strtok($spec, ' ');
+                    if (!extension_loaded($ext)) {
+                        return "extension {$ext} not loaded";
+                    }
+                    break;
+                case 'function':
+                    if (!function_exists($spec)) {
+                        return "function {$spec} not defined";
+                    }
+                    break;
+                case 'OS':
+                    if (!preg_match('/' . str_replace('/', '\\/', $spec) . '/i', PHP_OS)) {
+                        return "OS does not match {$spec} (have " . PHP_OS . ')';
+                    }
+                    break;
+                default:
+                    // Ignore unknown @requires kinds (PHPUnit, OSFAMILY, etc.)
+            }
+        }
+        return null;
     }
 
     /**
