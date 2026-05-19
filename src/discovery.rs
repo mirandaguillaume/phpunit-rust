@@ -301,7 +301,19 @@ pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
 
 /// Pass 3: walk the parsed classes, filter by the BFS, emit TestCases.
 /// Shared between `discover_in_file` and `discover_in_dir`.
+///
+/// For each non-abstract class reaching TestCase, we union test methods
+/// from the class itself plus every parsed ancestor in the chain. This
+/// catches the doctrine/collections-style pattern where a `final` concrete
+/// test class extends an abstract base that defines most/all of its tests.
+/// Without this, the concrete class would emit zero TestCase entries (the
+/// inherited methods were on the abstract parent), and the runner would
+/// silently skip them.
 fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<TestCase>> {
+    // Index by FQCN for chain-walking.
+    let by_fqcn: HashMap<&str, &ParsedClass> =
+        parsed.iter().map(|c| (c.fqcn.as_str(), c)).collect();
+
     let mut cases = Vec::new();
     for class in parsed {
         if class.is_abstract {
@@ -310,12 +322,32 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
         if !is_test_class_via_chain(&class.fqcn, graph) {
             continue;
         }
-        for method in &class.test_methods {
-            cases.push(TestCase {
-                file: class.file.clone(),
-                class: class.fqcn.clone(),
-                method: method.clone(),
-            });
+        // Collect methods from this class + all parsed ancestors, dedup by name.
+        // The PHP runtime will run inherited methods on the concrete subclass,
+        // so we emit them under `class.fqcn` (not the ancestor's FQCN).
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut visit = class.fqcn.as_str();
+        let mut depth = 0;
+        while depth < 32 {
+            if let Some(c) = by_fqcn.get(visit) {
+                for m in &c.test_methods {
+                    if seen.insert(m.as_str()) {
+                        cases.push(TestCase {
+                            file: class.file.clone(),
+                            class: class.fqcn.clone(),
+                            method: m.clone(),
+                        });
+                    }
+                }
+                match c.parent_fqcn.as_deref() {
+                    Some(p) => visit = p,
+                    None => break,
+                }
+            } else {
+                // Parent is outside our parsed set (e.g., PHPUnit's TestCase).
+                break;
+            }
+            depth += 1;
         }
     }
     Ok(cases)
