@@ -56,19 +56,51 @@ pub fn run(
         .collect();
 
     let groups = group_by_class(filtered_cases);
+    if groups.is_empty() {
+        return Ok(Report { outcomes: Vec::new(), total_duration_ms: 0.0 });
+    }
 
-    // One WorkerClient per pool worker. Cloned ureq::Agent shares connection
-    // pool internals; per-worker we want distinct URLs and isolated state.
+    // One WorkerClient per pool worker.
     let urls = pool.urls();
     let clients: Vec<WorkerClient> =
         urls.iter().map(|u| WorkerClient::new(u.clone())).collect();
 
-    // Distribute classes via rayon. Each rayon thread picks its client by
-    // thread index; rayon guarantees that index < pool size when the global
-    // thread pool was sized to match (see main.rs).
-    let results: Vec<Result<Vec<TestOutcome>>> = groups
+    // Phase A: probe each class for its depends info, then split into
+    // dependency components. Sequential — one round-trip per class, cheap.
+    // We dispatch all probes to clients[0]; parallelizing the probes saves
+    // negligible time and adds complication.
+    let probe_client = &clients[0];
+    let mut dispatch_units: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    for TestClass { file, class, methods } in &groups {
+        let probe_req = TestRunRequest {
+            autoload: cfg.autoload.clone(),
+            bootstrap: cfg.bootstrap.clone(),
+            file: file.clone(),
+            class: class.clone(),
+            methods: Vec::new(),
+            defines: cfg.defines.clone(),
+            describe_only: true,
+        };
+        let descriptor = probe_client.describe_class(&probe_req)?;
+        // Build the depends map from the descriptor.
+        let depends: std::collections::HashMap<String, Vec<String>> = descriptor
+            .description
+            .iter()
+            .map(|m| (m.name.clone(), m.depends.clone()))
+            .collect();
+        // Restrict to the methods we discovered (which respects any --filter
+        // we already applied at the case level).
+        let class_methods: Vec<String> = methods.clone();
+        let components = crate::components::partition_by_depends(&class_methods, &depends);
+        for component in components {
+            dispatch_units.push((file.clone(), class.clone(), component));
+        }
+    }
+
+    // Phase B: parallel dispatch. Each rayon thread picks a worker by index.
+    let results: Vec<Result<Vec<TestOutcome>>> = dispatch_units
         .into_par_iter()
-        .map(|TestClass { file, class, methods }| {
+        .map(|(file, class, methods)| {
             let idx = rayon::current_thread_index().unwrap_or(0);
             let client = &clients[idx % clients.len()];
             let req = TestRunRequest {
@@ -81,7 +113,7 @@ pub fn run(
                 describe_only: false,
             };
             let batch = client.run_class(&req)?;
-            // Emit progress inside the worker thread, as outcomes arrive.
+            // Emit progress inside the worker thread as outcomes arrive.
             for outcome in &batch {
                 on_progress(outcome);
             }
@@ -89,9 +121,7 @@ pub fn run(
         })
         .collect();
 
-    // Aggregate. Short-circuit on first transport/protocol error so the
-    // user sees the actual cause; per-test failures are returned in
-    // outcomes, not as Result errors.
+    // Aggregate. Short-circuit on the first transport error.
     let mut outcomes = Vec::new();
     let mut total = 0.0;
     for batch in results {
