@@ -35,6 +35,26 @@ final class _MpChain extends TestCase
     public function testLeaf(int $r): void {}
 }
 
+final class _MpGeneratorMultiSegment extends TestCase
+{
+    // Regression for the brick/math BigDecimalTest bug: a generator that
+    // yields without keys in one segment, then `yield from` an array literal,
+    // produces colliding integer keys (each segment restarts at 0). We must
+    // append for int keys, not overwrite.
+    public static function gen(): \Generator
+    {
+        yield [1];
+        yield [2];
+        yield [3];
+        yield from [
+            [10],
+            [20],
+        ];
+    }
+    #[DataProvider('gen')]
+    public function testGen(int $x): void {}
+}
+
 final class MethodPlannerTest extends TestCase
 {
     public function testNonProviderMethodEmitsSingleStep(): void
@@ -69,5 +89,16 @@ final class MethodPlannerTest extends TestCase
         $steps = MethodPlanner::plan(_MpChain::class, ['testRoot', 'testMiddle']);
         $this->assertSame([], $steps[0]['depends']);
         $this->assertSame(['testRoot'], $steps[1]['depends']);
+    }
+
+    public function testGeneratorWithUnkeyedYieldsAndYieldFromPreservesAllRows(): void
+    {
+        $steps = MethodPlanner::plan(_MpGeneratorMultiSegment::class, ['testGen']);
+        // 3 from the plain yields + 2 from `yield from [...]` = 5 distinct rows.
+        // Pre-fix this returned only 3 because keys 0/1/2 from `yield from`
+        // overwrote the earlier 3 unkeyed yields.
+        $this->assertCount(5, $steps, 'all rows must be preserved across generator segments');
+        $args = array_column($steps, 'args');
+        $this->assertSame([[1], [2], [3], [10], [20]], $args);
     }
 }

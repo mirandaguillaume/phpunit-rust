@@ -100,7 +100,15 @@ final class MethodPlanner
                 ? $providerRef->invoke(null)
                 : $providerRef->invoke($ref->newInstanceWithoutConstructor());
             foreach ($result as $key => $row) {
-                $rows[$key] = $row;
+                // Integer keys (the default from yield-without-key and from
+                // bare array literals like `yield from [...]`) collide across
+                // generator segments — both start at 0. Append for ints to
+                // preserve every row; keep string keys for named data sets.
+                if (is_int($key)) {
+                    $rows[] = $row;
+                } else {
+                    $rows[$key] = $row;
+                }
             }
         }
         return $rows;
