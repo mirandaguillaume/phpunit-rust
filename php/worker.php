@@ -55,6 +55,17 @@ $handler = static function () use (&$loadedAutoloads): void {
             if ($bootstrap !== null && is_file($bootstrap)) {
                 require_once $bootstrap;
             }
+            // PHPUnit's MockObject\Invocation::__toString eventually calls
+            // Registry::get(), which asserts a Configuration is registered.
+            // We don't use any of its values — we just need *something*
+            // there so mock error-formatting doesn't blow up with
+            // AssertionError. Single bare init per autoload is enough.
+            if (class_exists(\PHPUnit\TextUI\Configuration\Registry::class)) {
+                \PHPUnit\TextUI\Configuration\Registry::init(
+                    (new \PHPUnit\TextUI\CliArguments\Builder)->fromParameters([]),
+                    \PHPUnit\TextUI\XmlConfiguration\DefaultConfiguration::create(),
+                );
+            }
             $loadedAutoloads[$autoload] = true;
         }
         if (!is_file($file)) {
