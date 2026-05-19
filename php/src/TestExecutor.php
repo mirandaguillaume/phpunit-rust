@@ -71,12 +71,24 @@ final class TestExecutor
                 $returnValue = $test->{$method}(...$args);
                 self::invokeOptional($test, 'tearDown');
 
-                // expectException check: if the test declared one and didn't
-                // throw, that's a failure. PHPUnit's runner verifies this
-                // automatically via the runBare flow we're bypassing.
-                if ($expected = self::readExpectedException($test)) {
+                // expectException* check: if the test declared any expectation
+                // (class, message, or code) and no exception was thrown,
+                // that's a failure. PHPUnit's runner verifies this via the
+                // runBare flow we're bypassing.
+                $expectedClass = self::readExpectedException($test);
+                $expectedMessage = self::readPrivateProp($test, 'expectedExceptionMessage');
+                $expectedCode = self::readPrivateProp($test, 'expectedExceptionCode');
+                if (
+                    $expectedClass !== null
+                    || (is_string($expectedMessage) && $expectedMessage !== '')
+                    || ($expectedCode !== null && $expectedCode !== '')
+                ) {
+                    $desc = $expectedClass ?? 'exception';
+                    if (is_string($expectedMessage) && $expectedMessage !== '') {
+                        $desc .= " with message containing \"{$expectedMessage}\"";
+                    }
                     $error = new \PHPUnit\Framework\ExpectationFailedException(
-                        "Expected exception {$expected} was not thrown"
+                        "Expected {$desc} was not thrown"
                     );
                 }
             } catch (\PHPUnit\Framework\SkippedWithMessageException $e) {
@@ -127,26 +139,66 @@ final class TestExecutor
     }
 
     /**
+     * Read one of TestCase's private "expected*" properties via reflection.
+     * Returns null if the property doesn't exist (PHPUnit version drift) or
+     * is unset on this instance.
+     */
+    private static function readPrivateProp(TestCase $test, string $name)
+    {
+        $ref = new \ReflectionClass(TestCase::class);
+        if (!$ref->hasProperty($name)) return null;
+        $prop = $ref->getProperty($name);
+        $prop->setAccessible(true);
+        return $prop->getValue($test);
+    }
+
+    /**
      * Returns the FQCN of the exception class declared via expectException(),
      * or null if none was declared.
      */
     private static function readExpectedException(TestCase $test): ?string
     {
-        // PHPUnit stores the expected exception in a private property on
-        // TestCase itself — `expectedException`. Because the property is
-        // private to TestCase (not the subclass), we must reflect on
-        // TestCase directly; ReflectionObject of a subclass won't find it.
-        $ref = new \ReflectionClass(TestCase::class);
-        if (!$ref->hasProperty('expectedException')) return null;
-        $prop = $ref->getProperty('expectedException');
-        $prop->setAccessible(true);
-        $value = $prop->getValue($test);
+        $value = self::readPrivateProp($test, 'expectedException');
         return is_string($value) ? $value : null;
     }
 
+    /**
+     * Does the thrown exception match the test's `expectException*` setup?
+     *
+     * PHPUnit honors three separately-settable expectations:
+     *   - expectException(class)              → throw must be instance of class
+     *   - expectExceptionMessage(substring)   → throw->getMessage must contain substring
+     *   - expectExceptionCode(code)           → throw->getCode must equal code
+     *
+     * If ANY of the three is set, an exception is expected. The throw matches
+     * iff every set expectation is satisfied. A test that only sets
+     * `expectExceptionMessage('foo')` (no class) implicitly expects any
+     * Throwable whose message contains 'foo' — that's PHPUnit's semantics.
+     */
     private static function wasExceptionExpected(TestCase $test, \Throwable $thrown): bool
     {
-        $expected = self::readExpectedException($test);
-        return $expected !== null && ($thrown instanceof $expected);
+        $expectedClass   = self::readExpectedException($test);
+        $expectedMessage = self::readPrivateProp($test, 'expectedExceptionMessage');
+        $expectedCode    = self::readPrivateProp($test, 'expectedExceptionCode');
+
+        $anySet = $expectedClass !== null
+            || (is_string($expectedMessage) && $expectedMessage !== '')
+            || ($expectedCode !== null && $expectedCode !== '');
+        if (!$anySet) {
+            return false;
+        }
+
+        if ($expectedClass !== null && !($thrown instanceof $expectedClass)) {
+            return false;
+        }
+        if (is_string($expectedMessage) && $expectedMessage !== ''
+            && strpos((string) $thrown->getMessage(), $expectedMessage) === false) {
+            return false;
+        }
+        if ($expectedCode !== null && $expectedCode !== ''
+            && (string) $thrown->getCode() !== (string) $expectedCode) {
+            return false;
+        }
+        return true;
     }
 }

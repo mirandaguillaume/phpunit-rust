@@ -11,6 +11,10 @@ pub struct RunConfig {
     pub autoload: PathBuf,
     pub bootstrap: Option<PathBuf>,
     pub filter: Option<String>,
+    /// `define(name, value)` declarations extracted from `<php><const .../>`
+    /// in phpunit.xml. Passed through every request so the worker applies
+    /// them once per autoload before running tests.
+    pub defines: Vec<[String; 2]>,
 }
 
 #[derive(Debug)]
@@ -73,6 +77,7 @@ pub fn run(
                 file,
                 class,
                 methods,
+                defines: cfg.defines.clone(),
             };
             let batch = client.run_class(&req)?;
             // Emit progress inside the worker thread, as outcomes arrive.

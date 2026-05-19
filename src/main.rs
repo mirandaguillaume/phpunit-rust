@@ -3,9 +3,9 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::discover_in_dir;
+use phpunit_rust::discovery::{discover_in_dir, discover_in_dirs};
 use phpunit_rust::frankenphp::{find_worker_script, WorkerPool};
-use phpunit_rust::phpunit_xml::parse_bootstrap;
+use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
@@ -22,8 +22,10 @@ struct Cli {
     /// <bootstrap> attribute if both are present.
     #[arg(long)]
     bootstrap: Option<PathBuf>,
-    /// Path to phpunit.xml (only used to extract its `bootstrap` attribute).
-    /// Defaults to <project>/phpunit.xml or phpunit.xml.dist if found.
+    /// Path to phpunit.xml. Defaults to <project>/phpunit.xml or
+    /// phpunit.xml.dist if found. We extract: the `bootstrap` attribute,
+    /// `<testsuite><directory>` entries (used as additional discovery roots),
+    /// and `<php><const>` declarations (passed to the worker as `define()`s).
     #[arg(long)]
     configuration: Option<PathBuf>,
     /// Number of parallel FrankenPHP workers. Defaults to the number of CPU
@@ -53,10 +55,6 @@ fn real_main() -> Result<ExitCode> {
             autoload.display()
         ));
     }
-    let tests_dir = project.join(&cli.tests_dir);
-    if !tests_dir.is_dir() {
-        return Err(anyhow!("tests directory not found: {}", tests_dir.display()));
-    }
 
     let xml_path = match cli.configuration {
         Some(p) => Some(if p.is_absolute() { p } else { project.join(p) }),
@@ -70,33 +68,110 @@ fn real_main() -> Result<ExitCode> {
             }
         }
     };
-    let bootstrap = match (cli.bootstrap, xml_path) {
+
+    // Read the phpunit.xml once; reuse for bootstrap + testsuites + constants.
+    let xml_str = match &xml_path {
+        Some(xml) => Some(
+            std::fs::read_to_string(xml)
+                .with_context(|| format!("reading {}", xml.display()))?,
+        ),
+        None => None,
+    };
+
+    let bootstrap = match (cli.bootstrap, xml_str.as_deref()) {
         (Some(b), _) => Some(if b.is_absolute() { b } else { project.join(b) }),
-        (None, Some(xml)) => {
-            let xml_str = std::fs::read_to_string(&xml)
-                .with_context(|| format!("reading {}", xml.display()))?;
-            parse_bootstrap(&xml_str).map(|rel| {
-                let p = PathBuf::from(&rel);
-                if p.is_absolute() { p } else { project.join(p) }
-            })
-        }
+        (None, Some(xml)) => parse_bootstrap(xml).map(|rel| {
+            let p = PathBuf::from(&rel);
+            if p.is_absolute() { p } else { project.join(p) }
+        }),
         (None, None) => None,
     };
     if let Some(b) = &bootstrap {
         eprintln!("Using bootstrap: {}", b.display());
     }
 
-    // Decide worker count BEFORE initializing rayon. We need the rayon pool
-    // sized to match so `rayon::current_thread_index()` returns valid indices
-    // into our WorkerClient vec.
+    // <php><const>: forwarded to the worker so PHP's `define()` runs them
+    // before tests do.
+    let defines: Vec<[String; 2]> = xml_str
+        .as_deref()
+        .map(parse_php_constants)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| [c.name, c.value])
+        .collect();
+    if !defines.is_empty() {
+        eprintln!("Applying {} <php><const> declaration{} from configuration.",
+            defines.len(),
+            if defines.len() == 1 { "" } else { "s" });
+    }
+
+    // <testsuites>: collect include directories + excludes, resolved relative
+    // to the project root. If phpunit.xml declares testsuites we use them as
+    // the discovery roots; otherwise we fall back to --tests-dir.
+    let (test_roots, excludes): (Vec<PathBuf>, Vec<PathBuf>) = match xml_str.as_deref() {
+        Some(xml) => {
+            let suites = parse_testsuites(xml);
+            if suites.is_empty() {
+                let dir = project.join(&cli.tests_dir);
+                (vec![dir], vec![])
+            } else {
+                let mut roots = Vec::new();
+                let mut excls = Vec::new();
+                for s in suites {
+                    for d in s.directories {
+                        let p = PathBuf::from(&d);
+                        roots.push(if p.is_absolute() { p } else { project.join(p) });
+                    }
+                    for d in s.excludes {
+                        let p = PathBuf::from(&d);
+                        excls.push(if p.is_absolute() { p } else { project.join(p) });
+                    }
+                }
+                (roots, excls)
+            }
+        }
+        None => {
+            let dir = project.join(&cli.tests_dir);
+            (vec![dir], vec![])
+        }
+    };
+
+    // Validate discovery roots exist; warn (not error) if some don't, since
+    // phpunit.xml may reference optional or conditionally-installed suites.
+    let test_roots: Vec<PathBuf> = test_roots
+        .into_iter()
+        .filter(|p| {
+            if p.is_dir() {
+                true
+            } else {
+                eprintln!("warning: test directory not found, skipping: {}", p.display());
+                false
+            }
+        })
+        .collect();
+    if test_roots.is_empty() {
+        return Err(anyhow!(
+            "no discoverable test directories — checked --tests-dir and phpunit.xml's <testsuites>"
+        ));
+    }
+
     let worker_count = cli.workers.unwrap_or_else(num_cpus::get).max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(worker_count)
         .build_global()
         .context("initializing rayon thread pool")?;
 
-    eprintln!("Discovering tests in {}...", tests_dir.display());
-    let cases = discover_in_dir(&tests_dir)?;
+    if test_roots.len() == 1 {
+        eprintln!("Discovering tests in {}...", test_roots[0].display());
+    } else {
+        eprintln!("Discovering tests across {} roots ({} excludes)...",
+            test_roots.len(), excludes.len());
+    }
+    let cases = if test_roots.len() == 1 && excludes.is_empty() {
+        discover_in_dir(&test_roots[0])?
+    } else {
+        discover_in_dirs(&test_roots, &excludes)?
+    };
     eprintln!("Found {} test methods across {} classes.",
         cases.len(),
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
@@ -106,7 +181,7 @@ fn real_main() -> Result<ExitCode> {
     let worker_script = find_worker_script()?;
     let pool = WorkerPool::spawn(&worker_script, worker_count)?;
 
-    let cfg = RunConfig { autoload, bootstrap, filter: cli.filter };
+    let cfg = RunConfig { autoload, bootstrap, filter: cli.filter, defines };
     let report = run(&pool, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
 

@@ -36,6 +36,7 @@ $handler = static function () use (&$loadedAutoloads): void {
     $class     = (string) $req['class'];
     $methods   = (array)  $req['methods'];
     $bootstrap = isset($req['bootstrap']) ? (string) $req['bootstrap'] : null;
+    $defines   = isset($req['defines']) && is_array($req['defines']) ? $req['defines'] : [];
 
     if (!is_file($autoload)) {
         http_response_code(400);
@@ -52,19 +53,34 @@ $handler = static function () use (&$loadedAutoloads): void {
     try {
         if (!isset($loadedAutoloads[$autoload])) {
             require_once $autoload;
+            // Apply phpunit.xml's <php><const .../> declarations BEFORE
+            // requiring the bootstrap — many projects' bootstraps read these
+            // constants (REQUEST_FACTORY etc. for PSR-17 integration tests).
+            foreach ($defines as $pair) {
+                if (is_array($pair) && count($pair) === 2
+                    && is_string($pair[0]) && !defined($pair[0])) {
+                    define($pair[0], $pair[1]);
+                }
+            }
             if ($bootstrap !== null && is_file($bootstrap)) {
                 require_once $bootstrap;
             }
-            // PHPUnit's MockObject\Invocation::__toString eventually calls
+            // PHPUnit 10+'s MockObject\Invocation::__toString eventually calls
             // Registry::get(), which asserts a Configuration is registered.
-            // We don't use any of its values — we just need *something*
-            // there so mock error-formatting doesn't blow up with
-            // AssertionError. Single bare init per autoload is enough.
+            // Vanilla PHPUnit's CLI does this; our worker doesn't go through
+            // it, so we re-create the minimum init here. PHPUnit 9's API is
+            // different (fromParameters takes 2 args; doesn't have the same
+            // Registry assertion) — try/catch covers the version drift.
             if (class_exists(\PHPUnit\TextUI\Configuration\Registry::class)) {
-                \PHPUnit\TextUI\Configuration\Registry::init(
-                    (new \PHPUnit\TextUI\CliArguments\Builder)->fromParameters([]),
-                    \PHPUnit\TextUI\XmlConfiguration\DefaultConfiguration::create(),
-                );
+                try {
+                    \PHPUnit\TextUI\Configuration\Registry::init(
+                        (new \PHPUnit\TextUI\CliArguments\Builder)->fromParameters([]),
+                        \PHPUnit\TextUI\XmlConfiguration\DefaultConfiguration::create(),
+                    );
+                } catch (\Throwable) {
+                    // PHPUnit 9 or other version drift; Registry init isn't
+                    // required there for MockObject error formatting anyway.
+                }
             }
             $loadedAutoloads[$autoload] = true;
         }

@@ -17,6 +17,12 @@ pub struct TestRunRequest {
     pub class: String,
     /// Empty vec means "run all test methods in the class".
     pub methods: Vec<String>,
+    /// PHP `define()` declarations from `<php><const .../>` blocks in
+    /// phpunit.xml. Worker applies these once per autoload before any
+    /// test runs. Omitted from JSON when empty (avoid noise on tiny
+    /// fixtures that have no phpunit.xml at all).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub defines: Vec<[String; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -56,9 +62,11 @@ mod tests {
             file: PathBuf::from("/p/tests/Foo.php"),
             class: "App\\Tests\\FooTest".into(),
             methods: vec![],
+            defines: vec![],
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("bootstrap").is_none());
+        assert!(json.get("defines").is_none(), "defines must be omitted when empty");
         assert_eq!(json["class"], "App\\Tests\\FooTest");
     }
 
@@ -70,9 +78,12 @@ mod tests {
             file: PathBuf::from("/p/tests/Foo.php"),
             class: "FooTest".into(),
             methods: vec!["testBar".into()],
+            defines: vec![["API_KEY".into(), "xyz".into()]],
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["bootstrap"], "/p/phpunit.php");
+        assert_eq!(json["defines"][0][0], "API_KEY");
+        assert_eq!(json["defines"][0][1], "xyz");
         assert_eq!(json["methods"][0], "testBar");
     }
 

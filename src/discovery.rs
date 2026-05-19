@@ -353,30 +353,54 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
     Ok(cases)
 }
 
-/// Walk a directory, returning all discovered test cases.
-///
-/// Three-pass algorithm:
-///   1. Parse every `*Test*.php` file under `root` into a flat `Vec<ParsedClass>`.
-///      Each class carries its resolved-FQCN parent + its test methods + abstract bit.
-///   2. Build a `ClassGraph`: FQCN → resolved parent FQCN (or None).
-///   3. For each non-abstract class: if `is_test_class_via_chain(fqcn, &graph)`
-///      returns true, emit one `TestCase` per test method.
-///
-/// This catches projects with intermediate base classes (`AbstractTestCase`,
-/// `KernelTestCase`, etc.) that the old single-pass discovery missed.
+/// Walk a directory, returning all discovered test cases. Convenience wrapper
+/// around `discover_in_dirs` for the single-root + no-excludes case.
 pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
-    // Pass 1: parse every relevant file.
+    let roots = [root.to_path_buf()];
+    discover_in_dirs(&roots, &[])
+}
+
+/// Walk multiple roots and union their tests, honoring an exclude list.
+///
+/// Three-pass algorithm (extended to multi-root):
+///   1. Parse every `*Test*.php` file under each root, skipping anything whose
+///      path begins with one of the excludes. Build a flat `Vec<ParsedClass>`.
+///   2. Build a `ClassGraph`: FQCN → parent FQCN. Inheritance resolves across
+///      roots — an abstract base in `tests/` and a concrete subclass in
+///      `vendor/somepkg/tests/` are linked correctly.
+///   3. For each non-abstract class reaching `TestCase` via the chain, emit
+///      one `TestCase` per inherited test method.
+///
+/// `excludes` are checked as path prefixes (canonicalized) — a path under an
+/// excluded directory is skipped. Matches phpunit.xml's `<testsuite>` /
+/// `<exclude>` semantics.
+pub fn discover_in_dirs(roots: &[PathBuf], excludes: &[PathBuf]) -> Result<Vec<TestCase>> {
+    // Canonicalize excludes once so prefix checks are robust.
+    let canon_excludes: Vec<PathBuf> = excludes
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+
+    // Pass 1: parse every relevant file across all roots.
     let mut parsed: Vec<ParsedClass> = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("php") {
-            continue;
+    for root in roots {
+        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.contains("Test") {
+                continue;
+            }
+            // Apply excludes (prefix match on canonicalized path).
+            if let Ok(canon) = p.canonicalize() {
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) {
+                    continue;
+                }
+            }
+            parsed.extend(parse_file_classes(p)?);
         }
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.contains("Test") {
-            continue;
-        }
-        parsed.extend(parse_file_classes(p)?);
     }
 
     // Pass 2: build the inheritance graph (FQCN -> parent FQCN or None).
