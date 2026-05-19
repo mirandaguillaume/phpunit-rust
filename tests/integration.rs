@@ -21,6 +21,7 @@ fn request(file: &str, class: &str) -> TestRunRequest {
 }
 
 #[test]
+#[ignore = "integration tests ported to PhpWorkerPool in Task 7; FrankenPHP worker.php removed"]
 fn calculator_class_all_three_methods_pass() {
     let worker = find_worker_script().expect("worker.php must exist");
     let pool = WorkerPool::spawn(&worker, 1).expect("1-worker pool must spawn");
@@ -36,6 +37,7 @@ fn calculator_class_all_three_methods_pass() {
 }
 
 #[test]
+#[ignore = "integration tests ported to PhpWorkerPool in Task 7; FrankenPHP worker.php removed"]
 fn failing_class_mixed_results() {
     let worker = find_worker_script().expect("worker.php must exist");
     let pool = WorkerPool::spawn(&worker, 1).expect("pool must spawn");
@@ -52,6 +54,7 @@ fn failing_class_mixed_results() {
 }
 
 #[test]
+#[ignore = "integration tests ported to PhpWorkerPool in Task 7; FrankenPHP worker.php removed"]
 fn pool_of_three_serves_three_distinct_classes_concurrently() {
     // Sanity check: a 3-worker pool can serve 3 different class requests
     // without errors. We don't measure speed here; just correctness.

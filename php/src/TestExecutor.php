@@ -19,13 +19,13 @@ final class TestExecutor
      * @param list<string> $methods Empty = all `test*` methods on the class.
      * @return list<array<string, mixed>>
      */
-    public static function runClass(string $class, array $methods): array
+    public static function runClass(string $class, array $methods, ?array $rowFilter = null): array
     {
         if (!is_subclass_of($class, TestCase::class)) {
             throw new \InvalidArgumentException("$class does not extend PHPUnit\\Framework\\TestCase");
         }
 
-        $steps = MethodPlanner::plan($class, $methods);
+        $steps = MethodPlanner::plan($class, $methods, $rowFilter);
         $ref   = new \ReflectionClass($class);
 
         // setUpBeforeClass (PHPUnit's per-class hook, protected static).

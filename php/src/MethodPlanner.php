@@ -22,7 +22,7 @@ final class MethodPlanner
      * @param list<string> $methods Empty = all `test*` methods on the class.
      * @return list<Step>
      */
-    public static function plan(string $class, array $methods): array
+    public static function plan(string $class, array $methods, ?array $rowFilter = null): array
     {
         $ref = new \ReflectionClass($class);
         $candidate = empty($methods) ? self::allTestMethods($ref) : $methods;
@@ -36,7 +36,7 @@ final class MethodPlanner
             $depends   = self::dependsOf($methodRef);
             $datasets  = self::dataSetsFor($ref, $methodRef);
             if ($datasets === null) {
-                // Non-parameterized: one step.
+                // Non-parameterized: one step. row_filter has no effect.
                 $steps[] = [
                     'method'  => $methodName,
                     'dataset' => null,
@@ -45,7 +45,31 @@ final class MethodPlanner
                 ];
                 continue;
             }
-            foreach ($datasets as $key => $row) {
+            // Materialize datasets once so we can index/slice them.
+            $datasets = is_array($datasets) ? $datasets : iterator_to_array($datasets);
+            // Apply row_filter if present (only on this method's rows).
+            // The filter is `{chunk_index, total_chunks}`. We keep rows
+            // whose 0-based position satisfies `pos % total_chunks == chunk_index`
+            // (stride splitting — keeps related rows together for typical
+            // provider orderings while balancing across workers).
+            $kept = $datasets;
+            if ($rowFilter !== null
+                && isset($rowFilter['chunk_index'], $rowFilter['total_chunks'])
+                && is_int($rowFilter['chunk_index'])
+                && is_int($rowFilter['total_chunks'])
+                && $rowFilter['total_chunks'] > 1) {
+                $chunkIndex  = $rowFilter['chunk_index'];
+                $totalChunks = $rowFilter['total_chunks'];
+                $kept = [];
+                $pos = 0;
+                foreach ($datasets as $key => $row) {
+                    if ($pos % $totalChunks === $chunkIndex) {
+                        $kept[$key] = $row;
+                    }
+                    $pos++;
+                }
+            }
+            foreach ($kept as $key => $row) {
                 $steps[] = [
                     'method'  => $methodName,
                     'dataset' => is_int($key) ? "#{$key}" : (string) $key,
@@ -96,7 +120,7 @@ final class MethodPlanner
     }
 
     /** @return iterable<int|string, mixed>|null */
-    private static function dataSetsFor(\ReflectionClass $ref, \ReflectionMethod $m): ?iterable
+    public static function dataSetsFor(\ReflectionClass $ref, \ReflectionMethod $m): ?iterable
     {
         // Collect provider method names from both styles:
         //   - PHPUnit 10+ attribute: #[DataProvider('foo')]

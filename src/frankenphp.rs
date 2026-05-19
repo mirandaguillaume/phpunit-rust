@@ -170,6 +170,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "worker.php no longer uses FrankenPHP; this module is deleted in Task 8"]
     fn worker_pool_spawns_requested_count() {
         let worker = find_worker_script().expect("worker.php must exist");
         let pool = WorkerPool::spawn(&worker, 3).expect("3-worker pool must spawn");
