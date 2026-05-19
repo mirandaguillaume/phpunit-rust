@@ -39,7 +39,7 @@ function register_collector_with_active_facade(ResultCollector $collector): void
     foreach ($collector->subscribers() as $sub) {
         try {
             $facade->registerSubscriber($sub);
-        } catch (\PHPUnit\Event\EventFacadeIsSealedException $e) {
+        } catch (\PHPUnit\Event\EventFacadeIsSealedException) {
             // Already sealed; we cannot register — this request will return
             // empty outcomes. In a well-configured worker this should not happen.
         }
@@ -106,6 +106,13 @@ $handler = static function () use ($collector, &$loadedAutoloads, &$registeredFa
         return;
     }
 
+    // Capture and discard any stdout the project's bootstrap, autoloader, or
+    // tests print. Real-world phpunit.xml bootstraps commonly `echo` config
+    // banners ("Using NativeCalculator") before our header() is sent, which
+    // would otherwise emit a "headers already sent" warning and corrupt the
+    // JSON response body. Buffering here scopes the suppression to the suite
+    // run only; field-validation errors above this block are unaffected.
+    ob_start();
     try {
         Bootstrap::configure($phpunitXml);
         Bootstrap::resetState();
@@ -122,7 +129,11 @@ $handler = static function () use ($collector, &$loadedAutoloads, &$registeredFa
         }
 
         (new TestRunner)->run(\PHPUnit\TextUI\Configuration\Registry::get(), new NullResultCache, $suite);
+        ob_end_clean();
     } catch (\Throwable $e) {
+        if (ob_get_level() > 0) {
+            ob_end_clean();
+        }
         http_response_code(500);
         echo json_encode([
             'error'   => 'worker exception while running suite',
