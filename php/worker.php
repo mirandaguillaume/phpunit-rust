@@ -59,6 +59,13 @@ function register_collector_with_active_facade(ResultCollector $collector): void
 }
 
 $handler = static function () use ($collector, &$loadedAutoloads, &$registeredFacades): void {
+    // Disable PHP's per-request execution-time limit. Tests legitimately run
+    // arbitrarily long (pure-PHP arbitrary-precision math, integration tests
+    // hitting a real DB, etc.). PHPUnit's own CLI does this implicitly; we
+    // must too or we'll fatally abort mid-suite. The Rust client's timeout
+    // (60s by default, see WorkerClient::new) is the actual upper bound.
+    set_time_limit(0);
+
     $raw = file_get_contents('php://input');
     $req = json_decode($raw, true);
 
@@ -118,7 +125,14 @@ $handler = static function () use ($collector, &$loadedAutoloads, &$registeredFa
         Bootstrap::resetState();
         $collector->reset();
 
-        $suite = TestSuite::fromClassName($class);
+        // PHPUnit 10 uses TestSuite::fromClassName(string); PHPUnit 11 removed
+        // that in favor of fromClassReflector(ReflectionClass). We detect via
+        // method_exists rather than Version::id() because the bundled-vs-project
+        // PHPUnit class-load race can make Version disagree with the actually
+        // loaded TestSuite class.
+        $suite = method_exists(TestSuite::class, 'fromClassName')
+            ? TestSuite::fromClassName($class)
+            : TestSuite::fromClassReflector(new \ReflectionClass($class));
 
         // Filter to requested methods if a non-empty list was provided.
         // PHPUnit's TestSuite doesn't expose a clean method-set filter, so

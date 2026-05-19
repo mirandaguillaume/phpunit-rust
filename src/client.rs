@@ -15,8 +15,13 @@ pub struct WorkerClient {
 
 impl WorkerClient {
     pub fn new(url: impl Into<String>) -> Self {
+        // 10 minutes per class. Real-world classes can run for several minutes
+        // (slow PHPUnit fixtures, pure-PHP big-integer math, integration tests
+        // hitting external services). The PHP-side limit is disabled
+        // (`set_time_limit(0)` in worker.php), so this HTTP timeout is the
+        // actual upper bound.
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(600))
             .build();
         Self { url: url.into(), agent }
     }
