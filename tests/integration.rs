@@ -76,3 +76,31 @@ fn pool_of_three_serves_three_distinct_classes_concurrently() {
     assert_eq!(o2.len(), 2, "FailingTest outcomes");
     assert_eq!(o3.len(), 4, "DataProviderTest outcomes (4 data rows)");
 }
+
+#[cfg(feature = "coverage")]
+#[test]
+fn coverage_clover_smoke() {
+    let bin = env!("CARGO_BIN_EXE_phpunit-rust");
+    let out = std::env::temp_dir().join("phpunit_rust_cov_smoke.json");
+    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
+    // Debug builds may overflow the default 8 MB stack during coverage
+    // serialisation.  64 MB is safe for both debug and release.
+    let status = std::process::Command::new(bin)
+        .env("RUST_MIN_STACK", "67108864")
+        .args([
+            "--project", project.to_str().unwrap(),
+            "--workers", "1",
+            "--coverage-format", "json",
+            "--coverage-out", out.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to spawn phpunit-rust");
+    // The fixture intentionally contains a failing test, so the runner exits
+    // with code 1.  We only require that coverage was still written.
+    let _ = status;
+    let raw = std::fs::read_to_string(&out).expect("coverage output not written");
+    let map: std::collections::HashMap<String, serde_json::Value> =
+        serde_json::from_str(&raw).expect("coverage output is not valid JSON");
+    assert!(!map.is_empty(), "coverage map must contain at least one file");
+    let _ = std::fs::remove_file(&out);
+}
