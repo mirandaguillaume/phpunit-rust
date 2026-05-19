@@ -85,6 +85,15 @@ struct Cli {
     /// chunks. Below this, methods are dispatched whole. Default 50.
     #[arg(long)]
     row_chunk_min: Option<usize>,
+    /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
+    /// Formats: clover | json | pcov | pcov-extended
+    #[cfg(feature = "coverage")]
+    #[arg(long)]
+    coverage_format: Option<String>,
+    /// Write coverage output to this file (default: stdout).
+    #[cfg(feature = "coverage")]
+    #[arg(long)]
+    coverage_out: Option<std::path::PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -254,6 +263,20 @@ fn real_main() -> Result<ExitCode> {
     };
     let report = run(&pool, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
+
+    #[cfg(feature = "coverage")]
+    if let Some(fmt) = &cli.coverage_format {
+        use phpunit_rust::coverage::{emit, passed_set};
+        let allowed = passed_set(&report);
+        let xml_path = xml_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--coverage-format requires a phpunit.xml; use --configuration or place phpunit.xml in the project root")
+        })?;
+        emit(xml_path, Some(&allowed), fmt, cli.coverage_out.as_deref())
+            .context("coverage analysis failed")?;
+        if let Some(p) = &cli.coverage_out {
+            eprintln!("Coverage written to {}", p.display());
+        }
+    }
 
     if report.is_success() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::from(1)) }
 }
