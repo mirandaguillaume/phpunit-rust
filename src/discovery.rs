@@ -1,6 +1,6 @@
 use crate::types::TestCase;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 use walkdir::WalkDir;
@@ -185,7 +185,7 @@ fn collect_parsed_classes(
     let query_src = r#"
         (class_declaration
           name: (name) @class_name
-          (base_clause (name) @base)?
+          (base_clause [(name) (qualified_name)] @base)?
           body: (declaration_list) @body) @class
     "#;
     let lang = tree_sitter_php::language_php();
@@ -399,6 +399,33 @@ pub fn discover_in_dirs(roots: &[PathBuf], excludes: &[PathBuf]) -> Result<Vec<T
                     continue;
                 }
             }
+            parsed.extend(parse_file_classes(p)?);
+        }
+    }
+
+    // Supplement pass: scan the immediate parent directory of each root (depth=1
+    // only) for *Test*.php files. Picks up abstract base classes that sit one
+    // level above the phpunit.xml testsuite dirs — e.g. Carbon's
+    // tests/AbstractTestCase.php when the roots list tests/Carbon/, etc.
+    let parsed_paths: HashSet<PathBuf> = parsed.iter().map(|c| c.file.clone()).collect();
+    let mut seen_parents: HashSet<PathBuf> = HashSet::new();
+    for root in roots {
+        let Some(parent) = root.parent() else { continue };
+        let parent = parent.to_path_buf();
+        if !seen_parents.insert(parent.clone()) {
+            continue;
+        }
+        // Don't re-scan a directory that is itself one of the discovery roots.
+        if roots.iter().any(|r| r == &parent) {
+            continue;
+        }
+        for entry in WalkDir::new(&parent).max_depth(1).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.is_dir() { continue; }
+            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.contains("Test") { continue; }
+            if parsed_paths.contains(p) { continue; }
             parsed.extend(parse_file_classes(p)?);
         }
     }
