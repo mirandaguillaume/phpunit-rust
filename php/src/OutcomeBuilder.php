@@ -45,7 +45,17 @@ final class OutcomeBuilder
         if ($error === null) {
             return ['pass', null, null];
         }
-        if ($error instanceof SkippedWithMessageException) {
+        // markTestSkipped throws:
+        //   - PHPUnit 10+: SkippedWithMessageException
+        //   - PHPUnit 9:   SkippedTestError
+        // Detect by class name (fully-qualified) to support both without
+        // adding a hard dependency on either symbol.
+        $errorClass = get_class($error);
+        if (
+            $errorClass === 'PHPUnit\\Framework\\SkippedWithMessageException'
+            || $errorClass === 'PHPUnit\\Framework\\SkippedTestError'
+            || is_subclass_of($error, 'PHPUnit\\Framework\\SkippedTestError')
+        ) {
             return ['skipped', $error->getMessage(), null];
         }
         if ($error instanceof IncompleteTestError) {
