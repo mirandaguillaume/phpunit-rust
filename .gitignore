@@ -4,3 +4,7 @@
 **/composer.lock
 *.swp
 .DS_Store
+
+# Plan/spec docs and tooling caches stay local (do not commit)
+docs/
+.serena/
