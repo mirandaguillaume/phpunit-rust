@@ -41,4 +41,23 @@ impl WorkerClient {
         let body: WorkerResponse = resp.into_json().context("worker response was not valid JSON")?;
         Ok(body.outcomes)
     }
+
+    /// Probe a worker to enumerate `class`'s test methods + per-method depends.
+    /// Implemented by sending a TestRunRequest with `describe_only=true`; the
+    /// worker returns a ClassDescriptor instead of running the tests.
+    pub fn describe_class(&self, req: &TestRunRequest) -> Result<crate::types::ClassDescriptor> {
+        let resp = self.agent
+            .post(&self.url)
+            .set("Content-Type", "application/json")
+            .send_json(req)
+            .map_err(|e| match e {
+                ureq::Error::Status(code, r) => {
+                    let body = r.into_string().unwrap_or_default();
+                    anyhow!("worker returned HTTP {code}: {body}")
+                }
+                ureq::Error::Transport(t) => anyhow!("transport error talking to worker: {t}"),
+            })?;
+        let body: crate::types::ClassDescriptor = resp.into_json().context("describe response was not valid JSON")?;
+        Ok(body)
+    }
 }
