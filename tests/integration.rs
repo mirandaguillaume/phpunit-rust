@@ -1,5 +1,5 @@
-use phpunit_rust::client::WorkerClient;
-use phpunit_rust::frankenphp::{find_worker_script, WorkerPool};
+use phpunit_rust::php_client::PhpWorkerClient;
+use phpunit_rust::php_worker::{find_worker_script, PhpWorkerPool};
 use phpunit_rust::types::{TestRunRequest, TestStatus};
 use std::path::PathBuf;
 
@@ -22,11 +22,10 @@ fn request(file: &str, class: &str) -> TestRunRequest {
 }
 
 #[test]
-#[ignore = "integration tests ported to PhpWorkerPool in Task 7; FrankenPHP worker.php removed"]
 fn calculator_class_all_three_methods_pass() {
     let worker = find_worker_script().expect("worker.php must exist");
-    let pool = WorkerPool::spawn(&worker, 1).expect("1-worker pool must spawn");
-    let client = WorkerClient::new(pool.urls().first().unwrap().clone());
+    let pool = PhpWorkerPool::spawn(&worker, 1).expect("1-worker pool must spawn");
+    let client = PhpWorkerClient::new(pool.worker(0));
 
     let req = request("tests/CalculatorTest.php", "Sample\\Tests\\CalculatorTest");
     let outcomes = client.run_class(&req).expect("worker call must succeed");
@@ -38,11 +37,10 @@ fn calculator_class_all_three_methods_pass() {
 }
 
 #[test]
-#[ignore = "integration tests ported to PhpWorkerPool in Task 7; FrankenPHP worker.php removed"]
 fn failing_class_mixed_results() {
     let worker = find_worker_script().expect("worker.php must exist");
-    let pool = WorkerPool::spawn(&worker, 1).expect("pool must spawn");
-    let client = WorkerClient::new(pool.urls().first().unwrap().clone());
+    let pool = PhpWorkerPool::spawn(&worker, 1).expect("pool must spawn");
+    let client = PhpWorkerClient::new(pool.worker(0));
 
     let req = request("tests/FailingTest.php", "Sample\\Tests\\FailingTest");
     let outcomes = client.run_class(&req).expect("worker call must succeed");
@@ -55,17 +53,16 @@ fn failing_class_mixed_results() {
 }
 
 #[test]
-#[ignore = "integration tests ported to PhpWorkerPool in Task 7; FrankenPHP worker.php removed"]
 fn pool_of_three_serves_three_distinct_classes_concurrently() {
     // Sanity check: a 3-worker pool can serve 3 different class requests
     // without errors. We don't measure speed here; just correctness.
     let worker = find_worker_script().expect("worker.php must exist");
-    let pool = WorkerPool::spawn(&worker, 3).expect("3-worker pool must spawn");
+    let pool = PhpWorkerPool::spawn(&worker, 3).expect("3-worker pool must spawn");
     assert_eq!(pool.len(), 3);
 
-    let urls = pool.urls();
-    let clients: Vec<WorkerClient> =
-        urls.iter().map(|u| WorkerClient::new(u.clone())).collect();
+    let clients: Vec<PhpWorkerClient> = (0..pool.len())
+        .map(|i| PhpWorkerClient::new(pool.worker(i)))
+        .collect();
 
     let r1 = request("tests/CalculatorTest.php", "Sample\\Tests\\CalculatorTest");
     let r2 = request("tests/FailingTest.php", "Sample\\Tests\\FailingTest");
