@@ -1,9 +1,11 @@
-use crate::client::WorkerClient;
+use crate::components;
 use crate::discovery::{group_by_class, TestClass};
-use crate::frankenphp::WorkerPool;
-use crate::types::{TestCase, TestOutcome, TestRunRequest, TestStatus};
+use crate::php_client::PhpWorkerClient;
+use crate::php_worker::PhpWorkerPool;
+use crate::types::{ClassDescriptor, RowFilter, TestCase, TestOutcome, TestRunRequest, TestStatus};
 use anyhow::Result;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -15,6 +17,9 @@ pub struct RunConfig {
     /// in phpunit.xml. Passed through every request so the worker applies
     /// them once per autoload before running tests.
     pub defines: Vec<[String; 2]>,
+    /// Minimum row count for a data-provider method to be split into per-row
+    /// chunks. Below this, methods are dispatched whole. Default 50.
+    pub row_chunk_min: usize,
 }
 
 #[derive(Debug)]
@@ -40,7 +45,7 @@ impl Report {
 }
 
 pub fn run(
-    pool: &WorkerPool,
+    pool: &PhpWorkerPool,
     cases: Vec<TestCase>,
     cfg: &RunConfig,
     on_progress: impl Fn(&TestOutcome) + Sync,
@@ -60,17 +65,17 @@ pub fn run(
         return Ok(Report { outcomes: Vec::new(), total_duration_ms: 0.0 });
     }
 
-    // One WorkerClient per pool worker.
-    let urls = pool.urls();
-    let clients: Vec<WorkerClient> =
-        urls.iter().map(|u| WorkerClient::new(u.clone())).collect();
+    let total_workers = pool.len();
 
-    // Phase A: probe each class for its depends info, then split into
-    // dependency components. Sequential — one round-trip per class, cheap.
-    // We dispatch all probes to clients[0]; parallelizing the probes saves
-    // negligible time and adds complication.
-    let probe_client = &clients[0];
-    let mut dispatch_units: Vec<(PathBuf, String, Vec<String>)> = Vec::new();
+    // Phase A: probe each class for its depends info and row counts.
+    // Sequential — one round-trip per class, cheap.
+    // All probes go to worker 0; no contention.
+    let probe_client = PhpWorkerClient::new(pool.worker(0));
+
+    // Per-component dispatch units; each unit becomes ONE round-trip.
+    // (file, class, methods_subset, row_filter)
+    let mut dispatch_units: Vec<(PathBuf, String, Vec<String>, Option<RowFilter>)> = Vec::new();
+
     for TestClass { file, class, methods } in &groups {
         let probe_req = TestRunRequest {
             autoload: cfg.autoload.clone(),
@@ -82,28 +87,55 @@ pub fn run(
             describe_only: true,
             row_filter: None,
         };
-        let descriptor = probe_client.describe_class(&probe_req)?;
-        // Build the depends map from the descriptor.
-        let depends: std::collections::HashMap<String, Vec<String>> = descriptor
+        let descriptor: ClassDescriptor = probe_client.describe_class(&probe_req)?;
+
+        // Build the depends map AND row-count map from the descriptor.
+        let depends: HashMap<String, Vec<String>> = descriptor
             .description
             .iter()
             .map(|m| (m.name.clone(), m.depends.clone()))
             .collect();
+        let row_counts: HashMap<String, Option<usize>> = descriptor
+            .description
+            .iter()
+            .map(|m| (m.name.clone(), m.row_count))
+            .collect();
+
         // Restrict to the methods we discovered (which respects any --filter
         // we already applied at the case level).
         let class_methods: Vec<String> = methods.clone();
-        let components = crate::components::partition_by_depends(&class_methods, &depends);
+        let components = components::partition_by_depends(&class_methods, &depends);
+
         for component in components {
-            dispatch_units.push((file.clone(), class.clone(), component));
+            // If the component is a single method with row_count > threshold,
+            // split it into `total_workers` row-chunks.
+            if component.len() == 1 {
+                let m = &component[0];
+                let count = row_counts.get(m).copied().flatten().unwrap_or(0);
+                if count > cfg.row_chunk_min && total_workers > 1 {
+                    for chunk_index in 0..total_workers {
+                        dispatch_units.push((
+                            file.clone(),
+                            class.clone(),
+                            vec![m.clone()],
+                            Some(RowFilter { chunk_index, total_chunks: total_workers }),
+                        ));
+                    }
+                    continue;
+                }
+            }
+            // Default: dispatch the whole component as one unit, no row_filter.
+            dispatch_units.push((file.clone(), class.clone(), component, None));
         }
     }
 
-    // Phase B: parallel dispatch. Each rayon thread picks a worker by index.
+    // Phase B: parallel dispatch via rayon.
+    // Each rayon thread picks a worker by its thread index.
     let results: Vec<Result<Vec<TestOutcome>>> = dispatch_units
         .into_par_iter()
-        .map(|(file, class, methods)| {
+        .map(|(file, class, methods, row_filter)| {
             let idx = rayon::current_thread_index().unwrap_or(0);
-            let client = &clients[idx % clients.len()];
+            let client = PhpWorkerClient::new(pool.worker(idx));
             let req = TestRunRequest {
                 autoload: cfg.autoload.clone(),
                 bootstrap: cfg.bootstrap.clone(),
@@ -112,7 +144,7 @@ pub fn run(
                 methods,
                 defines: cfg.defines.clone(),
                 describe_only: false,
-                row_filter: None,
+                row_filter,
             };
             let batch = client.run_class(&req)?;
             // Emit progress inside the worker thread as outcomes arrive.
