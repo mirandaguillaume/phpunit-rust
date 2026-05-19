@@ -76,10 +76,21 @@ final class MethodPlanner
     private static function dependsOf(\ReflectionMethod $m): array
     {
         $out = [];
+        // PHPUnit 10+ attribute style.
         foreach ($m->getAttributes(Depends::class) as $attr) {
             $instance = $attr->newInstance();
-            // Depends::methodName() is the public accessor in PHPUnit 10+.
             $out[] = $instance->methodName();
+        }
+        // PHPUnit 9 / legacy PHPDoc style: `@depends methodName`.
+        // Many PHPUnit 10 codebases still use this for compat, and PHPUnit 9
+        // has no attributes at all.
+        $doc = $m->getDocComment();
+        if (is_string($doc) && preg_match_all('/@depends\s+(\S+)/', $doc, $matches)) {
+            foreach ($matches[1] as $name) {
+                if (!in_array($name, $out, true)) {
+                    $out[] = $name;
+                }
+            }
         }
         return $out;
     }
@@ -87,13 +98,28 @@ final class MethodPlanner
     /** @return iterable<int|string, mixed>|null */
     private static function dataSetsFor(\ReflectionClass $ref, \ReflectionMethod $m): ?iterable
     {
-        $providers = $m->getAttributes(DataProvider::class);
-        if (empty($providers)) {
+        // Collect provider method names from both styles:
+        //   - PHPUnit 10+ attribute: #[DataProvider('foo')]
+        //   - PHPUnit 9 / legacy:    @dataProvider foo  (in PHPDoc)
+        // Many PHPUnit 10 codebases still use the PHPDoc style for back-compat,
+        // and PHPUnit 9 has no attributes at all.
+        $providerNames = [];
+        foreach ($m->getAttributes(DataProvider::class) as $attr) {
+            $providerNames[] = $attr->newInstance()->methodName();
+        }
+        $doc = $m->getDocComment();
+        if (is_string($doc) && preg_match_all('/@dataProvider\s+(\S+)/', $doc, $matches)) {
+            foreach ($matches[1] as $name) {
+                if (!in_array($name, $providerNames, true)) {
+                    $providerNames[] = $name;
+                }
+            }
+        }
+        if (empty($providerNames)) {
             return null;
         }
         $rows = [];
-        foreach ($providers as $attr) {
-            $providerName = $attr->newInstance()->methodName();
+        foreach ($providerNames as $providerName) {
             $providerRef  = $ref->getMethod($providerName);
             $providerRef->setAccessible(true);
             $result = $providerRef->isStatic()
