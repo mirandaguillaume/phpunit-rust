@@ -17,6 +17,7 @@ fn request(file: &str, class: &str) -> TestRunRequest {
         methods: vec![],
         defines: vec![],
         describe_only: false,
+        row_filter: None,
     }
 }
 

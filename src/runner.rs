@@ -80,6 +80,7 @@ pub fn run(
             methods: Vec::new(),
             defines: cfg.defines.clone(),
             describe_only: true,
+            row_filter: None,
         };
         let descriptor = probe_client.describe_class(&probe_req)?;
         // Build the depends map from the descriptor.
@@ -111,6 +112,7 @@ pub fn run(
                 methods,
                 defines: cfg.defines.clone(),
                 describe_only: false,
+                row_filter: None,
             };
             let batch = client.run_class(&req)?;
             // Emit progress inside the worker thread as outcomes arrive.

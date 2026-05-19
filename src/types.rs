@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Slice a method's data-provider rows by stride. `chunk_index` is in
+/// `0..total_chunks`; the worker keeps rows whose 0-based position
+/// satisfies `pos % total_chunks == chunk_index`. Stride splitting (vs
+/// range splitting) balances workloads when the provider returns rows
+/// in increasing-difficulty order, which is common.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RowFilter {
+    pub chunk_index: usize,
+    pub total_chunks: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestCase {
     pub file: PathBuf,
@@ -28,6 +39,11 @@ pub struct TestRunRequest {
     /// to decide how to split a class across workers.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub describe_only: bool,
+    /// Optional row-stride filter applied to the (single) method named in
+    /// `methods[0]`. None = no filter (run all rows). Only meaningful when
+    /// `methods` has exactly one entry; otherwise behavior is undefined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<RowFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -61,6 +77,11 @@ pub struct MethodDescriptor {
     pub name: String,
     #[serde(default)]
     pub depends: Vec<String>,
+    /// Number of rows the data provider returns. `None` for non-parameterized
+    /// methods or when the provider couldn't be counted (we don't crash the
+    /// probe on provider errors — they surface at run time).
+    #[serde(default)]
+    pub row_count: Option<usize>,
 }
 
 /// Worker's response to a `describe_only=true` request.
@@ -83,6 +104,7 @@ mod tests {
             methods: vec![],
             defines: vec![],
             describe_only: false,
+            row_filter: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("bootstrap").is_none());
@@ -100,6 +122,7 @@ mod tests {
             methods: vec!["testBar".into()],
             defines: vec![["API_KEY".into(), "xyz".into()]],
             describe_only: false,
+            row_filter: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["bootstrap"], "/p/phpunit.php");
