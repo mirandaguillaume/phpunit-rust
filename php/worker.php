@@ -42,29 +42,34 @@ $handler = static function () use (&$loadedAutoloads): void {
         echo json_encode(['error' => "autoload not found: {$autoload}"]);
         return;
     }
-    if (!isset($loadedAutoloads[$autoload])) {
-        require_once $autoload;
-        if ($bootstrap !== null && is_file($bootstrap)) {
-            require_once $bootstrap;
-        }
-        $loadedAutoloads[$autoload] = true;
-    }
-    if (!is_file($file)) {
-        http_response_code(400);
-        echo json_encode(['error' => "test file not found: {$file}"]);
-        return;
-    }
-    require_once $file;
-    if (!class_exists($class)) {
-        http_response_code(404);
-        echo json_encode(['error' => "class {$class} not found after loading {$file}"]);
-        return;
-    }
 
-    // Capture and discard any stdout the test or bootstrap prints, so it
-    // doesn't corrupt the JSON envelope.
+    // Start the output buffer BEFORE any require — autoloaders and bootstrap
+    // files commonly echo configuration banners (e.g. brick/math's phpunit.php
+    // prints "Using NativeCalculator") which would otherwise corrupt the JSON
+    // envelope. Field-validation errors above this point stay outside the
+    // buffer so 400s still surface cleanly.
     ob_start();
     try {
+        if (!isset($loadedAutoloads[$autoload])) {
+            require_once $autoload;
+            if ($bootstrap !== null && is_file($bootstrap)) {
+                require_once $bootstrap;
+            }
+            $loadedAutoloads[$autoload] = true;
+        }
+        if (!is_file($file)) {
+            ob_end_clean();
+            http_response_code(400);
+            echo json_encode(['error' => "test file not found: {$file}"]);
+            return;
+        }
+        require_once $file;
+        if (!class_exists($class)) {
+            ob_end_clean();
+            http_response_code(404);
+            echo json_encode(['error' => "class {$class} not found after loading {$file}"]);
+            return;
+        }
         $outcomes = TestExecutor::runClass($class, $methods);
         ob_end_clean();
         echo json_encode(['outcomes' => $outcomes]);
