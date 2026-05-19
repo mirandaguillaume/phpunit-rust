@@ -16,6 +16,7 @@ fn request(file: &str, class: &str) -> TestRunRequest {
         class: class.into(),
         methods: vec![],
         defines: vec![],
+        describe_only: false,
     }
 }
 

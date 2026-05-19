@@ -78,6 +78,7 @@ pub fn run(
                 class,
                 methods,
                 defines: cfg.defines.clone(),
+                describe_only: false,
             };
             let batch = client.run_class(&req)?;
             // Emit progress inside the worker thread, as outcomes arrive.

@@ -23,6 +23,11 @@ pub struct TestRunRequest {
     /// fixtures that have no phpunit.xml at all).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub defines: Vec<[String; 2]>,
+    /// When true, the worker returns a `ClassDescriptor` (method + depends
+    /// info) instead of running anything. Used by the runner's probe phase
+    /// to decide how to split a class across workers.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub describe_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -50,6 +55,20 @@ pub struct TestOutcome {
     pub duration_ms: f64,
 }
 
+/// One method as reported by the worker's describe mode.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MethodDescriptor {
+    pub name: String,
+    #[serde(default)]
+    pub depends: Vec<String>,
+}
+
+/// Worker's response to a `describe_only=true` request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassDescriptor {
+    pub description: Vec<MethodDescriptor>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +82,7 @@ mod tests {
             class: "App\\Tests\\FooTest".into(),
             methods: vec![],
             defines: vec![],
+            describe_only: false,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("bootstrap").is_none());
@@ -79,6 +99,7 @@ mod tests {
             class: "FooTest".into(),
             methods: vec!["testBar".into()],
             defines: vec![["API_KEY".into(), "xyz".into()]],
+            describe_only: false,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["bootstrap"], "/p/phpunit.php");
