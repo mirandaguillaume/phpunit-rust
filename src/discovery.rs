@@ -256,23 +256,59 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
 fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<String> {
     let mut methods = Vec::new();
     let mut cursor = body.walk();
+    let mut prev_comment: Option<String> = None;
+
     for child in body.children(&mut cursor) {
+        if child.kind() == "comment" {
+            prev_comment = child.utf8_text(bytes).ok().map(String::from);
+            continue;
+        }
         if child.kind() != "method_declaration" {
+            prev_comment = None;
             continue;
         }
-        // Skip non-public for MVP — PHPUnit only runs public methods.
         let is_public = method_is_public(child, bytes);
-        if !is_public {
+        let Some(name_node) = child.child_by_field_name("name") else {
+            prev_comment = None;
             continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else { continue };
-        let Ok(name) = name_node.utf8_text(bytes) else { continue };
-        if name.starts_with("test") {
+        };
+        let Ok(name) = name_node.utf8_text(bytes) else {
+            prev_comment = None;
+            continue;
+        };
+
+        // PHPUnit recognises a method as a test if:
+        //   - its name starts with "test"
+        //   - it has a /** @test */ PHPDoc annotation
+        //   - it has a #[Test] or #[PHPUnit\Framework\Attributes\Test] attribute
+        let has_annotation = prev_comment.as_deref()
+            .map(|c| c.contains("@test"))
+            .unwrap_or(false);
+        let has_attr = method_has_test_attribute(child, bytes);
+
+        if is_public && (name.starts_with("test") || has_annotation || has_attr) {
             methods.push(name.to_string());
         }
-        // #[Test] attribute support is deferred to a follow-up plan.
+        prev_comment = None;
     }
     methods
+}
+
+fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
+    let mut cursor = method.walk();
+    for child in method.children(&mut cursor) {
+        let Ok(text) = child.utf8_text(bytes) else { continue };
+        // Attribute lists look like "#[Test]" or "#[PHPUnit\Framework\Attributes\Test]".
+        // Avoid false-positives on #[TestWith(...)], #[TestDox(...)], etc.
+        if text.starts_with("#[")
+            && (text == "#[Test]"
+                || text.ends_with("\\Test]")
+                || text.contains("\\Test,"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn method_is_public(method: Node, bytes: &[u8]) -> bool {

@@ -5,45 +5,53 @@ use std::process::ExitCode;
 
 use phpunit_rust::discovery::{discover_in_dir, discover_in_dirs};
 
-/// Parse composer.json's `autoload-dev.psr-4` and `autoload-dev.classmap`
-/// entries into a list of directories, resolved relative to `project`.
-/// Returns an empty Vec if the file is absent or has no autoload-dev.
+/// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
+/// into a list of directories, resolved relative to `project`. Used to build
+/// a complete class graph for inheritance resolution (e.g. abstract base classes
+/// in the main autoload like MockeryTestCase). Returns empty Vec if absent.
 fn parse_autoload_dev_dirs(project: &std::path::Path) -> Vec<PathBuf> {
     let path = project.join("composer.json");
     let Ok(text) = std::fs::read_to_string(&path) else { return vec![]; };
     let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![]; };
-    let Some(dev) = val.get("autoload-dev") else { return vec![]; };
+
     let mut dirs = Vec::new();
-    // psr-4: { "Ns\\" : "src/" }  — values can be a string or an array of strings
-    if let Some(psr4) = dev.get("psr-4").and_then(|v| v.as_object()) {
-        for v in psr4.values() {
-            match v {
-                serde_json::Value::String(s) => {
-                    let p = project.join(s);
-                    if p.is_dir() { dirs.push(p); }
-                }
-                serde_json::Value::Array(arr) => {
-                    for s in arr {
-                        if let Some(s) = s.as_str() {
-                            let p = project.join(s);
-                            if p.is_dir() { dirs.push(p); }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    // classmap: ["tests/", ...]
-    if let Some(arr) = dev.get("classmap").and_then(|v| v.as_array()) {
-        for s in arr {
-            if let Some(s) = s.as_str() {
-                let p = project.join(s);
-                if p.is_dir() { dirs.push(p); }
-            }
-        }
+    for section in ["autoload-dev", "autoload"] {
+        let Some(block) = val.get(section) else { continue };
+        collect_psr4_dirs(block, project, &mut dirs);
+        collect_classmap_dirs(block, project, &mut dirs);
     }
     dirs
+}
+
+fn collect_psr4_dirs(block: &serde_json::Value, project: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Some(psr4) = block.get("psr-4").and_then(|v| v.as_object()) else { return };
+    for v in psr4.values() {
+        match v {
+            serde_json::Value::String(s) => {
+                let p = project.join(s);
+                if p.is_dir() { out.push(p); }
+            }
+            serde_json::Value::Array(arr) => {
+                for s in arr {
+                    if let Some(s) = s.as_str() {
+                        let p = project.join(s);
+                        if p.is_dir() { out.push(p); }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Some(arr) = block.get("classmap").and_then(|v| v.as_array()) else { return };
+    for s in arr {
+        if let Some(s) = s.as_str() {
+            let p = project.join(s);
+            if p.is_dir() { out.push(p); }
+        }
+    }
 }
 use phpunit_rust::php_worker::{check_php_version, find_worker_script, PhpWorkerPool};
 use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
