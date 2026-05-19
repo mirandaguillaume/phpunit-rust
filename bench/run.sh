@@ -31,8 +31,17 @@ BINARY="$REPO/target/release/phpunit-rust"
 PHP_VERSIONS=(8.1 8.2 8.3 8.4 8.5)
 PROJECTS=(
     "fixture|$REPO/fixtures/sample_project|8.1||tests/"
-    "doctrine-collections|$SMOKE/doctrine-collections|8.4||"
     "guzzle-psr7|$SMOKE/guzzle-psr7|7.2||"
+    "php-parser|$SMOKE/php-parser|7.4||"
+    "mockery|$SMOKE/mockery|8.1||"
+    "faker|$SMOKE/faker|8.1||"
+    "psalm|$SMOKE/psalm|8.1||"
+    "doctrine-orm|$SMOKE/doctrine-orm|8.1||"
+    "ramsey-uuid|$SMOKE/ramsey-uuid|8.2||"
+    "carbon|$SMOKE/carbon|8.1||"
+    "doctrine-collections|$SMOKE/doctrine-collections|8.4||"
+    "phpunit-itself|$SMOKE/phpunit-itself|8.4||"
+    "symfony-validator|$SMOKE/symfony-validator|8.4||"
     "brick-math|$SMOKE/brick-math|8.2|CALCULATOR=Native|"
 )
 WORKERS=(1 4 22)
