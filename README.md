@@ -1,33 +1,34 @@
 # phpunit-rust
 
-A Rust test runner that orchestrates FrankenPHP to execute PHPUnit-style tests
-using its own minimal test executor — no longer dependent on PHPUnit's internal
-`TestRunner` API.
+A Rust orchestrator that runs PHPUnit tests in parallel using plain PHP CLI
+workers — no FrankenPHP, no HTTP, no daemon. Workers communicate over
+stdin/stdout with a one-JSON-per-line protocol and delegate actual test
+execution to the project's own PHPUnit installation.
 
-## Status: v0.4.0 — parallel execution
+## Status: v0.6.0 — plain PHP CLI workers + per-row parallelism
 
-phpunit-rust now runs N FrankenPHP worker processes concurrently. Test
-classes are distributed across the pool via Rayon. Wall-clock speedup
-scales with CPU count for CPU-bound suites, bounded by the largest
-single class (per-method parallelism is a future plan).
+phpunit-rust spawns N plain `php` processes, distributes test classes (and
+individual data-provider rows) across them via Rayon, and streams results back.
+Workers are long-lived within a run and restart only on crash.
 
 ### Supported
 
-- `assertSame` / `assertEquals` / all `TestCase` assertions (we don't touch them — user code calls them on `$this`)
-- Mocks (`createMock`, `MockBuilder`, expectation chaining — same)
+- All `TestCase` assertions — worker delegates to the project's PHPUnit
+- Mocks (`createMock`, `MockBuilder`, expectation chaining)
 - `expectException`, `expectExceptionMessage`, `expectExceptionCode`
-- Data providers (`#[DataProvider]`, expanded to one outcome per row)
+- Data providers (`#[DataProvider]` / `@dataProvider`) — per-row parallelism
 - Test dependencies (`#[Depends]`, with return-value passing within a class)
 - `markTestSkipped`, `markTestIncomplete`
-- `setUp` / `tearDown` per test
-- `setUpBeforeClass` / `tearDownAfterClass` per class run
-- `phpunit.xml`'s `bootstrap` attribute (or `--bootstrap` flag)
-- `--workers N` for parallel class-level dispatch (defaults to num_cpus)
+- `setUp` / `tearDown` per test; `setUpBeforeClass` / `tearDownAfterClass`
+- `phpunit.xml` — `bootstrap`, `<testsuites>` directories/excludes, `<php><const>`
+- `--bootstrap`, `--filter`, `--workers`, `--configuration` CLI flags
+- Test discovery: `testXxx` naming, `@test` PHPDoc annotation, `#[Test]` attribute
+- Fully-qualified extends (`extends \PHPUnit\Framework\TestCase`)
+- Abstract base classes outside testsuite dirs resolved via `composer.json` autoload
 
 ### Not yet supported (deferred)
 
-- Parallelism *within* a single test class (a single huge class is currently single-threaded)
-- Smart scheduling (longest-first, fail-fast-first, history-based)
+- Smart scheduling (longest-first, fail-fast)
 - `@runInSeparateProcess`
 - Code coverage (PCOV/Xdebug)
 - JUnit XML / TAP / TestDox reporters
@@ -38,66 +39,72 @@ single class (per-method parallelism is a future plan).
 ## Requirements
 
 - Rust 1.75+
-- FrankenPHP 1.x on `$PATH`
-- PHP 8.1+ on the system
-- Project under test must have `composer install`'d a PHPUnit version that
-  provides `PHPUnit\Framework\TestCase` and the assertion/mock surface.
-  Tested against PHPUnit 10.5 and 11.5.
+- PHP 8.1+ on `$PATH`
+- Project under test must have `composer install`'d; PHPUnit 10 or 11 on its
+  vendor path. Tested against PHPUnit 10.5 and 11.5.
 
 ## Usage
 
 ```bash
 cargo build --release
+
+# auto-detect phpunit.xml, use all CPU cores
 ./target/release/phpunit-rust --project /path/to/php/project
+
+# explicit worker count
 ./target/release/phpunit-rust --project /path/to/php/project --workers 8
-./target/release/phpunit-rust --project /path/to/php/project --workers 1     # sequential
+
+# sequential (no parallelism overhead — best for tiny suites)
+./target/release/phpunit-rust --project /path/to/php/project --workers 1
+
+# filter by class or method name
 ./target/release/phpunit-rust --project /path/to/php/project --filter MyClass
+
+# explicit bootstrap
 ./target/release/phpunit-rust --project /path/to/php/project --bootstrap tests/bootstrap.php
 ```
 
-If `--configuration` is omitted, the runner auto-detects `phpunit.xml` then
-`phpunit.xml.dist` at the project root and reads only the `bootstrap`
-attribute. All other `phpunit.xml` settings are ignored (use CLI flags
-instead).
+`phpunit.xml` / `phpunit.xml.dist` are auto-detected at the project root.
+`--configuration` overrides the search path. The runner reads `bootstrap`,
+`<testsuites>` directories/excludes, and `<php><const>` entries. The `--tests-dir`
+flag is the fallback when no `phpunit.xml` is found.
 
 ## Architecture
 
 ```
 phpunit-rust (Rust binary)
   ├─ discovery   : tree-sitter-php; class graph + BFS for transitive inheritance
-  ├─ phpunit_xml : minimal parser for <phpunit bootstrap="..."> attribute
-  ├─ frankenphp  : WorkerPool spawns N FrankenPHP children, each on its own port
-  ├─ client      : ureq HTTP/JSON to one worker.php instance
-  ├─ runner      : rayon::par_iter distributes classes across pool
-  └─ reporter    : TTY output (thread-safe via stdout's per-write atomicity)
+  ├─ phpunit_xml : parser for bootstrap, <testsuites>, <php><const>
+  ├─ php_worker  : PhpWorkerPool — N plain `php` processes, stdin/stdout JSON
+  ├─ runner      : rayon::par_iter distributes classes + data-provider rows
+  └─ reporter    : TTY progress + summary (thread-safe)
 
-N FrankenPHP workers (each ~50MB, long-lived in worker mode)
-  └─ worker.php → TestExecutor::runClass(...) → outcomes JSON
+N PHP workers (plain `php` CLI, long-lived per run)
+  └─ worker.php → require vendor/autoload.php → PHPUnit TestCase::runTest()
 ```
+
+Workers are plain `php worker.php` processes. Each receives a JSON job on
+stdin and writes a JSON result to stdout. No HTTP, no socket, no daemon.
 
 ## Performance
 
-Real measurements on a 22-CPU machine running the [brick/math](https://github.com/brick/math)
-test suite (13,589 tests via PHPUnit 11):
+Benchmarked on PHP 8.4 with 4 workers against a selection of real OSS suites.
+"vanilla-phpunit" is a single-process `./vendor/bin/phpunit` run.
 
-| Workers | Wall-clock | Speedup |
-|---------|-----------|---------|
-| 1       | 234s (3:54) | 1.0× (baseline) |
-| 22 (`num_cpus` default) | 188s (3:08) | **1.24×** |
+| Project | vanilla | phpunit-rust (4w) | Speedup | Tests |
+|---|---|---|---|---|
+| carbon | 0:23.10 | 0:09.90 | **2.3×** | 6 027 |
+| ramsey-uuid | 0:06.19 | 0:02.10 | **2.9×** | 2 022 |
+| doctrine-orm | 0:04.10 | 0:01.72 | **2.4×** | 3 478 |
+| faker | 0:00.88 | 0:00.81 | 1.1× | 1 380 |
+| php-parser | 0:00.38 | 0:00.30 | 1.3× | 1 887 |
+| guzzle-psr7 | 0:00.12 | 0:00.15 | — | 1 088 |
+| doctrine-collections | 0:00.09 | 0:00.10 | — | 242 |
 
-The speedup ceiling depends on the **largest single class** in the suite.
-brick/math's `BigIntegerTest` takes ~165s alone — one CPU is pinned to it
-for that entire duration, while the other 21 workers finish their classes
-in seconds. Suites with more even per-class duration distributions see
-proportionally larger speedups; suites with one dominant class approach
-`max(per_class_time)` as their wall-clock floor.
+CPU-bound suites with many independent classes (carbon, ramsey-uuid,
+doctrine-orm) see the largest gains. Sub-second suites are dominated by PHP
+startup cost and show parity or slight regression at low worker counts.
 
-For very small suites, parallel mode is *slower* than sequential because
-FrankenPHP startup (~1.5s per worker) dominates:
-
-| Workers | 15-test fixture |
-|---------|-----------------|
-| 1       | 1.15s |
-| 4       | 2.50s |
-
-Use `--workers 1` for small suites or quick smoke runs.
+The bench script (`bench/run.sh`) runs the full matrix across PHP 8.1–8.5 in
+Docker containers. `--quick` restricts it to PHP 8.4 + 4 workers for fast
+iteration.
