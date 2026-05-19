@@ -3,9 +3,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use phpunit_rust::client::WorkerClient;
 use phpunit_rust::discovery::discover_in_dir;
-use phpunit_rust::frankenphp::{find_worker_script, FrankenPhp};
+use phpunit_rust::frankenphp::{find_worker_script, WorkerPool};
 use phpunit_rust::phpunit_xml::parse_bootstrap;
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
@@ -27,6 +26,10 @@ struct Cli {
     /// Defaults to <project>/phpunit.xml or phpunit.xml.dist if found.
     #[arg(long)]
     configuration: Option<PathBuf>,
+    /// Number of parallel FrankenPHP workers. Defaults to the number of CPU
+    /// cores detected on this machine. Use --workers 1 for sequential mode.
+    #[arg(long)]
+    workers: Option<usize>,
 }
 
 fn main() -> ExitCode {
@@ -83,6 +86,15 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("Using bootstrap: {}", b.display());
     }
 
+    // Decide worker count BEFORE initializing rayon. We need the rayon pool
+    // sized to match so `rayon::current_thread_index()` returns valid indices
+    // into our WorkerClient vec.
+    let worker_count = cli.workers.unwrap_or_else(num_cpus::get).max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build_global()
+        .context("initializing rayon thread pool")?;
+
     eprintln!("Discovering tests in {}...", tests_dir.display());
     let cases = discover_in_dir(&tests_dir)?;
     eprintln!("Found {} test methods across {} classes.",
@@ -90,12 +102,12 @@ fn real_main() -> Result<ExitCode> {
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
     );
 
-    let worker = find_worker_script()?;
-    let fph = FrankenPhp::spawn(&worker)?;
-    let client = WorkerClient::new(fph.worker_url());
+    eprintln!("Spawning {} FrankenPHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
+    let worker_script = find_worker_script()?;
+    let pool = WorkerPool::spawn(&worker_script, worker_count)?;
 
     let cfg = RunConfig { autoload, bootstrap, filter: cli.filter };
-    let report = run(&client, cases, &cfg, |o| print_progress(o))?;
+    let report = run(&pool, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
 
     if report.is_success() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::from(1)) }
