@@ -134,6 +134,23 @@ pub fn find_worker_script() -> Result<PathBuf> {
     Err(anyhow!("worker.php not found in any of: {:?}", candidates))
 }
 
+/// Find `worker_fork.php` relative to the binary's directory layout.
+pub fn find_fork_script() -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("php/worker_fork.php")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("../../php/worker_fork.php"));
+            candidates.push(dir.join("php/worker_fork.php"));
+        }
+    }
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(c.canonicalize()?);
+        }
+    }
+    Err(anyhow!("worker_fork.php not found in any of: {:?}", candidates))
+}
+
 /// Verify `php` is on $PATH and at least 8.1. Errors clearly otherwise.
 pub fn check_php_version(min_version_id: u32) -> Result<u32> {
     let output = Command::new("php")

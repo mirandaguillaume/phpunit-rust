@@ -784,6 +784,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "libc",
  "num_cpus",
  "pcov-rs",
  "quick-xml",

@@ -122,3 +122,61 @@ fn fork_worker_php_script_exists_and_is_valid_syntax() {
         "php -l failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+#[test]
+fn fork_pool_runs_fixture_and_streams_outcomes() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::types::{BatchClass, BatchPlan};
+
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project");
+    let autoload = project.join("vendor/autoload.php");
+    let script = phpunit_rust::php_worker::find_fork_script()
+        .expect("worker_fork.php not found");
+
+    let mut pool = PhpForkPool::spawn(&script, &autoload, None, &[], 2)
+        .expect("PhpForkPool::spawn failed");
+
+    pool.write_batch(0, &BatchPlan {
+        autoload: autoload.clone(),
+        bootstrap: None,
+        defines: vec![],
+        classes: vec![BatchClass {
+            file: project.join("tests/SampleTest.php"),
+            class: "SampleTest".to_string(),
+            methods: vec![],
+        }],
+    }).expect("write_batch slot 0");
+
+    pool.write_batch(1, &BatchPlan {
+        autoload: autoload.clone(),
+        bootstrap: None,
+        defines: vec![],
+        classes: vec![],
+    }).expect("write_batch slot 1");
+
+    pool.close_write_ends();
+
+    let readers = pool.into_readers();
+    let mut all_outcomes: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
+    for mut reader in readers {
+        use std::io::BufRead;
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                if let Ok(o) = serde_json::from_str::<phpunit_rust::types::TestOutcome>(trimmed) {
+                    all_outcomes.push(o);
+                }
+            }
+            line.clear();
+        }
+    }
+    pool.wait();
+
+    assert!(!all_outcomes.is_empty(), "expected at least one outcome from SampleTest");
+    let classes: std::collections::HashSet<&str> =
+        all_outcomes.iter().map(|o| o.class.as_str()).collect();
+    assert!(classes.contains("SampleTest"),
+        "SampleTest outcomes missing; got: {classes:?}");
+}
