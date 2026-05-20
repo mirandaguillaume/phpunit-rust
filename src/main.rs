@@ -53,7 +53,8 @@ fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, o
         }
     }
 }
-use phpunit_rust::php_worker::{check_php_version, find_worker_script, PhpWorkerPool};
+use phpunit_rust::fork_pool::PhpForkPool;
+use phpunit_rust::php_worker::{check_php_version, find_fork_script};
 use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
@@ -81,10 +82,6 @@ struct Cli {
     /// cores detected on this machine. Use --workers 1 for sequential mode.
     #[arg(long)]
     workers: Option<usize>,
-    /// Minimum row count for a data-provider method to be split into per-row
-    /// chunks. Below this, methods are dispatched whole. Default 50.
-    #[arg(long)]
-    row_chunk_min: Option<usize>,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -251,17 +248,16 @@ fn real_main() -> Result<ExitCode> {
     eprintln!("PHP version id: {php_id}");
 
     eprintln!("Spawning {} PHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
-    let worker_script = find_worker_script()?;
-    let pool = PhpWorkerPool::spawn(&worker_script, worker_count)?;
+    let fork_script = find_fork_script()?;
+    let mut pool = PhpForkPool::spawn(&fork_script, &autoload, bootstrap.as_deref(), &defines, worker_count)?;
 
     let cfg = RunConfig {
         autoload,
-        bootstrap,
+        bootstrap: None,
         filter: cli.filter,
         defines,
-        row_chunk_min: cli.row_chunk_min.unwrap_or(50),
     };
-    let report = run(&pool, cases, &cfg, |o| print_progress(o))?;
+    let report = run(&mut pool, cases, &cfg, |o| print_progress(o))?;
     print_summary(&report);
 
     #[cfg(feature = "coverage")]

@@ -1,30 +1,23 @@
-use crate::components;
-use crate::discovery::{group_by_class, TestClass};
-use crate::php_client::PhpWorkerClient;
-use crate::php_worker::PhpWorkerPool;
-use crate::types::{ClassDescriptor, RowFilter, TestCase, TestOutcome, TestRunRequest, TestStatus};
+use crate::discovery::group_by_class;
+use crate::fork_pool::PhpForkPool;
+use crate::types::{BatchClass, BatchPlan, TestCase, TestOutcome, TestStatus};
 use anyhow::Result;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub autoload: PathBuf,
+    pub autoload:  PathBuf,
     pub bootstrap: Option<PathBuf>,
-    pub filter: Option<String>,
-    /// `define(name, value)` declarations extracted from `<php><const .../>`
-    /// in phpunit.xml. Passed through every request so the worker applies
-    /// them once per autoload before running tests.
-    pub defines: Vec<[String; 2]>,
-    /// Minimum row count for a data-provider method to be split into per-row
-    /// chunks. Below this, methods are dispatched whole. Default 50.
-    pub row_chunk_min: usize,
+    pub filter:    Option<String>,
+    pub defines:   Vec<[String; 2]>,
 }
 
 #[derive(Debug)]
 pub struct Report {
-    pub outcomes: Vec<TestOutcome>,
+    pub outcomes:          Vec<TestOutcome>,
     pub total_duration_ms: f64,
 }
 
@@ -32,163 +25,148 @@ impl Report {
     pub fn count(&self, status: TestStatus) -> usize {
         self.outcomes.iter().filter(|o| o.status == status).count()
     }
-    pub fn passed(&self) -> usize { self.count(TestStatus::Pass) }
-    pub fn failed(&self) -> usize { self.count(TestStatus::Fail) }
-    pub fn errored(&self) -> usize { self.count(TestStatus::Error) }
-    pub fn skipped(&self) -> usize { self.count(TestStatus::Skipped) }
+    pub fn passed(&self)     -> usize { self.count(TestStatus::Pass) }
+    pub fn failed(&self)     -> usize { self.count(TestStatus::Fail) }
+    pub fn errored(&self)    -> usize { self.count(TestStatus::Error) }
+    pub fn skipped(&self)    -> usize { self.count(TestStatus::Skipped) }
     pub fn incomplete(&self) -> usize { self.count(TestStatus::Incomplete) }
-    pub fn risky(&self) -> usize { self.count(TestStatus::Risky) }
+    pub fn risky(&self)      -> usize { self.count(TestStatus::Risky) }
 
     pub fn is_success(&self) -> bool {
         self.failed() == 0 && self.errored() == 0
     }
 }
 
+/// Run all cases through the fork pool.
+///
+/// Cases are distributed across pool slots without splitting any class across
+/// multiple slots. @depends ordering is handled inside PHP by MethodPlanner.
+/// Results are drained in parallel via rayon; `on_progress` is called for each
+/// outcome as it arrives from any slot.
 pub fn run(
-    pool: &PhpWorkerPool,
+    pool: &mut PhpForkPool,
     cases: Vec<TestCase>,
     cfg: &RunConfig,
     on_progress: impl Fn(&TestOutcome) + Sync,
 ) -> Result<Report> {
-    // Apply class-level filter pre-batch (so we don't ship classes that have
-    // no matching methods). Inside a class, the worker filters by methods.
-    let filtered_cases: Vec<TestCase> = cases
-        .into_iter()
+    let filtered: Vec<TestCase> = cases.into_iter()
         .filter(|c| match &cfg.filter {
-            Some(f) => format!("{}::{}", c.class, c.method).contains(f),
-            None => true,
+            Some(f) => format!("{}::{}", c.class, c.method).contains(f.as_str()),
+            None    => true,
         })
         .collect();
 
-    let groups = group_by_class(filtered_cases);
-    if groups.is_empty() {
-        return Ok(Report { outcomes: Vec::new(), total_duration_ms: 0.0 });
-    }
+    let n = rayon::current_num_threads().max(1);
+    let chunks = chunk_by_class(filtered, n);
 
-    let total_workers = pool.len();
-
-    // Phase A: probe each class for its depends info and row counts.
-    // Sequential — one round-trip per class, cheap.
-    // All probes go to worker 0; no contention.
-    let probe_client = PhpWorkerClient::new(pool.worker(0));
-
-    // Per-component dispatch units; each unit becomes ONE round-trip.
-    // (file, class, methods_subset, row_filter)
-    let mut dispatch_units: Vec<(PathBuf, String, Vec<String>, Option<RowFilter>)> = Vec::new();
-
-    // Error outcomes from classes whose describe probe failed (PHP OOM, etc.).
-    // Collected here and merged with Phase-B outcomes at the end.
-    let mut describe_errors: Vec<TestOutcome> = Vec::new();
-
-    for TestClass { file, class, methods } in &groups {
-        let probe_req = TestRunRequest {
-            autoload: cfg.autoload.clone(),
+    for (slot, chunk) in chunks.iter().enumerate() {
+        let groups = group_by_class(chunk.clone());
+        let classes: Vec<BatchClass> = groups.into_iter().map(|g| BatchClass {
+            file:    g.file,
+            class:   g.class,
+            methods: g.methods,
+        }).collect();
+        pool.write_batch(slot, &BatchPlan {
+            autoload:  cfg.autoload.clone(),
             bootstrap: cfg.bootstrap.clone(),
-            file: file.clone(),
-            class: class.clone(),
-            methods: Vec::new(),
-            defines: cfg.defines.clone(),
-            describe_only: true,
-            row_filter: None,
-        };
-        let descriptor: ClassDescriptor = match probe_client.describe_class(&probe_req) {
-            Ok(d) => d,
-            Err(e) => {
-                // Worker crashed (OOM, fatal error) — can't know method list.
-                // Use the methods we discovered statically as best-effort.
-                let msg = format!("{e:#}");
-                for method in methods {
-                    describe_errors.push(TestOutcome {
-                        class: class.clone(),
-                        method: method.clone(),
-                        dataset: None,
-                        status: TestStatus::Error,
-                        message: Some(msg.clone()),
-                        trace: None,
-                        duration_ms: 0.0,
-                    });
-                }
-                continue;
-            }
-        };
-
-        // Build the depends map AND row-count map from the descriptor.
-        let depends: HashMap<String, Vec<String>> = descriptor
-            .description
-            .iter()
-            .map(|m| (m.name.clone(), m.depends.clone()))
-            .collect();
-        let row_counts: HashMap<String, Option<usize>> = descriptor
-            .description
-            .iter()
-            .map(|m| (m.name.clone(), m.row_count))
-            .collect();
-
-        // Restrict to the methods we discovered (which respects any --filter
-        // we already applied at the case level).
-        let class_methods: Vec<String> = methods.clone();
-        let components = components::partition_by_depends(&class_methods, &depends);
-
-        for component in components {
-            // If the component is a single method with row_count > threshold,
-            // split it into `total_workers` row-chunks.
-            if component.len() == 1 {
-                let m = &component[0];
-                let count = row_counts.get(m).copied().flatten().unwrap_or(0);
-                if count > cfg.row_chunk_min && total_workers > 1 {
-                    for chunk_index in 0..total_workers {
-                        dispatch_units.push((
-                            file.clone(),
-                            class.clone(),
-                            vec![m.clone()],
-                            Some(RowFilter { chunk_index, total_chunks: total_workers }),
-                        ));
-                    }
-                    continue;
-                }
-            }
-            // Default: dispatch the whole component as one unit, no row_filter.
-            dispatch_units.push((file.clone(), class.clone(), component, None));
-        }
+            defines:   cfg.defines.clone(),
+            classes,
+        })?;
     }
 
-    // Phase B: parallel dispatch via rayon.
-    // Each rayon thread picks a worker by its thread index.
-    let results: Vec<Result<Vec<TestOutcome>>> = dispatch_units
+    let readers = pool.into_readers();
+    let slot_outcomes: Vec<Vec<TestOutcome>> = readers
         .into_par_iter()
-        .map(|(file, class, methods, row_filter)| {
-            let idx = rayon::current_thread_index().unwrap_or(0);
-            let client = PhpWorkerClient::new(pool.worker(idx));
-            let req = TestRunRequest {
-                autoload: cfg.autoload.clone(),
-                bootstrap: cfg.bootstrap.clone(),
-                file,
-                class,
-                methods,
-                defines: cfg.defines.clone(),
-                describe_only: false,
-                row_filter,
-            };
-            let batch = client.run_class(&req)?;
-            // Emit progress inside the worker thread as outcomes arrive.
-            for outcome in &batch {
-                on_progress(outcome);
+        .map(|mut reader| {
+            let mut outcomes = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    if let Ok(outcome) = serde_json::from_str::<TestOutcome>(trimmed) {
+                        on_progress(&outcome);
+                        outcomes.push(outcome);
+                    }
+                }
+                line.clear();
             }
-            Ok(batch)
+            outcomes
         })
         .collect();
 
-    // Aggregate. Short-circuit on the first transport error (process died).
-    // Worker-level class errors were already converted to error outcomes inside
-    // run_class, so they arrive as Ok(outcomes) and are counted normally.
-    let mut outcomes: Vec<TestOutcome> = describe_errors;
-    let mut total = 0.0;
-    for batch in results {
-        let batch = batch?;
-        for outcome in batch {
-            total += outcome.duration_ms;
-            outcomes.push(outcome);
+    let mut outcomes: Vec<TestOutcome> = Vec::new();
+    let mut total = 0.0f64;
+    for mut batch in slot_outcomes {
+        for o in &batch { total += o.duration_ms; }
+        outcomes.append(&mut batch);
+    }
+
+    Ok(Report { outcomes, total_duration_ms: total })
+}
+
+/// Distribute `cases` across `n` slots without splitting any class.
+/// Round-robin by class discovery order.
+pub fn chunk_by_class(cases: Vec<TestCase>, n: usize) -> Vec<Vec<TestCase>> {
+    let n = n.max(1);
+    let mut class_order: Vec<String> = Vec::new();
+    let mut by_class: HashMap<String, Vec<TestCase>> = HashMap::new();
+    for c in cases {
+        by_class.entry(c.class.clone())
+            .or_insert_with(|| { class_order.push(c.class.clone()); Vec::new() })
+            .push(c);
+    }
+    let mut slots: Vec<Vec<TestCase>> = vec![Vec::new(); n];
+    for (i, class) in class_order.into_iter().enumerate() {
+        if let Some(class_cases) = by_class.remove(&class) {
+            slots[i % n].extend(class_cases);
         }
     }
-    Ok(Report { outcomes, total_duration_ms: total })
+    slots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_case(class: &str, method: &str) -> TestCase {
+        TestCase {
+            file:   PathBuf::from("/f.php"),
+            class:  class.to_string(),
+            method: method.to_string(),
+        }
+    }
+
+    #[test]
+    fn chunk_preserves_all_cases() {
+        let cases = vec![
+            make_case("A", "t1"), make_case("A", "t2"),
+            make_case("B", "t1"),
+            make_case("C", "t1"),
+        ];
+        let chunks = chunk_by_class(cases, 2);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), 4);
+    }
+
+    #[test]
+    fn chunk_never_splits_a_class() {
+        let cases = vec![
+            make_case("Alpha", "t1"), make_case("Alpha", "t2"), make_case("Alpha", "t3"),
+            make_case("Beta", "t1"),
+        ];
+        let chunks = chunk_by_class(cases, 3);
+        for chunk in &chunks {
+            let alpha = chunk.iter().filter(|c| c.class == "Alpha").count();
+            assert!(alpha == 0 || alpha == 3,
+                "Alpha was split: found {alpha} in one slot");
+        }
+    }
+
+    #[test]
+    fn chunk_handles_more_slots_than_classes() {
+        let cases = vec![make_case("Only", "t1")];
+        let chunks = chunk_by_class(cases, 8);
+        assert_eq!(chunks.len(), 8);
+        assert_eq!(chunks.iter().filter(|c| !c.is_empty()).count(), 1);
+    }
 }
