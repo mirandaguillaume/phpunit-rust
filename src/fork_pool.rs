@@ -140,6 +140,11 @@ impl PhpForkPool {
             .collect()
     }
 
+    /// Returns the number of worker slots in this pool.
+    pub fn len(&self) -> usize {
+        self.write_ends.len()
+    }
+
     /// Wait for the PHP master process to exit cleanly.
     pub fn wait(&mut self) {
         let _ = self.master.wait();

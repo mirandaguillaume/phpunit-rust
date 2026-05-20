@@ -56,7 +56,7 @@ pub fn run(
         })
         .collect();
 
-    let n = rayon::current_num_threads().max(1);
+    let n = pool.len();
     let chunks = chunk_by_class(filtered, n);
 
     for (slot, chunk) in chunks.iter().enumerate() {
@@ -80,15 +80,21 @@ pub fn run(
         .map(|mut reader| {
             let mut outcomes = Vec::new();
             let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    if let Ok(outcome) = serde_json::from_str::<TestOutcome>(trimmed) {
-                        on_progress(&outcome);
-                        outcomes.push(outcome);
-                    }
-                }
+            loop {
                 line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            if let Ok(outcome) = serde_json::from_str::<TestOutcome>(trimmed) {
+                                on_progress(&outcome);
+                                outcomes.push(outcome);
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
             outcomes
         })
