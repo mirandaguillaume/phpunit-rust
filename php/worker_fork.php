@@ -195,7 +195,7 @@ function runChild($stdinStream, $stdoutStream): void
             }
             $outcomes = TestExecutor::runClass($class, $methods, null);
         } catch (\Throwable $e) {
-            if (ob_get_level() > 0) ob_end_clean();
+            while (ob_get_level() > 0) ob_end_clean();
             emitError($stdoutStream, $class, '<class>',
                 'exception: ' . $e->getMessage(), $e->getTraceAsString());
             continue;
