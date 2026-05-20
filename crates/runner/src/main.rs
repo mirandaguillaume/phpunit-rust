@@ -54,7 +54,8 @@ fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, o
     }
 }
 use phpunit_rust::fork_pool::PhpForkPool;
-use phpunit_rust::php_worker::{check_php_version, find_fork_script};
+use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
+use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
 use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
@@ -247,6 +248,25 @@ fn real_main() -> Result<ExitCode> {
         .context("PHP version check failed (need ≥ 8.1 on PATH)")?;
     eprintln!("PHP version id: {php_id}");
 
+    // Enumerate data-provider row counts BEFORE forking workers.
+    // The runner uses these to decide whether to split a heavy provider
+    // method into multiple stride-partitioned plans (see build_queue).
+    // A failed enumeration is non-fatal: missing entries fall back to
+    // single-bucket dispatch.
+    let provider_pairs = collect_provider_pairs(&cases);
+    let row_counts: RowCounts = if provider_pairs.is_empty() {
+        RowCounts::new()
+    } else {
+        let enum_script = find_enumerate_script()?;
+        match enumerate(&enum_script, &autoload, bootstrap.as_deref(), &defines, &provider_pairs) {
+            Ok(counts) => counts,
+            Err(e) => {
+                eprintln!("Provider enumeration failed (continuing with no row data): {e:#}");
+                RowCounts::new()
+            }
+        }
+    };
+
     eprintln!("Spawning {} PHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
     let fork_script = find_fork_script()?;
     let mut pool = PhpForkPool::spawn(&fork_script, &autoload, bootstrap.as_deref(), &defines, worker_count)?;
@@ -257,7 +277,7 @@ fn real_main() -> Result<ExitCode> {
         filter: cli.filter,
         defines,
     };
-    let report = run(&mut pool, cases, &cfg, |o| print_progress(o))?;
+    let report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
     print_summary(&report);
 
     #[cfg(feature = "coverage")]

@@ -204,9 +204,15 @@ function runChild($stdinStream, $stdoutStream): void
         $nextIdx        = 0;
 
         foreach ($currentClasses as $i => $entry) {
-            $file    = (string) ($entry['file']    ?? '');
-            $class   = (string) ($entry['class']   ?? '');
-            $methods = (array)  ($entry['methods'] ?? []);
+            $file       = (string) ($entry['file']    ?? '');
+            $class      = (string) ($entry['class']   ?? '');
+            $methods    = (array)  ($entry['methods'] ?? []);
+            // Optional stride row filter, e.g. {chunk_index: 2, total_chunks: 4}.
+            // Applied uniformly to every data-provider method in this batch:
+            // the runner emits one BatchClass per chunk when it wants to split
+            // a heavy provider across workers.
+            $rowFilter  = $entry['row_filter'] ?? null;
+            if (!is_array($rowFilter)) { $rowFilter = null; }
 
             // Mark this class as "in progress" before touching it.
             // If exit()/fatal fires here, shutdown reports from $i onward.
@@ -233,7 +239,7 @@ function runChild($stdinStream, $stdoutStream): void
                     $nextIdx = $i + 1;
                     continue;
                 }
-                $outcomes = TestExecutor::runClass($class, $methods, null);
+                $outcomes = TestExecutor::runClass($class, $methods, $rowFilter);
             } catch (\Throwable $e) {
                 while (ob_get_level() > 0) ob_end_clean();
                 emitError($stdoutStream, $class, '<class>',

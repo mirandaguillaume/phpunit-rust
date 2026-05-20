@@ -6,12 +6,21 @@ use std::process::Command;
 
 /// Find `worker_fork.php` relative to the binary's directory layout.
 pub fn find_fork_script() -> Result<PathBuf> {
-    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("php/worker_fork.php")];
+    find_script_named("worker_fork.php")
+}
+
+/// Find `enumerate_providers.php` — same search path as the fork script.
+pub fn find_enumerate_script() -> Result<PathBuf> {
+    find_script_named("enumerate_providers.php")
+}
+
+fn find_script_named(name: &str) -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from(format!("php/{name}"))];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("../../php/worker_fork.php"));
-            candidates.push(dir.join("../../../php/worker_fork.php"));
-            candidates.push(dir.join("php/worker_fork.php"));
+            candidates.push(dir.join(format!("../../php/{name}")));
+            candidates.push(dir.join(format!("../../../php/{name}")));
+            candidates.push(dir.join(format!("php/{name}")));
         }
     }
     for c in &candidates {
@@ -19,7 +28,7 @@ pub fn find_fork_script() -> Result<PathBuf> {
             return Ok(c.canonicalize()?);
         }
     }
-    Err(anyhow!("worker_fork.php not found in any of: {:?}", candidates))
+    Err(anyhow!("{name} not found in any of: {:?}", candidates))
 }
 
 /// Verify `php` is on $PATH and at least `min_version_id`. Errors clearly otherwise.

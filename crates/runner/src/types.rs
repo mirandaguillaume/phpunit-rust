@@ -6,6 +6,11 @@ pub struct TestCase {
     pub file: PathBuf,
     pub class: String,
     pub method: String,
+    /// Name of the data-provider method (without `()`), if this test was
+    /// declared with `#[DataProvider("name")]` or `/** @dataProvider name */`.
+    /// `None` for plain tests. Used by the runner to enumerate row counts
+    /// and split heavy providers across workers.
+    pub data_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -34,12 +39,25 @@ pub struct TestOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RowFilter {
+    pub chunk_index:  u32,
+    pub total_chunks: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BatchClass {
     pub file: PathBuf,
     pub class: String,
     /// Empty = all discovered methods. Worker calls MethodPlanner::plan()
     /// internally for @depends ordering.
     pub methods: Vec<String>,
+    /// Optional row filter applied to all data-provider methods in this
+    /// batch (stride partition: keep row i iff i % total_chunks == chunk_index).
+    /// `None` = no filter (run every row). Used by the runner to split a
+    /// fat data-provider method across multiple workers — the heavy method
+    /// becomes N BatchClass entries with different chunk_index values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<RowFilter>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,9 +118,10 @@ mod batch_plan_tests {
             bootstrap: Some(PathBuf::from("/proj/bootstrap.php")),
             defines: vec![["FOO".to_string(), "bar".to_string()]],
             classes: vec![BatchClass {
-                file: PathBuf::from("/proj/tests/FooTest.php"),
-                class: "App\\FooTest".to_string(),
-                methods: vec!["testA".to_string()],
+                file:       PathBuf::from("/proj/tests/FooTest.php"),
+                class:      "App\\FooTest".to_string(),
+                methods:    vec!["testA".to_string()],
+                row_filter: None,
             }],
         };
         let v = serde_json::to_value(&plan).unwrap();

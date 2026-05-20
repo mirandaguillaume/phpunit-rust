@@ -1,6 +1,7 @@
 use crate::discovery::group_by_class;
 use crate::fork_pool::PhpForkPool;
-use crate::types::{BatchClass, BatchPlan, TestCase, TestOutcome, TestStatus};
+use crate::provider_enum::RowCounts;
+use crate::types::{BatchClass, BatchPlan, RowFilter, TestCase, TestOutcome, TestStatus};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -67,6 +68,7 @@ pub fn run(
     pool: &mut PhpForkPool,
     cases: Vec<TestCase>,
     cfg: &RunConfig,
+    row_counts: &RowCounts,
     on_progress: impl Fn(&TestOutcome) + Sync,
 ) -> Result<Report> {
     let filtered: Vec<TestCase> = cases.into_iter()
@@ -77,7 +79,7 @@ pub fn run(
         .collect();
 
     let n = pool.len();
-    let mut queue: VecDeque<BatchPlan> = build_queue(filtered, cfg);
+    let mut queue: VecDeque<BatchPlan> = build_queue(filtered, cfg, row_counts);
 
     // Spawn one reader thread per slot. Each owns its BufReader and forwards
     // parsed messages + EOF over a single mpsc to the main loop below.
@@ -163,24 +165,59 @@ pub fn run(
     Ok(Report { outcomes, total_duration_ms: total })
 }
 
-/// Build the work queue using LPT (Longest Processing Time) scheduling:
-/// classes with the most methods go first so workers tackle the heaviest
-/// items while the queue is still wide enough to keep them all fed.
+/// Static weight of one test method for LPT cost estimation.
 ///
-/// Adaptive chunking limits RPC overhead on tiny classes: heavy classes
-/// (>= HEAVY_METHOD_THRESHOLD methods) get a plan each for max parallelism,
-/// while light classes are bundled into packs to amortize the JSON round-trip.
-fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig) -> VecDeque<BatchPlan> {
-    const HEAVY_METHOD_THRESHOLD: usize = 4;
-    const LIGHT_PACK_SIZE:        usize = 4;
+/// We deliberately use method *count* (every method = 1) rather than
+/// enumerated row count: tried weighting by row count first, it pushed
+/// nearly every dp-containing class above the heavy threshold and
+/// over-individualised the queue, regressing carbon by 20%. The row
+/// count is still consulted — but only to decide whether to *split*
+/// a heavy method into per-row plans (see ROW_SPLIT_THRESHOLD), not
+/// to bias the LPT ordering.
+fn method_weight(_class: &str, _m: &crate::discovery::GroupedMethod, _row_counts: &RowCounts) -> u32 {
+    1
+}
 
-    let mut groups = group_by_class(cases);
-    // LPT: heaviest classes first. method_count is our static cost proxy —
-    // cheap, derived from discovery without any extra parse, and a strict
-    // overestimate for short methods is fine (the worker doesn't care).
-    groups.sort_by(|a, b| b.methods.len().cmp(&a.methods.len()));
+/// A method with this many enumerated data-provider rows or more gets
+/// split into stride-partitioned plans. Set high because every chunk pays
+/// the full setUpBeforeClass/tearDownAfterClass cost; below ~15 rows the
+/// duplicated class setup outweighs the parallelism gain. (Tried 2 first:
+/// regressed carbon by 25% — the empirically dumb-but-wrong knob.)
+const ROW_SPLIT_THRESHOLD: u32 = 15;
+/// Max chunks a single method is split into. Bounded so we don't fragment
+/// a 1000-row provider into 1000 single-row plans (each pays setUpBeforeClass).
+const MAX_ROW_CHUNKS: u32 = 4;
 
-    let mut queue: VecDeque<BatchPlan> = VecDeque::with_capacity(groups.len());
+/// Build the work queue. Three categories of work:
+///
+/// 1. **Heavy data-provider methods** (>= ROW_SPLIT_THRESHOLD rows): split
+///    the class into N plans, each with `methods: [thatMethod]` and a
+///    `row_filter` selecting rows where `i % N == chunk_index`. Other
+///    methods of the same class get a separate filterless plan.
+///
+/// 2. **Other heavy classes** (cost >= HEAVY_COST_THRESHOLD): one plan per
+///    class for maximum parallelism.
+///
+/// 3. **Light classes**: bundled in packs of LIGHT_PACK_SIZE to amortize
+///    the JSON round-trip cost.
+///
+/// LPT ordering applies across all three: heaviest first into the queue.
+fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) -> VecDeque<BatchPlan> {
+    const HEAVY_COST_THRESHOLD: u32   = 4;
+    const LIGHT_PACK_SIZE:      usize = 4;
+
+    let groups = group_by_class(cases);
+    let mut by_cost: Vec<(u32, crate::discovery::TestClass)> = groups.into_iter()
+        .map(|g| {
+            let cost: u32 = g.methods.iter()
+                .map(|m| method_weight(&g.class, m, row_counts))
+                .sum();
+            (cost, g)
+        })
+        .collect();
+    by_cost.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut queue: VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
     let mut light_buf: Vec<BatchClass> = Vec::with_capacity(LIGHT_PACK_SIZE);
 
     let mk_plan = |classes: Vec<BatchClass>| BatchPlan {
@@ -190,9 +227,52 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig) -> VecDeque<BatchPlan> {
         classes,
     };
 
-    for g in groups {
-        let bc = BatchClass { file: g.file, class: g.class, methods: g.methods };
-        if bc.methods.len() >= HEAVY_METHOD_THRESHOLD {
+    for (cost, g) in by_cost {
+        // Only split methods where the enumerator gave us an actual row
+        // count. Unknown (or unresolved) providers stay in the plain plan —
+        // splitting blind risks creating empty chunks (filter chunk_index
+        // > actual rows-1 keeps nothing) which is wasted work.
+        let row_count_for = |m: &crate::discovery::GroupedMethod| -> Option<u32> {
+            let dp = m.data_provider.as_ref()?;
+            match row_counts.get(&(g.class.clone(), dp.clone())) {
+                Some(Some(n)) => Some(*n as u32),
+                _             => None,
+            }
+        };
+
+        let (heavy_methods, other_methods): (Vec<_>, Vec<_>) = g.methods.iter().cloned()
+            .partition(|m| row_count_for(m).map(|n| n >= ROW_SPLIT_THRESHOLD).unwrap_or(false));
+
+        for hm in &heavy_methods {
+            let rows = row_count_for(hm).unwrap_or(1);
+            // chunks = min(rows, MAX_ROW_CHUNKS) so a 2-row method splits
+            // into 2 (each gets one row) and a 100-row method splits into
+            // MAX_ROW_CHUNKS (each gets ~25). No empty chunks.
+            let chunks = rows.min(MAX_ROW_CHUNKS);
+            for chunk_index in 0..chunks {
+                let bc = BatchClass {
+                    file:       g.file.clone(),
+                    class:      g.class.clone(),
+                    methods:    vec![hm.name.clone()],
+                    row_filter: Some(RowFilter { chunk_index, total_chunks: chunks }),
+                };
+                queue.push_back(mk_plan(vec![bc]));
+            }
+        }
+
+        // Remaining (non-row-split) methods form their own batch with no filter.
+        if other_methods.is_empty() { continue; }
+        let other_cost = cost.saturating_sub(
+            heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
+        );
+        let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
+        let bc = BatchClass {
+            file:       g.file,
+            class:      g.class,
+            methods:    other_names,
+            row_filter: None,
+        };
+        if other_cost >= HEAVY_COST_THRESHOLD {
             queue.push_back(mk_plan(vec![bc]));
         } else {
             light_buf.push(bc);
@@ -206,6 +286,7 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig) -> VecDeque<BatchPlan> {
     }
     queue
 }
+
 
 /// Distribute `cases` across `n` slots without splitting any class.
 /// Kept for any external callers; the runner itself no longer needs it.
@@ -233,9 +314,10 @@ mod tests {
 
     fn make_case(class: &str, method: &str) -> TestCase {
         TestCase {
-            file:   PathBuf::from("/f.php"),
-            class:  class.to_string(),
-            method: method.to_string(),
+            file:          PathBuf::from("/f.php"),
+            class:         class.to_string(),
+            method:        method.to_string(),
+            data_provider: None,
         }
     }
 
@@ -273,6 +355,57 @@ mod tests {
         assert_eq!(chunks.iter().filter(|c| !c.is_empty()).count(), 1);
     }
 
+    fn make_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
+        TestCase {
+            file:          PathBuf::from("/f.php"),
+            class:         class.to_string(),
+            method:        method.to_string(),
+            data_provider: Some(dp.to_string()),
+        }
+    }
+
+    #[test]
+    fn build_queue_splits_heavy_provider_into_stride_chunks() {
+        // One class with one method that has 20 dp rows, plus one plain
+        // method on the same class. Expect: 4 row-split plans (chunks=4,
+        // because 20/4 ceil = 5, clamped to MAX_ROW_CHUNKS=4) + 1 plan
+        // for the plain method.
+        let cases = vec![
+            make_case_dp("BigDp", "testFat", "provideMany"),
+            make_case("BigDp", "testSimple"),
+        ];
+        let cfg = RunConfig {
+            autoload:  PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter:    None,
+            defines:   vec![],
+        };
+        let mut row_counts = RowCounts::new();
+        row_counts.insert(("BigDp".to_string(), "provideMany".to_string()), Some(20));
+
+        let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();
+        let row_split_plans: Vec<_> = q.iter()
+            .filter(|p| p.classes.iter().any(|c| c.row_filter.is_some()))
+            .collect();
+        assert_eq!(row_split_plans.len(), 4, "20 rows split into 4 chunks");
+        // Each chunk gets a unique chunk_index 0..4 with total_chunks=4.
+        let indices: std::collections::BTreeSet<u32> = row_split_plans.iter()
+            .flat_map(|p| p.classes.iter().filter_map(|c| c.row_filter.as_ref().map(|f| f.chunk_index)))
+            .collect();
+        assert_eq!(indices, [0, 1, 2, 3].iter().copied().collect());
+        for p in &row_split_plans {
+            let f = p.classes[0].row_filter.as_ref().unwrap();
+            assert_eq!(f.total_chunks, 4);
+            assert_eq!(p.classes[0].methods, vec!["testFat".to_string()]);
+        }
+        // And one filterless plan with the remaining method.
+        let plain_plans: Vec<_> = q.iter()
+            .filter(|p| p.classes.iter().all(|c| c.row_filter.is_none()))
+            .collect();
+        assert_eq!(plain_plans.len(), 1);
+        assert!(plain_plans[0].classes[0].methods.contains(&"testSimple".to_string()));
+    }
+
     #[test]
     fn build_queue_packs_light_classes_and_sorts_heavy_first() {
         // 1 heavy class (5 methods) + 5 light classes (1 method each).
@@ -286,11 +419,13 @@ mod tests {
             filter:    None,
             defines:   vec![],
         };
-        let q: Vec<_> = build_queue(cases, &cfg).into_iter().collect();
+        let row_counts = RowCounts::new();
+        let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();
         assert_eq!(q.len(), 3, "1 heavy plan + 2 light packs");
         assert_eq!(q[0].classes.len(), 1);
         assert_eq!(q[0].classes[0].class, "Heavy", "heavy class scheduled first");
         assert_eq!(q[1].classes.len(), 4, "first light pack is full");
         assert_eq!(q[2].classes.len(), 1, "remaining light tail in its own pack");
     }
+
 }

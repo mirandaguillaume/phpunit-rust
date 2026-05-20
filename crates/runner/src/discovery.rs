@@ -18,7 +18,9 @@ struct ParsedClass {
     parent_fqcn: Option<String>,
     /// All public methods whose name starts with "test". Already filtered;
     /// pass 3 just emits them if the class is determined to be a test.
-    test_methods: Vec<String>,
+    /// The second element is the data-provider method name, if any
+    /// (from `#[DataProvider("name")]` or `/** @dataProvider name */`).
+    test_methods: Vec<(String, Option<String>)>,
     /// `true` if the class is `abstract`. Abstract classes can never be
     /// instantiated by PHPUnit; we skip emitting test cases for them even
     /// when their chain reaches TestCase.
@@ -29,26 +31,37 @@ struct ParsedClass {
 /// Used by the BFS to decide whether a class reaches TestCase.
 type ClassGraph = HashMap<String, Option<String>>;
 
+/// A test method within a discovered class, with its optional data-provider
+/// reference. The runner uses `data_provider` to look up row counts and
+/// schedule heavy methods first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedMethod {
+    pub name:          String,
+    pub data_provider: Option<String>,
+}
+
 /// A discovered test class with all of its methods, grouped for batched
 /// dispatch (one request per class to the worker).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestClass {
-    pub file: PathBuf,
-    pub class: String,
-    pub methods: Vec<String>,
+    pub file:    PathBuf,
+    pub class:   String,
+    pub methods: Vec<GroupedMethod>,
 }
 
-/// Group a flat list of TestCases by class. Preserves discovery order.
+/// Group a flat list of TestCases by class. Preserves discovery order
+/// and per-method data-provider attribution.
 pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     let mut groups: Vec<TestClass> = Vec::new();
     for case in cases {
+        let gm = GroupedMethod { name: case.method, data_provider: case.data_provider };
         if let Some(existing) = groups.iter_mut().find(|g| g.class == case.class) {
-            existing.methods.push(case.method);
+            existing.methods.push(gm);
         } else {
             groups.push(TestClass {
-                file: case.file,
-                class: case.class,
-                methods: vec![case.method],
+                file:    case.file,
+                class:   case.class,
+                methods: vec![gm],
             });
         }
     }
@@ -253,7 +266,7 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
     false
 }
 
-fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<String> {
+fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<(String, Option<String>)> {
     let mut methods = Vec::new();
     let mut cursor = body.walk();
     let mut prev_comment: Option<String> = None;
@@ -287,11 +300,60 @@ fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<String> {
         let has_attr = method_has_test_attribute(child, bytes);
 
         if is_public && (name.starts_with("test") || has_annotation || has_attr) {
-            methods.push(name.to_string());
+            let dp = prev_comment.as_deref()
+                .and_then(phpdoc_data_provider)
+                .or_else(|| method_data_provider_attr(child, bytes));
+            methods.push((name.to_string(), dp));
         }
         prev_comment = None;
     }
     methods
+}
+
+/// Extract `name` from a `@dataProvider name` annotation in a PHPDoc block.
+/// Handles single-line (`/** @dataProvider foo */`) and multi-line forms
+/// alike by searching the whole comment text. Returns the first match.
+fn phpdoc_data_provider(comment: &str) -> Option<String> {
+    let needle = "@dataProvider ";
+    let start = comment.find(needle)?;
+    let after = &comment[start + needle.len()..];
+    let name = after.split(|c: char| c.is_whitespace() || c == '*').next()?;
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Extract the provider name from `#[DataProvider("name")]` (also matches
+/// the fully-qualified `#[PHPUnit\Framework\Attributes\DataProvider(...)]`).
+/// Single or double quotes accepted.
+fn method_data_provider_attr(method: Node, bytes: &[u8]) -> Option<String> {
+    let mut cursor = method.walk();
+    for child in method.children(&mut cursor) {
+        let Ok(text) = child.utf8_text(bytes) else { continue };
+        if !text.starts_with("#[") { continue; }
+        if let Some(name) = extract_data_provider_arg(text) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn extract_data_provider_arg(attr_text: &str) -> Option<String> {
+    let start = attr_text.find("DataProvider(")?;
+    // Guard against #[DataProviderExternal(...)] or similar overlap.
+    let after_ident_start = start + "DataProvider".len();
+    if attr_text.as_bytes().get(after_ident_start) != Some(&b'(') {
+        return None;
+    }
+    let inside = &attr_text[after_ident_start + 1..];
+    let trimmed = inside.trim_start();
+    let (quote, rest) = if let Some(r) = trimmed.strip_prefix('\'') {
+        ('\'', r)
+    } else if let Some(r) = trimmed.strip_prefix('"') {
+        ('"', r)
+    } else {
+        return None;
+    };
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
 }
 
 fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
@@ -366,12 +428,13 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
         let mut depth = 0;
         while depth < 32 {
             if let Some(c) = by_fqcn.get(visit) {
-                for m in &c.test_methods {
+                for (m, dp) in &c.test_methods {
                     if seen.insert(m.as_str()) {
                         cases.push(TestCase {
-                            file: class.file.clone(),
-                            class: class.fqcn.clone(),
-                            method: m.clone(),
+                            file:          class.file.clone(),
+                            class:         class.fqcn.clone(),
+                            method:        m.clone(),
+                            data_provider: dp.clone(),
                         });
                     }
                 }
@@ -568,6 +631,36 @@ final class NotATest {
     }
 
     #[test]
+    fn captures_data_provider_from_phpdoc_and_attribute() {
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+
+class DpTest extends TestCase {
+    /** @dataProvider provideOne */
+    public function testWithPhpdoc(int $n): void {}
+
+    #[DataProvider('provideTwo')]
+    public function testWithAttribute(int $n): void {}
+
+    #[DataProvider("provideThree")]
+    public function testWithAttributeDoubleQuotes(int $n): void {}
+
+    public function testPlain(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let by_method: HashMap<&str, &TestCase> =
+            cases.iter().map(|c| (c.method.as_str(), c)).collect();
+        assert_eq!(by_method["testWithPhpdoc"].data_provider.as_deref(),            Some("provideOne"));
+        assert_eq!(by_method["testWithAttribute"].data_provider.as_deref(),         Some("provideTwo"));
+        assert_eq!(by_method["testWithAttributeDoubleQuotes"].data_provider.as_deref(), Some("provideThree"));
+        assert_eq!(by_method["testPlain"].data_provider, None);
+    }
+
+    #[test]
     fn handles_file_without_namespace() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
@@ -650,15 +743,17 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into() },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into() },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into() },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0].class, "A");
-        assert_eq!(grouped[0].methods, vec!["testOne".to_string(), "testTwo".to_string()]);
+        let names_a: Vec<&str> = grouped[0].methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names_a, vec!["testOne", "testTwo"]);
         assert_eq!(grouped[1].class, "B");
-        assert_eq!(grouped[1].methods, vec!["testThree".to_string()]);
+        let names_b: Vec<&str> = grouped[1].methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names_b, vec!["testThree"]);
     }
 }
