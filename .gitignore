@@ -12,3 +12,4 @@ docs/
 # Benchmark output (machine-dependent, not committed)
 bench/results.md
 bench/results/
+**/.pcov-rs/

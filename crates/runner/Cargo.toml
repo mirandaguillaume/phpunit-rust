@@ -1,0 +1,34 @@
+[package]
+name = "phpunit-rust"
+version = "0.1.0"
+edition = "2021"
+description = "A fast PHPUnit-compatible test runner orchestrating PHP workers from Rust"
+license = "MIT"
+
+[[bin]]
+name = "phpunit-rust"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+coverage = ["dep:analyzer"]
+
+[dependencies]
+anyhow     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+rayon      = { workspace = true }
+walkdir    = { workspace = true }
+clap       = { workspace = true }
+libc       = "0.2"
+colored    = "2.1"
+num_cpus   = "1.16"
+quick-xml  = "0.36"
+tree-sitter     = "0.22"
+tree-sitter-php = "0.22"
+analyzer   = { path = "../analyzer", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

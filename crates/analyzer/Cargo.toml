@@ -1,0 +1,49 @@
+[package]
+name = "analyzer"
+version = "0.1.0"
+edition = "2021"
+description = "PHP static coverage analysis — Given/When/Then test model"
+license = "MIT"
+
+[[bin]]
+name = "pcov-rs"
+path = "src/main.rs"
+
+[lib]
+name = "analyzer"
+path = "src/lib.rs"
+
+[dependencies]
+clap         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+bincode      = { workspace = true }
+blake3       = { workspace = true }
+roxmltree    = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+rayon        = { workspace = true }
+walkdir      = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Mago crates: use mago-project 0.26 only — mago-analyzer 1.27 is incompatible
+# (different AST, span, and source/interner types).
+mago-project     = "0.26"
+mago-interner    = "0.26"
+mago-source      = "0.26"
+mago-syntax      = "0.26"
+mago-reflection  = "0.26"
+mago-span        = "0.26"
+mago-php-version = "0.26"
+mago-names       = "0.26"
+
+[dev-dependencies]
+tempfile   = { workspace = true }
+assert_cmd = "2"
+predicates = "3"
+insta      = { version = "1", features = ["json"] }
+criterion  = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "analyze"
+harness = false
