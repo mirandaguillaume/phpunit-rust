@@ -6,7 +6,7 @@
 use crate::types::BatchPlan;
 use anyhow::{anyhow, Context, Result};
 use std::io::{BufReader, Write};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
@@ -19,9 +19,9 @@ pub struct PhpForkPool {
 impl PhpForkPool {
     /// Spawn a PHP fork-master with `n` worker slots.
     ///
-    /// FD inheritance: `libc::pipe()` creates FDs without CLOEXEC; PHP-facing
-    /// FDs survive execv automatically. We set CLOEXEC on Rust-facing FDs in
-    /// the parent *before* spawn so the OS clears them on execv.
+    /// Pipe pairs are wrapped in `File` immediately after creation so that
+    /// any early return from this function automatically closes all allocated
+    /// FDs. CLOEXEC errors are propagated rather than silently ignored.
     pub fn spawn(
         script: &Path,
         autoload: &Path,
@@ -33,36 +33,51 @@ impl PhpForkPool {
             return Err(anyhow!("fork pool requires at least 1 slot"));
         }
 
-        let mut to_php_read:    Vec<RawFd> = Vec::with_capacity(n);
-        let mut to_php_write:   Vec<RawFd> = Vec::with_capacity(n);
-        let mut from_php_read:  Vec<RawFd> = Vec::with_capacity(n);
-        let mut from_php_write: Vec<RawFd> = Vec::with_capacity(n);
+        // Create N stdin-pipes (Rust writes, PHP reads) and
+        //        N stdout-pipes (PHP writes, Rust reads).
+        // Wrap raw FDs into File immediately so early returns auto-close them.
+        let mut to_php_read:    Vec<std::fs::File> = Vec::with_capacity(n);
+        let mut to_php_write:   Vec<std::fs::File> = Vec::with_capacity(n);
+        let mut from_php_read:  Vec<std::fs::File> = Vec::with_capacity(n);
+        let mut from_php_write: Vec<std::fs::File> = Vec::with_capacity(n);
 
         for _ in 0..n {
             let [r, w] = raw_pipe()?;
-            to_php_read.push(r);
-            to_php_write.push(w);
+            to_php_read.push(unsafe { std::fs::File::from_raw_fd(r) });
+            to_php_write.push(unsafe { std::fs::File::from_raw_fd(w) });
             let [r, w] = raw_pipe()?;
-            from_php_read.push(r);
-            from_php_write.push(w);
+            from_php_read.push(unsafe { std::fs::File::from_raw_fd(r) });
+            from_php_write.push(unsafe { std::fs::File::from_raw_fd(w) });
         }
 
-        // Mark Rust-facing FDs close-on-exec in the *parent* before spawn.
-        // The OS will close them automatically during execv in the child.
-        // PHP-facing FDs have no CLOEXEC flag and survive execv unchanged.
+        // Mark Rust-facing FDs close-on-exec so the OS closes them in the
+        // PHP master process during execv. PHP-facing FDs have no CLOEXEC
+        // and survive execv naturally (libc::pipe() default).
         unsafe {
-            for &fd in to_php_write.iter().chain(from_php_read.iter()) {
+            for f in to_php_write.iter().chain(from_php_read.iter()) {
+                let fd = f.as_raw_fd();
                 let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                if flags < 0 {
+                    return Err(anyhow!(
+                        "fcntl(F_GETFD) failed for fd {fd}: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                    return Err(anyhow!(
+                        "fcntl(F_SETFD, CLOEXEC) failed for fd {fd}: {}",
+                        std::io::Error::last_os_error()
+                    ));
                 }
             }
         }
 
         let stdin_fds_str = to_php_read.iter()
-            .map(|fd| fd.to_string()).collect::<Vec<_>>().join(",");
+            .map(|f| f.as_raw_fd().to_string())
+            .collect::<Vec<_>>().join(",");
         let stdout_fds_str = from_php_write.iter()
-            .map(|fd| fd.to_string()).collect::<Vec<_>>().join(",");
+            .map(|f| f.as_raw_fd().to_string())
+            .collect::<Vec<_>>().join(",");
 
         let mut cmd = Command::new("php");
         cmd.arg(script)
@@ -84,17 +99,13 @@ impl PhpForkPool {
 
         let master = cmd.spawn().context("failed to spawn PHP master")?;
 
-        // Close PHP-facing ends in Rust — PHP owns them from here on.
-        for &fd in to_php_read.iter().chain(from_php_write.iter()) {
-            unsafe { libc::close(fd) };
-        }
+        // Drop PHP-facing ends in Rust — PHP owns them from here on.
+        // Dropping File closes the underlying FD.
+        drop(to_php_read);
+        drop(from_php_write);
 
-        let write_ends = to_php_write.iter()
-            .map(|&fd| Some(unsafe { std::fs::File::from_raw_fd(fd) }))
-            .collect();
-        let read_ends = from_php_read.iter()
-            .map(|&fd| Some(unsafe { std::fs::File::from_raw_fd(fd) }))
-            .collect();
+        let write_ends = to_php_write.into_iter().map(Some).collect();
+        let read_ends  = from_php_read.into_iter().map(Some).collect();
 
         Ok(PhpForkPool { master, write_ends, read_ends })
     }
@@ -121,7 +132,6 @@ impl PhpForkPool {
     /// Consume the read ends as `BufReader<File>` for rayon draining.
     /// Call only after `close_write_ends()`.
     pub fn into_readers(&mut self) -> Vec<BufReader<std::fs::File>> {
-        // Ensure write ends are closed before we hand out readers.
         self.close_write_ends();
         std::mem::take(&mut self.read_ends)
             .into_iter()
