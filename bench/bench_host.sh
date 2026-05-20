@@ -82,9 +82,11 @@ bench_runs() {
         times+=($((t1-t0)))
         last_out="$out"
     done
-    tests=$(echo "$last_out" | grep -oE 'Tests: [0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+    # PHPUnit may print "Tests: N" multiple times (per suite, plus diff
+    # output in self-tests); the final summary is the LAST occurrence.
+    tests=$(echo "$last_out" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+' || true)
     if [ -z "${tests:-}" ]; then
-        tests=$(echo "$last_out" | grep -oE 'OK \([0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+        tests=$(echo "$last_out" | grep -oE 'OK \([0-9]+' | tail -1 | grep -oE '[0-9]+' || true)
     fi
     [ -z "${tests:-}" ] && tests="?"
     echo "$(median "${times[@]}") $tests"

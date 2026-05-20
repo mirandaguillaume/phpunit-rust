@@ -1,0 +1,26 @@
+# PHP 8.4 image with pcntl, used to bench phpunit-rust against projects that
+# require PHP >= 8.4 (currently phpunit-itself).
+#
+# The official php:N-cli images DON'T compile pcntl, so we build it. Without
+# pcntl, worker_fork.php can't fork — every benchmark would show 0 tests.
+#
+# Build:    docker build -f bench/Dockerfile.php84 -t phpunit-rust-bench:php84 .
+# Run:      docker run --rm -v "$PWD":/work -w /work phpunit-rust-bench:php84 \
+#               bench/bench_host.sh phpunit-itself
+FROM php:8.4-cli
+
+# Install pcntl (required by worker_fork.php's pcntl_fork) and a few build
+# basics for native composer extension installs. No-recommends keeps it lean.
+RUN docker-php-ext-install pcntl \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y git unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Composer (used to install OSS project deps inside the container).
+COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
+
+# Default workdir; assume the host mounts the workspace here.
+WORKDIR /work
+
+# Sanity-check pcntl is loaded (fails the build if not).
+RUN php -r 'if (!extension_loaded("pcntl")) { fwrite(STDERR, "pcntl missing\n"); exit(1); } echo "pcntl OK\n";'
