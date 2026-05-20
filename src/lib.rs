@@ -4,7 +4,6 @@ pub mod components;
 pub mod coverage;
 pub mod fork_pool;
 pub mod discovery;
-pub mod php_client;
 pub mod php_worker;
 pub mod phpunit_xml;
 pub mod reporter;
