@@ -90,6 +90,25 @@ pub struct ClassDescriptor {
     pub description: Vec<MethodDescriptor>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BatchClass {
+    pub file: PathBuf,
+    pub class: String,
+    /// Empty = all discovered methods. Worker calls MethodPlanner::plan()
+    /// internally for @depends ordering.
+    pub methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchPlan {
+    pub autoload: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub defines: Vec<[String; 2]>,
+    pub classes: Vec<BatchClass>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +180,43 @@ mod tests {
             let outcome: TestOutcome = serde_json::from_str(&raw).unwrap();
             assert_eq!(outcome.status, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod batch_plan_tests {
+    use super::*;
+
+    #[test]
+    fn batch_plan_serializes_correctly() {
+        let plan = BatchPlan {
+            autoload: PathBuf::from("/proj/vendor/autoload.php"),
+            bootstrap: Some(PathBuf::from("/proj/bootstrap.php")),
+            defines: vec![["FOO".to_string(), "bar".to_string()]],
+            classes: vec![BatchClass {
+                file: PathBuf::from("/proj/tests/FooTest.php"),
+                class: "App\\FooTest".to_string(),
+                methods: vec!["testA".to_string()],
+            }],
+        };
+        let v = serde_json::to_value(&plan).unwrap();
+        assert_eq!(v["autoload"], "/proj/vendor/autoload.php");
+        assert_eq!(v["bootstrap"], "/proj/bootstrap.php");
+        assert_eq!(v["defines"][0][0], "FOO");
+        assert_eq!(v["classes"][0]["class"], "App\\FooTest");
+        assert_eq!(v["classes"][0]["methods"][0], "testA");
+    }
+
+    #[test]
+    fn batch_plan_omits_bootstrap_when_none() {
+        let plan = BatchPlan {
+            autoload: PathBuf::from("/p/vendor/autoload.php"),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![],
+        };
+        let v = serde_json::to_value(&plan).unwrap();
+        assert!(v.get("bootstrap").is_none());
+        assert!(v.get("defines").is_none(), "empty defines must be omitted");
     }
 }
