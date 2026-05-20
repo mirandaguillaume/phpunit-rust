@@ -10,6 +10,7 @@ pub fn find_fork_script() -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("../../php/worker_fork.php"));
+            candidates.push(dir.join("../../../php/worker_fork.php"));
             candidates.push(dir.join("php/worker_fork.php"));
         }
     }

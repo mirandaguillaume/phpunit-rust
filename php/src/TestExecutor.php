@@ -28,14 +28,20 @@ final class TestExecutor
         $steps = MethodPlanner::plan($class, $methods, $rowFilter);
         $ref   = new \ReflectionClass($class);
 
-        // setUpBeforeClass (PHPUnit's per-class hook, protected static).
-        self::invokeOptionalStatic($ref, 'setUpBeforeClass');
+        // Check class-level requirements BEFORE setUpBeforeClass. This is
+        // critical: some test classes load PHP-version-specific entity files
+        // inside setUpBeforeClass, which causes E_COMPILE_ERROR if we're on
+        // the wrong PHP version (uncatchable — kills the worker process).
+        $classSkipReason = self::checkRequires((string) $ref->getDocComment())
+            ?? self::checkRequiresAttributes($ref->getAttributes());
+
+        if ($classSkipReason === null) {
+            // Only call setUpBeforeClass when requirements are satisfied.
+            self::invokeOptionalStatic($ref, 'setUpBeforeClass');
+        }
 
         $outcomes = [];
         $passedReturns = [];  // method -> return value, for @depends injection
-
-        // Check the CLASS-level @requires once; it applies to every step.
-        $classSkipReason = self::checkRequires((string) $ref->getDocComment());
 
         foreach ($steps as $step) {
             $method  = $step['method'];
@@ -47,7 +53,8 @@ final class TestExecutor
             // semantics: any failing @requires at either scope means skip).
             $methodRef = $ref->getMethod($method);
             $skipReason = $classSkipReason
-                ?: self::checkRequires((string) $methodRef->getDocComment());
+                ?: self::checkRequires((string) $methodRef->getDocComment())
+                ?: self::checkRequiresAttributes($methodRef->getAttributes());
             if ($skipReason !== null) {
                 $outcomes[] = OutcomeBuilder::build(
                     $class, $method, $dataset, 0.0,
@@ -141,7 +148,9 @@ final class TestExecutor
             }
         }
 
-        self::invokeOptionalStatic($ref, 'tearDownAfterClass');
+        if ($classSkipReason === null) {
+            self::invokeOptionalStatic($ref, 'tearDownAfterClass');
+        }
 
         return $outcomes;
     }
@@ -219,6 +228,67 @@ final class TestExecutor
                     break;
                 default:
                     // Ignore unknown @requires kinds (PHPUnit, OSFAMILY, etc.)
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Evaluate PHPUnit 10 PHP-8-attribute-based requirements on a class or
+     * method. Returns null if all requirements are satisfied, or a skip
+     * message if any requirement fails.
+     *
+     * @param \ReflectionAttribute[] $attrs
+     */
+    private static function checkRequiresAttributes(array $attrs): ?string
+    {
+        foreach ($attrs as $attr) {
+            $name = $attr->getName();
+            switch ($name) {
+                case 'PHPUnit\\Framework\\Attributes\\RequiresPhp':
+                    $inst = $attr->newInstance();
+                    $req = $inst->versionRequirement();
+                    if (!preg_match('/^(<=|>=|<>|!=|==|=|<|>)?\s*(.+)$/', $req, $vm)) break;
+                    $op = ($vm[1] !== '' ? $vm[1] : '>=');
+                    if ($op === '=') $op = '==';
+                    if (!version_compare(PHP_VERSION, $vm[2], $op)) {
+                        return "PHP {$op} {$vm[2]} required (have " . PHP_VERSION . ')';
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresPhpExtension':
+                    $inst = $attr->newInstance();
+                    $ext = $inst->extension();
+                    if (!extension_loaded($ext)) {
+                        return "extension {$ext} not loaded";
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresFunction':
+                    $inst = $attr->newInstance();
+                    $fn = $inst->functionName();
+                    if (!function_exists($fn)) {
+                        return "function {$fn} not defined";
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresMethod':
+                    $inst = $attr->newInstance();
+                    if (!method_exists($inst->className(), $inst->methodName())) {
+                        return "method {$inst->className()}::{$inst->methodName()} not defined";
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresOperatingSystem':
+                    $inst = $attr->newInstance();
+                    $pattern = $inst->regularExpression();
+                    if (!preg_match('/' . str_replace('/', '\\/', $pattern) . '/i', PHP_OS)) {
+                        return "OS does not match {$pattern} (have " . PHP_OS . ')';
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresOperatingSystemFamily':
+                    $inst = $attr->newInstance();
+                    $family = $inst->operatingSystemFamily();
+                    if (stripos(PHP_OS_FAMILY, $family) === false) {
+                        return "OS family {$family} required (have " . PHP_OS_FAMILY . ')';
+                    }
+                    break;
             }
         }
         return null;

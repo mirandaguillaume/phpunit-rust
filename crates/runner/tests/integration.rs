@@ -1,3 +1,4 @@
+#[cfg(feature = "coverage")]
 use std::path::PathBuf;
 
 #[cfg(feature = "coverage")]
@@ -31,7 +32,7 @@ fn coverage_clover_smoke() {
 #[test]
 fn fork_worker_php_script_exists_and_is_valid_syntax() {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("php/worker_fork.php");
+        .join("../../php/worker_fork.php");
     assert!(script.exists(), "php/worker_fork.php not found at {:?}", script);
 
     let output = std::process::Command::new("php")
