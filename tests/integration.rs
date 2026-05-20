@@ -104,3 +104,21 @@ fn coverage_clover_smoke() {
     assert!(!map.is_empty(), "coverage map must contain at least one file");
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn fork_worker_php_script_exists_and_is_valid_syntax() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("php/worker_fork.php");
+    assert!(script.exists(), "php/worker_fork.php not found at {:?}", script);
+
+    let output = std::process::Command::new("php")
+        .args(["-l", script.to_str().unwrap()])
+        .output()
+        .expect("php -l failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("No syntax errors"),
+        "php -l failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
