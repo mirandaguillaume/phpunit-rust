@@ -13,8 +13,10 @@ declare(strict_types=1);
  *     --child-stdin-fds  7,9,11,13           \
  *     --child-stdout-fds 8,10,12,14
  *
- * Rust writes one BatchPlan JSON per child-stdin-fd; children stream
- * TestOutcome JSON lines back on child-stdout-fds, then exit naturally.
+ * Rust streams newline-delimited BatchPlan JSONs per child-stdin-fd
+ * (work-stealing pool); children stream TestOutcome JSON lines back
+ * and emit {"batch_done": true} after each batch as a ready signal.
+ * Children exit when Rust closes their stdin (EOF).
  *
  * Requires: pcntl extension (standard PHP CLI on Linux/macOS).
  */
@@ -152,62 +154,111 @@ foreach ($childPids as $pid) {
 exit(0);
 
 // ---------------------------------------------------------------------------
-// Child: read one BatchPlan, run all classes, stream TestOutcome JSON lines
+// Child: read newline-delimited BatchPlans in a loop, run classes per batch,
+// stream TestOutcome JSON lines back and emit {"batch_done": true} between
+// batches as a ready signal. Exit cleanly when Rust closes our stdin.
 // ---------------------------------------------------------------------------
 function runChild($stdinStream, $stdoutStream): void
 {
-    // Read the entire batch plan. Rust closes the write end after writing,
-    // so feof() fires naturally.
-    $json = '';
-    while (!feof($stdinStream)) {
-        $chunk = fread($stdinStream, 65536);
-        if ($chunk === false) break;
-        $json .= $chunk;
-    }
-    fclose($stdinStream);
+    // Current-batch state, captured by reference in the shutdown handler.
+    // We reset both to empty after each clean batch so the handler doesn't
+    // double-emit; it only fires for uncatchable fatals (E_COMPILE_ERROR etc.)
+    // mid-batch, where these point to the class that killed us and the
+    // remainder of its batch that we never reached.
+    $currentClasses = [];
+    $nextIdx        = 0;
 
-    $plan = json_decode(trim($json), true);
-    if (!is_array($plan) || !isset($plan['classes'])) {
-        fclose($stdoutStream);
-        return;
-    }
+    register_shutdown_function(function() use (&$currentClasses, &$nextIdx, $stdoutStream): void {
+        while (ob_get_level() > 0) @ob_end_clean();
+        for ($i = $nextIdx; $i < count($currentClasses); $i++) {
+            $class = (string)($currentClasses[$i]['class'] ?? '');
+            if ($class === '') continue;
+            @fwrite($stdoutStream, json_encode([
+                'class'       => $class,
+                'method'      => '<class>',
+                'dataset'     => null,
+                'status'      => 'error',
+                'message'     => 'worker process terminated before this class could run',
+                'trace'       => null,
+                'duration_ms' => 0.0,
+            ]) . "\n");
+            @fflush($stdoutStream);
+        }
+    });
 
-    foreach ($plan['classes'] as $entry) {
-        $file    = (string) ($entry['file']    ?? '');
-        $class   = (string) ($entry['class']   ?? '');
-        $methods = (array)  ($entry['methods'] ?? []);
+    while (true) {
+        $line = fgets($stdinStream);
+        if ($line === false || $line === '') break;  // EOF: clean shutdown
+        $line = trim($line);
+        if ($line === '') continue;
 
-        if ($file === '' || $class === '') continue;
-
-        if (!is_file($file)) {
-            emitError($stdoutStream, $class, '<file>', "test file not found: $file");
+        $plan = json_decode($line, true);
+        if (!is_array($plan) || !isset($plan['classes'])) {
+            // Malformed line: still ack so master doesn't deadlock on us.
+            fwrite($stdoutStream, json_encode(['batch_done' => true]) . "\n");
+            fflush($stdoutStream);
             continue;
         }
 
-        ob_start();
-        try {
-            require_once $file;
-            if (!class_exists($class)) {
-                ob_end_clean();
-                emitError($stdoutStream, $class, '<class>',
-                    "class $class not found after loading $file");
+        $currentClasses = $plan['classes'];
+        $nextIdx        = 0;
+
+        foreach ($currentClasses as $i => $entry) {
+            $file    = (string) ($entry['file']    ?? '');
+            $class   = (string) ($entry['class']   ?? '');
+            $methods = (array)  ($entry['methods'] ?? []);
+
+            // Mark this class as "in progress" before touching it.
+            // If exit()/fatal fires here, shutdown reports from $i onward.
+            $nextIdx = $i;
+
+            if ($file === '' || $class === '') {
+                $nextIdx = $i + 1;
                 continue;
             }
-            $outcomes = TestExecutor::runClass($class, $methods, null);
-        } catch (\Throwable $e) {
-            while (ob_get_level() > 0) ob_end_clean();
-            emitError($stdoutStream, $class, '<class>',
-                'exception: ' . $e->getMessage(), $e->getTraceAsString());
-            continue;
-        }
-        ob_end_clean();
 
-        foreach ($outcomes as $outcome) {
-            fwrite($stdoutStream, json_encode($outcome) . "\n");
-            fflush($stdoutStream);
+            if (!is_file($file)) {
+                emitError($stdoutStream, $class, '<file>', "test file not found: $file");
+                $nextIdx = $i + 1;
+                continue;
+            }
+
+            ob_start();
+            try {
+                require_once $file;
+                if (!class_exists($class)) {
+                    ob_end_clean();
+                    emitError($stdoutStream, $class, '<class>',
+                        "class $class not found after loading $file");
+                    $nextIdx = $i + 1;
+                    continue;
+                }
+                $outcomes = TestExecutor::runClass($class, $methods, null);
+            } catch (\Throwable $e) {
+                while (ob_get_level() > 0) ob_end_clean();
+                emitError($stdoutStream, $class, '<class>',
+                    'exception: ' . $e->getMessage(), $e->getTraceAsString());
+                $nextIdx = $i + 1;
+                continue;
+            }
+            ob_end_clean();
+
+            foreach ($outcomes as $outcome) {
+                fwrite($stdoutStream, json_encode($outcome) . "\n");
+                fflush($stdoutStream);
+            }
+            $nextIdx = $i + 1;
         }
+
+        // Batch done cleanly: clear state so shutdown handler is a no-op
+        // if the process exits naturally on the next read, then signal ready.
+        $currentClasses = [];
+        $nextIdx        = 0;
+        fwrite($stdoutStream, json_encode(['batch_done' => true]) . "\n");
+        fflush($stdoutStream);
     }
 
+    fclose($stdinStream);
     fclose($stdoutStream);
 }
 

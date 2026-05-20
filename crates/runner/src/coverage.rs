@@ -4,7 +4,7 @@
 mod inner {
     use crate::runner::Report;
     use crate::types::TestStatus;
-    use pcov_rs::{analyze_filtered, parse_config, render, Format};
+    use analyzer::{analyze_filtered, parse_config, render, Format};
     use std::collections::HashSet;
     use std::path::Path;
 

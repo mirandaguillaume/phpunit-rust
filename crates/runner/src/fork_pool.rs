@@ -1,7 +1,9 @@
 //! Fork-based PHP worker pool. One PHP master loads autoloader + bootstrap,
-//! then forks N children via pcntl_fork(). Each child gets ONE BatchPlan JSON
-//! on its stdin pipe and streams TestOutcome lines back on its stdout pipe.
-//! No per-class round-trips. No describe phase.
+//! then forks N children via pcntl_fork(). The master keeps each child's
+//! stdin pipe open and streams newline-delimited BatchPlan JSONs to it
+//! (work-stealing dispatch). Children stream TestOutcome lines back and
+//! emit `{"batch_done": true}` between batches as a ready signal, exiting
+//! when their stdin is closed (EOF).
 
 use crate::types::BatchPlan;
 use anyhow::{anyhow, Context, Result};
@@ -110,7 +112,9 @@ impl PhpForkPool {
         Ok(PhpForkPool { master, write_ends, read_ends })
     }
 
-    /// Write a `BatchPlan` to slot `i`. Call before `close_write_ends()`.
+    /// Write a `BatchPlan` to slot `i`. Can be called multiple times per slot
+    /// (the worker reads newline-delimited plans in a loop). Call `close_slot`
+    /// when you have no more work for this slot.
     pub fn write_batch(&mut self, slot: usize, plan: &BatchPlan) -> Result<()> {
         let f = self.write_ends[slot].as_mut()
             .ok_or_else(|| anyhow!("write end for slot {slot} already closed"))?;
@@ -121,12 +125,25 @@ impl PhpForkPool {
         Ok(())
     }
 
+    /// Close one slot's write end, signalling EOF to that PHP child so it
+    /// exits its read loop cleanly. Idempotent.
+    pub fn close_slot(&mut self, slot: usize) {
+        if let Some(s) = self.write_ends.get_mut(slot) {
+            *s = None;
+        }
+    }
+
     /// Close all write ends, signalling EOF to each PHP child.
-    /// Must be called before `into_readers()`.
     pub fn close_write_ends(&mut self) {
         for slot in self.write_ends.iter_mut() {
             *slot = None;
         }
+    }
+
+    /// Take ownership of a single slot's read end as a `BufReader`. Once
+    /// taken, this slot's read end is no longer available from the pool.
+    pub fn take_reader(&mut self, slot: usize) -> Option<BufReader<std::fs::File>> {
+        self.read_ends.get_mut(slot)?.take().map(BufReader::new)
     }
 
     /// Consume the read ends as `BufReader<File>` for rayon draining.
