@@ -156,6 +156,36 @@ final class MethodPlanner
             }
         }
 
+        // PHPUnit 9 / legacy PHPDoc style: `@testWith` followed by one
+        // JSON array per line, optionally indented with the PHPDoc `*`
+        // line marker:
+        //
+        //   /**
+        //    * @testWith [10]
+        //    *           [20]
+        //    *           ["a string", 3]
+        //    */
+        //
+        // Faker uses this heavily. PHPUnit's parser is line-based — it
+        // walks each line, strips the leading `*`, and json_decodes any
+        // line that starts with `[`. We do the same.
+        if (is_string($doc) && ($twPos = strpos($doc, '@testWith')) !== false) {
+            $after = substr($doc, $twPos + strlen('@testWith'));
+            foreach (preg_split('/\R+/', $after) as $line) {
+                $line = ltrim($line);
+                // Strip PHPDoc line marker `*` (possibly preceded by space).
+                if ($line !== '' && $line[0] === '*') {
+                    $line = ltrim(substr($line, 1));
+                }
+                if ($line === '') continue;
+                // Stop at next annotation or end-of-block marker.
+                if ($line[0] === '@' || str_starts_with($line, '/')) break;
+                if ($line[0] !== '[') continue;
+                $row = json_decode($line, true);
+                if (is_array($row)) $testWithRows[] = $row;
+            }
+        }
+
         if (empty($providerNames) && empty($testWithRows)) {
             return null;
         }
