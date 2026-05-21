@@ -35,9 +35,17 @@ final class TestExecutor
         $classSkipReason = self::checkRequires((string) $ref->getDocComment())
             ?? self::checkRequiresAttributes($ref->getAttributes());
 
+        // setUpBeforeClass failure: emit one error outcome per method we
+        // were going to run, then skip the body. Otherwise an exception
+        // here aborts runClass entirely and we lose every per-test outcome
+        // (vanilla emits N errors, one per test method).
+        $setupBeforeError = null;
         if ($classSkipReason === null) {
-            // Only call setUpBeforeClass when requirements are satisfied.
-            self::invokeOptionalStatic($ref, 'setUpBeforeClass');
+            try {
+                self::invokeOptionalStatic($ref, 'setUpBeforeClass');
+            } catch (\Throwable $e) {
+                $setupBeforeError = $e;
+            }
         }
 
         $outcomes = [];
@@ -48,6 +56,22 @@ final class TestExecutor
             $dataset = $step['dataset'];
             $userArgs = $step['args'];
             $depends = $step['depends'];
+
+            // setUpBeforeClass threw: every test in this batch errors with
+            // the same message. Don't even reflect on the method — we may
+            // not have loaded its dependencies. Emit and continue.
+            if ($setupBeforeError !== null) {
+                $outcomes[] = [
+                    'class'       => $class,
+                    'method'      => $method,
+                    'dataset'     => $dataset,
+                    'status'      => 'error',
+                    'message'     => 'setUpBeforeClass: ' . $setupBeforeError->getMessage(),
+                    'trace'       => $setupBeforeError->getTraceAsString(),
+                    'duration_ms' => 0.0,
+                ];
+                continue;
+            }
 
             // Method-level @requires takes precedence over class-level (PHPUnit
             // semantics: any failing @requires at either scope means skip).
@@ -148,8 +172,20 @@ final class TestExecutor
             }
         }
 
-        if ($classSkipReason === null) {
-            self::invokeOptionalStatic($ref, 'tearDownAfterClass');
+        // tearDownAfterClass failure must NEVER lose the outcomes we've
+        // accumulated for actual test methods. Earlier this was the dominant
+        // cause of doctrine-orm's test-count gap (Doctrine\Tests\ORM\Functional\
+        // ValueConversionType\*Test::tearDownAfterClass() calls executeStatement
+        // on a null $sharedConn when no DB is configured, and dropped the
+        // entire class's outcomes on the floor).
+        if ($classSkipReason === null && $setupBeforeError === null) {
+            try {
+                self::invokeOptionalStatic($ref, 'tearDownAfterClass');
+            } catch (\Throwable) {
+                // Swallow; do not bias the run with a synthetic outcome.
+                // Vanilla PHPUnit also doesn't add a separate outcome for
+                // tearDownAfterClass failures.
+            }
         }
 
         return $outcomes;
@@ -287,6 +323,27 @@ final class TestExecutor
                     $family = $inst->operatingSystemFamily();
                     if (stripos(PHP_OS_FAMILY, $family) === false) {
                         return "OS family {$family} required (have " . PHP_OS_FAMILY . ')';
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresSetting':
+                    $inst = $attr->newInstance();
+                    $setting = $inst->setting();
+                    $expected = $inst->value();
+                    $actual = ini_get($setting);
+                    if ((string) $actual !== (string) $expected) {
+                        return "ini {$setting}={$expected} required (have " . var_export($actual, true) . ')';
+                    }
+                    break;
+                case 'PHPUnit\\Framework\\Attributes\\RequiresPhpunit':
+                    $inst = $attr->newInstance();
+                    $req = $inst->versionRequirement();
+                    if (!class_exists('PHPUnit\\Runner\\Version')) break;
+                    $current = \PHPUnit\Runner\Version::id();
+                    if (!preg_match('/^(<=|>=|<>|!=|==|=|<|>)?\s*(.+)$/', $req, $vm)) break;
+                    $op = ($vm[1] !== '' ? $vm[1] : '>=');
+                    if ($op === '=') $op = '==';
+                    if (!version_compare($current, $vm[2], $op)) {
+                        return "PHPUnit {$op} {$vm[2]} required (have {$current})";
                     }
                     break;
             }
