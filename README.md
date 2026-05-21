@@ -6,50 +6,124 @@ project's autoloader and bootstrap once; N children are forked via
 `pcntl_fork()` so they inherit the warmed-up interpreter via copy-on-write.
 Tests delegate to the project's own PHPUnit installation.
 
-## Status: v0.7.0 — fork-based pool + work-stealing + per-row dispatch
+## Status: v0.7.0 — exact test-count parity on 4 of 5 benched OSS suites
 
 The runner spawns one PHP master, forks N children, then streams test
 classes (and individual data-provider rows for heavy providers) over
-per-child pipes using a work-stealing queue. The class scheduler uses LPT
-(longest-processing-time-first) ordering so the heaviest classes start on
-all workers concurrently rather than stranding one at the end.
+per-child pipes using a work-stealing queue. LPT (longest-processing-
+time-first) scheduling means the heaviest classes start on all workers
+concurrently instead of stranding one at the end.
+
+**Test-count parity** is the goal: for every project we benchmark, the
+`Tests: N` line we report should match what `./vendor/bin/phpunit` reports.
+Today's scoreboard:
+
+| Project | vanilla | phpunit-rust | Status |
+|---|---:|---:|:---|
+| carbon | 6169 | **6169** | EXACT ✓ |
+| doctrine-orm | 3478 | **3478** | EXACT ✓ |
+| php-parser | 1887 | **1887** | EXACT ✓ |
+| guzzle-psr7 | 1088 | **1088** | EXACT ✓ |
+| faker | 1416 | 1402 | −14 *(Symfony PhpUnitTestsListener emits 14 synthetic SkippedTestCase wrappers we don't replicate — would require user-listener dispatch)* |
+| brick-math (PHP 8.4, Docker) | 13589 | **13589** | EXACT ✓ |
+
+Behavioural breakdowns may still differ on a small handful of tests
+(e.g. doctrine-orm: ~9 tests we pass that vanilla errors on; guzzle-psr7:
+one test that passes alone but fails after another due to state pollution
+in our worker process) — these are not count-parity issues.
 
 ### Supported
 
-- All `TestCase` assertions — worker delegates to the project's PHPUnit
-- Mocks (`createMock`, `MockBuilder`, expectation chaining)
+**TestCase API** (delegated to the project's PHPUnit, so all of it works):
+
+- All `TestCase` assertions, mocks (`createMock`, `MockBuilder`), expectation
+  chaining
 - `expectException`, `expectExceptionMessage`, `expectExceptionCode`
-- Data providers (`#[DataProvider]` / `@dataProvider`) — runtime row
-  enumeration via a one-shot pre-fork PHP pass, heavy providers split
-  across workers via stride filtering (`row_i % N == chunk_index`)
-- Test dependencies (`#[Depends]`, return-value passing within a class)
 - `markTestSkipped`, `markTestIncomplete`
 - `setUp` / `tearDown`, `setUpBeforeClass` / `tearDownAfterClass`
+
+**Test discovery** (tree-sitter-based, our `discovery` crate):
+
+- `testXxx` naming, `/** @test */` PHPDoc, `#[Test]` attribute (including
+  stacked with `#[Group(...)]` and other decorations)
+- Inheritance chains: fully-qualified extends, abstract base classes
+  outside test dirs (resolved via `composer.json` autoload)
+- Custom-framework base classes: any FQCN whose last segment ends in
+  `TestCase` is recognised (catches `PHPStanTestCase`, Symfony's
+  `KernelTestCase` / `WebTestCase`, etc.)
+- Case-insensitive method-name dedup along the inheritance chain (PHP
+  semantics: a subclass `testfoo` overrides a parent `testFoo`)
+
+**Data providers — every form PHPUnit supports:**
+
+- `#[DataProvider("methodName")]` attribute
+- `@dataProvider methodName` PHPDoc
+- `#[TestWith([1, 2])]` repeatable attribute
+- `#[TestWithJson('[1, 2]')]` repeatable attribute
+- `@testWith [1, 2]\n        [3, 4]` PHPDoc block
+
+Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
+(≥ 15 rows) get split across workers via stride filtering
+(`row_i % N == chunk_index`).
+
+**Skip / requires — all PHPUnit 10 attribute + PHPDoc forms:**
+
 - `#[RequiresPhp]`, `#[RequiresPhpExtension]`, `#[RequiresFunction]`,
   `#[RequiresMethod]`, `#[RequiresOperatingSystem]`,
-  `#[RequiresOperatingSystemFamily]` (checked **before**
-  `setUpBeforeClass` so version-gated entity files don't crash workers
-  with uncatchable `E_COMPILE_ERROR`)
-- `@requires` PHPDoc annotations (PHP version, extensions, functions, OS)
-- `phpunit.xml` — `bootstrap`, `<testsuites>` directories/excludes,
-  `<php><const>`
-- `--bootstrap`, `--filter`, `--workers`, `--configuration` CLI flags
-- Test discovery: `testXxx` naming, `@test` annotation, `#[Test]` attribute
-- Inheritance chains: fully-qualified extends + abstract base classes
-  outside test dirs resolved via `composer.json` autoload
-- Robust shutdown: SIGINT/SIGKILL on phpunit-rust reliably kills the PHP
-  master and every forked child (kernel `PR_SET_PDEATHSIG` + PHP signal
-  handlers — no orphan workers)
-- Optional static coverage via the sibling `analyzer` crate (build with
-  `--features coverage`, then `--coverage-format clover|json --coverage-out path`)
+  `#[RequiresOperatingSystemFamily]`, `#[RequiresSetting]`,
+  `#[RequiresPhpunit]`
+- `@requires` PHPDoc equivalents
+- All checked **before** `setUpBeforeClass` so version-gated entity files
+  don't crash workers with uncatchable `E_COMPILE_ERROR`
+
+**Groups:**
+
+- `#[Group('name')]` and `/** @group name */` (class- and method-level)
+- Inherited from the parent class along the test chain
+- `phpunit.xml` `<groups><exclude><group>name</group>` filters them out
+
+**Test dependencies:**
+
+- `#[Depends('method')]` and `@depends method`
+- Topological sort + return-value injection within a class
+
+**phpunit.xml:**
+
+- `bootstrap` attribute
+- `<testsuites>` (multiple suites, **per-suite** `<exclude>`: a directory
+  excluded by suite A but explicitly included by suite B is still walked
+  via B)
+- `<php><const>` declarations
+- `<groups><exclude>`
+- `<listeners>` parsed but **not dispatched** (see "Not yet supported")
+
+**CLI flags:**
+
+- `--project`, `--bootstrap`, `--filter`, `--workers`, `--configuration`
+- `--coverage-format clover|json --coverage-out path` (build with
+  `--features coverage`)
+
+**Robustness:**
+
+- SIGINT / SIGKILL on `phpunit-rust` reliably kills the PHP master and
+  every forked child via kernel `PR_SET_PDEATHSIG` + PHP signal handlers
+  — no orphan workers, no zombie 100%-CPU PHP processes after a Ctrl-C
+- `setUpBeforeClass` and `tearDownAfterClass` failures emit per-test
+  error outcomes instead of swallowing every test in the class
+
+**Static coverage** via the sibling `analyzer` crate (mago AST + per-test
+attribution; no Xdebug / PCOV needed).
 
 ### Not yet supported (deferred)
 
-- `@runInSeparateProcess`
+- Generic `<listeners>` dispatch (we parse the entries but don't execute
+  user listener code — affects projects using Symfony's PhpUnitTestsListener
+  for `@group legacy` handling)
+- `<extensions>` (PHPUnit 10+ extension API)
+- `@runInSeparateProcess` / `#[RunInSeparateProcess]`
 - Runtime coverage (PCOV/Xdebug) — static analysis only for now
 - JUnit XML / TAP / TestDox reporters
 - Watch mode
-- Custom PHPUnit extensions/listeners
 - Risky test detection (no assertions, unexpected output, etc.)
 
 ## Requirements
@@ -86,24 +160,31 @@ cargo build --release
 ```
 
 `phpunit.xml` / `phpunit.xml.dist` is auto-detected at the project root.
-`--configuration` overrides the search path. The runner reads `bootstrap`,
-`<testsuites>` directories/excludes, and `<php><const>` entries.
+`--configuration` overrides the search path.
 
 ## Architecture
 
 ```
-phpunit-rust (Rust binary, crates/runner)
-  ├─ discovery       : tree-sitter-php; class graph + transitive-inheritance BFS
-  │                    + #[DataProvider]/@dataProvider extraction per method
-  ├─ phpunit_xml     : parser for bootstrap, <testsuites>, <php><const>
-  ├─ provider_enum   : pre-fork PHP pass — enumerate data-provider row counts
-  ├─ fork_pool       : pipe-managed N-slot PHP fork pool with CLOEXEC hygiene
-  ├─ runner          : work-stealing queue + LPT scheduling + per-row split
-  └─ reporter        : TTY progress + summary (mpsc-driven, thread-safe)
+Workspace (Cargo)
+  ├─ crates/discovery   PHP test discovery (tree-sitter-php)
+  │                     · class graph + transitive-inheritance BFS
+  │                     · #[Test], @test, #[DataProvider], @dataProvider,
+  │                       #[TestWith], @testWith, #[Group], @group
+  │                     · custom-framework TestCase bases
+  ├─ crates/runner      phpunit-rust binary
+  │   ├─ phpunit_xml    bootstrap, <testsuites>, <php><const>,
+  │   │                 <groups><exclude>, <listeners>
+  │   ├─ provider_enum  pre-fork PHP pass to count provider rows
+  │   ├─ fork_pool      pipe-managed N-slot fork pool (CLOEXEC, PDEATHSIG)
+  │   ├─ runner         work-stealing queue, LPT scheduling, row split
+  │   └─ reporter       TTY progress + summary (mpsc-driven)
+  └─ crates/analyzer    static PHP coverage via mago AST
+                        · per-test attribution
+                        · Clover / JSON output (--features coverage)
 
 PHP master (php/worker_fork.php)
   ├─ Load autoload + bootstrap + project constants ONCE
-  ├─ Install SIGTERM/SIGINT/SIGHUP handlers (kill children → exit)
+  ├─ Install SIGTERM/SIGINT/SIGHUP handlers → kill children → exit
   └─ pcntl_fork() × N → children inherit the warmed interpreter via COW
 
 PHP child (one of N)
@@ -115,20 +196,16 @@ PHP child (one of N)
 ```
 
 The Rust master holds a `VecDeque<BatchPlan>` and one reader thread per
-child. Each reader forwards `(slot, TestOutcome | BatchDone | Eof)` over an
-`mpsc` channel to the main dispatcher loop, which sends the next plan to
-whichever child reported `BatchDone` first. When the queue empties, idle
-slots get their stdin pipes closed and the children exit on EOF.
+child. Each reader forwards `(slot, TestOutcome | BatchDone | Eof)` over
+an `mpsc` channel to the main dispatcher loop, which sends the next plan
+to whichever child reported `BatchDone` first. When the queue empties,
+idle slots get their stdin pipes closed and the children exit on EOF.
 
 Heavy data-provider methods (≥ 15 enumerated rows) are split into up to 4
 stride-partitioned plans, each running on a different worker via the
 existing `RowFilter` (`chunk_index % total_chunks`) inside `TestExecutor`.
 Plain methods stay in a single class-level plan (splitting them would
 multiply the `setUpBeforeClass` cost without paying for itself).
-
-The sibling `crates/analyzer` provides static PHP coverage (mago-based AST
-walks, per-test attribution) and is consumed by the runner behind the
-optional `coverage` feature.
 
 ## Performance
 
@@ -137,23 +214,21 @@ Median of 3 runs. "vanilla" is `./vendor/bin/phpunit` (one process).
 
 | Project | vanilla | phpunit-rust (4w) | Speedup | Tests |
 |---|---:|---:|---:|---:|
-| carbon | 21.6s | 8.8s | **2.5×** | 6 027 |
-| doctrine-orm | 1.61s | 1.63s | tied | 3 438 |
-| faker | 1.03s | 0.83s | **1.25×** | 1 380 |
-| php-parser | 0.40s | 0.36s | 1.10× | 1 887 |
-| guzzle-psr7 | 0.14s | 0.20s | — | 1 087 |
-| doctrine-collections | <0.05s | 0.12s | — | 143 |
+| carbon | 20.9s | 8.5s | **2.45×** | 6169 |
+| doctrine-orm | 1.60s | 1.60s | tied | 3478 |
+| faker | 1.00s | 0.85s | **1.17×** | 1402 / 1416 |
+| php-parser | 0.40s | 0.35s | 1.13× | 1887 |
+| guzzle-psr7 | 0.14s | 0.20s | — | 1088 |
+| brick-math (Docker, PHP 8.4) | 183s | 167s | 1.09× | 13589 |
 
-CPU-bound suites with many independent classes (carbon especially) see the
-largest gains. Sub-second suites are dominated by PHP startup cost and the
-fork-pool overhead doesn't amortize; for those, prefer
+CPU-bound suites with many independent classes (carbon especially) see
+the biggest gains. Sub-second suites are dominated by PHP startup cost
+and the fork-pool overhead doesn't amortize; for those, prefer
 `--workers 1` or run vanilla.
 
-For a project requiring PHP 8.4 (e.g. PHPUnit's own test suite), a Docker
-harness in `bench/Dockerfile.php84` builds a container with `pcntl`
-pre-compiled. A single-run smoke on phpunit-itself showed vanilla ~74s
-vs phpunit-rust ~3s (median validation pending — fixture-loading quirks
-in PHPUnit's own tests cause a partial test-count gap).
+For a project requiring PHP 8.4 (e.g. PHPUnit's own test suite,
+brick-math), a Docker harness in `bench/Dockerfile.php84` builds a
+container with `pcntl` pre-compiled.
 
 ## Benchmarking
 
