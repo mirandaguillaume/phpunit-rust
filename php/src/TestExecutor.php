@@ -35,6 +35,15 @@ final class TestExecutor
         $classSkipReason = self::checkRequires((string) $ref->getDocComment())
             ?? self::checkRequiresAttributes($ref->getAttributes());
 
+        // Collect PHPUnit 10 lifecycle attribute methods once for the class.
+        // Order of invocation, per PHPUnit docs, around each test:
+        //   setUpBeforeClass + #[BeforeClass]   (once, before any test)
+        //   setUp + #[Before] + #[PreCondition]  (each test)
+        //   ...test...
+        //   #[PostCondition] + #[After] + tearDown (each test)
+        //   #[AfterClass] + tearDownAfterClass  (once, after all tests)
+        $hooks = self::collectLifecycleHooks($ref);
+
         // setUpBeforeClass failure: emit one error outcome per method we
         // were going to run, then skip the body. Otherwise an exception
         // here aborts runClass entirely and we lose every per-test outcome
@@ -43,6 +52,9 @@ final class TestExecutor
         if ($classSkipReason === null) {
             try {
                 self::invokeOptionalStatic($ref, 'setUpBeforeClass');
+                foreach ($hooks['before_class'] as $name) {
+                    self::invokeStaticByName($ref, $name);
+                }
             } catch (\Throwable $e) {
                 $setupBeforeError = $e;
             }
@@ -127,7 +139,11 @@ final class TestExecutor
             try {
                 $test = new $class($method);
                 self::invokeOptional($test, 'setUp');
+                foreach ($hooks['before'] as $name)         self::invokeInstanceByName($test, $name);
+                foreach ($hooks['pre_condition'] as $name)  self::invokeInstanceByName($test, $name);
                 $returnValue = $test->{$method}(...$args);
+                foreach ($hooks['post_condition'] as $name) self::invokeInstanceByName($test, $name);
+                foreach ($hooks['after'] as $name)          self::invokeInstanceByName($test, $name);
                 self::invokeOptional($test, 'tearDown');
 
                 // expectException* check: if the test declared any expectation
@@ -157,8 +173,13 @@ final class TestExecutor
             } catch (\Throwable $e) {
                 // Was this exception expected via expectException()?
                 if (isset($test) && self::wasExceptionExpected($test, $e)) {
-                    // Pass. Run tearDown if setUp succeeded — best-effort.
-                    self::invokeOptional($test, 'tearDown');
+                    // Pass. Run post-test hooks + tearDown best-effort —
+                    // any of these failing here would override the pass,
+                    // which is consistent with vanilla PHPUnit.
+                    try {
+                        foreach ($hooks['after'] as $name) self::invokeInstanceByName($test, $name);
+                        self::invokeOptional($test, 'tearDown');
+                    } catch (\Throwable) { /* best-effort */ }
                 } else {
                     $error = $e;
                 }
@@ -180,6 +201,9 @@ final class TestExecutor
         // entire class's outcomes on the floor).
         if ($classSkipReason === null && $setupBeforeError === null) {
             try {
+                foreach ($hooks['after_class'] as $name) {
+                    self::invokeStaticByName($ref, $name);
+                }
                 self::invokeOptionalStatic($ref, 'tearDownAfterClass');
             } catch (\Throwable) {
                 // Swallow; do not bias the run with a synthetic outcome.
@@ -209,6 +233,93 @@ final class TestExecutor
         if (!$m->isStatic()) return;
         $m->setAccessible(true);
         $m->invoke(null);
+    }
+
+    /**
+     * Like invokeOptional but for an already-known method name from a
+     * lifecycle attribute. The method is guaranteed to exist (we just
+     * collected it via reflection) but may be protected/private; bind
+     * the closure to the instance's scope to bypass visibility.
+     */
+    private static function invokeInstanceByName(TestCase $test, string $name): void
+    {
+        \Closure::bind(function () use ($name) {
+            // @phpstan-ignore-next-line
+            $this->{$name}();
+        }, $test, $test)();
+    }
+
+    /**
+     * Static-method counterpart for #[BeforeClass] / #[AfterClass] hooks
+     * we collected. Method existence already verified at collection time.
+     */
+    private static function invokeStaticByName(\ReflectionClass $ref, string $name): void
+    {
+        $m = $ref->getMethod($name);
+        $m->setAccessible(true);
+        $m->invoke(null);
+    }
+
+    /**
+     * Walk the class's methods and, for each, collect the lifecycle
+     * attributes that decorate it. PHPUnit recognises six:
+     *
+     *   #[BeforeClass] / #[AfterClass]    static, around the class
+     *   #[Before] / #[After]              instance, around each test
+     *   #[PreCondition] / #[PostCondition] instance, *inside* the
+     *                                       setUp/tearDown sandwich
+     *
+     * Each attribute is repeatable and a single method may carry several.
+     * The class's parent chain is walked so inherited hooks fire too.
+     * Order within one attribute kind is "as declared, parent-first".
+     *
+     * @return array{
+     *   before_class: list<string>, after_class: list<string>,
+     *   before: list<string>, after: list<string>,
+     *   pre_condition: list<string>, post_condition: list<string>,
+     * }
+     */
+    private static function collectLifecycleHooks(\ReflectionClass $ref): array
+    {
+        $hooks = [
+            'before_class'   => [],
+            'after_class'    => [],
+            'before'         => [],
+            'after'          => [],
+            'pre_condition'  => [],
+            'post_condition' => [],
+        ];
+        $kinds = [
+            'PHPUnit\\Framework\\Attributes\\BeforeClass'    => 'before_class',
+            'PHPUnit\\Framework\\Attributes\\AfterClass'     => 'after_class',
+            'PHPUnit\\Framework\\Attributes\\Before'         => 'before',
+            'PHPUnit\\Framework\\Attributes\\After'          => 'after',
+            'PHPUnit\\Framework\\Attributes\\PreCondition'   => 'pre_condition',
+            'PHPUnit\\Framework\\Attributes\\PostCondition'  => 'post_condition',
+        ];
+
+        // Walk parent-first so inherited hooks run before subclass ones,
+        // matching PHPUnit's behaviour. A child can dedup by overriding
+        // a parent's hook with the same method name.
+        $chain = [];
+        for ($c = $ref; $c !== false; $c = $c->getParentClass()) {
+            array_unshift($chain, $c);
+        }
+        $seen = [];  // (kind, method_name) -> true
+        foreach ($chain as $c) {
+            foreach ($c->getMethods() as $m) {
+                foreach ($m->getAttributes() as $attr) {
+                    $kind = $kinds[$attr->getName()] ?? null;
+                    if ($kind === null) continue;
+                    $name = $m->getName();
+                    $key = "$kind\0$name";
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+                    $hooks[$kind][] = $name;
+                }
+            }
+        }
+        return $hooks;
     }
 
     /**
