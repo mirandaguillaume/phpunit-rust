@@ -209,26 +209,54 @@ multiply the `setUpBeforeClass` cost without paying for itself).
 
 ## Performance
 
-Benchmarked on Linux/PHP 8.1.33 with 4 workers against real OSS suites.
-Median of 3 runs. "vanilla" is `./vendor/bin/phpunit` (one process).
+Benchmarked on Linux/PHP 8.1.33 against real OSS suites. Median of 3
+runs each. "vanilla" is `./vendor/bin/phpunit` (one process); `1w` /
+`2w` / `4w` / `8w` are our fork pool at that worker count.
+
+### Worker scaling
+
+| Project | vanilla | 1w | 2w | 4w | 8w | Best speedup vs vanilla |
+|---|---:|---:|---:|---:|---:|---:|
+| carbon (6169 tests) | 21.4s | 31.7s | 15.4s | 8.7s | **5.8s** | **3.7×** at 8w |
+| doctrine-orm (3478 tests) | 1.62s | 2.15s | 1.74s | 1.66s | **1.59s** | 1.02× at 8w (≈ tied) |
+| faker (1402 tests) | 1.08s | 1.22s | **0.81s** | 0.81s | 0.82s | 1.34× at 2w |
+| php-parser (1887 tests) | 0.38s | 0.44s | 0.36s | **0.34s** | 0.38s | 1.13× at 4w |
+| guzzle-psr7 (1088 tests) | 0.14s | 0.21s | 0.20s | 0.19s | 0.20s | — (vanilla wins) |
+
+What this says:
+
+- **CPU-bound suites with many independent classes** (carbon) scale
+  cleanly: 1→8 workers gives 5.4× speedup (68 % parallel efficiency),
+  and 8 workers buys 3.7× over vanilla's single-process run.
+- **Mixed suites** (faker, php-parser) peak at 2–4 workers and degrade
+  past that: per-class fork/dispatch overhead starts to dominate when
+  tests are short.
+- **Suites of fast-erroring tests** (doctrine-orm functional tests bail
+  out in setUp because no DB is configured) are essentially tied with
+  vanilla — the parallelism can't help when tests take <1 ms each and
+  there's no real work to spread.
+- **Sub-second suites** (guzzle-psr7) can't beat vanilla at any worker
+  count: our fork-pool startup is ~50 ms, vanilla starts in ~10 ms.
+  For these, run vanilla.
+
+The rule of thumb: **use `--workers N` where N is between 2 and the
+number of physical cores you have, capped at half the test class
+count.** Default is 4. If a 1-second suite slows down at 4 workers,
+drop to 1 — the parallelism overhead isn't free.
+
+### Docker (PHP 8.4 projects)
+
+Some OSS suites require a newer PHP than the host. Build the Docker
+image once (`docker build -f bench/Dockerfile.php84 -t phpunit-rust-bench:php84 .`)
+and the `bench/bench_docker.sh` wrapper handles `composer install`
+and the bind-mount of our release binary + PHP scripts.
 
 | Project | vanilla | phpunit-rust (4w) | Speedup | Tests |
 |---|---:|---:|---:|---:|
-| carbon | 20.9s | 8.5s | **2.45×** | 6169 |
-| doctrine-orm | 1.60s | 1.60s | tied | 3478 |
-| faker | 1.00s | 0.85s | **1.17×** | 1402 / 1416 |
-| php-parser | 0.40s | 0.35s | 1.13× | 1887 |
-| guzzle-psr7 | 0.14s | 0.20s | — | 1088 |
-| brick-math (Docker, PHP 8.4) | 183s | 167s | 1.09× | 13589 |
+| brick-math | 183s | 167s | 1.09× | 13589 |
 
-CPU-bound suites with many independent classes (carbon especially) see
-the biggest gains. Sub-second suites are dominated by PHP startup cost
-and the fork-pool overhead doesn't amortize; for those, prefer
-`--workers 1` or run vanilla.
-
-For a project requiring PHP 8.4 (e.g. PHPUnit's own test suite,
-brick-math), a Docker harness in `bench/Dockerfile.php84` builds a
-container with `pcntl` pre-compiled.
+(More Docker projects pending; brick-math is the heavyweight reference
+point — 13 k tests across 6 classes, almost entirely CPU-bound arithmetic.)
 
 ## Benchmarking
 
