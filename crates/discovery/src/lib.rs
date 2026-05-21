@@ -383,15 +383,44 @@ fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
         let Ok(text) = child.utf8_text(bytes) else { continue };
-        // Attribute lists look like "#[Test]" or "#[PHPUnit\Framework\Attributes\Test]".
-        // Avoid false-positives on #[TestWith(...)], #[TestDox(...)], etc.
-        if text.starts_with("#[")
-            && (text == "#[Test]"
-                || text.ends_with("\\Test]")
-                || text.contains("\\Test,"))
-        {
+        if !text.starts_with("#[") { continue; }
+        if has_attribute_name(text, "Test") {
             return true;
         }
+    }
+    false
+}
+
+/// Tree-sitter-php groups consecutive `#[Foo] #[Bar]` decorations into one
+/// attribute_list node whose text is a concatenation. So `text == "#[Test]"`
+/// fails for the common doctrine-orm pattern:
+///
+/// ```text
+/// #[Test]
+/// #[Group('GH7266')]
+/// public function corruptedDataDoesNotLeakIntoApplication(): void
+/// ```
+///
+/// We instead scan the attribute text for `name` as a properly delimited
+/// identifier — preceded by `[`, `,`, `\`, or whitespace, and followed by
+/// `]`, `,`, `(`, or whitespace. This rejects `TestWith`, `TestDox`,
+/// `TestDoxName`, etc., while accepting `#[Test]`, `#[Test, Other]`, and
+/// fully-qualified `#[PHPUnit\Framework\Attributes\Test]`.
+fn has_attribute_name(attr_text: &str, name: &str) -> bool {
+    let haystack = attr_text.as_bytes();
+    let needle = name.as_bytes();
+    if needle.is_empty() || haystack.len() < needle.len() { return false; }
+    let is_boundary_before = |b: u8| matches!(b, b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r');
+    let is_boundary_after  = |b: u8| matches!(b, b']' | b',' | b'(' | b' ' | b'\t' | b'\n' | b'\r');
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || is_boundary_before(haystack[i - 1]);
+            let after_idx = i + needle.len();
+            let after_ok = after_idx == haystack.len() || is_boundary_after(haystack[after_idx]);
+            if before_ok && after_ok { return true; }
+        }
+        i += 1;
     }
     false
 }
@@ -681,6 +710,52 @@ class DpTest extends TestCase {
         assert_eq!(by_method["testWithAttribute"].data_provider.as_deref(),         Some("provideTwo"));
         assert_eq!(by_method["testWithAttributeDoubleQuotes"].data_provider.as_deref(), Some("provideThree"));
         assert_eq!(by_method["testPlain"].data_provider, None);
+    }
+
+    #[test]
+    fn detects_test_attribute_when_stacked_with_other_attributes() {
+        // The doctrine-orm pattern: #[Test] immediately followed by
+        // #[Group('xyz')] on a method whose name doesn't start with "test".
+        // tree-sitter-php groups stacked attributes into one attribute_list
+        // node, so an exact text match on "#[Test]" fails.
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\Test;
+use PHPUnit\Framework\Attributes\Group;
+
+class StackedTest extends TestCase {
+    #[Test]
+    #[Group('GH7266')]
+    public function thisIsActuallyATestDespiteTheName(): void {}
+
+    #[Group('other')]
+    #[Test]
+    public function reversedOrderAlsoCounts(): void {}
+
+    #[Group('not-a-test')]
+    public function plainGroupNoTest(): void {}
+
+    #[TestDox('description')]
+    public function testDoxIsNotTheTestAttribute(): void {}
+
+    #[TestWith([1, 2])]
+    public function testWithIsAlsoNotTest(int $a, int $b): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let methods: std::collections::BTreeSet<&str> = cases.iter()
+            .map(|c| c.method.as_str()).collect();
+        assert!(methods.contains("thisIsActuallyATestDespiteTheName"),
+            "missed #[Test] before #[Group]");
+        assert!(methods.contains("reversedOrderAlsoCounts"),
+            "missed #[Test] after #[Group]");
+        assert!(!methods.contains("plainGroupNoTest"),
+            "false positive on plain non-test method");
+        // testDoxIsNotTheTestAttribute / testWithIsAlsoNotTest start with
+        // "test" so they're picked up by the name rule, not the attribute.
+        // That's expected — we just want #[Test]-only methods to be found.
     }
 
     #[test]
