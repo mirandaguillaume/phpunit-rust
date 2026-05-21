@@ -587,13 +587,17 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
         // Collect methods from this class + all parsed ancestors, dedup by name.
         // The PHP runtime will run inherited methods on the concrete subclass,
         // so we emit them under `class.fqcn` (not the ancestor's FQCN).
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // PHP method names are case-insensitive at call time: a subclass
+        // declaring `testfoo` overrides a parent's `testFoo`. PHPUnit's
+        // reflection-based discovery collapses them; we mirror that by
+        // deduping on the lowercased name as we walk the inheritance chain.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut visit = class.fqcn.as_str();
         let mut depth = 0;
         while depth < 32 {
             if let Some(c) = by_fqcn.get(visit) {
                 for mi in &c.test_methods {
-                    if seen.insert(mi.name.as_str()) {
+                    if seen.insert(mi.name.to_ascii_lowercase()) {
                         // Effective groups = the concrete subclass's
                         // class-level groups + the inherited method's
                         // class-level groups + the method's own groups.
