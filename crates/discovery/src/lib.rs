@@ -618,6 +618,22 @@ pub fn discover_in_dirs(
 ///   terminal name check to that string and stop. Returning `false` when the
 ///   parent is unknown AND doesn't match terminal patterns is correct: we
 ///   simply don't have enough information to claim it's a TestCase.
+/// Last-segment heuristic for "this class looks like a PHPUnit TestCase".
+///
+/// Accepts: `TestCase` (bare), `PHPUnit\Framework\TestCase`, `My\Custom\TestCase`,
+/// `PHPStan\Testing\PHPStanTestCase`, `Symfony\.../KernelTestCase`,
+/// `Symfony\.../WebTestCase`. Rejects: `Foo\TestCases` (plural),
+/// `Foo\NotTested`, `Foo\TestCaseDescription` (suffix only).
+///
+/// False positives are tolerable here: the PHP worker rejects non-TestCase
+/// classes at runtime, and the misses (custom frameworks naming their base
+/// class `BaseSpec` or whatever) are still handled by walking the graph
+/// further up.
+fn looks_like_test_case(fqcn: &str) -> bool {
+    let last = fqcn.rsplit('\\').next().unwrap_or(fqcn);
+    last.ends_with("TestCase")
+}
+
 fn is_test_class_via_chain(start_fqcn: &str, graph: &ClassGraph) -> bool {
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut current = start_fqcn;
@@ -627,7 +643,7 @@ fn is_test_class_via_chain(start_fqcn: &str, graph: &ClassGraph) -> bool {
             // No parent (no `extends` clause) OR class not in graph — stop walking.
             _ => return false,
         };
-        if parent == "PHPUnit\\Framework\\TestCase" || parent.ends_with("\\TestCase") {
+        if looks_like_test_case(parent) {
             return true;
         }
         current = parent;
@@ -710,6 +726,21 @@ class DpTest extends TestCase {
         assert_eq!(by_method["testWithAttribute"].data_provider.as_deref(),         Some("provideTwo"));
         assert_eq!(by_method["testWithAttributeDoubleQuotes"].data_provider.as_deref(), Some("provideThree"));
         assert_eq!(by_method["testPlain"].data_provider, None);
+    }
+
+    #[test]
+    fn looks_like_test_case_accepts_known_frameworks() {
+        assert!(looks_like_test_case("TestCase"));
+        assert!(looks_like_test_case("PHPUnit\\Framework\\TestCase"));
+        assert!(looks_like_test_case("My\\Custom\\TestCase"));
+        assert!(looks_like_test_case("PHPStan\\Testing\\PHPStanTestCase"));
+        assert!(looks_like_test_case("Symfony\\Bundle\\FrameworkBundle\\Test\\KernelTestCase"));
+        assert!(looks_like_test_case("Symfony\\Bundle\\FrameworkBundle\\Test\\WebTestCase"));
+
+        assert!(!looks_like_test_case("Foo\\TestCases"), "plural form rejected");
+        assert!(!looks_like_test_case("Foo\\TestCaseDescription"), "suffix-only rejected");
+        assert!(!looks_like_test_case("Foo\\NotTested"));
+        assert!(!looks_like_test_case("App\\Service\\OrderService"));
     }
 
     #[test]
