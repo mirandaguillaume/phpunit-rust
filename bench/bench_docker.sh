@@ -61,18 +61,51 @@ parse_tests_file() {
         | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+' || true
 }
 
+# `--init` runs tini (or docker's built-in init) as PID 1 so that signals
+# the daemon forwards to the container's main process actually propagate
+# to the PHP fork children. Without it, killing `docker run` from the
+# host leaves orphan PHP workers spinning at 100% CPU inside the
+# container (verified the hard way after a 5-hour ghost run).
 DOCKER_FLAGS=(
     --rm
+    --init
     -v "$PROJ_DIR":/proj
     -v "$BINARY":/opt/phpunit-rust/bin/phpunit-rust:ro
     -v "$PHP_SCRIPTS":/opt/php:ro
     -w /proj
 )
 
+# Track every container we start so we can docker-stop them on interrupt.
+# `docker run --rm` doesn't help if the daemon never sees the SIGTERM —
+# Ctrl-C on the shell kills the local docker client but the container
+# keeps running attached to the daemon.
+CID_DIR=$(mktemp -d)
+cleanup() {
+    local cidfile
+    for cidfile in "$CID_DIR"/*; do
+        [ -f "$cidfile" ] || continue
+        local cid
+        cid=$(cat "$cidfile" 2>/dev/null || true)
+        [ -n "$cid" ] && docker stop --time 2 "$cid" >/dev/null 2>&1 || true
+    done
+    rm -rf "$CID_DIR"
+}
+trap cleanup EXIT INT TERM
+
+run_in_container() {
+    local cidfile
+    cidfile=$(mktemp -p "$CID_DIR")
+    rm -f "$cidfile"  # docker refuses to write to an existing path
+    docker run --cidfile "$cidfile" "${DOCKER_FLAGS[@]}" "$IMAGE" "$@"
+    local rc=$?
+    rm -f "$cidfile"  # successful exit: container is already gone via --rm
+    return $rc
+}
+
 # Composer install on first use; idempotent if vendor is already populated.
 if [ ! -f "$PROJ_DIR/vendor/autoload.php" ]; then
     echo "Installing composer deps in $PROJECT (one-time)..." >&2
-    docker run "${DOCKER_FLAGS[@]}" "$IMAGE" composer install --no-interaction --prefer-dist --no-progress
+    run_in_container composer install --no-interaction --prefer-dist --no-progress
 fi
 
 bench_runs() {
@@ -82,7 +115,7 @@ bench_runs() {
     trap "rm -f $out_file" RETURN
     for ((i=1; i<=RUNS; i++)); do
         local t0=$(ms_now)
-        docker run "${DOCKER_FLAGS[@]}" "$IMAGE" "$@" > "$out_file" 2>&1 || true
+        run_in_container "$@" > "$out_file" 2>&1 || true
         local t1=$(ms_now)
         times+=($((t1-t0)))
     done
