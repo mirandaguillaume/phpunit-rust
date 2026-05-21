@@ -6,6 +6,8 @@ namespace PhpunitRust;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Depends;
+use PHPUnit\Framework\Attributes\TestWith;
+use PHPUnit\Framework\Attributes\TestWithJson;
 
 /**
  * Turns "run these methods of this class" into an ordered sequence of steps.
@@ -139,12 +141,28 @@ final class MethodPlanner
                 }
             }
         }
-        if (empty($providerNames)) {
+
+        // PHPUnit 10+ also supports inline data via #[TestWith([...])] and
+        // #[TestWithJson('{"key": "val"}')]. Both are repeatable, each
+        // instance contributes ONE row. Carbon makes heavy use of these.
+        $testWithRows = [];
+        foreach ($m->getAttributes(TestWith::class) as $attr) {
+            $testWithRows[] = $attr->newInstance()->data();
+        }
+        foreach ($m->getAttributes(TestWithJson::class) as $attr) {
+            $decoded = json_decode($attr->newInstance()->json(), true);
+            if (is_array($decoded)) {
+                $testWithRows[] = $decoded;
+            }
+        }
+
+        if (empty($providerNames) && empty($testWithRows)) {
             return null;
         }
+
         $rows = [];
         foreach ($providerNames as $providerName) {
-            $providerRef  = $ref->getMethod($providerName);
+            $providerRef = $ref->getMethod($providerName);
             $providerRef->setAccessible(true);
             $result = $providerRef->isStatic()
                 ? $providerRef->invoke(null)
@@ -160,6 +178,11 @@ final class MethodPlanner
                     $rows[$key] = $row;
                 }
             }
+        }
+        // Append TestWith rows AFTER provider rows so PHPUnit-style dataset
+        // indices match (provider rows numbered 0..N-1, TestWith rows N+).
+        foreach ($testWithRows as $row) {
+            $rows[] = $row;
         }
         return $rows;
     }
