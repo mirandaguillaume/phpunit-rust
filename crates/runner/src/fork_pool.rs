@@ -31,6 +31,9 @@ impl PhpForkPool {
         autoload: &Path,
         bootstrap: Option<&Path>,
         defines: &[[String; 2]],
+        env: &[(String, String, bool)],
+        server: &[[String; 2]],
+        ini: &[[String; 2]],
         n: usize,
     ) -> Result<Self> {
         if n == 0 {
@@ -113,6 +116,27 @@ impl PhpForkPool {
         if !defines.is_empty() {
             cmd.arg("--defines").arg(
                 serde_json::to_string(defines).context("serializing defines")?
+            );
+        }
+        if !env.is_empty() {
+            // Wire each <env> as [name, value, force?] triples so the
+            // master can honour the `force` semantics (don't clobber a
+            // shell-provided value unless the XML says so).
+            let payload: Vec<(&str, &str, bool)> = env.iter()
+                .map(|(n, v, f)| (n.as_str(), v.as_str(), *f))
+                .collect();
+            cmd.arg("--env").arg(
+                serde_json::to_string(&payload).context("serializing env")?
+            );
+        }
+        if !server.is_empty() {
+            cmd.arg("--server").arg(
+                serde_json::to_string(server).context("serializing server")?
+            );
+        }
+        if !ini.is_empty() {
+            cmd.arg("--ini").arg(
+                serde_json::to_string(ini).context("serializing ini")?
             );
         }
 

@@ -56,7 +56,7 @@ fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, o
 use phpunit_rust::fork_pool::PhpForkPool;
 use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
-use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_constants, parse_testsuites};
+use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_block, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
@@ -177,19 +177,28 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("Using bootstrap: {}", b.display());
     }
 
-    // <php><const>: forwarded to the worker so PHP's `define()` runs them
-    // before tests do.
-    let defines: Vec<[String; 2]> = xml_str
-        .as_deref()
-        .map(parse_php_constants)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|c| [c.name, c.value])
+    // <php> block: const + env + server + ini, all in one walk over
+    // the XML. Forwarded to the master so it can apply them once
+    // before fork (so each child inherits the configured state via COW).
+    let php_block = xml_str.as_deref()
+        .map(parse_php_block)
+        .unwrap_or_default();
+    let defines: Vec<[String; 2]> = php_block.constants.iter()
+        .map(|c| [c.name.clone(), c.value.clone()])
         .collect();
-    if !defines.is_empty() {
-        eprintln!("Applying {} <php><const> declaration{} from configuration.",
-            defines.len(),
-            if defines.len() == 1 { "" } else { "s" });
+    let env_triples: Vec<(String, String, bool)> = php_block.env.iter()
+        .map(|e| (e.name.clone(), e.value.clone(), e.force))
+        .collect();
+    let server_pairs: Vec<[String; 2]> = php_block.server.iter()
+        .map(|s| [s.name.clone(), s.value.clone()])
+        .collect();
+    let ini_pairs: Vec<[String; 2]> = php_block.ini.iter()
+        .map(|s| [s.name.clone(), s.value.clone()])
+        .collect();
+    let total = defines.len() + env_triples.len() + server_pairs.len() + ini_pairs.len();
+    if total > 0 {
+        eprintln!("Applying <php> block: {} const, {} env, {} server, {} ini",
+            defines.len(), env_triples.len(), server_pairs.len(), ini_pairs.len());
     }
 
     // <testsuites>: collect include directories + excludes, resolved relative
@@ -380,7 +389,11 @@ fn real_main() -> Result<ExitCode> {
 
     eprintln!("Spawning {} PHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
     let fork_script = find_fork_script()?;
-    let mut pool = PhpForkPool::spawn(&fork_script, &autoload, bootstrap.as_deref(), &defines, worker_count)?;
+    let mut pool = PhpForkPool::spawn(
+        &fork_script, &autoload, bootstrap.as_deref(),
+        &defines, &env_triples, &server_pairs, &ini_pairs,
+        worker_count,
+    )?;
 
     let stop_on = if cli.stop_on_defect {
         phpunit_rust::runner::StopOn::on_defect()

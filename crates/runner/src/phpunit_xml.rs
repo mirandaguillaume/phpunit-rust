@@ -24,6 +24,29 @@ pub struct PhpConstant {
     pub value: String,
 }
 
+/// Everything we extract from the `<php>` block in one pass. PHPUnit
+/// supports `<const>`, `<env>`, `<server>`, `<ini>`, `<var>`, `<get>`,
+/// `<post>`, `<cookie>`, `<files>`, `<request>` — we currently handle
+/// the four most-used (const/env/server/ini); the others can be added
+/// the same way when a real project needs them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PhpBlock {
+    pub constants: Vec<PhpConstant>,
+    pub env:       Vec<PhpEnv>,
+    pub server:    Vec<PhpConstant>,
+    pub ini:       Vec<PhpConstant>,
+}
+
+/// `<env name="..." value="..." force="true"/>`. `force` controls whether
+/// to overwrite an existing environment variable; PHPUnit defaults to
+/// false (do NOT clobber a value present in the shell).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpEnv {
+    pub name:  String,
+    pub value: String,
+    pub force: bool,
+}
+
 /// Returns the value of the `bootstrap` attribute on the root `<phpunit>`
 /// element, or None if absent / file is malformed.
 pub fn parse_bootstrap(xml: &str) -> Option<String> {
@@ -141,6 +164,52 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
         buf.clear();
     }
     suites
+}
+
+/// Parse the full `<php>` block: `<const>`, `<env>`, `<server>`, `<ini>`.
+/// One walk over the XML. Symfony/Laravel tests rely on env/server vars
+/// being set before any code runs; ini lets projects bump memory_limit,
+/// error_reporting, etc. that PHPUnit normally sets at boot.
+pub fn parse_php_block(xml: &str) -> PhpBlock {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_php = false;
+    let mut out = PhpBlock::default();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"php" => in_php = true,
+            Ok(Event::End(e))   if e.local_name().as_ref() == b"php" => in_php = false,
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_php => {
+                let tag = e.local_name().as_ref().to_vec();
+                let mut name = None;
+                let mut value = None;
+                let mut force = false;
+                for attr in e.attributes().flatten() {
+                    let k = attr.key.local_name();
+                    match k.as_ref() {
+                        b"name"  => name  = std::str::from_utf8(&attr.value).ok().map(String::from),
+                        b"value" => value = std::str::from_utf8(&attr.value).ok().map(String::from),
+                        b"force" => force = matches!(attr.value.as_ref(), b"true" | b"1"),
+                        _ => {}
+                    }
+                }
+                let (Some(n), Some(v)) = (name, value) else { continue };
+                match tag.as_slice() {
+                    b"const"  => out.constants.push(PhpConstant { name: n, value: v }),
+                    b"env"    => out.env.push(PhpEnv { name: n, value: v, force }),
+                    b"server" => out.server.push(PhpConstant { name: n, value: v }),
+                    b"ini"    => out.ini.push(PhpConstant { name: n, value: v }),
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
 }
 
 /// Parse `<const name="..." value="..."/>` declarations inside the `<php>`
@@ -370,6 +439,41 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <phpunit><testsuites><testsuite name="x"><directory>tests</directory></testsuite></testsuites></phpunit>"#;
         assert!(parse_excluded_groups(xml).is_empty());
+    }
+
+    #[test]
+    fn parses_full_php_block() {
+        // Real Symfony/Laravel pattern.
+        let xml = r#"<?xml version="1.0"?>
+<phpunit>
+    <php>
+        <const name="API_KEY" value="abc123"/>
+        <env name="APP_ENV" value="testing"/>
+        <env name="DB_DSN" value="sqlite::memory:" force="true"/>
+        <server name="HTTPS" value="on"/>
+        <ini name="memory_limit" value="-1"/>
+        <ini name="error_reporting" value="-1"/>
+    </php>
+</phpunit>"#;
+        let b = parse_php_block(xml);
+        assert_eq!(b.constants.len(), 1);
+        assert_eq!(b.constants[0].name, "API_KEY");
+        assert_eq!(b.env.len(), 2);
+        assert_eq!(b.env[0].name, "APP_ENV");
+        assert!(!b.env[0].force, "default force=false");
+        assert!(b.env[1].force, "force=\"true\" recognised");
+        assert_eq!(b.server.len(), 1);
+        assert_eq!(b.server[0].name, "HTTPS");
+        assert_eq!(b.ini.len(), 2);
+        assert_eq!(b.ini[1].value, "-1");
+    }
+
+    #[test]
+    fn returns_empty_php_block_when_no_block() {
+        let xml = r#"<?xml version="1.0"?><phpunit bootstrap="boot.php"></phpunit>"#;
+        let b = parse_php_block(xml);
+        assert!(b.constants.is_empty() && b.env.is_empty()
+             && b.server.is_empty() && b.ini.is_empty());
     }
 
     #[test]

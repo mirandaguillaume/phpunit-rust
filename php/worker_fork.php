@@ -42,6 +42,9 @@ for ($i = 1; $i < $argc; $i++) {
 $autoload        = $args['autoload']           ?? null;
 $bootstrap       = $args['bootstrap']          ?? null;
 $definesJson     = $args['defines']            ?? '[]';
+$envJson         = $args['env']                ?? '[]';
+$serverJson      = $args['server']             ?? '[]';
+$iniJson         = $args['ini']                ?? '[]';
 $childStdinFdsStr  = $args['child-stdin-fds']  ?? '';
 $childStdoutFdsStr = $args['child-stdout-fds'] ?? '';
 
@@ -51,6 +54,35 @@ if ($autoload === null || $childStdinFdsStr === '' || $childStdoutFdsStr === '')
 }
 
 $defines        = json_decode($definesJson, true) ?? [];
+$envVars        = json_decode($envJson,     true) ?? [];
+$serverVars     = json_decode($serverJson,  true) ?? [];
+$iniVars        = json_decode($iniJson,     true) ?? [];
+
+// Apply <ini> first so error_reporting / memory_limit etc. are in effect
+// before we run any user code in autoload/bootstrap.
+foreach ($iniVars as $pair) {
+    if (is_array($pair) && count($pair) === 2 && is_string($pair[0])) {
+        @ini_set($pair[0], (string) $pair[1]);
+    }
+}
+// Apply <env>: each is [name, value, force]. PHPUnit's force=false means
+// "don't clobber a value already in the shell environment".
+foreach ($envVars as $entry) {
+    if (!is_array($entry) || count($entry) !== 3) continue;
+    [$name, $value, $force] = $entry;
+    if (!is_string($name)) continue;
+    if (!$force && getenv($name) !== false) continue;
+    putenv("$name=$value");
+    $_ENV[$name] = $value;
+}
+// Apply <server>: populate $_SERVER (commonly used for HTTPS, SCRIPT_NAME,
+// etc.). PHPUnit does NOT honour `force` on <server> in any version
+// I can find, so we always set.
+foreach ($serverVars as $pair) {
+    if (is_array($pair) && count($pair) === 2 && is_string($pair[0])) {
+        $_SERVER[$pair[0]] = $pair[1];
+    }
+}
 $childStdinFds  = array_map('intval', explode(',', $childStdinFdsStr));
 $childStdoutFds = array_map('intval', explode(',', $childStdoutFdsStr));
 $n              = count($childStdinFds);

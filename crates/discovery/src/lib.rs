@@ -431,44 +431,49 @@ fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
     false
 }
 
-/// Extract every group name declared on a node via `#[Group('name')]`
-/// (or the fully-qualified `#[PHPUnit\Framework\Attributes\Group('name')]`).
-/// `node` is typically the method_declaration or class_declaration.
+/// Extract every group name declared on a node via:
+///   #[Group('name')]   or  #[PHPUnit\Framework\Attributes\Group('name')]
+///   #[Ticket('name')]  or  #[PHPUnit\Framework\Attributes\Ticket('name')]
+///
+/// `Ticket` is PHPUnit's documented alias for `Group` — they share a
+/// namespace and PHPUnit's runner treats them identically. `node` is
+/// typically the method_declaration or class_declaration.
 fn extract_groups_attr(node: Node, bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         let Ok(text) = child.utf8_text(bytes) else { continue };
         if !text.starts_with("#[") { continue; }
-        // The attribute_list text contains every #[...] decoration stacked
-        // on this node. Scan for "Group(" occurrences and extract each arg.
-        let mut search_start = 0;
-        while let Some(idx) = text[search_start..].find("Group(") {
-            let abs = search_start + idx;
-            // Verify the identifier really is Group (not e.g. SubGroup, AnyOtherGroup).
-            let before_ok = abs == 0 || matches!(
-                text.as_bytes()[abs - 1],
-                b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
-            );
-            if before_ok {
-                let inside = &text[abs + "Group(".len()..];
-                let trimmed = inside.trim_start();
-                let (quote, rest) = if let Some(r) = trimmed.strip_prefix('\'') {
-                    ('\'', r)
-                } else if let Some(r) = trimmed.strip_prefix('"') {
-                    ('"', r)
-                } else {
-                    search_start = abs + "Group(".len();
-                    continue;
-                };
-                if let Some(end) = rest.find(quote) {
-                    out.push(rest[..end].to_string());
-                }
-            }
-            search_start = abs + "Group(".len();
+        for needle in ["Group(", "Ticket("] {
+            scan_string_arg(text, needle, &mut out);
         }
     }
     out
+}
+
+/// Scan `text` for every occurrence of `needle` (an identifier followed
+/// by `(`), check the preceding char is an attribute-list boundary, then
+/// extract the first quoted string argument. Pushes into `out`.
+fn scan_string_arg(text: &str, needle: &str, out: &mut Vec<String>) {
+    let mut search_start = 0;
+    while let Some(idx) = text[search_start..].find(needle) {
+        let abs = search_start + idx;
+        let before_ok = abs == 0 || matches!(
+            text.as_bytes()[abs - 1],
+            b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
+        );
+        if before_ok {
+            let inside = &text[abs + needle.len()..];
+            let trimmed = inside.trim_start();
+            let parsed = if let Some(r) = trimmed.strip_prefix('\'') {
+                r.find('\'').map(|end| &r[..end])
+            } else if let Some(r) = trimmed.strip_prefix('"') {
+                r.find('"').map(|end| &r[..end])
+            } else { None };
+            if let Some(name) = parsed { out.push(name.to_string()); }
+        }
+        search_start = abs + needle.len();
+    }
 }
 
 /// Return the docblock comment immediately preceding `node`, if any.
@@ -489,16 +494,18 @@ fn preceding_docblock(node: Node, bytes: &[u8]) -> Option<String> {
     Some(text.to_string())
 }
 
-/// Extract group names from `@group name` PHPDoc lines. PHPUnit allows
-/// multiple `@group` annotations per docblock; we collect them all.
+/// Extract group names from PHPDoc lines. PHPUnit recognises both
+/// `@group name` and `@ticket name` (which is just an alias).
 fn extract_groups_phpdoc(comment: &str, into: &mut Vec<String>) {
     for line in comment.lines() {
         let trimmed = line.trim_start_matches(|c: char|
             c == '*' || c == '/' || c.is_whitespace()
         );
-        if let Some(rest) = trimmed.strip_prefix("@group ") {
-            let name = rest.split_whitespace().next().unwrap_or("");
-            if !name.is_empty() { into.push(name.to_string()); }
+        for prefix in ["@group ", "@ticket "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let name = rest.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() { into.push(name.to_string()); }
+            }
         }
     }
 }
@@ -821,6 +828,43 @@ final class NotATest {
         let (_dir, path) = write_tmp(src);
         let cases = discover_in_file(&path).unwrap();
         assert!(cases.is_empty());
+    }
+
+    #[test]
+    fn ticket_attribute_and_phpdoc_become_groups() {
+        // PHPUnit's #[Ticket] is documented as an alias for #[Group],
+        // and @ticket is the PHPDoc equivalent of @group.
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\Ticket;
+use PHPUnit\Framework\Attributes\Group;
+
+#[Ticket('GH-1234')]
+class WithClassTicket extends TestCase {
+    public function testStuff(): void {}
+}
+
+class WithMethodTicket extends TestCase {
+    #[Ticket('GH-9999')]
+    #[Group('regression')]
+    public function testMethodTicket(): void {}
+
+    /** @ticket GH-1111 */
+    public function testPhpdocTicket(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let by_method: std::collections::HashMap<&str, &TestCase> =
+            cases.iter().map(|c| (c.method.as_str(), c)).collect();
+        assert!(by_method["testStuff"].groups.contains(&"GH-1234".to_string()),
+            "class-level #[Ticket] becomes a group");
+        let mt = &by_method["testMethodTicket"].groups;
+        assert!(mt.contains(&"GH-9999".to_string()) && mt.contains(&"regression".to_string()),
+            "#[Ticket] and #[Group] on the same method both land in groups");
+        assert!(by_method["testPhpdocTicket"].groups.contains(&"GH-1111".to_string()),
+            "@ticket PHPDoc becomes a group");
     }
 
     #[test]
