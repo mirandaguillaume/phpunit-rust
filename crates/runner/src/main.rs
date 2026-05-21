@@ -56,7 +56,7 @@ fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, o
 use phpunit_rust::fork_pool::PhpForkPool;
 use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
-use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_php_constants, parse_testsuites};
+use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
@@ -263,6 +263,19 @@ fn real_main() -> Result<ExitCode> {
             excluded_groups.join(", "));
     }
 
+    // Symfony's PhpUnitTestsListener detection is intentionally NOT acted
+    // upon: the listener's "SkippedTestCase wrapper" behaviour isn't
+    // "every @group legacy test" — it inspects deprecation emissions at
+    // run-time and conditionally skips. Replicating that without running
+    // the listener itself is unsound (initial attempt over-skipped 526
+    // cases when vanilla wraps only 14). Leaving this stub so we know
+    // the detection is wired up if we later add generic <listeners>
+    // dispatch.
+    let _listeners: Vec<String> = xml_str.as_deref()
+        .map(parse_listeners)
+        .unwrap_or_default();
+    let synthetic_legacy_skips: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
+
     eprintln!("Found {} test methods across {} classes.",
         cases.len(),
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
@@ -304,7 +317,16 @@ fn real_main() -> Result<ExitCode> {
         filter: cli.filter,
         defines,
     };
-    let report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
+    let mut report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
+
+    // Append the synthetic skip outcomes for @group legacy under Symfony's
+    // listener. They were never dispatched, so emit them now and adjust
+    // the report's totals accordingly.
+    if !synthetic_legacy_skips.is_empty() {
+        for o in &synthetic_legacy_skips { print_progress(o); }
+        report.outcomes.extend(synthetic_legacy_skips);
+    }
+
     print_summary(&report);
 
     #[cfg(feature = "coverage")]

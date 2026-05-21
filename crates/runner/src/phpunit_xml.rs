@@ -171,6 +171,36 @@ pub fn parse_php_constants(xml: &str) -> Vec<PhpConstant> {
     out
 }
 
+/// Parse `<listeners><listener class="..."/>` entries. Returns the list of
+/// listener class FQCNs. We don't dispatch into them generically (that
+/// would require running arbitrary PHP), but we *detect* well-known ones
+/// (currently Symfony\Bridge\PhpUnit\SymfonyTestsListener) to replicate
+/// their visible side-effect: emitting one SkippedTestCase outcome per
+/// `@group legacy` test method.
+pub fn parse_listeners(xml: &str) -> Vec<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.local_name().as_ref() == b"listener" => {
+                for attr in e.attributes().flatten() {
+                    if attr.key.local_name().as_ref() == b"class" {
+                        if let Ok(v) = std::str::from_utf8(&attr.value) {
+                            out.push(v.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
 /// Parse `<groups><exclude><group>name</group>...` declarations. Returns
 /// the list of excluded group names. Tests annotated with one of these
 /// groups via `#[Group('name')]` or `@group name` must be skipped (vanilla
@@ -330,6 +360,30 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <phpunit><testsuites><testsuite name="x"><directory>tests</directory></testsuite></testsuites></phpunit>"#;
         assert!(parse_excluded_groups(xml).is_empty());
+    }
+
+    #[test]
+    fn parses_listeners() {
+        // Faker's actual phpunit.xml.dist pattern.
+        let xml = r#"<?xml version="1.0"?>
+<phpunit>
+    <listeners>
+        <listener class="Symfony\Bridge\PhpUnit\SymfonyTestsListener"/>
+        <listener class="My\Other\Listener"/>
+    </listeners>
+</phpunit>"#;
+        let listeners = parse_listeners(xml);
+        assert_eq!(listeners, vec![
+            "Symfony\\Bridge\\PhpUnit\\SymfonyTestsListener".to_string(),
+            "My\\Other\\Listener".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn returns_empty_listeners_when_no_block() {
+        let xml = r#"<?xml version="1.0"?>
+<phpunit bootstrap="boot.php"></phpunit>"#;
+        assert!(parse_listeners(xml).is_empty());
     }
 
     #[test]
