@@ -2,6 +2,7 @@
 members = [
     "crates/runner",
     "crates/analyzer",
+    "crates/discovery",
 ]
 resolver = "2"
 

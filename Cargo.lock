@@ -452,6 +452,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
 
 [[package]]
+name = "discovery"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-php",
+ "walkdir",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1021,6 +1033,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "discovery",
  "libc",
  "num_cpus",
  "quick-xml",

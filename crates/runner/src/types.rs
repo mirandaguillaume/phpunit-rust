@@ -1,17 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestCase {
-    pub file: PathBuf,
-    pub class: String,
-    pub method: String,
-    /// Name of the data-provider method (without `()`), if this test was
-    /// declared with `#[DataProvider("name")]` or `/** @dataProvider name */`.
-    /// `None` for plain tests. Used by the runner to enumerate row counts
-    /// and split heavy providers across workers.
-    pub data_provider: Option<String>,
-}
+// TestCase moved to the shared `discovery` crate (so the analyzer can
+// consume it too). Re-exported here for the historical import path.
+pub use discovery::TestCase;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
