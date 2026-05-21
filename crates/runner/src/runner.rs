@@ -318,6 +318,7 @@ mod tests {
             class:         class.to_string(),
             method:        method.to_string(),
             data_provider: None,
+            groups:        vec![],
         }
     }
 
@@ -361,6 +362,7 @@ mod tests {
             class:         class.to_string(),
             method:        method.to_string(),
             data_provider: Some(dp.to_string()),
+            groups:        vec![],
         }
     }
 

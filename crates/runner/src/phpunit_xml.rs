@@ -171,6 +171,57 @@ pub fn parse_php_constants(xml: &str) -> Vec<PhpConstant> {
     out
 }
 
+/// Parse `<groups><exclude><group>name</group>...` declarations. Returns
+/// the list of excluded group names. Tests annotated with one of these
+/// groups via `#[Group('name')]` or `@group name` must be skipped (vanilla
+/// PHPUnit behaviour). doctrine-orm uses this to exclude their
+/// `performance` and `locking_functional` groups by default.
+pub fn parse_excluded_groups(xml: &str) -> Vec<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut depth_groups = 0;
+    let mut depth_exclude = 0;
+    let mut in_group_elem = false;
+    let mut current = String::new();
+    let mut out = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                match e.local_name().as_ref() {
+                    b"groups"  => depth_groups += 1,
+                    b"exclude" if depth_groups > 0 => depth_exclude += 1,
+                    b"group"   if depth_exclude > 0 => {
+                        in_group_elem = true;
+                        current.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                match e.local_name().as_ref() {
+                    b"groups"  => depth_groups -= 1,
+                    b"exclude" if depth_groups > 0 => depth_exclude -= 1,
+                    b"group"   if in_group_elem => {
+                        in_group_elem = false;
+                        let name = current.trim().to_string();
+                        if !name.is_empty() { out.push(name); }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(t)) if in_group_elem => {
+                if let Ok(s) = std::str::from_utf8(&t) { current.push_str(s); }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +306,43 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <phpunit bootstrap="boot.php"></phpunit>"#;
         assert!(parse_php_constants(xml).is_empty());
+    }
+
+    #[test]
+    fn parses_excluded_groups() {
+        // Real doctrine-orm pattern.
+        let xml = r#"<?xml version="1.0"?>
+<phpunit>
+    <testsuites><testsuite name="x"><directory>tests</directory></testsuite></testsuites>
+    <groups>
+        <exclude>
+            <group>performance</group>
+            <group>locking_functional</group>
+        </exclude>
+    </groups>
+</phpunit>"#;
+        let excl = parse_excluded_groups(xml);
+        assert_eq!(excl, vec!["performance".to_string(), "locking_functional".to_string()]);
+    }
+
+    #[test]
+    fn returns_empty_excluded_groups_when_no_groups_block() {
+        let xml = r#"<?xml version="1.0"?>
+<phpunit><testsuites><testsuite name="x"><directory>tests</directory></testsuite></testsuites></phpunit>"#;
+        assert!(parse_excluded_groups(xml).is_empty());
+    }
+
+    #[test]
+    fn ignores_include_groups() {
+        // `<include>` is the dual of `<exclude>` — we only return excludes.
+        let xml = r#"<?xml version="1.0"?>
+<phpunit>
+    <groups>
+        <include><group>fast</group></include>
+        <exclude><group>slow</group></exclude>
+    </groups>
+</phpunit>"#;
+        let excl = parse_excluded_groups(xml);
+        assert_eq!(excl, vec!["slow".to_string()]);
     }
 }

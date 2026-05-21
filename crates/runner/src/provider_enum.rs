@@ -110,6 +110,7 @@ mod tests {
             class:         class.to_string(),
             method:        method.to_string(),
             data_provider: dp.map(String::from),
+            groups:        vec![],
         }
     }
 

@@ -56,7 +56,7 @@ fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, o
 use phpunit_rust::fork_pool::PhpForkPool;
 use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
-use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_php_constants, parse_testsuites};
+use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_php_constants, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::{run, RunConfig};
 
@@ -231,11 +231,30 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("Discovering tests across {} roots ({} excludes)...",
             test_roots.len(), excludes.len());
     }
-    let cases = if test_roots.len() == 1 && excludes.is_empty() && graph_supplement_dirs.is_empty() {
+    let mut cases = if test_roots.len() == 1 && excludes.is_empty() && graph_supplement_dirs.is_empty() {
         discover_in_dir(&test_roots[0])?
     } else {
         discover_in_dirs(&test_roots, &excludes, &graph_supplement_dirs)?
     };
+
+    // Honor phpunit.xml's <groups><exclude>: drop any test whose effective
+    // groups include one of the excluded names. Vanilla PHPUnit does this
+    // at run time; we do it at discovery so the dispatch queue and the
+    // outcome count match vanilla's.
+    let excluded_groups: Vec<String> = xml_str.as_deref()
+        .map(parse_excluded_groups)
+        .unwrap_or_default();
+    if !excluded_groups.is_empty() {
+        use std::collections::HashSet;
+        let excl: HashSet<&str> = excluded_groups.iter().map(|s| s.as_str()).collect();
+        let before = cases.len();
+        cases.retain(|c| !c.groups.iter().any(|g| excl.contains(g.as_str())));
+        let dropped = before - cases.len();
+        eprintln!("Excluding {} test{} in groups: {}",
+            dropped, if dropped == 1 { "" } else { "s" },
+            excluded_groups.join(", "));
+    }
+
     eprintln!("Found {} test methods across {} classes.",
         cases.len(),
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()

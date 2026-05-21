@@ -20,12 +20,18 @@ use walkdir::WalkDir;
 /// `#[DataProvider("name")]` or `/** @dataProvider name */`, used by
 /// downstream consumers to enumerate row counts and split heavy providers
 /// across workers.
+///
+/// `groups` is the union of every group declared on the class and on the
+/// method via `#[Group('name')]` and `/** @group name */`. The runner uses
+/// it to filter out tests in groups excluded by `phpunit.xml`'s
+/// `<groups><exclude>` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestCase {
     pub file: PathBuf,
     pub class: String,
     pub method: String,
     pub data_provider: Option<String>,
+    pub groups: Vec<String>,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -39,15 +45,25 @@ struct ParsedClass {
     /// Resolved FQCN of the parent (post namespace + use-alias resolution),
     /// or `None` if the class has no `extends` clause.
     parent_fqcn: Option<String>,
-    /// All public methods whose name starts with "test". Already filtered;
-    /// pass 3 just emits them if the class is determined to be a test.
-    /// The second element is the data-provider method name, if any
-    /// (from `#[DataProvider("name")]` or `/** @dataProvider name */`).
-    test_methods: Vec<(String, Option<String>)>,
+    /// All public methods recognised as tests (by name, `@test` annotation,
+    /// or `#[Test]` attribute). Each has its data-provider name (if any)
+    /// and its set of `#[Group]`/`@group` annotations.
+    test_methods: Vec<MethodInfo>,
+    /// `#[Group]` and `@group` annotations on the class declaration itself;
+    /// applied to every test method via union with method-level groups.
+    class_groups: Vec<String>,
     /// `true` if the class is `abstract`. Abstract classes can never be
     /// instantiated by PHPUnit; we skip emitting test cases for them even
     /// when their chain reaches TestCase.
     is_abstract: bool,
+}
+
+/// Per-method discovery info collected during the tree-sitter walk.
+#[derive(Debug, Clone)]
+struct MethodInfo {
+    name:          String,
+    data_provider: Option<String>,
+    groups:        Vec<String>,
 }
 
 /// Maps every discovered class FQCN to its resolved parent FQCN (or None).
@@ -61,6 +77,7 @@ type ClassGraph = HashMap<String, Option<String>>;
 pub struct GroupedMethod {
     pub name:          String,
     pub data_provider: Option<String>,
+    pub groups:        Vec<String>,
 }
 
 /// A discovered test class with all of its methods, grouped for batched
@@ -77,7 +94,11 @@ pub struct TestClass {
 pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     let mut groups: Vec<TestClass> = Vec::new();
     for case in cases {
-        let gm = GroupedMethod { name: case.method, data_provider: case.data_provider };
+        let gm = GroupedMethod {
+            name: case.method,
+            data_provider: case.data_provider,
+            groups: case.groups,
+        };
         if let Some(existing) = groups.iter_mut().find(|g| g.class == case.class) {
             existing.methods.push(gm);
         } else {
@@ -261,11 +282,22 @@ fn collect_parsed_classes(
         let test_methods = collect_test_methods(body, bytes);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
+        // Class-level groups apply to every test method in the class.
+        // Collect both attribute and PHPDoc forms; the docblock immediately
+        // preceding the class declaration is its docblock (tree-sitter
+        // attaches it to the class_declaration node's preceding `comment`
+        // sibling).
+        let mut class_groups = extract_groups_attr(decl, bytes);
+        if let Some(doc) = preceding_docblock(decl, bytes) {
+            extract_groups_phpdoc(&doc, &mut class_groups);
+        }
+
         out.push(ParsedClass {
             file: path.to_path_buf(),
             fqcn,
             parent_fqcn,
             test_methods,
+            class_groups,
             is_abstract,
         });
     }
@@ -289,7 +321,7 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
     false
 }
 
-fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<(String, Option<String>)> {
+fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<MethodInfo> {
     let mut methods = Vec::new();
     let mut cursor = body.walk();
     let mut prev_comment: Option<String> = None;
@@ -326,7 +358,15 @@ fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<(String, Option<String>
             let dp = prev_comment.as_deref()
                 .and_then(phpdoc_data_provider)
                 .or_else(|| method_data_provider_attr(child, bytes));
-            methods.push((name.to_string(), dp));
+            let mut groups = extract_groups_attr(child, bytes);
+            if let Some(c) = prev_comment.as_deref() {
+                extract_groups_phpdoc(c, &mut groups);
+            }
+            methods.push(MethodInfo {
+                name: name.to_string(),
+                data_provider: dp,
+                groups,
+            });
         }
         prev_comment = None;
     }
@@ -389,6 +429,78 @@ fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Extract every group name declared on a node via `#[Group('name')]`
+/// (or the fully-qualified `#[PHPUnit\Framework\Attributes\Group('name')]`).
+/// `node` is typically the method_declaration or class_declaration.
+fn extract_groups_attr(node: Node, bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let Ok(text) = child.utf8_text(bytes) else { continue };
+        if !text.starts_with("#[") { continue; }
+        // The attribute_list text contains every #[...] decoration stacked
+        // on this node. Scan for "Group(" occurrences and extract each arg.
+        let mut search_start = 0;
+        while let Some(idx) = text[search_start..].find("Group(") {
+            let abs = search_start + idx;
+            // Verify the identifier really is Group (not e.g. SubGroup, AnyOtherGroup).
+            let before_ok = abs == 0 || matches!(
+                text.as_bytes()[abs - 1],
+                b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
+            );
+            if before_ok {
+                let inside = &text[abs + "Group(".len()..];
+                let trimmed = inside.trim_start();
+                let (quote, rest) = if let Some(r) = trimmed.strip_prefix('\'') {
+                    ('\'', r)
+                } else if let Some(r) = trimmed.strip_prefix('"') {
+                    ('"', r)
+                } else {
+                    search_start = abs + "Group(".len();
+                    continue;
+                };
+                if let Some(end) = rest.find(quote) {
+                    out.push(rest[..end].to_string());
+                }
+            }
+            search_start = abs + "Group(".len();
+        }
+    }
+    out
+}
+
+/// Return the docblock comment immediately preceding `node`, if any.
+/// PHPDoc lives in the file as a regular `comment` node positioned right
+/// before the declaration; we walk siblings backwards from `node`'s parent.
+fn preceding_docblock(node: Node, bytes: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    let mut prev: Option<Node> = None;
+    let mut cursor = parent.walk();
+    for child in parent.children(&mut cursor) {
+        if child.id() == node.id() { break; }
+        prev = Some(child);
+    }
+    let prev = prev?;
+    if prev.kind() != "comment" { return None; }
+    let text = prev.utf8_text(bytes).ok()?;
+    if !text.contains("/**") { return None; }
+    Some(text.to_string())
+}
+
+/// Extract group names from `@group name` PHPDoc lines. PHPUnit allows
+/// multiple `@group` annotations per docblock; we collect them all.
+fn extract_groups_phpdoc(comment: &str, into: &mut Vec<String>) {
+    for line in comment.lines() {
+        let trimmed = line.trim_start_matches(|c: char|
+            c == '*' || c == '/' || c.is_whitespace()
+        );
+        if let Some(rest) = trimmed.strip_prefix("@group ") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if !name.is_empty() { into.push(name.to_string()); }
+        }
+    }
 }
 
 /// Tree-sitter-php groups consecutive `#[Foo] #[Bar]` decorations into one
@@ -480,13 +592,22 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
         let mut depth = 0;
         while depth < 32 {
             if let Some(c) = by_fqcn.get(visit) {
-                for (m, dp) in &c.test_methods {
-                    if seen.insert(m.as_str()) {
+                for mi in &c.test_methods {
+                    if seen.insert(mi.name.as_str()) {
+                        // Effective groups = the concrete subclass's
+                        // class-level groups + the inherited method's
+                        // class-level groups + the method's own groups.
+                        // Dedup with a btreeset to keep output stable.
+                        let mut groups: std::collections::BTreeSet<String> =
+                            class.class_groups.iter().cloned().collect();
+                        groups.extend(c.class_groups.iter().cloned());
+                        groups.extend(mi.groups.iter().cloned());
                         cases.push(TestCase {
                             file:          class.file.clone(),
                             class:         class.fqcn.clone(),
-                            method:        m.clone(),
-                            data_provider: dp.clone(),
+                            method:        mi.name.clone(),
+                            data_provider: mi.data_provider.clone(),
+                            groups:        groups.into_iter().collect(),
                         });
                     }
                 }
@@ -874,9 +995,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![] },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![] },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![] },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
