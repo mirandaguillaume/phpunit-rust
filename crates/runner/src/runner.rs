@@ -10,12 +10,50 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
+/// Stopping policy applied at runtime by the dispatcher: when an outcome
+/// matching one of these statuses arrives, the queue is drained and no
+/// further plans are sent. In-flight tests on other workers still finish.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StopOn {
+    pub failure:    bool,
+    pub error:      bool,
+    pub skipped:    bool,
+    pub incomplete: bool,
+    pub risky:      bool,
+}
+
+impl StopOn {
+    /// `--stop-on-failure` PHPUnit semantics: stop on Fail OR Error
+    /// (both are "real" defects).
+    pub fn on_failure() -> Self {
+        Self { failure: true, error: true, ..Self::default() }
+    }
+    /// `--stop-on-defect` PHPUnit semantics: stop on anything not-pass.
+    pub fn on_defect() -> Self {
+        Self {
+            failure: true, error: true,
+            skipped: true, incomplete: true, risky: true,
+        }
+    }
+    pub fn matches(&self, status: &TestStatus) -> bool {
+        match status {
+            TestStatus::Fail       => self.failure,
+            TestStatus::Error      => self.error,
+            TestStatus::Skipped    => self.skipped,
+            TestStatus::Incomplete => self.incomplete,
+            TestStatus::Risky      => self.risky,
+            TestStatus::Pass       => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub autoload:  PathBuf,
     pub bootstrap: Option<PathBuf>,
     pub filter:    Option<String>,
     pub defines:   Vec<[String; 2]>,
+    pub stop_on:   StopOn,
 }
 
 #[derive(Debug)]
@@ -132,6 +170,7 @@ pub fn run(
     let mut outcomes: Vec<TestOutcome> = Vec::new();
     let mut total = 0.0f64;
     let mut live_readers = n;
+    let mut stopping = false;
     while live_readers > 0 {
         let ev = match rx.recv() {
             Ok(e) => e,
@@ -141,6 +180,14 @@ pub fn run(
             WorkerEvent::Message(_slot, WorkerMessage::Outcome(o)) => {
                 total += o.duration_ms;
                 on_progress(&o);
+                // --stop-on-X policy: if this outcome matches, drain the
+                // queue so no further plans are dispatched. In-flight
+                // tests on other workers finish naturally; their EOF
+                // closes out the loop.
+                if !stopping && cfg.stop_on.matches(&o.status) {
+                    stopping = true;
+                    queue.clear();
+                }
                 outcomes.push(o);
             }
             WorkerEvent::Message(slot, WorkerMessage::BatchDone { .. }) => {
@@ -381,6 +428,7 @@ mod tests {
             bootstrap: None,
             filter:    None,
             defines:   vec![],
+            stop_on:   StopOn::default(),
         };
         let mut row_counts = RowCounts::new();
         row_counts.insert(("BigDp".to_string(), "provideMany".to_string()), Some(20));
@@ -420,6 +468,7 @@ mod tests {
             bootstrap: None,
             filter:    None,
             defines:   vec![],
+            stop_on:   StopOn::default(),
         };
         let row_counts = RowCounts::new();
         let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();

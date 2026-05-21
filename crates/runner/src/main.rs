@@ -83,6 +83,33 @@ struct Cli {
     /// cores detected on this machine. Use --workers 1 for sequential mode.
     #[arg(long)]
     workers: Option<usize>,
+    /// Run only tests whose effective groups include any of these names.
+    /// Comma-separated or repeated. PHPUnit-compatible.
+    #[arg(long = "group", value_delimiter = ',')]
+    groups: Vec<String>,
+    /// Skip tests whose effective groups include any of these names.
+    /// Adds to phpunit.xml's <groups><exclude>. Comma-separated or repeated.
+    #[arg(long = "exclude-group", value_delimiter = ',')]
+    exclude_groups: Vec<String>,
+    /// Run only the named testsuite from phpunit.xml (matches the `name`
+    /// attribute of a <testsuite> element). If absent, all suites run.
+    #[arg(long)]
+    testsuite: Option<String>,
+    /// Stop dispatching new tests after the first failed test
+    /// (failed / errored). Tests already in flight on other workers
+    /// still run to completion.
+    #[arg(long)]
+    stop_on_failure: bool,
+    /// Like --stop-on-failure but also stops on skipped / incomplete /
+    /// risky outcomes. Convenience for "stop on anything not-pass".
+    #[arg(long)]
+    stop_on_defect: bool,
+    /// Print the full list of (class, method) tests that would be run
+    /// for the current config (after group filtering and testsuite
+    /// selection), then exit without running anything. Matches vanilla's
+    /// --list-tests format.
+    #[arg(long)]
+    list_tests: bool,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -170,7 +197,21 @@ fn real_main() -> Result<ExitCode> {
     // the discovery roots; otherwise we fall back to --tests-dir.
     let (test_roots, excludes): (Vec<PathBuf>, Vec<PathBuf>) = match xml_str.as_deref() {
         Some(xml) => {
-            let suites = parse_testsuites(xml);
+            let mut suites = parse_testsuites(xml);
+            // --testsuite NAME filters to a single suite (matches the
+            // `name` attribute). Vanilla PHPUnit's --testsuite picks one.
+            if let Some(target) = &cli.testsuite {
+                let before = suites.len();
+                suites.retain(|s| &s.name == target);
+                if suites.is_empty() {
+                    return Err(anyhow!(
+                        "--testsuite '{}' did not match any of the {} <testsuite> entries in phpunit.xml",
+                        target, before
+                    ));
+                }
+                eprintln!("Selecting testsuite '{}' ({} suite{} matched)",
+                    target, suites.len(), if suites.len() == 1 { "" } else { "s" });
+            }
             if suites.is_empty() {
                 let dir = project.join(&cli.tests_dir);
                 (vec![dir], vec![])
@@ -249,9 +290,17 @@ fn real_main() -> Result<ExitCode> {
     // groups include one of the excluded names. Vanilla PHPUnit does this
     // at run time; we do it at discovery so the dispatch queue and the
     // outcome count match vanilla's.
-    let excluded_groups: Vec<String> = xml_str.as_deref()
+    //
+    // CLI flags --group / --exclude-group layer ON TOP:
+    //   * --exclude-group adds names to the XML's exclude list.
+    //   * --group restricts to tests whose groups intersect the include set
+    //     (PHPUnit semantics: only the named groups run).
+    let mut excluded_groups: Vec<String> = xml_str.as_deref()
         .map(parse_excluded_groups)
         .unwrap_or_default();
+    for g in &cli.exclude_groups {
+        if !excluded_groups.contains(g) { excluded_groups.push(g.clone()); }
+    }
     if !excluded_groups.is_empty() {
         use std::collections::HashSet;
         let excl: HashSet<&str> = excluded_groups.iter().map(|s| s.as_str()).collect();
@@ -261,6 +310,16 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("Excluding {} test{} in groups: {}",
             dropped, if dropped == 1 { "" } else { "s" },
             excluded_groups.join(", "));
+    }
+    if !cli.groups.is_empty() {
+        use std::collections::HashSet;
+        let incl: HashSet<&str> = cli.groups.iter().map(|s| s.as_str()).collect();
+        let before = cases.len();
+        cases.retain(|c| c.groups.iter().any(|g| incl.contains(g.as_str())));
+        eprintln!("Including only {} test{} in group{} {} (filtered {} → {})",
+            cases.len(), if cases.len() == 1 { "" } else { "s" },
+            if cli.groups.len() == 1 { "" } else { "s" },
+            cli.groups.join(", "), before, cases.len());
     }
 
     // Symfony's PhpUnitTestsListener detection is intentionally NOT acted
@@ -280,6 +339,18 @@ fn real_main() -> Result<ExitCode> {
         cases.len(),
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
     );
+
+    // --list-tests: print "Class::method" lines (vanilla PHPUnit format)
+    // and exit. We don't expand data-provider rows here — vanilla's own
+    // --list-tests does, but that's a runtime side-effect; the static
+    // list is the more useful CI primitive.
+    if cli.list_tests {
+        println!("Available tests:");
+        for c in &cases {
+            println!(" - {}::{}", c.class, c.method);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // Verify a usable PHP is on PATH. We require ≥ 8.1; some projects need
     // newer (brick/math: 8.2; doctrine/collections: 8.4). The user is on
@@ -311,11 +382,19 @@ fn real_main() -> Result<ExitCode> {
     let fork_script = find_fork_script()?;
     let mut pool = PhpForkPool::spawn(&fork_script, &autoload, bootstrap.as_deref(), &defines, worker_count)?;
 
+    let stop_on = if cli.stop_on_defect {
+        phpunit_rust::runner::StopOn::on_defect()
+    } else if cli.stop_on_failure {
+        phpunit_rust::runner::StopOn::on_failure()
+    } else {
+        phpunit_rust::runner::StopOn::default()
+    };
     let cfg = RunConfig {
         autoload,
         bootstrap: None,
         filter: cli.filter,
         defines,
+        stop_on,
     };
     let mut report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
 

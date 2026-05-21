@@ -11,6 +11,8 @@ use quick_xml::reader::Reader;
 /// all as relative path strings (caller resolves against phpunit.xml's dir).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TestSuite {
+    /// The `name` attribute (used by `--testsuite NAME` to pick one).
+    pub name: String,
     pub directories: Vec<String>,
     pub excludes: Vec<String>,
 }
@@ -71,7 +73,15 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
                 let name = e.local_name().as_ref().to_vec();
                 match name.as_slice() {
                     b"testsuite" => {
-                        current = Some(TestSuite::default());
+                        let mut s = TestSuite::default();
+                        for attr in e.attributes().flatten() {
+                            if attr.key.local_name().as_ref() == b"name" {
+                                if let Ok(v) = std::str::from_utf8(&attr.value) {
+                                    s.name = v.to_string();
+                                }
+                            }
+                        }
+                        current = Some(s);
                         in_exclude = false;
                     }
                     b"exclude" => {
