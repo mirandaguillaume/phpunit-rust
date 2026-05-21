@@ -118,9 +118,31 @@ for ($i = 0; $i < $n; $i++) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Fork N children
+// 5. Install master-side signal handlers
 // ---------------------------------------------------------------------------
+// Triggered by:
+//   - Rust's Drop sending SIGTERM during normal shutdown
+//   - The kernel's PR_SET_PDEATHSIG firing SIGTERM when Rust dies of any
+//     other cause (SIGKILL, panic before Drop, OOM, …)
+//   - User hitting Ctrl-C on phpunit-rust (SIGINT propagates to the
+//     process group)
+// We SIGKILL every forked child immediately so a child stuck in setUp or
+// an infinite-loop test can't outlive its parent.
 $childPids = [];
+pcntl_async_signals(true);
+$signalHandler = function (int $sig) use (&$childPids): void {
+    foreach ($childPids as $pid) {
+        @posix_kill($pid, SIGKILL);
+    }
+    exit(128 + $sig);
+};
+pcntl_signal(SIGTERM, $signalHandler);
+pcntl_signal(SIGINT,  $signalHandler);
+pcntl_signal(SIGHUP,  $signalHandler);
+
+// ---------------------------------------------------------------------------
+// 6. Fork N children
+// ---------------------------------------------------------------------------
 for ($i = 0; $i < $n; $i++) {
     $pid = pcntl_fork();
     if ($pid === -1) {
@@ -128,7 +150,13 @@ for ($i = 0; $i < $n; $i++) {
         exit(1);
     }
     if ($pid === 0) {
-        // Child process: close every sibling's streams.
+        // Child process: restore default signal disposition so SIGTERM/SIGINT
+        // terminate this worker immediately instead of running the master's
+        // handler with a stale (pre-fork) $childPids snapshot.
+        pcntl_signal(SIGTERM, SIG_DFL);
+        pcntl_signal(SIGINT,  SIG_DFL);
+        pcntl_signal(SIGHUP,  SIG_DFL);
+        // Close every sibling's streams.
         // CRITICAL: each child MUST close the write ends it does not own;
         // Rust's reader on those pipes blocks until the last writer exits.
         for ($j = 0; $j < $n; $j++) {

@@ -9,8 +9,10 @@ use crate::types::BatchPlan;
 use anyhow::{anyhow, Context, Result};
 use std::io::{BufReader, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub struct PhpForkPool {
     master: Child,
@@ -89,6 +91,21 @@ impl PhpForkPool {
            .stdin(Stdio::null())
            .stdout(Stdio::null())
            .stderr(Stdio::inherit());
+
+        // Linux: ask the kernel to deliver SIGTERM to the PHP master when
+        // *we* die for any reason — including SIGKILL on Rust where Drop
+        // never runs. The master's SIGTERM handler (in worker_fork.php)
+        // then propagates the death to its forked children. Without this,
+        // a worker stuck in setUp can outlive its parent for hours.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         if let Some(bs) = bootstrap {
             cmd.arg("--bootstrap").arg(bs);
@@ -171,6 +188,22 @@ impl PhpForkPool {
 impl Drop for PhpForkPool {
     fn drop(&mut self) {
         self.close_write_ends();
+        // SIGTERM first so the master can run its handler (which posix_kills
+        // every forked child). SIGKILL would bypass the handler and leave
+        // grandchildren orphaned, blocked in setUp/test. Give it 500ms,
+        // then SIGKILL as a fallback.
+        let pid = self.master.id() as i32;
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.master.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => break,
+            }
+        }
         let _ = self.master.kill();
         let _ = self.master.wait();
     }
