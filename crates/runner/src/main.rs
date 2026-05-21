@@ -187,6 +187,14 @@ fn real_main() -> Result<ExitCode> {
                         excls.push(if p.is_absolute() { p } else { project.join(p) });
                     }
                 }
+                // PHPUnit's <exclude> is per-testsuite — a directory excluded
+                // by suite A but explicitly included by suite B should still
+                // be walked. We flatten to a single (roots, excludes) pair
+                // for discovery, so drop any exclude that also appears as a
+                // root in another suite. (Guzzle-psr7's "tests/Integration"
+                // hit this: suite 1 excludes it, suite 2 includes it.)
+                let root_set: std::collections::HashSet<&PathBuf> = roots.iter().collect();
+                excls.retain(|e| !root_set.contains(e));
                 (roots, excls)
             }
         }
