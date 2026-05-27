@@ -292,6 +292,11 @@ function runChild($stdinStream, $stdoutStream): void
             ob_start();
             try {
                 require_once $file;
+                foreach ($entry['required_files'] ?? [] as $rf) {
+                    if (is_string($rf) && is_file($rf)) {
+                        require_once $rf;
+                    }
+                }
                 if (!class_exists($class)) {
                     ob_end_clean();
                     emitError($stdoutStream, $class, '<class>',
