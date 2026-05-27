@@ -220,6 +220,11 @@ exit(0);
 // ---------------------------------------------------------------------------
 function runChild($stdinStream, $stdoutStream): void
 {
+    // Long-lived workers must not be bound by phpunit.xml's <ini name="memory_limit">.
+    // That setting targets short PHP CLI invocations; applying it here causes OOM after
+    // ~3000 tests. Unlimited memory is safe because the process is isolated per-slot.
+    @ini_set('memory_limit', '-1');
+
     // Current-batch state, captured by reference in the shutdown handler.
     // We reset both to empty after each clean batch so the handler doesn't
     // double-emit; it only fires for uncatchable fatals (E_COMPILE_ERROR etc.)
@@ -298,6 +303,27 @@ function runChild($stdinStream, $stdoutStream): void
                 // when the class is already defined from a previous batch.
                 if (!class_exists($class, false)) {
                     require_once $file;
+                } else {
+                    // Class already loaded from a different file. Emit errors for
+                    // any methods in this batch that don't exist on the loaded
+                    // definition so they appear in the report rather than being
+                    // silently dropped by MethodPlanner's hasMethod filter.
+                    $conflictMethods = array_unique(array_filter(
+                        $methods, fn($m) => !method_exists($class, $m)
+                    ));
+                    foreach ($conflictMethods as $m) {
+                        emitError($stdoutStream, $class, $m,
+                            "method $m not found on $class (FQCN defined in multiple files; " .
+                            "loaded from a different path — run with more workers to avoid conflicts)");
+                    }
+                    $methods = array_values(array_filter(
+                        $methods, fn($m) => method_exists($class, $m)
+                    ));
+                    if (empty($methods)) {
+                        ob_end_clean();
+                        $nextIdx = $i + 1;
+                        continue;
+                    }
                 }
                 foreach ($entry['required_files'] ?? [] as $rf) {
                     if (is_string($rf) && is_file($rf)) {
