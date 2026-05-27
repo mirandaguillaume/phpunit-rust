@@ -441,6 +441,7 @@ fn real_main() -> Result<ExitCode> {
         defines,
         stop_on,
         class_file_index,
+        n_workers: worker_count,
     };
     let mut report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
 

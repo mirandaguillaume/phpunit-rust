@@ -57,6 +57,8 @@ pub struct RunConfig {
     /// FQCN → file path for all PHP classes in the test roots.
     /// Used to resolve `#[DataProviderExternal]` dependencies.
     pub class_file_index: HashMap<String, PathBuf>,
+    /// Number of PHP workers — used to compute adaptive batch sizes.
+    pub n_workers:        usize,
 }
 
 #[derive(Debug)]
@@ -263,23 +265,26 @@ const ROW_SPLIT_THRESHOLD: u32 = 15;
 /// a 1000-row provider into 1000 single-row plans (each pays setUpBeforeClass).
 const MAX_ROW_CHUNKS: u32 = 4;
 
-/// Build the work queue. Three categories of work:
+/// Build the work queue.
 ///
-/// 1. **Heavy data-provider methods** (>= ROW_SPLIT_THRESHOLD rows): split
-///    the class into N plans, each with `methods: [thatMethod]` and a
-///    `row_filter` selecting rows where `i % N == chunk_index`. Other
-///    methods of the same class get a separate filterless plan.
+/// Targets a uniform number of test methods per `BatchPlan` so every worker
+/// gets roughly the same amount of work regardless of how tests are distributed
+/// across classes.
 ///
-/// 2. **Other heavy classes** (cost >= HEAVY_COST_THRESHOLD): one plan per
-///    class for maximum parallelism.
+/// Algorithm (bin-packing LPT):
+///   target = total_methods / (n_workers × OVERSATURATION)
+///   Sort classes descending by method count (LPT order).
+///   Accumulate classes into the current batch until it reaches `target`;
+///   then flush as a BatchPlan and start a new one.
+///   Classes with row-split data providers are extracted first and each
+///   chunk is still dispatched as a solo plan (fine-grained parallelism).
+///   Classes whose non-split method count exceeds `target` are dispatched
+///   solo regardless (they are already "full" batches on their own).
 ///
-/// 3. **Light classes**: bundled in packs of LIGHT_PACK_SIZE to amortize
-///    the JSON round-trip cost.
-///
-/// LPT ordering applies across all three: heaviest first into the queue.
+/// OVERSATURATION ensures more batches than workers so work-stealing has
+/// granularity to keep all workers busy even with variance in test duration.
 fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) -> VecDeque<BatchPlan> {
-    const HEAVY_COST_THRESHOLD: u32   = 4;
-    const LIGHT_PACK_SIZE:      usize = 4;
+    const OVERSATURATION: usize = 4; // target 4× more batches than workers
 
     // Collect required files for a set of method names from the class-file index.
     let required_files_for = |method_names: &[String],
@@ -301,6 +306,15 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
     };
 
     let groups = group_by_class(cases);
+
+    // Compute target methods-per-batch: total_methods / (n_workers × OVERSATURATION).
+    // Floor at 1 so we never divide by zero; ceil at a large value so a single
+    // class with hundreds of methods still gets its own solo plan.
+    let total_methods: usize = groups.iter().map(|g| g.methods.len()).sum();
+    let n_workers = cfg.n_workers.max(1);
+    let target: usize = (total_methods / (n_workers * OVERSATURATION)).max(1);
+
+    // Sort LPT (largest class first) to minimise leftover waste in each bin.
     let mut by_cost: Vec<(u32, crate::discovery::TestClass)> = groups.into_iter()
         .map(|g| {
             let cost: u32 = g.methods.iter()
@@ -311,8 +325,9 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
         .collect();
     by_cost.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let mut queue: VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
-    let mut light_buf: Vec<BatchClass> = Vec::with_capacity(LIGHT_PACK_SIZE);
+    let mut queue:   VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
+    let mut bin_buf: Vec<BatchClass>     = Vec::new();
+    let mut bin_methods: usize           = 0;
 
     let mk_plan = |classes: Vec<BatchClass>| BatchPlan {
         autoload:  cfg.autoload.clone(),
@@ -322,10 +337,7 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
     };
 
     for (cost, g) in by_cost {
-        // Only split methods where the enumerator gave us an actual row
-        // count. Unknown (or unresolved) providers stay in the plain plan —
-        // splitting blind risks creating empty chunks (filter chunk_index
-        // > actual rows-1 keeps nothing) which is wasted work.
+        // Extract and dispatch row-split data-provider methods first (unchanged logic).
         let row_count_for = |m: &crate::discovery::GroupedMethod| -> Option<u32> {
             let dp = m.data_provider.as_ref()?;
             match row_counts.get(&(g.class.clone(), dp.clone())) {
@@ -338,10 +350,7 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
             .partition(|m| row_count_for(m).map(|n| n >= ROW_SPLIT_THRESHOLD).unwrap_or(false));
 
         for hm in &heavy_methods {
-            let rows = row_count_for(hm).unwrap_or(1);
-            // chunks = min(rows, MAX_ROW_CHUNKS) so a 2-row method splits
-            // into 2 (each gets one row) and a 100-row method splits into
-            // MAX_ROW_CHUNKS (each gets ~25). No empty chunks.
+            let rows   = row_count_for(hm).unwrap_or(1);
             let chunks = rows.min(MAX_ROW_CHUNKS);
             for chunk_index in 0..chunks {
                 let bc = BatchClass {
@@ -355,13 +364,12 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
             }
         }
 
-        // Remaining (non-row-split) methods form their own batch with no filter.
         if other_methods.is_empty() { continue; }
-        let other_cost = cost.saturating_sub(
+        let other_cost  = cost.saturating_sub(
             heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
-        );
+        ) as usize;
         let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
-        let req_files = required_files_for(&other_names, &g.methods);
+        let req_files   = required_files_for(&other_names, &g.methods);
         let bc = BatchClass {
             file:           g.file,
             class:          g.class,
@@ -369,17 +377,27 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
             row_filter:     None,
             required_files: req_files,
         };
-        if other_cost >= HEAVY_COST_THRESHOLD {
+
+        // A class that already meets or exceeds the target on its own gets a
+        // solo plan so it doesn't inflate a neighbour's batch.
+        if other_cost >= target {
+            // Flush any accumulated bin first to preserve LPT order.
+            if !bin_buf.is_empty() {
+                queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                bin_methods = 0;
+            }
             queue.push_back(mk_plan(vec![bc]));
         } else {
-            light_buf.push(bc);
-            if light_buf.len() >= LIGHT_PACK_SIZE {
-                queue.push_back(mk_plan(std::mem::take(&mut light_buf)));
+            bin_buf.push(bc);
+            bin_methods += other_cost;
+            if bin_methods >= target {
+                queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                bin_methods = 0;
             }
         }
     }
-    if !light_buf.is_empty() {
-        queue.push_back(mk_plan(light_buf));
+    if !bin_buf.is_empty() {
+        queue.push_back(mk_plan(bin_buf));
     }
     queue
 }
@@ -482,6 +500,7 @@ mod tests {
             defines:          vec![],
             stop_on:          StopOn::default(),
             class_file_index: HashMap::new(),
+            n_workers:        4,
         };
         let mut row_counts = RowCounts::new();
         row_counts.insert(("BigDp".to_string(), "provideMany".to_string()), Some(20));
@@ -512,7 +531,8 @@ mod tests {
     #[test]
     fn build_queue_packs_light_classes_and_sorts_heavy_first() {
         // 1 heavy class (5 methods) + 5 light classes (1 method each).
-        // Expected: heavy plan first, then 1 pack of 4 light + 1 pack of 1 light.
+        // n_workers=4, OVERSATURATION=4 → target = max(1, 10/16) = 1.
+        // Every class (cost ≥ target=1) gets its own solo plan; Heavy comes first (LPT).
         let mut cases = Vec::new();
         for m in 0..5 { cases.push(make_case("Heavy", &format!("t{m}"))); }
         for c in 0..5 { cases.push(make_case(&format!("Light{c}"), "t1")); }
@@ -523,14 +543,16 @@ mod tests {
             defines:          vec![],
             stop_on:          StopOn::default(),
             class_file_index: HashMap::new(),
+            n_workers:        4,
         };
         let row_counts = RowCounts::new();
         let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();
-        assert_eq!(q.len(), 3, "1 heavy plan + 2 light packs");
+        assert_eq!(q.len(), 6, "1 heavy solo + 5 light solos (target=1)");
         assert_eq!(q[0].classes.len(), 1);
-        assert_eq!(q[0].classes[0].class, "Heavy", "heavy class scheduled first");
-        assert_eq!(q[1].classes.len(), 4, "first light pack is full");
-        assert_eq!(q[2].classes.len(), 1, "remaining light tail in its own pack");
+        assert_eq!(q[0].classes[0].class, "Heavy", "heavy class scheduled first (LPT)");
+        for i in 1..6 {
+            assert_eq!(q[i].classes.len(), 1, "each light class is its own plan");
+        }
     }
 
 }
