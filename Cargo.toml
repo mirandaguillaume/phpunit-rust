@@ -3,6 +3,7 @@ members = [
     "crates/runner",
     "crates/analyzer",
     "crates/discovery",
+    "crates/mock_baker",
 ]
 resolver = "2"
 

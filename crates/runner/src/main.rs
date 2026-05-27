@@ -110,6 +110,11 @@ struct Cli {
     /// --list-tests format.
     #[arg(long)]
     list_tests: bool,
+    /// Rewrite `createMock()` patterns in test files into anonymous-class stubs
+    /// before execution. Requires that mocked interfaces are resolvable via
+    /// the project's PSR-4 autoload map in composer.json.
+    #[arg(long)]
+    bake_mocks: bool,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -348,6 +353,26 @@ fn real_main() -> Result<ExitCode> {
         cases.len(),
         cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
     );
+
+    // --bake-mocks: rewrite createMock patterns into anonymous classes before
+    // dispatching. The temp_dir must outlive the pool so baked PHP files are
+    // still on disk when the worker tries to require them.
+    let _bake_temp_dir: Option<tempfile::TempDir>;
+    if cli.bake_mocks {
+        let td = tempfile::TempDir::new()
+            .context("creating temp dir for baked test files")?;
+        let rewritten = phpunit_rust::mock_bake::bake_test_cases(&cases, &project, &td);
+        let baked_count = rewritten.iter().zip(cases.iter())
+            .filter(|(a, b)| a.file != b.file)
+            .count();
+        if baked_count > 0 {
+            eprintln!("Baked {baked_count} test file(s) (createMock → anonymous class).");
+        }
+        cases = rewritten;
+        _bake_temp_dir = Some(td);
+    } else {
+        _bake_temp_dir = None;
+    }
 
     // --list-tests: print "Class::method" lines (vanilla PHPUnit format)
     // and exit. We don't expand data-provider rows here — vanilla's own

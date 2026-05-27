@@ -1,0 +1,19 @@
+[package]
+name = "mock_baker"
+version = "0.7.0"
+edition = "2021"
+description = "Transforms PHPUnit createMock(...) expectation chains into anonymous-class equivalents (static mock baking)."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bake-mock"
+path = "src/bin/bake_mock.rs"
+
+[dependencies]
+anyhow          = { workspace = true }
+clap            = { workspace = true }
+tree-sitter     = "0.22"
+tree-sitter-php = "0.22"

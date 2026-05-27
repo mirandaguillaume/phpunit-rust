@@ -30,6 +30,8 @@ tree-sitter     = "0.22"
 tree-sitter-php = "0.22"
 discovery  = { path = "../discovery" }
 analyzer   = { path = "../analyzer", optional = true }
+mock_baker = { path = "../mock_baker" }
+tempfile   = { workspace = true }
+blake3     = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }

@@ -10,3 +10,4 @@ pub mod provider_enum;
 pub mod reporter;
 pub mod runner;
 pub mod types;
+pub mod mock_bake;
