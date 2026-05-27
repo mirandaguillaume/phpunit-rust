@@ -361,11 +361,12 @@ mod tests {
 
     fn make_case(class: &str, method: &str) -> TestCase {
         TestCase {
-            file:          PathBuf::from("/f.php"),
-            class:         class.to_string(),
-            method:        method.to_string(),
-            data_provider: None,
-            groups:        vec![],
+            file:               PathBuf::from("/f.php"),
+            class:              class.to_string(),
+            method:             method.to_string(),
+            data_provider:      None,
+            groups:             vec![],
+            external_providers: vec![],
         }
     }
 
@@ -405,11 +406,12 @@ mod tests {
 
     fn make_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
         TestCase {
-            file:          PathBuf::from("/f.php"),
-            class:         class.to_string(),
-            method:        method.to_string(),
-            data_provider: Some(dp.to_string()),
-            groups:        vec![],
+            file:               PathBuf::from("/f.php"),
+            class:              class.to_string(),
+            method:             method.to_string(),
+            data_provider:      Some(dp.to_string()),
+            groups:             vec![],
+            external_providers: vec![],
         }
     }
 

@@ -27,11 +27,12 @@ use walkdir::WalkDir;
 /// `<groups><exclude>` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestCase {
-    pub file: PathBuf,
-    pub class: String,
-    pub method: String,
-    pub data_provider: Option<String>,
-    pub groups: Vec<String>,
+    pub file:               PathBuf,
+    pub class:              String,
+    pub method:             String,
+    pub data_provider:      Option<String>,
+    pub groups:             Vec<String>,
+    pub external_providers: Vec<(String, String)>,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -61,9 +62,10 @@ struct ParsedClass {
 /// Per-method discovery info collected during the tree-sitter walk.
 #[derive(Debug, Clone)]
 struct MethodInfo {
-    name:          String,
-    data_provider: Option<String>,
-    groups:        Vec<String>,
+    name:               String,
+    data_provider:      Option<String>,
+    groups:             Vec<String>,
+    external_providers: Vec<(String, String)>,
 }
 
 /// Maps every discovered class FQCN to its resolved parent FQCN (or None).
@@ -75,9 +77,10 @@ type ClassGraph = HashMap<String, Option<String>>;
 /// schedule heavy methods first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupedMethod {
-    pub name:          String,
-    pub data_provider: Option<String>,
-    pub groups:        Vec<String>,
+    pub name:               String,
+    pub data_provider:      Option<String>,
+    pub groups:             Vec<String>,
+    pub external_providers: Vec<(String, String)>,
 }
 
 /// A discovered test class with all of its methods, grouped for batched
@@ -95,9 +98,10 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     let mut groups: Vec<TestClass> = Vec::new();
     for case in cases {
         let gm = GroupedMethod {
-            name: case.method,
-            data_provider: case.data_provider,
-            groups: case.groups,
+            name:               case.method,
+            data_provider:      case.data_provider,
+            groups:             case.groups,
+            external_providers: case.external_providers,
         };
         if let Some(existing) = groups.iter_mut().find(|g| g.class == case.class) {
             existing.methods.push(gm);
@@ -279,7 +283,7 @@ fn collect_parsed_classes(
             None => name.to_string(),
         };
         let parent_fqcn = base_name.map(|b| resolve_class_reference(b, namespace, aliases));
-        let test_methods = collect_test_methods(body, bytes);
+        let test_methods = collect_test_methods(body, bytes, namespace.as_deref(), &aliases);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
         // Class-level groups apply to every test method in the class.
@@ -321,7 +325,12 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
     false
 }
 
-fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<MethodInfo> {
+fn collect_test_methods(
+    body: Node,
+    bytes: &[u8],
+    namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
+) -> Vec<MethodInfo> {
     let mut methods = Vec::new();
     let mut cursor = body.walk();
     let mut prev_comment: Option<String> = None;
@@ -362,10 +371,12 @@ fn collect_test_methods(body: Node, bytes: &[u8]) -> Vec<MethodInfo> {
             if let Some(c) = prev_comment.as_deref() {
                 extract_groups_phpdoc(c, &mut groups);
             }
+            let external_providers = extract_external_provider_attrs(child, bytes, namespace, aliases);
             methods.push(MethodInfo {
-                name: name.to_string(),
-                data_provider: dp,
+                name:               name.to_string(),
+                data_provider:      dp,
                 groups,
+                external_providers,
             });
         }
         prev_comment = None;
@@ -417,6 +428,67 @@ fn extract_data_provider_arg(attr_text: &str) -> Option<String> {
     };
     let end = rest.find(quote)?;
     Some(rest[..end].to_string())
+}
+
+/// Parse `DataProviderExternal(ClassName::class, 'method')` occurrences from
+/// an attribute list text string (e.g. `"#[DataProviderExternal(Foo::class, 'bar')]"`).
+/// Returns `(resolved_fqcn, method_name)` for every match found.
+fn parse_external_provider_attr_text(
+    text: &str,
+    namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let needle = "DataProviderExternal(";
+    let mut out = Vec::new();
+    let mut search = 0;
+    while let Some(idx) = text[search..].find(needle) {
+        let abs = search + idx;
+        // Reject false matches — require a boundary character before `DataProviderExternal`.
+        let before_ok = abs == 0 || matches!(
+            text.as_bytes()[abs - 1],
+            b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
+        );
+        let inside_start = abs + needle.len();
+        if before_ok {
+            let inside = &text[inside_start..];
+            if let Some(class_end) = inside.find("::class") {
+                let raw_class = inside[..class_end].trim();
+                let fqcn = resolve_class_reference(raw_class, namespace, aliases);
+                let after_class = &inside[class_end + "::class".len()..];
+                let after_comma = after_class.trim_start_matches(|c: char| {
+                    c == ',' || c.is_whitespace()
+                });
+                let method_name = if let Some(r) = after_comma.strip_prefix('\'') {
+                    r.find('\'').map(|e| r[..e].to_string())
+                } else if let Some(r) = after_comma.strip_prefix('"') {
+                    r.find('"').map(|e| r[..e].to_string())
+                } else {
+                    None
+                };
+                if let Some(m) = method_name {
+                    out.push((fqcn, m));
+                }
+            }
+        }
+        search = inside_start;
+    }
+    out
+}
+
+fn extract_external_provider_attrs(
+    method: Node,
+    bytes: &[u8],
+    namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut cursor = method.walk();
+    for child in method.children(&mut cursor) {
+        let Ok(text) = child.utf8_text(bytes) else { continue };
+        if !text.starts_with("#[") { continue; }
+        out.extend(parse_external_provider_attr_text(text, namespace, aliases));
+    }
+    out
 }
 
 fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
@@ -614,11 +686,12 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                         groups.extend(c.class_groups.iter().cloned());
                         groups.extend(mi.groups.iter().cloned());
                         cases.push(TestCase {
-                            file:          class.file.clone(),
-                            class:         class.fqcn.clone(),
-                            method:        mi.name.clone(),
-                            data_provider: mi.data_provider.clone(),
-                            groups:        groups.into_iter().collect(),
+                            file:               class.file.clone(),
+                            class:              class.fqcn.clone(),
+                            method:             mi.name.clone(),
+                            data_provider:      mi.data_provider.clone(),
+                            groups:             groups.into_iter().collect(),
+                            external_providers: mi.external_providers.clone(),
                         });
                     }
                 }
@@ -1043,9 +1116,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![] },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![] },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![] },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![] },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -1055,5 +1128,51 @@ final class ConcreteTest extends AbstractBaseTest {
         assert_eq!(grouped[1].class, "B");
         let names_b: Vec<&str> = grouped[1].methods.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names_b, vec!["testThree"]);
+    }
+
+    #[test]
+    fn parse_external_provider_attr_text_short_class() {
+        let aliases: HashMap<String, String> = [
+            ("AssertSize".to_string(), "PHPUnit\\Tests\\AssertSize".to_string()),
+        ].into_iter().collect();
+        let text = "#[DataProviderExternal(AssertSize::class, 'providerMethod')]";
+        let got = parse_external_provider_attr_text(text, Some("PHPUnit\\Tests"), &aliases);
+        assert_eq!(got, vec![("PHPUnit\\Tests\\AssertSize".to_string(), "providerMethod".to_string())]);
+    }
+
+    #[test]
+    fn parse_external_provider_attr_text_fqcn() {
+        let aliases = HashMap::new();
+        let text = "#[DataProviderExternal(PHPUnit\\Framework\\ProviderClass::class, \"myProvider\")]";
+        let got = parse_external_provider_attr_text(text, None, &aliases);
+        assert_eq!(got, vec![("PHPUnit\\Framework\\ProviderClass".to_string(), "myProvider".to_string())]);
+    }
+
+    #[test]
+    fn parse_external_provider_does_not_match_regular_data_provider() {
+        let aliases = HashMap::new();
+        let text = "#[DataProvider('localProvider')]";
+        let got = parse_external_provider_attr_text(text, None, &aliases);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn discovers_external_provider_on_method() {
+        let src = r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+use App\Data\Provider as DataProv;
+class FooTest extends TestCase {
+    #[DataProviderExternal(DataProv::class, 'rows')]
+    public function testWithExternal(int $x): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(
+            cases[0].external_providers,
+            vec![("App\\Data\\Provider".to_string(), "rows".to_string())]
+        );
     }
 }

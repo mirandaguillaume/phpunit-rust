@@ -106,11 +106,12 @@ mod tests {
 
     fn case(class: &str, method: &str, dp: Option<&str>) -> TestCase {
         TestCase {
-            file:          PathBuf::from("/f.php"),
-            class:         class.to_string(),
-            method:        method.to_string(),
-            data_provider: dp.map(String::from),
-            groups:        vec![],
+            file:               PathBuf::from("/f.php"),
+            class:              class.to_string(),
+            method:             method.to_string(),
+            data_provider:      dp.map(String::from),
+            groups:             vec![],
+            external_providers: vec![],
         }
     }
 
