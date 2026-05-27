@@ -7,6 +7,7 @@
 //! don't have to switch their use-statements.
 
 pub use discovery::{
+    discover_class_file_index,
     discover_in_dir,
     discover_in_dirs,
     discover_in_file,

@@ -49,11 +49,14 @@ impl StopOn {
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub autoload:  PathBuf,
-    pub bootstrap: Option<PathBuf>,
-    pub filter:    Option<String>,
-    pub defines:   Vec<[String; 2]>,
-    pub stop_on:   StopOn,
+    pub autoload:         PathBuf,
+    pub bootstrap:        Option<PathBuf>,
+    pub filter:           Option<String>,
+    pub defines:          Vec<[String; 2]>,
+    pub stop_on:          StopOn,
+    /// FQCN → file path for all PHP classes in the test roots.
+    /// Used to resolve `#[DataProviderExternal]` dependencies.
+    pub class_file_index: HashMap<String, PathBuf>,
 }
 
 #[derive(Debug)]
@@ -253,6 +256,25 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
     const HEAVY_COST_THRESHOLD: u32   = 4;
     const LIGHT_PACK_SIZE:      usize = 4;
 
+    // Collect required files for a set of method names from the class-file index.
+    let required_files_for = |method_names: &[String],
+                               all_methods: &[crate::discovery::GroupedMethod]|
+     -> Vec<PathBuf> {
+        let name_set: std::collections::HashSet<&str> =
+            method_names.iter().map(String::as_str).collect();
+        let mut files: std::collections::HashSet<PathBuf> = Default::default();
+        for gm in all_methods {
+            if name_set.is_empty() || name_set.contains(gm.name.as_str()) {
+                for (fqcn, _) in &gm.external_providers {
+                    if let Some(f) = cfg.class_file_index.get(fqcn) {
+                        files.insert(f.clone());
+                    }
+                }
+            }
+        }
+        files.into_iter().collect()
+    };
+
     let groups = group_by_class(cases);
     let mut by_cost: Vec<(u32, crate::discovery::TestClass)> = groups.into_iter()
         .map(|g| {
@@ -302,7 +324,7 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
                     class:          g.class.clone(),
                     methods:        vec![hm.name.clone()],
                     row_filter:     Some(RowFilter { chunk_index, total_chunks: chunks }),
-                    required_files: vec![],
+                    required_files: required_files_for(&[hm.name.clone()], &g.methods),
                 };
                 queue.push_back(mk_plan(vec![bc]));
             }
@@ -314,12 +336,13 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
             heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
         );
         let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
+        let req_files = required_files_for(&other_names, &g.methods);
         let bc = BatchClass {
             file:           g.file,
             class:          g.class,
             methods:        other_names,
             row_filter:     None,
-            required_files: vec![],
+            required_files: req_files,
         };
         if other_cost >= HEAVY_COST_THRESHOLD {
             queue.push_back(mk_plan(vec![bc]));
@@ -428,11 +451,12 @@ mod tests {
             make_case("BigDp", "testSimple"),
         ];
         let cfg = RunConfig {
-            autoload:  PathBuf::from("/autoload.php"),
-            bootstrap: None,
-            filter:    None,
-            defines:   vec![],
-            stop_on:   StopOn::default(),
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
         };
         let mut row_counts = RowCounts::new();
         row_counts.insert(("BigDp".to_string(), "provideMany".to_string()), Some(20));
@@ -468,11 +492,12 @@ mod tests {
         for m in 0..5 { cases.push(make_case("Heavy", &format!("t{m}"))); }
         for c in 0..5 { cases.push(make_case(&format!("Light{c}"), "t1")); }
         let cfg = RunConfig {
-            autoload:  PathBuf::from("/autoload.php"),
-            bootstrap: None,
-            filter:    None,
-            defines:   vec![],
-            stop_on:   StopOn::default(),
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
         };
         let row_counts = RowCounts::new();
         let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();

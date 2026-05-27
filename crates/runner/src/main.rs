@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::{discover_in_dir, discover_in_dirs};
+use phpunit_rust::discovery::{discover_class_file_index, discover_in_dir, discover_in_dirs};
 
 /// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
 /// into a list of directories, resolved relative to `project`. Used to build
@@ -300,6 +300,13 @@ fn real_main() -> Result<ExitCode> {
         discover_in_dirs(&test_roots, &excludes, &graph_supplement_dirs)?
     };
 
+    // Build a FQCN→file index over all PHP files in test roots and supplement
+    // dirs so the runner can locate external data provider classes not in the
+    // PSR-4 autoloader.
+    let mut index_dirs = test_roots.clone();
+    index_dirs.extend(graph_supplement_dirs.iter().cloned());
+    let class_file_index = discover_class_file_index(&index_dirs);
+
     // Honor phpunit.xml's <groups><exclude>: drop any test whose effective
     // groups include one of the excluded names. Vanilla PHPUnit does this
     // at run time; we do it at discovery so the dispatch queue and the
@@ -433,6 +440,7 @@ fn real_main() -> Result<ExitCode> {
         filter: cli.filter,
         defines,
         stop_on,
+        class_file_index,
     };
     let mut report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
 
