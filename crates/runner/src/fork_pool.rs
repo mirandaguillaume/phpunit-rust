@@ -18,6 +18,8 @@ pub struct PhpForkPool {
     master: Child,
     write_ends: Vec<Option<std::fs::File>>,
     read_ends:  Vec<Option<std::fs::File>>,
+    // Keep class-map temp file alive until the pool is dropped.
+    _class_map_tmp: Option<tempfile::NamedTempFile>,
 }
 
 impl PhpForkPool {
@@ -35,6 +37,7 @@ impl PhpForkPool {
         server: &[[String; 2]],
         ini: &[[String; 2]],
         n: usize,
+        class_map: &std::collections::HashMap<String, std::path::PathBuf>,
     ) -> Result<Self> {
         if n == 0 {
             return Err(anyhow!("fork pool requires at least 1 slot"));
@@ -139,6 +142,25 @@ impl PhpForkPool {
                 serde_json::to_string(ini).context("serializing ini")?
             );
         }
+        // Write class map to a temp file to avoid ARG_MAX limits.
+        // The file is deleted when the pool is dropped (or when the process exits).
+        let _class_map_tmp: Option<tempfile::NamedTempFile>;
+        if !class_map.is_empty() {
+            let map_str: std::collections::HashMap<&str, &str> = class_map
+                .iter()
+                .filter_map(|(k, v)| v.to_str().map(|s| (k.as_str(), s)))
+                .collect();
+            let json = serde_json::to_string(&map_str).context("serializing class-map")?;
+            let mut tmp = tempfile::NamedTempFile::new()
+                .context("creating class-map temp file")?;
+            use std::io::Write as _;
+            tmp.write_all(json.as_bytes())
+                .context("writing class-map temp file")?;
+            cmd.arg("--class-map-file").arg(tmp.path());
+            _class_map_tmp = Some(tmp);
+        } else {
+            _class_map_tmp = None;
+        }
 
         let master = cmd.spawn().context("failed to spawn PHP master")?;
 
@@ -150,7 +172,7 @@ impl PhpForkPool {
         let write_ends = to_php_write.into_iter().map(Some).collect();
         let read_ends  = from_php_read.into_iter().map(Some).collect();
 
-        Ok(PhpForkPool { master, write_ends, read_ends })
+        Ok(PhpForkPool { master, write_ends, read_ends, _class_map_tmp })
     }
 
     /// Write a `BatchPlan` to slot `i`. Can be called multiple times per slot

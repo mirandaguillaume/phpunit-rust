@@ -58,7 +58,7 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     let script = phpunit_rust::php_worker::find_fork_script()
         .expect("worker_fork.php not found");
 
-    let mut pool = PhpForkPool::spawn(&script, &autoload, None, &[], &[], &[], &[], 2)
+    let mut pool = PhpForkPool::spawn(&script, &autoload, None, &[], &[], &[], &[], 2, &std::collections::HashMap::new())
         .expect("PhpForkPool::spawn failed");
 
     pool.write_batch(0, &BatchPlan {

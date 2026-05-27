@@ -424,7 +424,7 @@ fn real_main() -> Result<ExitCode> {
     let mut pool = PhpForkPool::spawn(
         &fork_script, &autoload, bootstrap.as_deref(),
         &defines, &env_triples, &server_pairs, &ini_pairs,
-        worker_count,
+        worker_count, &class_file_index,
     )?;
 
     let stop_on = if cli.stop_on_defect {

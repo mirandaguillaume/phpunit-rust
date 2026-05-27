@@ -43,7 +43,21 @@ final class MethodPlanner
         foreach ($ordered as $methodName) {
             $methodRef = $ref->getMethod($methodName);
             $depends   = self::dependsOf($methodRef);
-            $datasets  = self::dataSetsFor($ref, $methodRef);
+            try {
+                $datasets = self::dataSetsFor($ref, $methodRef);
+            } catch (\Throwable $e) {
+                // Provider threw (e.g. a cross-class dependency not loaded in this
+                // worker slot). Emit a single error step so the method appears in
+                // the report instead of silently crashing the entire class.
+                $steps[] = [
+                    'method'         => $methodName,
+                    'dataset'        => null,
+                    'args'           => [],
+                    'depends'        => [],
+                    'provider_error' => $e->getMessage(),
+                ];
+                continue;
+            }
             if ($datasets === null) {
                 // Non-parameterized: one step. row_filter has no effect.
                 $steps[] = [

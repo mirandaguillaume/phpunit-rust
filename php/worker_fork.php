@@ -47,16 +47,20 @@ $serverJson      = $args['server']             ?? '[]';
 $iniJson         = $args['ini']                ?? '[]';
 $childStdinFdsStr  = $args['child-stdin-fds']  ?? '';
 $childStdoutFdsStr = $args['child-stdout-fds'] ?? '';
+$classMapFile      = $args['class-map-file']   ?? null;
 
 if ($autoload === null || $childStdinFdsStr === '' || $childStdoutFdsStr === '') {
     fwrite(STDERR, "worker_fork.php: missing --autoload, --child-stdin-fds, --child-stdout-fds\n");
     exit(1);
 }
 
-$defines        = json_decode($definesJson, true) ?? [];
-$envVars        = json_decode($envJson,     true) ?? [];
-$serverVars     = json_decode($serverJson,  true) ?? [];
-$iniVars        = json_decode($iniJson,     true) ?? [];
+$defines       = json_decode($definesJson, true) ?? [];
+$envVars       = json_decode($envJson,     true) ?? [];
+$serverVars    = json_decode($serverJson,  true) ?? [];
+$iniVars       = json_decode($iniJson,     true) ?? [];
+$classMapExtra = ($classMapFile !== null && is_file($classMapFile))
+    ? (json_decode(file_get_contents($classMapFile), true) ?? [])
+    : [];
 
 // Apply <ini> first so error_reporting / memory_limit etc. are in effect
 // before we run any user code in autoload/bootstrap.
@@ -98,6 +102,16 @@ if ($n !== count($childStdoutFds) || $n < 1) {
 ob_start();
 try {
     require_once $autoload;
+    // Register a secondary autoloader for test classes that Composer's
+    // classmap doesn't cover (e.g. test helpers whose providers call sibling
+    // test classes). The map is built from the runner's discovery index.
+    if (!empty($classMapExtra)) {
+        spl_autoload_register(static function (string $class) use ($classMapExtra): void {
+            if (isset($classMapExtra[$class]) && is_file($classMapExtra[$class])) {
+                require_once $classMapExtra[$class];
+            }
+        });
+    }
     foreach ($defines as $pair) {
         if (is_array($pair) && count($pair) === 2
             && is_string($pair[0]) && !defined($pair[0])) {

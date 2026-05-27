@@ -69,6 +69,20 @@ final class TestExecutor
             $userArgs = $step['args'];
             $depends = $step['depends'];
 
+            // Provider threw during planning — emit error and move on.
+            if (isset($step['provider_error'])) {
+                $outcomes[] = [
+                    'class'       => $class,
+                    'method'      => $method,
+                    'dataset'     => null,
+                    'status'      => 'error',
+                    'message'     => 'data provider threw: ' . $step['provider_error'],
+                    'trace'       => null,
+                    'duration_ms' => 0.0,
+                ];
+                continue;
+            }
+
             // setUpBeforeClass threw: every test in this batch errors with
             // the same message. Don't even reflect on the method — we may
             // not have loaded its dependencies. Emit and continue.
