@@ -10,6 +10,7 @@
 //! (for coverage tracing entry points).
 
 use anyhow::{anyhow, Context, Result};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Query, QueryCursor};
@@ -244,6 +245,27 @@ fn find_namespace(root: Node, bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// For files with multiple `namespace Foo { ... }` blocks (braced form), find
+/// the namespace that directly encloses the given class_declaration node.
+/// Returns Some(namespace) when the class sits inside a braced namespace body,
+/// None when it is at file level (the semicolon-form namespace applies instead).
+fn find_enclosing_namespace(class_node: Node, bytes: &[u8]) -> Option<String> {
+    let parent = class_node.parent()?;
+    // Braced namespace body is a declaration_list (or compound_statement in some
+    // grammar versions) that is itself a direct child of namespace_definition.
+    if !matches!(parent.kind(), "declaration_list" | "compound_statement") {
+        return None;
+    }
+    let ns_def = parent.parent()?;
+    if ns_def.kind() != "namespace_definition" {
+        return None;
+    }
+    ns_def
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok())
+        .map(String::from)
+}
+
 fn collect_parsed_classes(
     root: Node,
     bytes: &[u8],
@@ -287,12 +309,17 @@ fn collect_parsed_classes(
 
         let (Some(name), Some(body), Some(decl)) = (class_name, body_node, class_node) else { continue };
 
-        let fqcn = match namespace {
+        // For multi-namespace files (namespace Foo { ... } braced form), each
+        // class lives in the namespace of its own enclosing block, not the
+        // first namespace encountered in the file.
+        let class_ns: Option<String> = find_enclosing_namespace(decl, bytes)
+            .or_else(|| namespace.map(String::from));
+        let fqcn = match class_ns.as_deref() {
             Some(ns) => format!("{ns}\\{name}"),
             None => name.to_string(),
         };
-        let parent_fqcn = base_name.map(|b| resolve_class_reference(b, namespace, aliases));
-        let test_methods = collect_test_methods(body, bytes, namespace.as_deref(), &aliases);
+        let parent_fqcn = base_name.map(|b| resolve_class_reference(b, class_ns.as_deref(), aliases));
+        let test_methods = collect_test_methods(body, bytes, class_ns.as_deref(), &aliases);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
         // Class-level groups apply to every test method in the class.
@@ -762,43 +789,51 @@ pub fn discover_in_dirs(
         .filter_map(|p| p.canonicalize().ok())
         .collect();
 
-    // Pass 1: parse every *Test*.php file across all testsuite roots.
-    let mut parsed: Vec<ParsedClass> = Vec::new();
+    // Pass 1: collect matching paths, then parse in parallel.
+    let mut root_files: Vec<PathBuf> = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("php") {
-                continue;
-            }
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.contains("Test") {
-                continue;
-            }
-            // Apply excludes (prefix match on canonicalized path).
+            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
+            if !p.file_name().and_then(|n| n.to_str()).unwrap_or("").contains("Test") { continue; }
             if let Ok(canon) = p.canonicalize() {
-                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) {
-                    continue;
-                }
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) { continue; }
             }
-            parsed.extend(parse_file_classes(p)?);
+            root_files.push(p.to_path_buf());
         }
     }
+    let mut parsed: Vec<ParsedClass> = root_files
+        .par_iter()
+        .map(|p| parse_file_classes(p))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let emit_count = parsed.len(); // classes from roots — those we'll emit TestCases for
 
     // Supplement: parse *Test*.php files from autoload-dev dirs to enrich the
     // class graph with abstract base classes that live outside the testsuite
     // directories (e.g. Carbon's tests/AbstractTestCase.php).
     let parsed_paths: HashSet<PathBuf> = parsed.iter().map(|c| c.file.clone()).collect();
+    let mut supp_files: Vec<PathBuf> = Vec::new();
     for dir in graph_supplement_dirs {
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.contains("Test") { continue; }
-            if parsed_paths.contains(p) { continue; }
-            parsed.extend(parse_file_classes(p)?);
+            if !p.file_name().and_then(|n| n.to_str()).unwrap_or("").contains("Test") { continue; }
+            if !parsed_paths.contains(p) {
+                supp_files.push(p.to_path_buf());
+            }
         }
     }
+    let supp: Vec<ParsedClass> = supp_files
+        .par_iter()
+        .map(|p| parse_file_classes(p))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    parsed.extend(supp);
 
     // Pass 2: build the inheritance graph (FQCN -> parent FQCN or None).
     let graph: ClassGraph = parsed
@@ -817,19 +852,23 @@ pub fn discover_in_dirs(
 ///
 /// Only the first file seen for each FQCN is kept (stable, depth-first).
 pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
-    let mut index: HashMap<String, PathBuf> = HashMap::new();
-    for dir in dirs {
-        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("php") {
-                continue;
-            }
-            if let Ok(classes) = parse_file_classes(p) {
-                for c in classes {
-                    index.entry(c.fqcn).or_insert(c.file);
-                }
-            }
-        }
+    let files: Vec<PathBuf> = dirs.iter()
+        .flat_map(|dir| WalkDir::new(dir).into_iter().filter_map(|e| e.ok()))
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("php"))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let pairs: Vec<(String, PathBuf)> = files
+        .par_iter()
+        .flat_map(|p| parse_file_classes(p).unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.fqcn, c.file))
+            .collect::<Vec<_>>())
+        .collect();
+
+    let mut index = HashMap::with_capacity(pairs.len());
+    for (fqcn, file) in pairs {
+        index.entry(fqcn).or_insert(file);
     }
     index
 }
