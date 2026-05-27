@@ -66,10 +66,11 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
         bootstrap: None,
         defines: vec![],
         classes: vec![BatchClass {
-            file:       project.join("tests/SampleTest.php"),
-            class:      "SampleTest".to_string(),
-            methods:    vec![],
-            row_filter: None,
+            file:           project.join("tests/SampleTest.php"),
+            class:          "SampleTest".to_string(),
+            methods:        vec![],
+            row_filter:     None,
+            required_files: vec![],
         }],
     }).expect("write_batch slot 0");
 

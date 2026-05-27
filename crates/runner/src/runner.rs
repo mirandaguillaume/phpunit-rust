@@ -298,10 +298,11 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
             let chunks = rows.min(MAX_ROW_CHUNKS);
             for chunk_index in 0..chunks {
                 let bc = BatchClass {
-                    file:       g.file.clone(),
-                    class:      g.class.clone(),
-                    methods:    vec![hm.name.clone()],
-                    row_filter: Some(RowFilter { chunk_index, total_chunks: chunks }),
+                    file:           g.file.clone(),
+                    class:          g.class.clone(),
+                    methods:        vec![hm.name.clone()],
+                    row_filter:     Some(RowFilter { chunk_index, total_chunks: chunks }),
+                    required_files: vec![],
                 };
                 queue.push_back(mk_plan(vec![bc]));
             }
@@ -314,10 +315,11 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
         );
         let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
         let bc = BatchClass {
-            file:       g.file,
-            class:      g.class,
-            methods:    other_names,
-            row_filter: None,
+            file:           g.file,
+            class:          g.class,
+            methods:        other_names,
+            row_filter:     None,
+            required_files: vec![],
         };
         if other_cost >= HEAVY_COST_THRESHOLD {
             queue.push_back(mk_plan(vec![bc]));

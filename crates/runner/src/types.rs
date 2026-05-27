@@ -50,6 +50,11 @@ pub struct BatchClass {
     /// becomes N BatchClass entries with different chunk_index values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row_filter: Option<RowFilter>,
+    /// Extra PHP files to `require_once` before running this class.
+    /// Used for `#[DataProviderExternal]` provider classes not in the
+    /// PSR-4 autoloader.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub required_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,10 +115,11 @@ mod batch_plan_tests {
             bootstrap: Some(PathBuf::from("/proj/bootstrap.php")),
             defines: vec![["FOO".to_string(), "bar".to_string()]],
             classes: vec![BatchClass {
-                file:       PathBuf::from("/proj/tests/FooTest.php"),
-                class:      "App\\FooTest".to_string(),
-                methods:    vec!["testA".to_string()],
-                row_filter: None,
+                file:           PathBuf::from("/proj/tests/FooTest.php"),
+                class:          "App\\FooTest".to_string(),
+                methods:        vec!["testA".to_string()],
+                row_filter:     None,
+                required_files: vec![],
             }],
         };
         let v = serde_json::to_value(&plan).unwrap();
@@ -122,6 +128,32 @@ mod batch_plan_tests {
         assert_eq!(v["defines"][0][0], "FOO");
         assert_eq!(v["classes"][0]["class"], "App\\FooTest");
         assert_eq!(v["classes"][0]["methods"][0], "testA");
+    }
+
+    #[test]
+    fn batch_class_required_files_omitted_when_empty() {
+        let bc = BatchClass {
+            file:           PathBuf::from("/t/FooTest.php"),
+            class:          "FooTest".to_string(),
+            methods:        vec![],
+            row_filter:     None,
+            required_files: vec![],
+        };
+        let v = serde_json::to_value(&bc).unwrap();
+        assert!(v.get("required_files").is_none());
+    }
+
+    #[test]
+    fn batch_class_required_files_present_when_non_empty() {
+        let bc = BatchClass {
+            file:           PathBuf::from("/t/FooTest.php"),
+            class:          "FooTest".to_string(),
+            methods:        vec![],
+            row_filter:     None,
+            required_files: vec![PathBuf::from("/t/Provider.php")],
+        };
+        let v = serde_json::to_value(&bc).unwrap();
+        assert_eq!(v["required_files"][0], "/t/Provider.php");
     }
 
     #[test]
