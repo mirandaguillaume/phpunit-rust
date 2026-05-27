@@ -164,7 +164,7 @@ $childPids = [];
 pcntl_async_signals(true);
 $signalHandler = function (int $sig) use (&$childPids): void {
     foreach ($childPids as $pid) {
-        @posix_kill($pid, SIGKILL);
+        @posix_kill(-$pid, SIGKILL);  // negative PID = kill entire process group
     }
     exit(128 + $sig);
 };
@@ -182,9 +182,13 @@ for ($i = 0; $i < $n; $i++) {
         exit(1);
     }
     if ($pid === 0) {
-        // Child process: restore default signal disposition so SIGTERM/SIGINT
-        // terminate this worker immediately instead of running the master's
-        // handler with a stale (pre-fork) $childPids snapshot.
+        // Become our own process group leader so that posix_kill(-pgid) from
+        // the master's signal handler reaches every subprocess we spawn (via
+        // proc_open, exec, shell_exec, etc.) — not just us.
+        posix_setpgid(0, 0);
+        // Restore default signal disposition so SIGTERM/SIGINT terminate this
+        // worker immediately instead of running the master's handler with a
+        // stale (pre-fork) $childPids snapshot.
         pcntl_signal(SIGTERM, SIG_DFL);
         pcntl_signal(SIGINT,  SIG_DFL);
         pcntl_signal(SIGHUP,  SIG_DFL);
@@ -200,6 +204,9 @@ for ($i = 0; $i < $n; $i++) {
         runChild($childStdinStreams[$i], $childStdoutStreams[$i]);
         exit(0);
     }
+    // Set from the parent side too: avoids the race where the child hasn't
+    // called posix_setpgid(0,0) yet when the master receives a signal.
+    @posix_setpgid($pid, $pid);
     $childPids[] = $pid;
 }
 
