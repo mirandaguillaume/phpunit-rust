@@ -452,6 +452,10 @@ fn parse_external_provider_attr_text(
         if before_ok {
             let inside = &text[inside_start..];
             if let Some(class_end) = inside.find("::class") {
+                // `::class` is only a valid PHP expression as a standalone keyword —
+                // any continuation (e.g. `::classMap`) would cause the comma-quote scan
+                // below to find no quote and produce `method_name = None`, silently
+                // discarding the entry rather than emitting a false match.
                 let raw_class = inside[..class_end].trim();
                 let fqcn = resolve_class_reference(raw_class, namespace, aliases);
                 let after_class = &inside[class_end + "::class".len()..];
@@ -469,8 +473,10 @@ fn parse_external_provider_attr_text(
                     out.push((fqcn, m));
                 }
             }
+            search = inside_start;
+        } else {
+            search = abs + 1;
         }
-        search = inside_start;
     }
     out
 }
@@ -1170,6 +1176,53 @@ class FooTest extends TestCase {
         let (_dir, path) = write_tmp(src);
         let cases = discover_in_file(&path).unwrap();
         assert_eq!(cases.len(), 1);
+        assert_eq!(
+            cases[0].external_providers,
+            vec![("App\\Data\\Provider".to_string(), "rows".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_external_provider_attr_text_absolute_fqcn() {
+        // #[\DataProviderExternal(...)] — leading backslash (absolute FQCN attribute form)
+        let aliases = HashMap::new();
+        let text = "#[\\DataProviderExternal(Foo\\Bar::class, 'myMethod')]";
+        let got = parse_external_provider_attr_text(text, None, &aliases);
+        assert_eq!(got, vec![("Foo\\Bar".to_string(), "myMethod".to_string())]);
+    }
+
+    #[test]
+    fn parse_external_provider_attr_text_multiple_providers() {
+        let aliases = HashMap::new();
+        let text = "#[DataProviderExternal(ClassA::class, 'p1'), DataProviderExternal(ClassB::class, 'p2')]";
+        let mut got = parse_external_provider_attr_text(text, None, &aliases);
+        got.sort();
+        assert_eq!(got, vec![
+            ("ClassA".to_string(), "p1".to_string()),
+            ("ClassB".to_string(), "p2".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn discovers_external_provider_inherited_method() {
+        // Method with DataProviderExternal lives on abstract parent; discovered via concrete subclass.
+        let src = r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+use App\Data\Provider as DataProv;
+abstract class BaseTest extends TestCase {
+    #[DataProviderExternal(DataProv::class, 'rows')]
+    public function testWithExternal(int $x): void {}
+}
+class ConcreteTest extends BaseTest {}
+"#;
+        // write_tmp creates a single file; discover_in_file handles same-file inheritance.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ConcreteTest.php");
+        std::fs::write(&path, src).unwrap();
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].class, "App\\Tests\\ConcreteTest");
         assert_eq!(
             cases[0].external_providers,
             vec![("App\\Data\\Provider".to_string(), "rows".to_string())]
