@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PhpunitRust;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\DataProviderExternal;
 use PHPUnit\Framework\Attributes\Depends;
 use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\Attributes\TestWithJson;
@@ -142,6 +143,19 @@ final class MethodPlanner
             }
         }
 
+        // PHPUnit 10+ #[DataProviderExternal] — provider in a different class,
+        // already require_once'd by the worker via required_files.
+        $externalRows = [];
+        foreach ($m->getAttributes(DataProviderExternal::class) as $attr) {
+            $inst     = $attr->newInstance();
+            $extClass = $inst->className();
+            $extMeth  = $inst->methodName();
+            foreach ($extClass::$extMeth() as $key => $row) {
+                if (is_int($key)) { $externalRows[] = $row; }
+                else              { $externalRows[$key] = $row; }
+            }
+        }
+
         // PHPUnit 10+ also supports inline data via #[TestWith([...])] and
         // #[TestWithJson('{"key": "val"}')]. Both are repeatable, each
         // instance contributes ONE row. Carbon makes heavy use of these.
@@ -186,7 +200,7 @@ final class MethodPlanner
             }
         }
 
-        if (empty($providerNames) && empty($testWithRows)) {
+        if (empty($providerNames) && empty($testWithRows) && empty($externalRows)) {
             return null;
         }
 
@@ -213,6 +227,10 @@ final class MethodPlanner
         // indices match (provider rows numbered 0..N-1, TestWith rows N+).
         foreach ($testWithRows as $row) {
             $rows[] = $row;
+        }
+        foreach ($externalRows as $key => $row) {
+            if (is_int($key)) { $rows[] = $row; }
+            else              { $rows[$key] = $row; }
         }
         return $rows;
     }
