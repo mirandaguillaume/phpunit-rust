@@ -801,6 +801,30 @@ pub fn discover_in_dirs(
     emit_test_cases(&parsed[..emit_count], &graph)
 }
 
+/// Scan `dirs` for ALL `.php` files (not just `*Test*.php`) and return a
+/// map of FQCN → file path. Used by the runner to locate files for
+/// `#[DataProviderExternal]` provider classes that are not in the PSR-4
+/// autoloader.
+///
+/// Only the first file seen for each FQCN is kept (stable, depth-first).
+pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
+    for dir in dirs {
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
+            if let Ok(classes) = parse_file_classes(p) {
+                for c in classes {
+                    index.entry(c.fqcn).or_insert(c.file);
+                }
+            }
+        }
+    }
+    index
+}
+
 /// Returns true if `start_fqcn` is (transitively) a subclass of PHPUnit's
 /// `TestCase`.
 ///
@@ -1227,5 +1251,20 @@ class ConcreteTest extends BaseTest {}
             cases[0].external_providers,
             vec![("App\\Data\\Provider".to_string(), "rows".to_string())]
         );
+    }
+
+    #[test]
+    fn discover_class_file_index_finds_classes() {
+        let src = r#"<?php
+namespace App\Data;
+class Provider {
+    public static function rows(): array { return []; }
+}
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Provider.php");
+        std::fs::write(&path, src).unwrap();
+        let idx = discover_class_file_index(&[dir.path().to_path_buf()]);
+        assert_eq!(idx.get("App\\Data\\Provider"), Some(&path));
     }
 }
