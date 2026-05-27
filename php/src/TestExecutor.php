@@ -395,6 +395,32 @@ final class TestExecutor
                 case 'PHPUnit\\Framework\\Attributes\\RequiresPhp':
                     $inst = $attr->newInstance();
                     $req = $inst->versionRequirement();
+                    // Semver caret: ^X.Y  →  >=X.Y.0 <(X+1).0.0
+                    if (preg_match('/^\^(\d+)\.(\d+)(?:\.(\d+))?$/', $req, $cm)) {
+                        $major = (int) $cm[1];
+                        $minor = (int) $cm[2];
+                        $patch = isset($cm[3]) ? (int) $cm[3] : 0;
+                        $low  = "{$major}.{$minor}.{$patch}";
+                        $high = ($major + 1) . '.0.0';
+                        if (!version_compare(PHP_VERSION, $low, '>=')
+                            || !version_compare(PHP_VERSION, $high, '<')) {
+                            return "PHP ^{$major}.{$minor} required (have " . PHP_VERSION . ')';
+                        }
+                        break;
+                    }
+                    // Semver tilde: ~X.Y  →  >=X.Y.0 <X.(Y+1).0
+                    if (preg_match('/^~(\d+)\.(\d+)(?:\.(\d+))?$/', $req, $tm)) {
+                        $major = (int) $tm[1];
+                        $minor = (int) $tm[2];
+                        $patch = isset($tm[3]) ? (int) $tm[3] : 0;
+                        $low  = "{$major}.{$minor}.{$patch}";
+                        $high = "{$major}." . ($minor + 1) . '.0';
+                        if (!version_compare(PHP_VERSION, $low, '>=')
+                            || !version_compare(PHP_VERSION, $high, '<')) {
+                            return "PHP ~{$major}.{$minor} required (have " . PHP_VERSION . ')';
+                        }
+                        break;
+                    }
                     if (!preg_match('/^(<=|>=|<>|!=|==|=|<|>)?\s*(.+)$/', $req, $vm)) break;
                     $op = ($vm[1] !== '' ? $vm[1] : '>=');
                     if ($op === '=') $op = '==';
