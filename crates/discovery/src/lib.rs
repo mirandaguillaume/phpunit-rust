@@ -94,6 +94,13 @@ pub struct TestClass {
 
 /// Group a flat list of TestCases by class. Preserves discovery order
 /// and per-method data-provider attribution.
+///
+/// Groups by `(file, class)` rather than `class` alone so that the same
+/// FQCN defined in multiple files (e.g. PHPUnit end-to-end fixture
+/// sub-directories each with their own phpunit.xml context) produces
+/// separate batches with the correct file and methods, rather than one
+/// merged batch where the loaded class definition and the dispatched
+/// method names disagree.
 pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     let mut groups: Vec<TestClass> = Vec::new();
     for case in cases {
@@ -103,7 +110,9 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             groups:             case.groups,
             external_providers: case.external_providers,
         };
-        if let Some(existing) = groups.iter_mut().find(|g| g.class == case.class) {
+        if let Some(existing) = groups.iter_mut()
+            .find(|g| g.class == case.class && g.file == case.file)
+        {
             existing.methods.push(gm);
         } else {
             groups.push(TestClass {
@@ -1158,6 +1167,25 @@ final class ConcreteTest extends AbstractBaseTest {
         assert_eq!(grouped[1].class, "B");
         let names_b: Vec<&str> = grouped[1].methods.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names_b, vec!["testThree"]);
+    }
+
+    #[test]
+    fn group_by_class_keeps_same_fqcn_from_different_files_separate() {
+        // PHPUnit's own end-to-end fixtures declare the same FQCN in multiple
+        // sub-directories (each with its own phpunit.xml). grouping by (file,
+        // class) prevents method names from one file bleeding into the batch
+        // for another file, which previously caused ReflectionException crashes
+        // when --workers 1 serialised all batches through one PHP process.
+        let cases = vec![
+            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![] },
+            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
+            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
+        ];
+        let grouped = group_by_class(cases);
+        assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");
+        assert_eq!(grouped[0].methods[0].name, "testDeprecation");
+        assert_eq!(grouped[1].methods[0].name, "testSomething");
+        assert_eq!(grouped[2].methods[0].name, "testSomething");
     }
 
     #[test]

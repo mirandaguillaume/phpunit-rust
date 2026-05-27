@@ -30,6 +30,12 @@ final class MethodPlanner
         $ref = new \ReflectionClass($class);
         $candidate = empty($methods) ? self::allTestMethods($ref) : $methods;
 
+        // Filter to methods that actually exist on the loaded class.
+        // Defends against FQCN-conflict batches in long-lived workers where
+        // the same FQCN is defined in multiple files but only the first file's
+        // definition was loaded (PHP cannot redefine a class in one process).
+        $candidate = array_values(array_filter($candidate, [$ref, 'hasMethod']));
+
         // Resolve dependencies and topologically sort.
         $ordered = self::topoSort($ref, $candidate);
 
@@ -253,6 +259,9 @@ final class MethodPlanner
             if (isset($visited[$m])) return;
             $visited[$m] = true;
             if (!isset($set[$m])) return;
+            // Defensive guard: a @depends target may reference a method
+            // absent on the loaded class definition (FQCN conflict).
+            if (!$ref->hasMethod($m)) return;
             foreach (self::dependsOf($ref->getMethod($m)) as $dep) {
                 $visit($dep);
             }

@@ -205,6 +205,31 @@ pub fn run(
             }
             WorkerEvent::Eof(_slot) => {
                 live_readers -= 1;
+                // If this was the last live reader and there are still
+                // batches in the queue, the worker(s) crashed before
+                // draining them.  Emit error outcomes so every test
+                // appears in the report rather than being silently lost.
+                if live_readers == 0 && !queue.is_empty() {
+                    while let Some(plan) = queue.pop_front() {
+                        for bc in &plan.classes {
+                            for method in &bc.methods {
+                                let o = TestOutcome {
+                                    class:       bc.class.clone(),
+                                    method:      method.clone(),
+                                    dataset:     None,
+                                    status:      TestStatus::Error,
+                                    message:     Some(
+                                        "worker process crashed before reaching this test".into()
+                                    ),
+                                    trace:       None,
+                                    duration_ms: 0.0,
+                                };
+                                on_progress(&o);
+                                outcomes.push(o);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

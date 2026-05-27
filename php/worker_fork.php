@@ -291,7 +291,14 @@ function runChild($stdinStream, $stdoutStream): void
 
             ob_start();
             try {
-                require_once $file;
+                // Guard against E_COMPILE_ERROR "Cannot redeclare class": when
+                // multiple fixture files share the same FQCN (e.g. PHPUnit's own
+                // end-to-end fixtures), loading the second file in the same
+                // long-lived worker process would be fatal. Skip require_once
+                // when the class is already defined from a previous batch.
+                if (!class_exists($class, false)) {
+                    require_once $file;
+                }
                 foreach ($entry['required_files'] ?? [] as $rf) {
                     if (is_string($rf) && is_file($rf)) {
                         require_once $rf;
