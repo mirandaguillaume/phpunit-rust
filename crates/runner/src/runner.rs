@@ -391,6 +391,30 @@ fn build_queue(
         }
 
         if other_methods.is_empty() { continue; }
+
+        // For method_dispatch_safe classes: each method gets its own BatchPlan
+        // so they can run on different workers in parallel.
+        if g.method_dispatch_safe {
+            // Flush any accumulated bin first to preserve LPT order.
+            if !bin_buf.is_empty() {
+                queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                bin_methods = 0;
+            }
+            for m in other_methods {
+                let method_name = m.name.clone();
+                let req_files = required_files_for(&[method_name.clone()], &g.methods);
+                let bc = BatchClass {
+                    file:           g.file.clone(),
+                    class:          g.class.clone(),
+                    methods:        vec![method_name],
+                    row_filter:     None,
+                    required_files: req_files,
+                };
+                queue.push_back(mk_plan(vec![bc]));
+            }
+            continue;
+        }
+
         // Recompute other_cost from real (non-tautological) methods only.
         let real_cost: u32 = heavy_methods.iter().chain(other_methods.iter())
             .map(|m| method_weight(&g.class, m, row_counts))
@@ -460,13 +484,14 @@ mod tests {
 
     fn make_case(class: &str, method: &str) -> TestCase {
         TestCase {
-            file:               PathBuf::from("/f.php"),
-            class:              class.to_string(),
-            method:             method.to_string(),
-            data_provider:      None,
-            groups:             vec![],
-            external_providers: vec![],
-            is_tautological:    false,
+            file:                 PathBuf::from("/f.php"),
+            class:                class.to_string(),
+            method:               method.to_string(),
+            data_provider:        None,
+            groups:               vec![],
+            external_providers:   vec![],
+            is_tautological:      false,
+            method_dispatch_safe: false,
         }
     }
 
@@ -506,13 +531,14 @@ mod tests {
 
     fn make_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
         TestCase {
-            file:               PathBuf::from("/f.php"),
-            class:              class.to_string(),
-            method:             method.to_string(),
-            data_provider:      Some(dp.to_string()),
-            groups:             vec![],
-            external_providers: vec![],
-            is_tautological:    false,
+            file:                 PathBuf::from("/f.php"),
+            class:                class.to_string(),
+            method:               method.to_string(),
+            data_provider:        Some(dp.to_string()),
+            groups:               vec![],
+            external_providers:   vec![],
+            is_tautological:      false,
+            method_dispatch_safe: false,
         }
     }
 
@@ -588,6 +614,96 @@ mod tests {
         for i in 1..6 {
             assert_eq!(q[i].classes.len(), 1, "each light class is its own plan");
         }
+    }
+
+    fn make_safe_case(class: &str, method: &str) -> TestCase {
+        TestCase {
+            file:                 PathBuf::from("/f.php"),
+            class:                class.to_string(),
+            method:               method.to_string(),
+            data_provider:        None,
+            groups:               vec![],
+            external_providers:   vec![],
+            is_tautological:      false,
+            method_dispatch_safe: true,
+        }
+    }
+
+    #[test]
+    fn method_dispatch_safe_class_gets_per_method_batches() {
+        // A class with 3 methods and method_dispatch_safe=true must produce
+        // exactly 3 BatchPlans, each with a single-method BatchClass.
+        let cases = vec![
+            make_safe_case("SafeClass", "testAlpha"),
+            make_safe_case("SafeClass", "testBeta"),
+            make_safe_case("SafeClass", "testGamma"),
+        ];
+        let cfg = RunConfig {
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
+            n_workers:        4,
+        };
+        let row_counts = RowCounts::new();
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
+
+        assert_eq!(q.len(), 3, "3 methods → 3 separate BatchPlans");
+        for plan in &q {
+            assert_eq!(plan.classes.len(), 1, "each plan wraps exactly one class entry");
+            assert_eq!(plan.classes[0].methods.len(), 1, "each BatchClass has exactly one method");
+            assert_eq!(plan.classes[0].class, "SafeClass");
+        }
+        let mut dispatched_methods: Vec<&str> = q.iter()
+            .map(|p| p.classes[0].methods[0].as_str())
+            .collect();
+        dispatched_methods.sort_unstable();
+        assert_eq!(dispatched_methods, vec!["testAlpha", "testBeta", "testGamma"]);
+    }
+
+    #[test]
+    fn stateful_class_keeps_class_level_batching() {
+        // A class with method_dispatch_safe=false must NOT be split into
+        // per-method plans — all methods should land in the same BatchClass.
+        let cases = vec![
+            make_case("StatefulClass", "testOne"),
+            make_case("StatefulClass", "testTwo"),
+            make_case("StatefulClass", "testThree"),
+        ];
+        let cfg = RunConfig {
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
+            n_workers:        4,
+        };
+        let row_counts = RowCounts::new();
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
+
+        // With target=1 (3 methods / (4 workers × 4 oversaturation) → max(1,0) = 1),
+        // each single-class group gets its own solo plan, but still as ONE BatchClass
+        // with all methods together.
+        let all_methods: Vec<&str> = q.iter()
+            .flat_map(|p| p.classes.iter())
+            .filter(|bc| bc.class == "StatefulClass")
+            .flat_map(|bc| bc.methods.iter().map(String::as_str))
+            .collect();
+        assert_eq!(all_methods.len(), 3, "all 3 methods must appear exactly once");
+
+        // Verify they are NOT split across 3 separate single-method plans:
+        // at least one BatchClass must contain more than 1 method, OR
+        // we verify there is exactly 1 plan for this class (class-level batch).
+        let class_plans: Vec<_> = q.iter()
+            .filter(|p| p.classes.iter().any(|bc| bc.class == "StatefulClass"))
+            .collect();
+        assert_eq!(class_plans.len(), 1, "stateful class must be dispatched as one batch");
+        assert_eq!(class_plans[0].classes[0].methods.len(), 3);
     }
 
 }
