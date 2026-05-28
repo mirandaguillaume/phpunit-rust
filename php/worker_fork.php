@@ -418,6 +418,39 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
     // (default "512M"); pass "-1" to restore unlimited behaviour.
     @ini_set('memory_limit', $memoryLimit);
 
+    // Per-worker isolated temp directory. PHPUnit's @runInSeparateProcess
+    // template builder calls tempnam(sys_get_temp_dir(), ...) and proc_open's
+    // a sub-PHP against the resulting file; with several workers racing on
+    // the same /tmp, two parallel separateProcess tests can stomp on each
+    // other's template path, corrupt the sub-process's stdin, and hang the
+    // worker waiting for output that will never come. Giving each child a
+    // fresh TMPDIR/TMP/TEMP off its own PID dodges the collision entirely.
+    // We also point sys_temp_dir at it (some PHP code reads the ini value
+    // directly rather than the env var). The dir is best-effort cleaned by
+    // a shutdown hook; tmpfs takes care of the rest when the container ends.
+    $childPid = getmypid();
+    $childTmp = sys_get_temp_dir() . "/phpunit-rust-worker-" . $childPid;
+    if (@mkdir($childTmp, 0700, true) || is_dir($childTmp)) {
+        putenv("TMPDIR={$childTmp}");
+        putenv("TMP={$childTmp}");
+        putenv("TEMP={$childTmp}");
+        $_ENV['TMPDIR']    = $childTmp;
+        $_SERVER['TMPDIR'] = $childTmp;
+        @ini_set('sys_temp_dir', $childTmp);
+        register_shutdown_function(static function () use ($childTmp): void {
+            // Recursive rmdir — best effort, ignore failures.
+            $rmRec = static function (string $p) use (&$rmRec): void {
+                foreach (@scandir($p) ?: [] as $entry) {
+                    if ($entry === '.' || $entry === '..') continue;
+                    $sub = $p . '/' . $entry;
+                    is_dir($sub) ? $rmRec($sub) : @unlink($sub);
+                }
+                @rmdir($p);
+            };
+            $rmRec($childTmp);
+        });
+    }
+
     // Current-batch state, captured by reference in the shutdown handler.
     // We reset both to empty after each clean batch so the handler doesn't
     // double-emit; it only fires for uncatchable fatals (E_COMPILE_ERROR etc.)
