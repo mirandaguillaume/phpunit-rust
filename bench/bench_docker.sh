@@ -66,9 +66,19 @@ parse_tests_file() {
 # to the PHP fork children. Without it, killing `docker run` from the
 # host leaves orphan PHP workers spinning at 100% CPU inside the
 # container (verified the hard way after a 5-hour ghost run).
+#
+# `--tmpfs /tmp` puts the test scratch space in RAM rather than on the
+# container's overlay filesystem. Test suites that write fixture data
+# per test (phpstan ~200 KB/test × 12 k tests, doctrine's database
+# fixtures, rector's before/after pairs) otherwise dump multi-GB of
+# disposable scratch through the storage driver — wasted disk wear,
+# wasted IO bandwidth, and nothing meaningful written back. The host's
+# /tmp is already tmpfs on modern Linux so the local bench wouldn't
+# notice; inside Docker the overlay default makes it painful.
 DOCKER_FLAGS=(
     --rm
     --init
+    --tmpfs "/tmp:rw,exec,nosuid,size=${TMPFS_SIZE:-4g}"
     -v "$PROJ_DIR":/proj
     -v "$BINARY":/opt/phpunit-rust/bin/phpunit-rust:ro
     -v "$PHP_SCRIPTS":/opt/php:ro

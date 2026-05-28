@@ -1,0 +1,27 @@
+# PHP 8.3 image used to bench phpunit-rust against OSS suites that require
+# PHP >= 8.3 (rector, current phpstan-src, current monolog).
+#
+# The official php:N-cli images don't compile pcntl, and they don't enable
+# opcache CLI — both are mandatory for our fork pool. We also add /usr/bin/time
+# for the bench harness to capture wall + RSS + page faults + ctx switches.
+#
+# Build: docker build -f bench/Dockerfile.php83 -t phpunit-rust-bench:php83 .
+# Use:   bench/bench_docker.sh <project>
+FROM php:8.3-cli
+
+# pcntl: master fork-server uses pcntl_fork / pcntl_signal.
+# opcache: pre-warmed by the master so children inherit compiled bytecode via COW.
+RUN docker-php-ext-install pcntl opcache \
+    && docker-php-ext-enable opcache
+
+# Composer for installing project deps inside the container.
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+# git + unzip — composer source/dist installs.
+# time — GNU time for the bench harness (%M, %F, %R, %w, %c, %I, %O).
+RUN apt-get update && apt-get install -y --no-install-recommends git unzip time \
+    && rm -rf /var/lib/apt/lists/*
+
+# Opcache must be on for CLI invocations; the master's pre-warm path silently
+# no-ops otherwise and we lose the COW benefit on every worker's first batch.
+RUN echo "opcache.enable_cli=1" >> /usr/local/etc/php/conf.d/opcache-cli.ini

@@ -24,6 +24,7 @@ fi
 echo "=== PHP $PHP_IMAGE | $PROJECT ==="
 
 docker run --rm \
+    --tmpfs "/tmp:rw,exec,nosuid,size=${TMPFS_SIZE:-4g}" \
     -v "${BIN}:/phpunit-rust/target/release/phpunit-rust:ro" \
     -v "${PHP_SCRIPTS}:/phpunit-rust/php:ro" \
     -v "${PROJECT}:/app" \

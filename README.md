@@ -281,6 +281,69 @@ and the bind-mount of our release binary + PHP scripts.
 (More Docker projects pending; brick-math is the heavyweight reference
 point — 13 k tests across 6 classes, almost entirely CPU-bound arithmetic.)
 
+#### Docker (PHP 8.3, defaults)
+
+Measured single-run on the same Linux host using `bench/Dockerfile.php83`
+with `--tmpfs /tmp` + `--worker-memory-limit 4G`, 8 workers, K=20 recycling.
+Wall and RSS captured by `/usr/bin/time` inside the container.
+
+| Project (tests) | vanilla wall | rust wall | speedup | vanilla RSS | rust RSS |
+|---|---:|---:|---:|---:|---:|
+| monolog (1162) | 4.28 s | **1.38 s** | **3.10×** | 60 MB | **35 MB** |
+| rector (5207) | 19.63 s | **4.00 s** | **4.91×** | 676 MB | **157 MB** |
+| phpstan-src (12397) | ≈ 97 s ¹ | **22.92 s** | **≈ 4.24×** | 1.83 GB ¹ | **313 MB** |
+
+¹ phpstan-src needs `php -d memory_limit=2G` on vanilla — its tests
+allocate the analyzer in-memory per case. Default 128 MB makes vanilla
+crash within 3 s.
+
+Rector + phpstan exercise three of the runner's bug-class repairs at
+once: per-class state isolation (stream wrappers, error handlers),
+in-flight batch recovery when a child fatal kills a worker mid-run,
+and skipping opcache pre-warm for the fixture-style files those
+suites pack into the test roots.
+
+#### Running inside Docker or CI
+
+Two flags matter when running the runner inside a container:
+
+- `--tmpfs /tmp:rw,exec,nosuid,size=4g` — analyzer-style suites (phpstan,
+  psalm, rector) write multi-GB of disposable scratch under `/tmp` per
+  test. With the container's default overlay `/tmp` these writes hit the
+  storage driver — wasted IO bandwidth and disk wear. tmpfs keeps them
+  in RAM. Measured on phpstan-src (12 k tests): 1.83 GB → 11 MB filesystem
+  writes, wall unchanged. The host's `/tmp` is already tmpfs on modern
+  Linux, so this only matters in containers.
+
+- `--init` (or `tini`) — without it, Ctrl-C on `docker run` orphans the
+  PHP fork children; the daemon never signals the container's main
+  process, and the workers spin until the OOM killer notices. Both
+  bundled wrappers (`bench/bench_docker.sh` and
+  `scripts/docker-test-bake.sh`) set both flags automatically; pass them
+  yourself when invoking phpunit-rust directly.
+
+Memory-heavy suites (phpstan-src needs ≥ 2 GB resident, rector ~700 MB)
+need `--worker-memory-limit 4G` to keep the fork children from being
+killed by their own self-imposed cap. The master process always runs
+with `memory_limit=-1` because it pre-warms opcache for every test
+file before forking.
+
+#### Environment variables
+
+Three opt-in knobs surface from the PHP master, useful for debugging
+and A/B benchmarking:
+
+- `PHPUNIT_RUST_TIMING=1` — log master phase timings to stderr
+  (autoload, bootstrap, opcache pre-warm, fork) as `[TIMING]` lines.
+- `PHPUNIT_RUST_OPCACHE_THRESHOLD=N` — override the default
+  50-test-file threshold for pre-warming opcache. Pass `99999` to
+  disable pre-warm entirely (useful when investigating master crashes
+  on very large suites).
+- `PHPUNIT_RUST_NO_ISOLATION=1` — disable the per-batch fresh-fork
+  applied to stateful test classes (those calling
+  `stream_wrapper_register`, `set_error_handler`, …). Costs ~14 % on
+  state-sensitive suites but exposes their pollution for diagnosis.
+
 ## Benchmarking
 
 ```bash
