@@ -448,6 +448,9 @@ fn setUp_is_stateless(class_body: Node, src: &[u8]) -> bool {
                     };
                     if !is_safe_setup_expr(inner, src) { return false; }
                 }
+                "if_statement" => {
+                    if !is_safe_guard_if(stmt, src) { return false; }
+                }
                 _ => return false,
             }
         }
@@ -466,6 +469,8 @@ fn is_safe_setup_expr(expr: Node, src: &[u8]) -> bool {
             .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
         return scope == "parent" && method == "setUp";
     }
+    // $this->markTestSkipped(...) / $this->markTestIncomplete(...) standalone
+    if is_skip_call(expr, src) { return true; }
     // $this->x = <safe_rhs>
     if expr.kind() == "assignment_expression" {
         let lhs = match expr.child_by_field_name("left") {
@@ -520,8 +525,75 @@ fn is_safe_rhs(node: Node, src: &[u8]) -> bool {
         "array_element_initializer" => {
             node.named_child(0).map(|n| is_safe_rhs(n, src)).unwrap_or(true)
         }
+        // $this->createMock(...) / $this->getMockBuilder(...)->... chains
+        "member_call_expression" => is_mock_chain(node, src),
         _ => false,
     }
+}
+
+/// Returns true when `node` is a `member_call_expression` chain that
+/// originates from `$this->createMock(...)`, `$this->createStub(...)`,
+/// `$this->getMockBuilder(...)`, or `$this->getMockForAbstractClass(...)`.
+/// Walks down the `.object` spine until it reaches the root call.
+fn is_mock_chain(mut node: Node, src: &[u8]) -> bool {
+    loop {
+        if node.kind() != "member_call_expression" { return false; }
+        let method = node.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
+        if matches!(method, "createMock" | "createStub" | "getMockBuilder" | "getMockForAbstractClass") {
+            let obj = node.child_by_field_name("object")
+                .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
+            return obj == "$this";
+        }
+        node = match node.child_by_field_name("object") {
+            Some(o) => o,
+            None => return false,
+        };
+    }
+}
+
+/// Returns true when `expr` is `$this->markTestSkipped(...)` or
+/// `$this->markTestIncomplete(...)`.
+fn is_skip_call(expr: Node, src: &[u8]) -> bool {
+    if expr.kind() != "member_call_expression" { return false; }
+    let obj = expr.child_by_field_name("object")
+        .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
+    if obj != "$this" { return false; }
+    matches!(
+        expr.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok()).unwrap_or(""),
+        "markTestSkipped" | "markTestIncomplete"
+    )
+}
+
+/// Returns true when an `if_statement` is a safe guard block:
+///   - no `else` / `elseif` clause
+///   - body contains only `$this->markTestSkipped(...)` or
+///     `$this->markTestIncomplete(...)` calls
+///
+/// The condition itself is not inspected — any pure boolean expression
+/// is assumed safe because guards never mutate shared state.
+fn is_safe_guard_if(node: Node, src: &[u8]) -> bool {
+    if node.child_by_field_name("alternative").is_some() { return false; }
+    let body = match node.child_by_field_name("body") {
+        Some(b) => b,
+        None => return false,
+    };
+    let mut cursor = body.walk();
+    for stmt in body.children(&mut cursor) {
+        match stmt.kind() {
+            "{" | "}" | "comment" => continue,
+            "expression_statement" => {
+                let inner = match stmt.named_child(0) {
+                    Some(i) => i,
+                    None => return false,
+                };
+                if !is_skip_call(inner, src) { return false; }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 // ── end setUp-stateless helpers ────────────────────────────────────────────
@@ -1683,6 +1755,101 @@ class LifecycleTest extends TestCase {
         assert!(
             !by_class["App\\Tests\\LifecycleTest"].method_dispatch_safe,
             "class with setUpBeforeClass must be unsafe"
+        );
+    }
+
+    #[test]
+    fn stateless_setup_allows_guard_blocks_skips_and_mocks() {
+        let src = r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+
+// Pattern 1: guard block with extension check
+class GuardIfTest extends TestCase {
+    public function setUp(): void {
+        if (!extension_loaded('openssl')) {
+            $this->markTestSkipped('Requires openssl');
+        }
+        $this->obj = new \stdClass();
+    }
+    public function testA(): void {}
+}
+
+// Pattern 2: standalone skip call
+class StandaloneSkipTest extends TestCase {
+    public function setUp(): void {
+        $this->markTestSkipped('not implemented yet');
+    }
+    public function testB(): void {}
+}
+
+// Pattern 3: mock assignment via getMockBuilder chain
+class MockBuilderTest extends TestCase {
+    public function setUp(): void {
+        parent::setUp();
+        $this->mailer = $this->getMockBuilder(MailerInterface::class)
+            ->disableOriginalConstructor()
+            ->getMock();
+    }
+    public function testC(): void {}
+}
+
+// Pattern 4: createMock assignment
+class CreateMockTest extends TestCase {
+    public function setUp(): void {
+        $this->logger = $this->createMock(LoggerInterface::class);
+        $this->stub   = $this->createStub(SomeInterface::class);
+    }
+    public function testD(): void {}
+}
+
+// Pattern 5: guard with function_exists check
+class FunctionExistsGuardTest extends TestCase {
+    public function setUp(): void {
+        if (!function_exists('zend_monitor_custom_event')) {
+            $this->markTestIncomplete('ZendServer not installed');
+        }
+    }
+    public function testE(): void {}
+}
+
+// Unsafe: method call on existing $this property (not a mock chain root)
+class UnsafeMethodCallTest extends TestCase {
+    public function setUp(): void {
+        $this->db->query('TRUNCATE foo');
+    }
+    public function testF(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let grouped = group_by_class(cases);
+        let by_class: std::collections::HashMap<&str, &TestClass> =
+            grouped.iter().map(|g| (g.class.as_str(), g)).collect();
+
+        assert!(
+            by_class["App\\Tests\\GuardIfTest"].method_dispatch_safe,
+            "guard if with markTestSkipped in body must be safe"
+        );
+        assert!(
+            by_class["App\\Tests\\StandaloneSkipTest"].method_dispatch_safe,
+            "standalone markTestSkipped must be safe"
+        );
+        assert!(
+            by_class["App\\Tests\\MockBuilderTest"].method_dispatch_safe,
+            "getMockBuilder chain assignment must be safe"
+        );
+        assert!(
+            by_class["App\\Tests\\CreateMockTest"].method_dispatch_safe,
+            "createMock / createStub assignments must be safe"
+        );
+        assert!(
+            by_class["App\\Tests\\FunctionExistsGuardTest"].method_dispatch_safe,
+            "guard if with function_exists + markTestIncomplete must be safe"
+        );
+        assert!(
+            !by_class["App\\Tests\\UnsafeMethodCallTest"].method_dispatch_safe,
+            "$this->db->query(...) must remain unsafe (not a mock chain root)"
         );
     }
 
