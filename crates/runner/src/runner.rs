@@ -392,25 +392,70 @@ fn build_queue(
 
         if other_methods.is_empty() { continue; }
 
-        // For method_dispatch_safe classes: each method gets its own BatchPlan
-        // so they can run on different workers in parallel.
+        // For method_dispatch_safe classes: plain methods (no data provider) each
+        // get their own BatchPlan for maximum parallelism; provider methods fall
+        // through to the existing LPT/stride logic below.
         if g.method_dispatch_safe {
-            // Flush any accumulated bin first to preserve LPT order.
-            if !bin_buf.is_empty() {
-                queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
-                bin_methods = 0;
+            let (plain, with_providers): (Vec<_>, Vec<_>) = other_methods
+                .into_iter()
+                .partition(|m| m.data_provider.is_none() && m.external_providers.is_empty());
+
+            if !plain.is_empty() {
+                // Flush any accumulated bin first to preserve LPT order.
+                if !bin_buf.is_empty() {
+                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                    bin_methods = 0;
+                }
+                for m in &plain {
+                    let method_name = m.name.clone();
+                    let req_files = required_files_for(&[method_name.clone()], &g.methods);
+                    let bc = BatchClass {
+                        file:           g.file.clone(),
+                        class:          g.class.clone(),
+                        methods:        vec![method_name],
+                        row_filter:     None,
+                        required_files: req_files,
+                    };
+                    queue.push_back(mk_plan(vec![bc]));
+                }
             }
-            for m in other_methods {
-                let method_name = m.name.clone();
-                let req_files = required_files_for(&[method_name.clone()], &g.methods);
-                let bc = BatchClass {
-                    file:           g.file.clone(),
-                    class:          g.class.clone(),
-                    methods:        vec![method_name],
-                    row_filter:     None,
-                    required_files: req_files,
-                };
+
+            if with_providers.is_empty() {
+                continue;
+            }
+
+            // Fall through to the class-level LPT logic with only provider methods.
+            let other_methods = with_providers;
+
+            let real_cost: u32 = heavy_methods.iter().chain(other_methods.iter())
+                .map(|m| method_weight(&g.class, m, row_counts))
+                .sum();
+            let _ = cost;
+            let other_cost = real_cost.saturating_sub(
+                heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
+            ) as usize;
+            let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
+            let req_files   = required_files_for(&other_names, &g.methods);
+            let bc = BatchClass {
+                file:           g.file,
+                class:          g.class,
+                methods:        other_names,
+                row_filter:     None,
+                required_files: req_files,
+            };
+            if other_cost >= target {
+                if !bin_buf.is_empty() {
+                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                    bin_methods = 0;
+                }
                 queue.push_back(mk_plan(vec![bc]));
+            } else {
+                bin_buf.push(bc);
+                bin_methods += other_cost;
+                if bin_methods >= target {
+                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                    bin_methods = 0;
+                }
             }
             continue;
         }
@@ -704,6 +749,90 @@ mod tests {
             .collect();
         assert_eq!(class_plans.len(), 1, "stateful class must be dispatched as one batch");
         assert_eq!(class_plans[0].classes[0].methods.len(), 3);
+    }
+
+    /// Helper: safe case with a data provider (method_dispatch_safe=true).
+    fn make_safe_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
+        TestCase {
+            file:                 PathBuf::from("/f.php"),
+            class:                class.to_string(),
+            method:               method.to_string(),
+            data_provider:        Some(dp.to_string()),
+            groups:               vec![],
+            external_providers:   vec![],
+            is_tautological:      false,
+            method_dispatch_safe: true,
+        }
+    }
+
+    #[test]
+    fn method_dispatch_safe_mixed_plain_and_provider_methods() {
+        // A method_dispatch_safe class with:
+        //   - 2 plain methods (no data provider) → each gets its own BatchPlan
+        //   - 1 provider method                  → goes through class-level LPT path
+        //
+        // Expected: 3 plans total — 2 single-method solo plans + 1 class-level plan
+        // containing only the provider method.
+        let cases = vec![
+            make_safe_case("MixedClass", "testPlainA"),
+            make_safe_case("MixedClass", "testPlainB"),
+            make_safe_case_dp("MixedClass", "testWithProvider", "providerRows"),
+        ];
+        let cfg = RunConfig {
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
+            n_workers:        4,
+        };
+        let row_counts = RowCounts::new();
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
+
+        // 2 solo plans for plain methods + 1 class-level plan for the provider method.
+        assert_eq!(q.len(), 3, "2 plain solo plans + 1 provider class-level plan");
+
+        // Each plan must target MixedClass.
+        for plan in &q {
+            assert_eq!(plan.classes.len(), 1);
+            assert_eq!(plan.classes[0].class, "MixedClass");
+        }
+
+        // Collect all dispatched method names.
+        let mut all_methods: Vec<&str> = q.iter()
+            .flat_map(|p| p.classes.iter().flat_map(|bc| bc.methods.iter().map(String::as_str)))
+            .collect();
+        all_methods.sort_unstable();
+        assert_eq!(
+            all_methods,
+            vec!["testPlainA", "testPlainB", "testWithProvider"],
+            "every method must appear exactly once"
+        );
+
+        // The two plain methods must each be in their own single-method plan.
+        let plain_solo_plans: Vec<_> = q.iter()
+            .filter(|p| {
+                p.classes[0].methods.len() == 1
+                    && p.classes[0].row_filter.is_none()
+                    && (p.classes[0].methods[0] == "testPlainA"
+                        || p.classes[0].methods[0] == "testPlainB")
+            })
+            .collect();
+        assert_eq!(plain_solo_plans.len(), 2, "plain methods each get a solo BatchPlan");
+
+        // The provider method must appear in a plan without a row_filter (below
+        // ROW_SPLIT_THRESHOLD since row_counts is empty) and must be the only
+        // remaining plan.
+        let provider_plans: Vec<_> = q.iter()
+            .filter(|p| p.classes[0].methods.contains(&"testWithProvider".to_string()))
+            .collect();
+        assert_eq!(provider_plans.len(), 1, "provider method dispatched in one class-level plan");
+        assert!(
+            provider_plans[0].classes[0].row_filter.is_none(),
+            "no row split when row_counts is empty (below threshold)"
+        );
     }
 
 }
