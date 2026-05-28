@@ -16,7 +16,7 @@ use PHPUnit\Framework\Attributes\TestWithJson;
  * from a data provider, and the list of dependencies whose return values
  * should be prepended to args at invocation time.
  *
- * @phpstan-type Step array{method:string,dataset:?string,args:list<mixed>,depends:list<string>}
+ * @phpstan-type Step array{method:string,dataset:?string,args:list<mixed>,args_hash:?string,is_duplicate:bool,depends:list<string>}
  */
 final class MethodPlanner
 {
@@ -99,7 +99,8 @@ final class MethodPlanner
             $seenHashes = [];
             foreach ($kept as $key => $row) {
                 $rowData     = is_array($row) ? $row : iterator_to_array($row);
-                $rowHash     = md5(json_encode(array_values($rowData)));
+                $encoded     = json_encode(array_values($rowData));
+                $rowHash     = md5($encoded !== false ? $encoded : serialize(array_values($rowData)));
                 $isDuplicate = isset($seenHashes[$rowHash]);
                 $seenHashes[$rowHash] = true;
                 $steps[] = [
