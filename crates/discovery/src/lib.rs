@@ -101,17 +101,18 @@ pub struct GroupedMethod {
 /// A discovered test class with all of its methods, grouped for batched
 /// dispatch (one request per class to the worker).
 ///
-/// `method_dispatch_safe` is `true` when every method in this class can be
-/// dispatched independently (one `BatchPlan` per method) without violating
+/// `method_dispatch_safe` is `true` when methods in this class can be
+/// dispatched independently (one `BatchPlan` per plain method) without violating
 /// PHPUnit's test-lifecycle guarantees. The conditions are:
 ///   - No `setUpBeforeClass` or `tearDownAfterClass` override (shared class-level
 ///     state would break when the class is instantiated multiple times).
-///   - No method has a `#[DataProvider]` or `#[DataProviderExternal]` dependency
-///     (providers are resolved once per class run; splitting would duplicate work
-///     or miss rows).
 ///   - `setUp()`, if overridden, assigns only fresh object-construction or scalar
 ///     literals to `$this` properties — no shared mutable state escapes a single
 ///     test method boundary.
+///
+/// Methods with `#[DataProvider]` or `#[DataProviderExternal]` are handled by
+/// the existing LPT/stride-split logic even when this flag is `true`; only
+/// provider-free methods are dispatched as individual plans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestClass {
     pub file:                 PathBuf,
@@ -364,7 +365,6 @@ fn collect_parsed_classes(
         }
 
         let method_dispatch_safe = has_no_lifecycle_overrides(body, bytes)
-            && test_methods.iter().all(|m| m.data_provider.is_none() && m.external_providers.is_empty())
             && setUp_is_stateless(body, bytes);
 
         out.push(ParsedClass {
