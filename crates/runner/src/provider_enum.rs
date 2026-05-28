@@ -112,6 +112,7 @@ mod tests {
             data_provider:      dp.map(String::from),
             groups:             vec![],
             external_providers: vec![],
+            is_tautological:    false,
         }
     }
 

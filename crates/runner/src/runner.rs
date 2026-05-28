@@ -122,7 +122,7 @@ pub fn run(
         .collect();
 
     let n = pool.len();
-    let mut queue: VecDeque<BatchPlan> = build_queue(filtered, cfg, row_counts);
+    let (mut queue, synthetic) = build_queue(filtered, cfg, row_counts);
 
     // Spawn one reader thread per slot. Each owns its BufReader and forwards
     // parsed messages + EOF over a single mpsc to the main loop below.
@@ -171,8 +171,14 @@ pub fn run(
         }
     }
 
-    // Main dispatcher loop.
+    // Emit synthetic pass outcomes for tautological methods — they are never
+    // sent to a PHP worker but must appear in the report to keep test-count
+    // parity with vanilla PHPUnit.
     let mut outcomes: Vec<TestOutcome> = Vec::new();
+    for o in synthetic {
+        on_progress(&o);
+        outcomes.push(o);
+    }
     let mut total = 0.0f64;
     let mut live_readers = n;
     let mut stopping = false;
@@ -283,7 +289,11 @@ const MAX_ROW_CHUNKS: u32 = 4;
 ///
 /// OVERSATURATION ensures more batches than workers so work-stealing has
 /// granularity to keep all workers busy even with variance in test duration.
-fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) -> VecDeque<BatchPlan> {
+fn build_queue(
+    cases: Vec<TestCase>,
+    cfg: &RunConfig,
+    row_counts: &RowCounts,
+) -> (VecDeque<BatchPlan>, Vec<TestOutcome>) {
     const OVERSATURATION: usize = 4; // target 4× more batches than workers
 
     // Collect required files for a set of method names from the class-file index.
@@ -325,9 +335,10 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
         .collect();
     by_cost.sort_by(|a, b| b.0.cmp(&a.0));
 
-    let mut queue:   VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
-    let mut bin_buf: Vec<BatchClass>     = Vec::new();
-    let mut bin_methods: usize           = 0;
+    let mut queue:      VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
+    let mut synthetic:  Vec<TestOutcome>    = Vec::new();
+    let mut bin_buf:    Vec<BatchClass>     = Vec::new();
+    let mut bin_methods: usize              = 0;
 
     let mk_plan = |classes: Vec<BatchClass>| BatchPlan {
         autoload:  cfg.autoload.clone(),
@@ -346,7 +357,22 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
             }
         };
 
-        let (heavy_methods, other_methods): (Vec<_>, Vec<_>) = g.methods.iter().cloned()
+        // Partition: tautological methods never go to workers.
+        let (tauto_methods, real_methods): (Vec<_>, Vec<_>) = g.methods.iter().cloned()
+            .partition(|m| m.is_tautological);
+        for tm in tauto_methods {
+            synthetic.push(TestOutcome {
+                class:       g.class.clone(),
+                method:      tm.name.clone(),
+                dataset:     None,
+                status:      TestStatus::Pass,
+                message:     Some("tautological — skipped execution".into()),
+                trace:       None,
+                duration_ms: 0.0,
+            });
+        }
+
+        let (heavy_methods, other_methods): (Vec<_>, Vec<_>) = real_methods.into_iter()
             .partition(|m| row_count_for(m).map(|n| n >= ROW_SPLIT_THRESHOLD).unwrap_or(false));
 
         for hm in &heavy_methods {
@@ -365,7 +391,12 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
         }
 
         if other_methods.is_empty() { continue; }
-        let other_cost  = cost.saturating_sub(
+        // Recompute other_cost from real (non-tautological) methods only.
+        let real_cost: u32 = heavy_methods.iter().chain(other_methods.iter())
+            .map(|m| method_weight(&g.class, m, row_counts))
+            .sum();
+        let _ = cost; // original cost included tautological methods; unused now
+        let other_cost = real_cost.saturating_sub(
             heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
         ) as usize;
         let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
@@ -399,7 +430,7 @@ fn build_queue(cases: Vec<TestCase>, cfg: &RunConfig, row_counts: &RowCounts) ->
     if !bin_buf.is_empty() {
         queue.push_back(mk_plan(bin_buf));
     }
-    queue
+    (queue, synthetic)
 }
 
 
@@ -435,6 +466,7 @@ mod tests {
             data_provider:      None,
             groups:             vec![],
             external_providers: vec![],
+            is_tautological:    false,
         }
     }
 
@@ -480,6 +512,7 @@ mod tests {
             data_provider:      Some(dp.to_string()),
             groups:             vec![],
             external_providers: vec![],
+            is_tautological:    false,
         }
     }
 
@@ -505,7 +538,8 @@ mod tests {
         let mut row_counts = RowCounts::new();
         row_counts.insert(("BigDp".to_string(), "provideMany".to_string()), Some(20));
 
-        let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
         let row_split_plans: Vec<_> = q.iter()
             .filter(|p| p.classes.iter().any(|c| c.row_filter.is_some()))
             .collect();
@@ -546,7 +580,8 @@ mod tests {
             n_workers:        4,
         };
         let row_counts = RowCounts::new();
-        let q: Vec<_> = build_queue(cases, &cfg, &row_counts).into_iter().collect();
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
         assert_eq!(q.len(), 6, "1 heavy solo + 5 light solos (target=1)");
         assert_eq!(q[0].classes.len(), 1);
         assert_eq!(q[0].classes[0].class, "Heavy", "heavy class scheduled first (LPT)");
