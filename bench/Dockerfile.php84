@@ -11,10 +11,15 @@ FROM php:8.4-cli
 
 # Install pcntl (required by worker_fork.php's pcntl_fork) and a few build
 # basics for native composer extension installs. No-recommends keeps it lean.
-RUN docker-php-ext-install pcntl \
+RUN docker-php-ext-install pcntl opcache \
+    && docker-php-ext-enable opcache \
     && apt-get update \
-    && apt-get install --no-install-recommends -y git unzip ca-certificates \
+    && apt-get install --no-install-recommends -y git unzip ca-certificates time \
     && rm -rf /var/lib/apt/lists/*
+
+# Opcache CLI on, same reason as the php83 image — our master pre-warm
+# silently no-ops otherwise and we lose the COW benefit.
+RUN echo "opcache.enable_cli=1" >> /usr/local/etc/php/conf.d/opcache-cli.ini
 
 # Composer (used to install OSS project deps inside the container).
 COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer

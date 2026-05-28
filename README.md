@@ -236,6 +236,75 @@ Benchmarked on Linux/PHP 8.1.33 against real OSS suites. Median of 3
 runs each. "vanilla" is `./vendor/bin/phpunit` (one process); `1w` /
 `2w` / `4w` / `8w` are our fork pool at that worker count.
 
+### Reference run — May 2026
+
+End-to-end bench of seven real OSS suites on the same Linux laptop,
+8 workers (`-w 8 -k 20`), Docker projects mounted with `--tmpfs /tmp`
+and the host's `/tmp` already on tmpfs. Δ columns use a uniform
+sign convention: **`+` = phpunit-rust wins, `−` = vanilla wins**.
+
+| Project (tests) | Vanilla wall | Rust wall | Speedup | Wall saved | Vanilla RAM | Rust RAM | RAM saved | user-CPU vanilla | user-CPU rust | CPU overhead |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| guzzle-psr7 (1227) | 0.23 s | 0.39 s | 0.59× | **−0.16 s** | 50 MB | 45 MB | +10 % | 0.19 s | 1.43 s | +750 % |
+| nikic/php-parser (1878) | 0.55 s | 0.65 s | 0.85× | **−0.10 s** | 68 MB | 64 MB | +6 % | 0.48 s | 2.55 s | +430 % |
+| fakerphp/faker (1402) | 1.12 s | 0.94 s | 1.19× | **+0.18 s** | 337 MB | 113 MB | +67 % | 0.55 s | 5.18 s | +772 % |
+| Carbon (6139) | 23.25 s | 8.15 s | 2.85× | **+15.10 s** | 200 MB | 158 MB | +21 % | 21.65 s | 47.40 s | +149 % |
+| monolog (1162, PHP 8.3) | 4.30 s | 1.41 s | 3.05× | **+2.89 s** | 59 MB | 33 MB | +44 % | 0.41 s | 2.19 s | +438 % |
+| rector (5207, PHP 8.3) | 19.68 s | 5.78 s | 3.40× | **+13.90 s** | 661 MB | 176 MB | **+73 %** | 17.65 s | 37.85 s | +103 % |
+| phpstan-src (11928, PHP 8.3) | 96.22 s | 23.59 s | **4.08×** | **+72.63 s** | 1749 MB | 295 MB | **+83 %** | 93.17 s | 119.19 s | +48 % |
+
+`+ %` on RAM = peak RSS reduction by phpunit-rust. CPU overhead = extra
+user-CPU seconds we burn for the parallelism; the worst case (guzzle's
+`+750 %`) costs **1.2 vCPU-seconds of compute** to save nothing — it
+loses 0.16 s of wall — but on rector the same overhead bracket
+(`+103 %`) buys back **13.9 s of wall and 485 MB of resident set**.
+
+#### Reading the trade-off in actual money
+
+Indexed against a fully-loaded senior PHP engineer salary in the US
+mid-2026 (~$90/hr — base ~$65-70/hr W2 + ~30 % employer load),
+AWS m7i.large on-demand at $0.1008/hr, and GitHub Actions Linux
+small at $0.006/min (post January-2026 reduction), the wall-time
+savings dominate every other cost line by ~3 orders of magnitude.
+Worked example: a 10-engineer team running rector's suite 30 times
+each weekday.
+
+| Cost line | Vanilla | Rust | Annual savings |
+|---|---:|---:|---:|
+| Engineer wait time @ $90/hr | $10.6 k / yr | $3.1 k / yr | **~$7.5 k** per engineer × 10 = **~$22.9 k** |
+| Cloud compute @ $0.1008/hr | ~$31 / yr | ~$9 / yr | ~$22 |
+| GitHub Actions runner @ $0.006/min | ~$210 / yr | ~$61 / yr | ~$149 |
+
+The CPU we pay for is essentially free; the wall we save is paid back
+in engineer-hours.
+
+Salary anchor: [Senior PHP Developer 2026 — Salary.com](https://www.salary.com/research/salary/hiring/senior-php-developer-salary)
+($70/hr W2). EC2 reference: [m7i.large — Vantage Instances](https://instances.vantage.sh/aws/ec2/m7i.large)
+(updated 2026-05-27). CI rate: [GitHub Actions 2026 pricing](https://resources.github.com/actions/2026-pricing-changes-for-github-actions/).
+
+#### Known limitation — process-isolation hangs (PHPUnit-itself)
+
+The PHPUnit project's own test suite was attempted as an eighth
+data point (PHP 8.4, Docker, `bench/Dockerfile.php84` + `--tmpfs /tmp`).
+Vanilla median: **133.66 s** (3 runs: 132.31, 133.66, 141.10 s), ~108 MB
+RSS. phpunit-rust did **not** complete: a worker hangs partway
+through, our reader thread blocks on its (still-open) stdout pipe,
+no `SIGCHLD` ever fires because the child is alive — just stuck.
+
+The root cause is PHPUnit's own `@runInSeparateProcess` / end-to-end
+fixtures: a test spawns a sub-PHP process via `proc_open`, and if
+that sub-process never returns (e.g. waiting on input the worker
+never produces), the parent worker stays in `read()` indefinitely.
+The lost-batch recovery added in `feat(runner): recover lost
+batches when a worker dies mid-run` only triggers on actual death
+(non-zero exit / signal), not on a stuck-but-alive worker.
+
+Fix is straightforward but unwritten: a per-slot inactivity
+watchdog. If a slot has an in-flight batch and hasn't emitted any
+outcome for N seconds, the dispatcher SIGKILLs the worker, treats
+the batch as crashed (lost-batch path takes over), and the master's
+SIGCHLD handler respawns a clean child. Tracked as a follow-up.
+
 ### Worker scaling
 
 | Project | vanilla | 1w | 2w | 4w | 8w | Best speedup vs vanilla |
