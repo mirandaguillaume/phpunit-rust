@@ -24,7 +24,23 @@ declare(strict_types=1);
 error_reporting(E_ALL & ~E_DEPRECATED);
 @set_time_limit(0);
 
+// POC instrumentation: write phase timings to STDERR. Turn on with
+// PHPUNIT_RUST_TIMING=1 in the env. Output format:
+//   [TIMING] phase=name delta_ms=X total_ms=Y
+$__t0 = microtime(true);
+$__tprev = $__t0;
+$__timing_enabled = getenv('PHPUNIT_RUST_TIMING') === '1';
+$__log_phase = function(string $name) use (&$__tprev, $__t0, $__timing_enabled): void {
+    if (!$__timing_enabled) return;
+    $now = microtime(true);
+    fwrite(STDERR, sprintf("[TIMING] phase=%-22s delta_ms=%6.1f total_ms=%6.1f\n",
+        $name, ($now - $__tprev) * 1000, ($now - $__t0) * 1000));
+    $__tprev = $now;
+};
+$__log_phase('start');
+
 require_once __DIR__ . '/vendor/autoload.php';
+$__log_phase('worker_vendor_autoload');
 
 use PhpunitRust\TestExecutor;
 
@@ -135,6 +151,7 @@ try {
     exit(1);
 }
 ob_end_clean();
+$__log_phase('project_autoload');
 
 // ---------------------------------------------------------------------------
 // 3. Layer 2: bootstrap (optional)
@@ -150,6 +167,7 @@ if ($bootstrap !== null && is_file($bootstrap)) {
     }
     ob_end_clean();
 }
+$__log_phase('bootstrap');
 
 // ---------------------------------------------------------------------------
 // 4. OPcache pre-warm: compile every test file before forking so children
@@ -179,12 +197,21 @@ if (!empty($classMapExtra)
             }
         }
     }
-    foreach ($fileClassCount as $rp => $count) {
-        if ($count !== 1) continue;          // multi-class file → skip
-        if (file_has_top_level_function($rp)) continue;  // file with fn → skip
-        @opcache_compile_file($rp);
+    // Skip the pre-warm loop entirely on small suites: opcache_compile_file
+    // costs ~0.5ms per file (measured: 50 files ≈ 25ms), but the COW saving
+    // it buys per worker is roughly the same as a plain require_once on the
+    // first batch — i.e. negligible when there are few files. Below the
+    // threshold, lazy require_once in the child wins on cold runs by ~20ms.
+    // Above the threshold, sharing compiled opcodes via COW dominates.
+    if (count($fileClassCount) >= 50) {
+        foreach ($fileClassCount as $rp => $count) {
+            if ($count !== 1) continue;          // multi-class file → skip
+            if (file_has_top_level_function($rp)) continue;  // file with fn → skip
+            @opcache_compile_file($rp);
+        }
     }
 }
+$__log_phase('opcache_prewarm');
 
 /**
  * Return true if the PHP file declares at least one top-level (depth-0)
@@ -291,11 +318,13 @@ $forkChildForSlot = static function (int $slot) use (
 
 $slotPid    = array_fill(0, $n, 0);
 $slotClosed = array_fill(0, $n, false);
+$__log_phase('pre_fork');
 for ($i = 0; $i < $n; $i++) {
     $slotPid[$i] = $forkChildForSlot($i);
     if ($slotPid[$i] === -1) exit(1);
     $childPids[] = $slotPid[$i];
 }
+$__log_phase('post_fork_all_children');
 
 if ($maxBatches === 0) {
     // Long-lived mode: just wait for all children to exit (on Rust closing
