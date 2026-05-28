@@ -395,10 +395,12 @@ fn build_queue(
         // For method_dispatch_safe classes: plain methods (no data provider) each
         // get their own BatchPlan for maximum parallelism; provider methods fall
         // through to the existing LPT/stride logic below.
-        if g.method_dispatch_safe {
+        if !g.has_lifecycle_overrides {
             let (plain, with_providers): (Vec<_>, Vec<_>) = other_methods
                 .into_iter()
-                .partition(|m| m.data_provider.is_none() && m.external_providers.is_empty());
+                .partition(|m| m.is_dispatch_safe
+                    && m.data_provider.is_none()
+                    && m.external_providers.is_empty());
 
             if !plain.is_empty() {
                 // Flush any accumulated bin first to preserve LPT order.
@@ -535,8 +537,9 @@ mod tests {
             data_provider:        None,
             groups:               vec![],
             external_providers:   vec![],
-            is_tautological:      false,
-            method_dispatch_safe: false,
+            is_tautological:         false,
+            has_lifecycle_overrides: false,
+            is_dispatch_safe:        true,
         }
     }
 
@@ -582,8 +585,9 @@ mod tests {
             data_provider:        Some(dp.to_string()),
             groups:               vec![],
             external_providers:   vec![],
-            is_tautological:      false,
-            method_dispatch_safe: false,
+            is_tautological:         false,
+            has_lifecycle_overrides: false,
+            is_dispatch_safe:        true,
         }
     }
 
@@ -633,14 +637,29 @@ mod tests {
         assert!(plain_plans[0].classes[0].methods.contains(&"testSimple".to_string()));
     }
 
+    fn make_lifecycle_case(class: &str, method: &str) -> TestCase {
+        TestCase {
+            file:                    PathBuf::from("/f.php"),
+            class:                   class.to_string(),
+            method:                  method.to_string(),
+            data_provider:           None,
+            groups:                  vec![],
+            external_providers:      vec![],
+            is_tautological:         false,
+            has_lifecycle_overrides: true,   // forces class-level dispatch path
+            is_dispatch_safe:        true,
+        }
+    }
+
     #[test]
     fn build_queue_packs_light_classes_and_sorts_heavy_first() {
         // 1 heavy class (5 methods) + 5 light classes (1 method each).
         // n_workers=4, OVERSATURATION=4 → target = max(1, 10/16) = 1.
         // Every class (cost ≥ target=1) gets its own solo plan; Heavy comes first (LPT).
+        // Classes have lifecycle overrides to exercise the class-level LPT path.
         let mut cases = Vec::new();
-        for m in 0..5 { cases.push(make_case("Heavy", &format!("t{m}"))); }
-        for c in 0..5 { cases.push(make_case(&format!("Light{c}"), "t1")); }
+        for m in 0..5 { cases.push(make_lifecycle_case("Heavy", &format!("t{m}"))); }
+        for c in 0..5 { cases.push(make_lifecycle_case(&format!("Light{c}"), "t1")); }
         let cfg = RunConfig {
             autoload:         PathBuf::from("/autoload.php"),
             bootstrap:        None,
@@ -669,8 +688,9 @@ mod tests {
             data_provider:        None,
             groups:               vec![],
             external_providers:   vec![],
-            is_tautological:      false,
-            method_dispatch_safe: true,
+            is_tautological:         false,
+            has_lifecycle_overrides: false,
+            is_dispatch_safe:        true,
         }
     }
 
@@ -711,12 +731,12 @@ mod tests {
 
     #[test]
     fn stateful_class_keeps_class_level_batching() {
-        // A class with method_dispatch_safe=false must NOT be split into
+        // A class with has_lifecycle_overrides=true must NOT be split into
         // per-method plans — all methods should land in the same BatchClass.
         let cases = vec![
-            make_case("StatefulClass", "testOne"),
-            make_case("StatefulClass", "testTwo"),
-            make_case("StatefulClass", "testThree"),
+            make_lifecycle_case("StatefulClass", "testOne"),
+            make_lifecycle_case("StatefulClass", "testTwo"),
+            make_lifecycle_case("StatefulClass", "testThree"),
         ];
         let cfg = RunConfig {
             autoload:         PathBuf::from("/autoload.php"),
@@ -760,8 +780,9 @@ mod tests {
             data_provider:        Some(dp.to_string()),
             groups:               vec![],
             external_providers:   vec![],
-            is_tautological:      false,
-            method_dispatch_safe: true,
+            is_tautological:         false,
+            has_lifecycle_overrides: false,
+            is_dispatch_safe:        true,
         }
     }
 
