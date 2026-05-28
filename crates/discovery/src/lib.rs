@@ -34,6 +34,9 @@ pub struct TestCase {
     pub data_provider:      Option<String>,
     pub groups:             Vec<String>,
     pub external_providers: Vec<(String, String)>,
+    /// True when the method body consists entirely of trivially-true assertions
+    /// and has at least one such assertion. See [`GroupedMethod::is_tautological`].
+    pub is_tautological:    bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -67,6 +70,7 @@ struct MethodInfo {
     data_provider:      Option<String>,
     groups:             Vec<String>,
     external_providers: Vec<(String, String)>,
+    is_tautological:    bool,
 }
 
 /// Maps every discovered class FQCN to its resolved parent FQCN (or None).
@@ -82,6 +86,11 @@ pub struct GroupedMethod {
     pub data_provider:      Option<String>,
     pub groups:             Vec<String>,
     pub external_providers: Vec<(String, String)>,
+    /// True when the method body consists entirely of trivially-true assertions
+    /// (assertTrue(true), assertFalse(false), assertNull(null), assertEquals(X,X),
+    /// assertSame(X,X)) and has at least one such assertion. The runner can skip
+    /// dispatching these to a PHP worker and emit a synthetic Pass outcome instead.
+    pub is_tautological:    bool,
 }
 
 /// A discovered test class with all of its methods, grouped for batched
@@ -110,6 +119,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             data_provider:      case.data_provider,
             groups:             case.groups,
             external_providers: case.external_providers,
+            is_tautological:    case.is_tautological,
         };
         if let Some(existing) = groups.iter_mut()
             .find(|g| g.class == case.class && g.file == case.file)
@@ -361,6 +371,120 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
     false
 }
 
+/// Returns `true` when the method body consists *entirely* of trivially-true
+/// PHPUnit assertions and contains at least one of them:
+///
+/// - `$this->assertTrue(true)`
+/// - `$this->assertFalse(false)`
+/// - `$this->assertNull(null)`
+/// - `$this->assertEquals(X, X)` — both args are identical source text
+/// - `$this->assertSame(X, X)` — both args are identical source text
+///
+/// Any non-assertion statement (assignment, if, foreach, return, …) or a
+/// method body with zero assertions causes this function to return `false`.
+fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
+    let body = match method_node.child_by_field_name("body") {
+        Some(b) => b,
+        None => return false,
+    };
+
+    let mut found_assertion = false;
+    let mut cursor = body.walk();
+
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            "{" | "}" | "comment" => continue,
+            "expression_statement" => {
+                // The inner expression must be a $this->assertXxx(...) call.
+                let expr = match child.child(0) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                if expr.kind() != "member_call_expression" {
+                    return false;
+                }
+                // object must be $this
+                let object = match expr.child_by_field_name("object") {
+                    Some(o) => o,
+                    None => return false,
+                };
+                let object_text = match object.utf8_text(src) {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+                if object_text != "$this" {
+                    return false;
+                }
+                // method name
+                let method_name_node = match expr.child_by_field_name("name") {
+                    Some(n) => n,
+                    None => return false,
+                };
+                let method_name = match method_name_node.utf8_text(src) {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+                // arguments node
+                let args_node = match expr.child_by_field_name("arguments") {
+                    Some(a) => a,
+                    None => return false,
+                };
+
+                // Collect actual argument nodes (skip punctuation: `(`, `)`, `,`)
+                let mut args: Vec<Node> = Vec::new();
+                let mut args_cursor = args_node.walk();
+                for arg in args_node.children(&mut args_cursor) {
+                    match arg.kind() {
+                        "(" | ")" | "," => continue,
+                        "argument" => {
+                            // argument node wraps the actual expression
+                            if let Some(inner) = arg.child(0) {
+                                args.push(inner);
+                            } else {
+                                args.push(arg);
+                            }
+                        }
+                        _ => args.push(arg),
+                    }
+                }
+
+                let trivial = match method_name {
+                    "assertTrue" => {
+                        args.len() == 1
+                            && matches!(args[0].utf8_text(src), Ok("true"))
+                    }
+                    "assertFalse" => {
+                        args.len() == 1
+                            && matches!(args[0].utf8_text(src), Ok("false"))
+                    }
+                    "assertNull" => {
+                        args.len() == 1
+                            && matches!(args[0].utf8_text(src), Ok("null"))
+                    }
+                    "assertEquals" | "assertSame" => {
+                        if args.len() == 2 {
+                            let a = args[0].utf8_text(src).unwrap_or("");
+                            let b = args[1].utf8_text(src).unwrap_or("");
+                            !a.is_empty() && a == b
+                        } else {
+                            false
+                        }
+                    }
+                    _ => return false,
+                };
+
+                if !trivial {
+                    return false;
+                }
+                found_assertion = true;
+            }
+            _ => return false,
+        }
+    }
+
+    found_assertion
+}
+
 fn collect_test_methods(
     body: Node,
     bytes: &[u8],
@@ -408,11 +532,13 @@ fn collect_test_methods(
                 extract_groups_phpdoc(c, &mut groups);
             }
             let external_providers = extract_external_provider_attrs(child, bytes, namespace, aliases);
+            let is_tautological = is_tautological_method(child, bytes);
             methods.push(MethodInfo {
                 name:               name.to_string(),
                 data_provider:      dp,
                 groups,
                 external_providers,
+                is_tautological,
             });
         }
         prev_comment = None;
@@ -734,6 +860,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             data_provider:      mi.data_provider.clone(),
                             groups:             groups.into_iter().collect(),
                             external_providers: mi.external_providers.clone(),
+                            is_tautological:    mi.is_tautological,
                         });
                     }
                 }
@@ -1194,9 +1321,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![] },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -1216,9 +1343,9 @@ final class ConcreteTest extends AbstractBaseTest {
         // for another file, which previously caused ReflectionException crashes
         // when --workers 1 serialised all batches through one PHP process.
         let cases = vec![
-            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![] },
-            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
-            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![] },
+            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
+            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
+            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");
@@ -1333,5 +1460,54 @@ class Provider {
         std::fs::write(&path, src).unwrap();
         let idx = discover_class_file_index(&[dir.path().to_path_buf()]);
         assert_eq!(idx.get("App\\Data\\Provider"), Some(&path));
+    }
+
+    #[test]
+    fn tautology_detection_marks_trivially_true_methods() {
+        let src = r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+class TautologyTest extends TestCase {
+    public function testTrivialTrue(): void {
+        $this->assertTrue(true);
+    }
+    public function testTrivialFalse(): void {
+        $this->assertFalse(false);
+    }
+    public function testTrivialNull(): void {
+        $this->assertNull(null);
+    }
+    public function testTrivialEquals(): void {
+        $this->assertEquals(42, 42);
+    }
+    public function testTrivialSame(): void {
+        $this->assertSame('hello', 'hello');
+    }
+    public function testRealAssert(): void {
+        $value = 1 + 1;
+        $this->assertEquals(2, $value);
+    }
+    public function testAssertsTrue(): void {
+        $this->assertTrue(false);
+    }
+    public function testNoAssertions(): void {
+        // intentionally empty
+    }
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let by_method: std::collections::HashMap<&str, &TestCase> =
+            cases.iter().map(|c| (c.method.as_str(), c)).collect();
+
+        assert!(by_method["testTrivialTrue"].is_tautological,  "assertTrue(true) must be tautological");
+        assert!(by_method["testTrivialFalse"].is_tautological, "assertFalse(false) must be tautological");
+        assert!(by_method["testTrivialNull"].is_tautological,  "assertNull(null) must be tautological");
+        assert!(by_method["testTrivialEquals"].is_tautological,"assertEquals(42,42) must be tautological");
+        assert!(by_method["testTrivialSame"].is_tautological,  "assertSame('hello','hello') must be tautological");
+
+        assert!(!by_method["testRealAssert"].is_tautological,  "body with assignment must NOT be tautological");
+        assert!(!by_method["testAssertsTrue"].is_tautological, "assertTrue(false) must NOT be tautological");
+        assert!(!by_method["testNoAssertions"].is_tautological,"zero assertions must NOT be tautological");
     }
 }
