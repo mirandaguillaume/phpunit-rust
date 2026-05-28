@@ -158,12 +158,15 @@ if ($bootstrap !== null && is_file($bootstrap)) {
 //    opcache.enable_cli is on (we pass -d opcache.enable_cli=1 from Rust).
 // ---------------------------------------------------------------------------
 // Pre-compile every test file into opcache so children inherit compiled
-// opcodes via COW. We skip files that contain more than one top-level
-// class because opcache_compile_file on PHP 8.1 (and likely later) leaks
-// some class symbols into the master process — those symbols are then
-// inherited by forks and trigger "class already in use" fatals when the
-// child re-includes the file (observed on fakerphp/faker's BaseTest.php
-// which declares both BaseTest and a Collection helper in the same file).
+// opcodes via COW. We skip files that declare more than one top-level
+// symbol or any top-level function because opcache_compile_file on
+// PHP 8.1 (and likely later) leaks the secondary symbols into the master
+// process — those symbols are then inherited by forks and trigger
+// "Cannot declare ..." fatals when the child re-includes the file.
+// Observed cases:
+//   - fakerphp/faker BaseTest.php — class BaseTest + class Collection
+//   - guzzlehttp/psr7 StreamTest.php — class StreamTest + namespaced
+//     function GuzzleHttp\Psr7\fread() that shadows the builtin
 if (!empty($classMapExtra)
     && function_exists('opcache_compile_file')
     && filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN)) {
@@ -177,10 +180,41 @@ if (!empty($classMapExtra)
         }
     }
     foreach ($fileClassCount as $rp => $count) {
-        if ($count === 1) {
-            @opcache_compile_file($rp);
+        if ($count !== 1) continue;          // multi-class file → skip
+        if (file_has_top_level_function($rp)) continue;  // file with fn → skip
+        @opcache_compile_file($rp);
+    }
+}
+
+/**
+ * Return true if the PHP file declares at least one top-level (depth-0)
+ * function. Used to skip opcache pre-warm for files that mix a test class
+ * with namespaced helper functions, because opcache_compile_file leaks the
+ * function into the master and causes redeclaration fatals in forks.
+ *
+ * Brace-depth tracking is approximate but correct for well-formed PHP:
+ * anonymous classes and closures have their `function` / `class` token at
+ * depth 0 only when they're the file's top-level declaration; nested ones
+ * sit inside another body so depth > 0 and aren't counted.
+ */
+function file_has_top_level_function(string $file): bool
+{
+    $src = @file_get_contents($file);
+    if ($src === false) return true; // err on the safe side — skip pre-warm
+    $tokens = @token_get_all($src);
+    if (!is_array($tokens) || empty($tokens)) return false;
+    $depth = 0;
+    foreach ($tokens as $tok) {
+        if (is_array($tok)) {
+            if ($depth === 0 && $tok[0] === T_FUNCTION) {
+                return true;
+            }
+        } else {
+            if ($tok === '{') $depth++;
+            elseif ($tok === '}') $depth--;
         }
     }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
