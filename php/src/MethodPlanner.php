@@ -53,6 +53,8 @@ final class MethodPlanner
                     'method'         => $methodName,
                     'dataset'        => null,
                     'args'           => [],
+                    'args_hash'      => null,
+                    'is_duplicate'   => false,
                     'depends'        => [],
                     'provider_error' => $e->getMessage(),
                 ];
@@ -61,10 +63,12 @@ final class MethodPlanner
             if ($datasets === null) {
                 // Non-parameterized: one step. row_filter has no effect.
                 $steps[] = [
-                    'method'  => $methodName,
-                    'dataset' => null,
-                    'args'    => [],
-                    'depends' => $depends,
+                    'method'       => $methodName,
+                    'dataset'      => null,
+                    'args'         => [],
+                    'args_hash'    => null,
+                    'is_duplicate' => false,
+                    'depends'      => $depends,
                 ];
                 continue;
             }
@@ -92,12 +96,19 @@ final class MethodPlanner
                     $pos++;
                 }
             }
+            $seenHashes = [];
             foreach ($kept as $key => $row) {
+                $rowData     = is_array($row) ? $row : iterator_to_array($row);
+                $rowHash     = md5(json_encode(array_values($rowData)));
+                $isDuplicate = isset($seenHashes[$rowHash]);
+                $seenHashes[$rowHash] = true;
                 $steps[] = [
-                    'method'  => $methodName,
-                    'dataset' => is_int($key) ? "#{$key}" : (string) $key,
-                    'args'    => array_values(is_array($row) ? $row : iterator_to_array($row)),
-                    'depends' => $depends,
+                    'method'       => $methodName,
+                    'dataset'      => is_int($key) ? "#{$key}" : (string) $key,
+                    'args'         => array_values($rowData),
+                    'args_hash'    => $rowHash,
+                    'is_duplicate' => $isDuplicate,
+                    'depends'      => $depends,
                 ];
             }
         }
