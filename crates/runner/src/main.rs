@@ -115,6 +115,12 @@ struct Cli {
     /// the project's PSR-4 autoload map in composer.json.
     #[arg(long)]
     bake_mocks: bool,
+    /// PHP memory_limit applied inside each long-lived worker process.
+    /// Accepts any value php.ini understands: "256M", "1G", "-1" (unlimited).
+    /// Defaults to "512M" — generous enough for most suites without letting
+    /// 8 workers collectively exhaust the host's RAM.
+    #[arg(long, default_value = "512M")]
+    worker_memory_limit: String,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -424,7 +430,7 @@ fn real_main() -> Result<ExitCode> {
     let mut pool = PhpForkPool::spawn(
         &fork_script, &autoload, bootstrap.as_deref(),
         &defines, &env_triples, &server_pairs, &ini_pairs,
-        worker_count, &class_file_index,
+        worker_count, &class_file_index, &cli.worker_memory_limit,
     )?;
 
     let stop_on = if cli.stop_on_defect {

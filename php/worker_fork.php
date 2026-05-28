@@ -45,9 +45,10 @@ $definesJson     = $args['defines']            ?? '[]';
 $envJson         = $args['env']                ?? '[]';
 $serverJson      = $args['server']             ?? '[]';
 $iniJson         = $args['ini']                ?? '[]';
-$childStdinFdsStr  = $args['child-stdin-fds']  ?? '';
-$childStdoutFdsStr = $args['child-stdout-fds'] ?? '';
-$classMapFile      = $args['class-map-file']   ?? null;
+$childStdinFdsStr  = $args['child-stdin-fds']    ?? '';
+$childStdoutFdsStr = $args['child-stdout-fds']   ?? '';
+$classMapFile      = $args['class-map-file']     ?? null;
+$workerMemoryLimit = $args['worker-memory-limit'] ?? '512M';
 
 if ($autoload === null || $childStdinFdsStr === '' || $childStdoutFdsStr === '') {
     fwrite(STDERR, "worker_fork.php: missing --autoload, --child-stdin-fds, --child-stdout-fds\n");
@@ -215,7 +216,7 @@ for ($i = 0; $i < $n; $i++) {
                 fclose($childStdoutStreams[$j]);
             }
         }
-        runChild($childStdinStreams[$i], $childStdoutStreams[$i]);
+        runChild($childStdinStreams[$i], $childStdoutStreams[$i], $workerMemoryLimit);
         exit(0);
     }
     // Set from the parent side too: avoids the race where the child hasn't
@@ -239,12 +240,14 @@ exit(0);
 // stream TestOutcome JSON lines back and emit {"batch_done": true} between
 // batches as a ready signal. Exit cleanly when Rust closes our stdin.
 // ---------------------------------------------------------------------------
-function runChild($stdinStream, $stdoutStream): void
+function runChild($stdinStream, $stdoutStream, string $memoryLimit): void
 {
-    // Long-lived workers must not be bound by phpunit.xml's <ini name="memory_limit">.
-    // That setting targets short PHP CLI invocations; applying it here causes OOM after
-    // ~3000 tests. Unlimited memory is safe because the process is isolated per-slot.
-    @ini_set('memory_limit', '-1');
+    // Apply the worker-specific memory limit. This intentionally overrides
+    // phpunit.xml's <ini name="memory_limit"> because that setting is designed
+    // for short single-run PHP invocations, not long-lived workers that execute
+    // thousands of tests in sequence. The value is controlled by --worker-memory-limit
+    // (default "512M"); pass "-1" to restore unlimited behaviour.
+    @ini_set('memory_limit', $memoryLimit);
 
     // Current-batch state, captured by reference in the shutdown handler.
     // We reset both to empty after each clean batch so the handler doesn't

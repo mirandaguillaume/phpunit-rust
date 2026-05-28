@@ -38,6 +38,7 @@ impl PhpForkPool {
         ini: &[[String; 2]],
         n: usize,
         class_map: &std::collections::HashMap<String, std::path::PathBuf>,
+        worker_memory_limit: &str,
     ) -> Result<Self> {
         if n == 0 {
             return Err(anyhow!("fork pool requires at least 1 slot"));
@@ -161,6 +162,7 @@ impl PhpForkPool {
         } else {
             _class_map_tmp = None;
         }
+        cmd.arg("--worker-memory-limit").arg(worker_memory_limit);
 
         let master = cmd.spawn().context("failed to spawn PHP master")?;
 
