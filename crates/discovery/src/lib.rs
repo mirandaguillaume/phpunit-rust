@@ -40,6 +40,8 @@ pub struct TestCase {
     /// True when the class has no `setUpBeforeClass`/`tearDownAfterClass` override.
     /// See [`TestClass::has_lifecycle_overrides`].
     pub has_lifecycle_overrides: bool,
+    /// Mirrors [`GroupedMethod::depends_on`].
+    pub depends_on:      Vec<String>,
     /// Mirrors [`GroupedMethod::is_dispatch_safe`].
     pub is_dispatch_safe: bool,
 }
@@ -77,7 +79,7 @@ struct MethodInfo {
     groups:             Vec<String>,
     external_providers: Vec<(String, String)>,
     is_tautological:    bool,
-    has_depends:        bool,
+    depends_on:         Vec<String>,
 }
 
 /// Maps every discovered class FQCN to its resolved parent FQCN (or None).
@@ -98,11 +100,13 @@ pub struct GroupedMethod {
     /// assertSame(X,X)) and has at least one such assertion. The runner can skip
     /// dispatching these to a PHP worker and emit a synthetic Pass outcome instead.
     pub is_tautological:    bool,
-    /// True when the method carries a `#[Depends]` or `@depends` annotation.
-    /// Methods with dependencies must stay on the same worker as their
-    /// dependency — dispatching them individually would break return-value
-    /// injection. The runner uses this to exclude such methods from the
-    /// per-method dispatch path.
+    /// Names of methods this one depends on via `#[Depends('name')]` or
+    /// `@depends name`. Empty when there are no declared dependencies.
+    /// The runner uses this to group dependency chains together so
+    /// return-value injection works correctly.
+    pub depends_on:         Vec<String>,
+    /// True when `depends_on` is empty — the method has no ordering constraint
+    /// and can be dispatched to any worker independently.
     pub is_dispatch_safe:   bool,
 }
 
@@ -143,6 +147,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             external_providers: case.external_providers,
             is_tautological:    case.is_tautological,
             is_dispatch_safe:   case.is_dispatch_safe,
+            depends_on:         case.depends_on,
         };
         if let Some(existing) = groups.iter_mut()
             .find(|g| g.class == case.class && g.file == case.file)
@@ -590,17 +595,17 @@ fn collect_test_methods(
             }
             let external_providers = extract_external_provider_attrs(child, bytes, namespace, aliases);
             let is_tautological = is_tautological_method(child, bytes);
-            let has_depends = prev_comment.as_deref()
-                .map(|c| phpdoc_has_depends(c))
-                .unwrap_or(false)
-                || method_has_depends_attr(child, bytes);
+            let mut depends_on = prev_comment.as_deref()
+                .map(|c| phpdoc_depends(c))
+                .unwrap_or_default();
+            depends_on.extend(method_depends_attr(child, bytes));
             methods.push(MethodInfo {
                 name:               name.to_string(),
                 data_provider:      dp,
                 groups,
                 external_providers,
                 is_tautological,
-                has_depends,
+                depends_on,
             });
         }
         prev_comment = None;
@@ -608,22 +613,48 @@ fn collect_test_methods(
     methods
 }
 
-/// True when a PHPDoc block contains `@depends` (i.e. the method declares
-/// a test dependency via the PHPDoc form).
-fn phpdoc_has_depends(comment: &str) -> bool {
-    comment.contains("@depends ")
+/// Extract all `@depends methodName` targets from a PHPDoc comment.
+fn phpdoc_depends(comment: &str) -> Vec<String> {
+    let needle = "@depends ";
+    let mut result = Vec::new();
+    let mut search = comment;
+    while let Some(pos) = search.find(needle) {
+        let after = &search[pos + needle.len()..];
+        let name = after.split(|c: char| c.is_whitespace() || c == '*').next().unwrap_or("");
+        if !name.is_empty() {
+            result.push(name.to_string());
+        }
+        search = &search[pos + needle.len()..];
+    }
+    result
 }
 
-/// True when the method node has a `#[Depends(...)]` or
-/// `#[PHPUnit\...\Depends]` attribute.
-fn method_has_depends_attr(method: Node, bytes: &[u8]) -> bool {
+/// Extract all `#[Depends('methodName')]` targets from a method node's attributes.
+fn method_depends_attr(method: Node, bytes: &[u8]) -> Vec<String> {
+    let mut result = Vec::new();
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
         let Ok(text) = child.utf8_text(bytes) else { continue };
-        if !text.starts_with("#[") { continue; }
-        if text.contains("Depends") { return true; }
+        if !text.starts_with("#[") || !text.contains("Depends") { continue };
+        // Walk all occurrences of Depends( in this attribute block
+        let mut search = text;
+        while let Some(start) = search.find("Depends(") {
+            let after = &search[start + "Depends(".len()..];
+            let trimmed = after.trim_start();
+            let name = if let Some(r) = trimmed.strip_prefix('\'') {
+                r.split('\'').next().unwrap_or("")
+            } else if let Some(r) = trimmed.strip_prefix('"') {
+                r.split('"').next().unwrap_or("")
+            } else {
+                ""
+            };
+            if !name.is_empty() {
+                result.push(name.to_string());
+            }
+            search = &search[start + "Depends(".len()..];
+        }
     }
-    false
+    result
 }
 
 /// Extract `name` from a `@dataProvider name` annotation in a PHPDoc block.
@@ -942,7 +973,8 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             external_providers:      mi.external_providers.clone(),
                             is_tautological:         mi.is_tautological,
                             has_lifecycle_overrides: class.has_lifecycle_overrides,
-                            is_dispatch_safe:        !mi.has_depends,
+                            depends_on:              mi.depends_on.clone(),
+                            is_dispatch_safe:        mi.depends_on.is_empty(),
                         });
                     }
                 }
@@ -1403,9 +1435,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -1425,9 +1457,9 @@ final class ConcreteTest extends AbstractBaseTest {
         // for another file, which previously caused ReflectionException crashes
         // when --workers 1 serialised all batches through one PHP process.
         let cases = vec![
-            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");

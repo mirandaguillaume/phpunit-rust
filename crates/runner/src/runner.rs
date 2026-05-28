@@ -289,6 +289,58 @@ const MAX_ROW_CHUNKS: u32 = 4;
 ///
 /// OVERSATURATION ensures more batches than workers so work-stealing has
 /// granularity to keep all workers busy even with variance in test duration.
+
+/// Group a slice of methods into dependency chains using union-find.
+///
+/// Two methods end up in the same chain when one directly or transitively
+/// depends on the other. Each chain should be dispatched as a single
+/// `BatchClass` so that PHPUnit's `MethodPlanner` can inject return values
+/// from dependency methods into their dependents.
+///
+/// Methods whose `depends_on` names are not present in the slice are treated
+/// as isolated (the dependency is external or missing — MethodPlanner handles
+/// this gracefully at runtime). Methods not involved in any dependency
+/// (singleton chains) are returned as one-element groups.
+fn dependency_chains<'a>(
+    methods: &'a [&'a discovery::GroupedMethod],
+) -> Vec<Vec<&'a discovery::GroupedMethod>> {
+    let n = methods.len();
+    if n == 0 { return vec![]; }
+
+    let name_to_idx: HashMap<&str, usize> = methods.iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.as_str(), i))
+        .collect();
+
+    // Path-compressed union-find.
+    let mut parent: Vec<usize> = (0..n).collect();
+    let find = |parent: &mut Vec<usize>, mut x: usize| -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]]; // path halving
+            x = parent[x];
+        }
+        x
+    };
+
+    for (i, m) in methods.iter().enumerate() {
+        for dep in &m.depends_on {
+            if let Some(&j) = name_to_idx.get(dep.as_str()) {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj { parent[ri] = rj; }
+            }
+        }
+    }
+
+    // Collect groups by root representative.
+    let mut groups: HashMap<usize, Vec<&'a discovery::GroupedMethod>> = HashMap::new();
+    for (i, &m) in methods.iter().enumerate() {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(m);
+    }
+    groups.into_values().collect()
+}
+
 fn build_queue(
     cases: Vec<TestCase>,
     cfg: &RunConfig,
@@ -392,29 +444,31 @@ fn build_queue(
 
         if other_methods.is_empty() { continue; }
 
-        // For method_dispatch_safe classes: plain methods (no data provider) each
-        // get their own BatchPlan for maximum parallelism; provider methods fall
-        // through to the existing LPT/stride logic below.
+        // For classes without lifecycle overrides: partition into
+        // (a) provider methods  → existing LPT/stride path
+        // (b) non-provider methods → run through dependency chain grouping:
+        //       singleton chains (no deps, not depended on) → individual BatchPlan
+        //       multi-method chains                         → one BatchPlan per chain
         if !g.has_lifecycle_overrides {
-            let (plain, with_providers): (Vec<_>, Vec<_>) = other_methods
+            let (non_provider, with_providers): (Vec<_>, Vec<_>) = other_methods
                 .into_iter()
-                .partition(|m| m.is_dispatch_safe
-                    && m.data_provider.is_none()
-                    && m.external_providers.is_empty());
+                .partition(|m| m.data_provider.is_none() && m.external_providers.is_empty());
 
-            if !plain.is_empty() {
+            if !non_provider.is_empty() {
                 // Flush any accumulated bin first to preserve LPT order.
                 if !bin_buf.is_empty() {
                     queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
                     bin_methods = 0;
                 }
-                for m in &plain {
-                    let method_name = m.name.clone();
-                    let req_files = required_files_for(&[method_name.clone()], &g.methods);
+                let non_provider_refs: Vec<&_> = non_provider.iter().collect();
+                let chains = dependency_chains(&non_provider_refs);
+                for chain in chains {
+                    let method_names: Vec<String> = chain.iter().map(|m| m.name.clone()).collect();
+                    let req_files = required_files_for(&method_names, &g.methods);
                     let bc = BatchClass {
                         file:           g.file.clone(),
                         class:          g.class.clone(),
-                        methods:        vec![method_name],
+                        methods:        method_names,
                         row_filter:     None,
                         required_files: req_files,
                     };
@@ -539,6 +593,7 @@ mod tests {
             external_providers:   vec![],
             is_tautological:         false,
             has_lifecycle_overrides: false,
+            depends_on:              vec![],
             is_dispatch_safe:        true,
         }
     }
@@ -587,6 +642,7 @@ mod tests {
             external_providers:   vec![],
             is_tautological:         false,
             has_lifecycle_overrides: false,
+            depends_on:              vec![],
             is_dispatch_safe:        true,
         }
     }
@@ -647,6 +703,7 @@ mod tests {
             external_providers:      vec![],
             is_tautological:         false,
             has_lifecycle_overrides: true,   // forces class-level dispatch path
+            depends_on:              vec![],
             is_dispatch_safe:        true,
         }
     }
@@ -690,6 +747,7 @@ mod tests {
             external_providers:   vec![],
             is_tautological:         false,
             has_lifecycle_overrides: false,
+            depends_on:              vec![],
             is_dispatch_safe:        true,
         }
     }
@@ -782,6 +840,7 @@ mod tests {
             external_providers:   vec![],
             is_tautological:         false,
             has_lifecycle_overrides: false,
+            depends_on:              vec![],
             is_dispatch_safe:        true,
         }
     }
@@ -854,6 +913,61 @@ mod tests {
             provider_plans[0].classes[0].row_filter.is_none(),
             "no row split when row_counts is empty (below threshold)"
         );
+    }
+
+    fn make_depends_case(class: &str, method: &str, deps: Vec<&str>) -> TestCase {
+        let depends_on: Vec<String> = deps.iter().map(|s| s.to_string()).collect();
+        let safe = depends_on.is_empty();
+        TestCase {
+            file:                    PathBuf::from("/f.php"),
+            class:                   class.to_string(),
+            method:                  method.to_string(),
+            data_provider:           None,
+            groups:                  vec![],
+            external_providers:      vec![],
+            is_tautological:         false,
+            has_lifecycle_overrides: false,
+            depends_on,
+            is_dispatch_safe:        safe,
+        }
+    }
+
+    #[test]
+    fn dependency_chain_methods_dispatched_together() {
+        // testA (no deps) ← testB depends on testA ← testC depends on testB
+        // testD and testE have no deps
+        // Expected: testA+testB+testC in one BatchPlan, testD and testE solo.
+        let cases = vec![
+            make_depends_case("ChainClass", "testA", vec![]),
+            make_depends_case("ChainClass", "testB", vec!["testA"]),
+            make_depends_case("ChainClass", "testC", vec!["testB"]),
+            make_depends_case("ChainClass", "testD", vec![]),
+            make_depends_case("ChainClass", "testE", vec![]),
+        ];
+        let cfg = RunConfig {
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
+            n_workers:        4,
+        };
+        let (queue, _) = build_queue(cases, &cfg, &RowCounts::new());
+        let q: Vec<_> = queue.into_iter().collect();
+
+        assert_eq!(q.len(), 3, "chain A→B→C + solo D + solo E = 3 plans");
+
+        let chain = q.iter().find(|p| p.classes[0].methods.len() == 3)
+            .expect("chain plan A+B+C must exist");
+        let mut cm = chain.classes[0].methods.clone(); cm.sort_unstable();
+        assert_eq!(cm, vec!["testA", "testB", "testC"]);
+
+        let solos: Vec<_> = q.iter().filter(|p| p.classes[0].methods.len() == 1).collect();
+        assert_eq!(solos.len(), 2);
+        let mut sm: Vec<&str> = solos.iter().map(|p| p.classes[0].methods[0].as_str()).collect();
+        sm.sort_unstable();
+        assert_eq!(sm, vec!["testD", "testE"]);
     }
 
 }

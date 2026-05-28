@@ -114,6 +114,7 @@ mod tests {
             external_providers:   vec![],
             is_tautological:         false,
             has_lifecycle_overrides: false,
+            depends_on:              vec![],
             is_dispatch_safe:        true,
         }
     }
