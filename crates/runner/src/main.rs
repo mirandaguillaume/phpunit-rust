@@ -315,11 +315,38 @@ fn real_main() -> Result<ExitCode> {
     };
 
     // Build a FQCN→file index over all PHP files in test roots and supplement
-    // dirs so the runner can locate external data provider classes not in the
-    // PSR-4 autoloader.
+    // dirs so the runner can locate classes the test code references but the
+    // PSR-4 autoloader can't reach. We then filter the index down to *only*
+    // the FQCNs the tests can statically reach: their #[DataProviderExternal]
+    // pairs (those are explicit by name) AND every class FQCN that appears
+    // in any test method's body fingerprint — `new Foo()`, `Foo::class`,
+    // `createMock(Foo::class)`, `Foo::CONST`, `instanceof Foo`, …
+    //
+    // This mirrors PHPUnit's behaviour (it never indexes a class until
+    // reflection demands it). A full scan would index every fixture file
+    // rector ships (~1500 entries), bloat the PHP master's classMapExtra
+    // map, and make the opcache pre-warm loop fatal on suites with
+    // thousands of fixture stubs.
     let mut index_dirs = test_roots.clone();
     index_dirs.extend(graph_supplement_dirs.iter().cloned());
-    let class_file_index = discover_class_file_index(&index_dirs);
+    let class_file_index_full = discover_class_file_index(&index_dirs);
+    let mut wanted_fqcns: std::collections::HashSet<String> = cases.iter()
+        .flat_map(|c| {
+            c.external_providers.iter().map(|(fqcn, _)| fqcn.clone())
+                .chain(c.fingerprint.iter().cloned())
+        })
+        .collect();
+    // The test classes themselves must also be resolvable through the
+    // fallback map so the worker can `require_once` them before running
+    // their methods — they aren't necessarily in their own fingerprint
+    // (a method body rarely references its enclosing class).
+    for c in &cases {
+        wanted_fqcns.insert(c.class.clone());
+    }
+    let class_file_index: std::collections::HashMap<String, PathBuf> = class_file_index_full
+        .into_iter()
+        .filter(|(fqcn, _)| wanted_fqcns.contains(fqcn))
+        .collect();
 
     // Honor phpunit.xml's <groups><exclude>: drop any test whose effective
     // groups include one of the excluded names. Vanilla PHPUnit does this
