@@ -49,6 +49,7 @@ $childStdinFdsStr  = $args['child-stdin-fds']    ?? '';
 $childStdoutFdsStr = $args['child-stdout-fds']   ?? '';
 $classMapFile      = $args['class-map-file']     ?? null;
 $workerMemoryLimit = $args['worker-memory-limit'] ?? '512M';
+$maxBatches        = (int) ($args['max-batches-per-child'] ?? '0'); // 0 = unlimited
 
 if ($autoload === null || $childStdinFdsStr === '' || $childStdoutFdsStr === '') {
     fwrite(STDERR, "worker_fork.php: missing --autoload, --child-stdin-fds, --child-stdout-fds\n");
@@ -204,50 +205,100 @@ pcntl_signal(SIGINT,  $signalHandler);
 pcntl_signal(SIGHUP,  $signalHandler);
 
 // ---------------------------------------------------------------------------
-// 8. Fork N children
+// 8. Fork N children. When $maxBatches > 0 we behave as a fork-server: a
+//    child exits voluntarily after processing $maxBatches batches, and the
+//    master forks a fresh replacement that inherits the master's warm state
+//    (autoload + bootstrap) via COW. This caps per-fork state accumulation —
+//    e.g. Symfony bridge deprecation collectors — without paying the cost
+//    of a one-batch-per-process model.
+//    When $maxBatches = 0 we keep the original long-lived behaviour.
 // ---------------------------------------------------------------------------
-for ($i = 0; $i < $n; $i++) {
+$forkChildForSlot = static function (int $slot) use (
+    $childStdinStreams, $childStdoutStreams, $n, $workerMemoryLimit, $maxBatches
+): int {
     $pid = pcntl_fork();
     if ($pid === -1) {
-        fwrite(STDERR, "worker_fork.php: pcntl_fork() failed\n");
-        exit(1);
+        fwrite(STDERR, "worker_fork.php: pcntl_fork() failed for slot $slot\n");
+        return -1;
     }
     if ($pid === 0) {
-        // Become our own process group leader so that posix_kill(-pgid) from
-        // the master's signal handler reaches every subprocess we spawn (via
-        // proc_open, exec, shell_exec, etc.) — not just us.
         posix_setpgid(0, 0);
-        // Restore default signal disposition so SIGTERM/SIGINT terminate this
-        // worker immediately instead of running the master's handler with a
-        // stale (pre-fork) $childPids snapshot.
         pcntl_signal(SIGTERM, SIG_DFL);
         pcntl_signal(SIGINT,  SIG_DFL);
         pcntl_signal(SIGHUP,  SIG_DFL);
-        // Close every sibling's streams.
-        // CRITICAL: each child MUST close the write ends it does not own;
-        // Rust's reader on those pipes blocks until the last writer exits.
         for ($j = 0; $j < $n; $j++) {
-            if ($j !== $i) {
-                fclose($childStdinStreams[$j]);
-                fclose($childStdoutStreams[$j]);
+            if ($j !== $slot) {
+                @fclose($childStdinStreams[$j]);
+                @fclose($childStdoutStreams[$j]);
             }
         }
-        runChild($childStdinStreams[$i], $childStdoutStreams[$i], $workerMemoryLimit);
+        runChild($childStdinStreams[$slot], $childStdoutStreams[$slot], $workerMemoryLimit, $maxBatches);
         exit(0);
     }
-    // Set from the parent side too: avoids the race where the child hasn't
-    // called posix_setpgid(0,0) yet when the master receives a signal.
     @posix_setpgid($pid, $pid);
-    $childPids[] = $pid;
+    return $pid;
+};
+
+$slotPid    = array_fill(0, $n, 0);
+$slotClosed = array_fill(0, $n, false);
+for ($i = 0; $i < $n; $i++) {
+    $slotPid[$i] = $forkChildForSlot($i);
+    if ($slotPid[$i] === -1) exit(1);
+    $childPids[] = $slotPid[$i];
 }
 
-// Master: close all child FDs, then wait for children.
-for ($i = 0; $i < $n; $i++) {
-    fclose($childStdinStreams[$i]);
-    fclose($childStdoutStreams[$i]);
+if ($maxBatches === 0) {
+    // Long-lived mode: just wait for all children to exit (on Rust closing
+    // their stdin) — no respawning. Closing master FDs here lets Rust's
+    // reader see EOF when each child eventually exits.
+    for ($i = 0; $i < $n; $i++) {
+        fclose($childStdinStreams[$i]);
+        fclose($childStdoutStreams[$i]);
+    }
+    foreach ($childPids as $pid) {
+        pcntl_waitpid($pid, $status);
+    }
+    exit(0);
+}
+
+// Fork-server mode: install SIGCHLD handler to respawn children that exit
+// voluntarily (after $maxBatches). A child exit with code 7 means "EOF on
+// stdin, slot is closed" — we don't respawn then.
+//
+// CRITICAL: keep $childStdinStreams / $childStdoutStreams open in the master
+// across the entire run. The kernel-level FDs underlie them; fresh forked
+// children inherit those FDs only if the master still holds them.
+pcntl_signal(SIGCHLD, function () use (
+    &$slotPid, &$slotClosed, &$childPids, $forkChildForSlot
+): void {
+    while (($deadPid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
+        $slot = array_search($deadPid, $slotPid, true);
+        if ($slot === false) continue;
+        $childPids = array_values(array_diff($childPids, [$deadPid]));
+        // exit code 7 = child saw EOF on stdin; Rust closed this slot.
+        if (pcntl_wifexited($status) && pcntl_wexitstatus($status) === 7) {
+            $slotClosed[$slot] = true;
+            $slotPid[$slot] = 0;
+            continue;
+        }
+        // Any other exit: respawn for the next batch.
+        $newPid = $forkChildForSlot($slot);
+        if ($newPid === -1) {
+            $slotClosed[$slot] = true;
+            $slotPid[$slot] = 0;
+            continue;
+        }
+        $slotPid[$slot] = $newPid;
+        $childPids[]    = $newPid;
+    }
+});
+
+while (in_array(false, $slotClosed, true)) {
+    pcntl_signal_dispatch();
+    usleep(5_000);
 }
 foreach ($childPids as $pid) {
-    pcntl_waitpid($pid, $status);
+    @pcntl_waitpid($pid, $status, WNOHANG);
 }
 exit(0);
 
@@ -256,7 +307,7 @@ exit(0);
 // stream TestOutcome JSON lines back and emit {"batch_done": true} between
 // batches as a ready signal. Exit cleanly when Rust closes our stdin.
 // ---------------------------------------------------------------------------
-function runChild($stdinStream, $stdoutStream, string $memoryLimit): void
+function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatches = 0): void
 {
     // Apply the worker-specific memory limit. This intentionally overrides
     // phpunit.xml's <ini name="memory_limit"> because that setting is designed
@@ -291,9 +342,14 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit): void
         }
     });
 
+    $batchesProcessed = 0;
     while (true) {
         $line = fgets($stdinStream);
-        if ($line === false || $line === '') break;  // EOF: clean shutdown
+        if ($line === false || $line === '') {
+            // EOF on stdin: Rust closed the pipe. Tell master via exit(7)
+            // so it knows this slot is closed (don't respawn).
+            exit(7);
+        }
         $line = trim($line);
         if ($line === '') continue;
 
@@ -400,6 +456,16 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit): void
         $nextIdx        = 0;
         fwrite($stdoutStream, json_encode(['batch_done' => true]) . "\n");
         fflush($stdoutStream);
+
+        // Fork-server mode: exit voluntarily after $maxBatches batches so
+        // the master can fork a fresh child for the next batch. This bounds
+        // per-fork state accumulation (e.g. Symfony bridge collectors).
+        if ($maxBatches > 0) {
+            $batchesProcessed++;
+            if ($batchesProcessed >= $maxBatches) {
+                exit(0);
+            }
+        }
     }
 
     fclose($stdinStream);

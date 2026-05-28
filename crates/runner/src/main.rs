@@ -121,6 +121,14 @@ struct Cli {
     /// 8 workers collectively exhaust the host's RAM.
     #[arg(long, default_value = "512M")]
     worker_memory_limit: String,
+    /// Recycle each PHP worker fork after it has processed this many batches.
+    /// The master forks a fresh replacement that inherits its warm
+    /// autoload/bootstrap state via COW — so per-fork accumulators (e.g.
+    /// Symfony bridge deprecation collectors) can't blow the memory limit
+    /// before recycling. Defaults to 20. Pass 0 to disable (long-lived
+    /// workers, original behaviour). Counting happens in PHP master.
+    #[arg(long, default_value = "20")]
+    worker_max_batches: u32,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -431,6 +439,7 @@ fn real_main() -> Result<ExitCode> {
         &fork_script, &autoload, bootstrap.as_deref(),
         &defines, &env_triples, &server_pairs, &ini_pairs,
         worker_count, &class_file_index, &cli.worker_memory_limit,
+        cli.worker_max_batches,
     )?;
 
     let stop_on = if cli.stop_on_defect {
