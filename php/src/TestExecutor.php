@@ -62,12 +62,29 @@ final class TestExecutor
 
         $outcomes = [];
         $passedReturns = [];  // method -> return value, for @depends injection
+        $givenCache = [];  // "$method\0$args_hash" → array (outcome shape)
 
         foreach ($steps as $step) {
             $method  = $step['method'];
             $dataset = $step['dataset'];
             $userArgs = $step['args'];
             $depends = $step['depends'];
+
+            // Check cache for duplicate Given (identical method + args_hash).
+            $cacheKey = (isset($step['args_hash']) && $step['args_hash'] !== null)
+                ? $step['method'] . "\0" . $step['args_hash']
+                : null;
+
+            if (($step['is_duplicate'] ?? false) && $cacheKey !== null && isset($givenCache[$cacheKey])) {
+                $cached = $givenCache[$cacheKey];
+                $outcomes[] = array_merge($cached, [
+                    'dataset' => $step['dataset'],
+                    'message' => ($cached['message'] ?? null) !== null
+                        ? $cached['message']
+                        : '[memoized: identical Given]',
+                ]);
+                continue;
+            }
 
             // Provider threw during planning — emit error and move on.
             if (isset($step['provider_error'])) {
@@ -201,6 +218,11 @@ final class TestExecutor
 
             $duration = (microtime(true) - $startedAt) * 1000.0;
             $outcomes[] = OutcomeBuilder::build($class, $method, $dataset, $duration, $error);
+
+            // Store in cache (first occurrence only) for memoization.
+            if ($cacheKey !== null && !isset($givenCache[$cacheKey])) {
+                $givenCache[$cacheKey] = end($outcomes);
+            }
 
             if ($error === null && $returnValue !== null) {
                 $passedReturns[$method] = $returnValue;
