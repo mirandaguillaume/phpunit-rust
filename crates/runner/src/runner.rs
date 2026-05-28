@@ -83,15 +83,23 @@ impl Report {
     }
 }
 
-/// One per-line message from a worker child: either a test outcome or a
-/// `batch_done` ready-signal. Untagged so we can deserialize without changing
-/// the existing TestOutcome JSON shape.
+/// One per-line message from a worker child: either a test outcome, a
+/// `batch_done` ready-signal, or a `slot_died` notice the master writes
+/// when SIGCHLD reaped a child non-voluntarily (crash, OOM, signal). The
+/// enum is untagged so we can deserialise without changing the existing
+/// TestOutcome JSON shape.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum WorkerMessage {
     BatchDone {
         #[allow(dead_code)] // discriminant only — its truthiness is the signal
         batch_done: bool,
+    },
+    SlotDied {
+        #[allow(dead_code)]
+        slot_died: bool,
+        exit_code: i32,
+        signal:    i32,
     },
     Outcome(TestOutcome),
 }
@@ -158,6 +166,14 @@ pub fn run(
     // Seed each slot with one chunk, then close any slots we can't feed.
     let mut slot_busy = vec![false; n];
     let mut slot_open = vec![true; n];
+    // Per-slot bookkeeping of the batch we've handed to a worker but not yet
+    // seen `batch_done` for. If the master reports `slot_died` (the child
+    // crashed mid-batch — fatal, OOM, segfault), we drain the corresponding
+    // entry and synthesise an error outcome for every test that batch was
+    // supposed to run. Without this, those tests would silently disappear
+    // from the report and the dispatcher would hang waiting for outcomes
+    // that will never come.
+    let mut slot_in_flight: Vec<Option<BatchPlan>> = (0..n).map(|_| None).collect();
     // Slot-affinity dispatch: track the union of FQCN fingerprints each slot
     // has been fed. When a slot reports `batch_done`, prefer queuing the
     // pending batch whose fingerprint overlaps most with `slot_loaded`. The
@@ -197,6 +213,7 @@ pub fn run(
             Some(plan) => {
                 slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                 pool.write_batch(slot, &plan)?;
+                slot_in_flight[slot] = Some(plan);
                 slot_busy[slot] = true;
             }
             None => {
@@ -238,9 +255,73 @@ pub fn run(
             }
             WorkerEvent::Message(slot, WorkerMessage::BatchDone { .. }) => {
                 slot_busy[slot] = false;
+                slot_in_flight[slot] = None;
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
+                    slot_in_flight[slot] = Some(plan);
+                    slot_busy[slot] = true;
+                } else if slot_open[slot] {
+                    pool.close_slot(slot);
+                    slot_open[slot] = false;
+                }
+            }
+            WorkerEvent::Message(slot, WorkerMessage::SlotDied { exit_code, signal, .. }) => {
+                // Master telegraphs that the child PID for this slot died.
+                // If the previous batch had already emitted `batch_done`, the
+                // in_flight slot is None and there's nothing to recover — the
+                // death was a clean K-recycle or force_exit_after. Otherwise
+                // we synthesise one error outcome per test in the lost batch
+                // so the report stays accurate and the dispatcher doesn't
+                // hang waiting for outcomes that will never arrive.
+                if let Some(lost) = slot_in_flight[slot].take() {
+                    let cause = if signal != 0 {
+                        format!("worker process died: signal {signal}")
+                    } else {
+                        format!("worker process died: exit code {exit_code}")
+                    };
+                    for bc in &lost.classes {
+                        // Empty methods vector in a BatchClass means "run all
+                        // methods of this class" — we don't have the list at
+                        // dispatch time. Emit one class-level error so the
+                        // class shows up in the report.
+                        if bc.methods.is_empty() {
+                            let o = TestOutcome {
+                                class:       bc.class.clone(),
+                                method:      "<class>".to_string(),
+                                dataset:     None,
+                                status:      TestStatus::Error,
+                                message:     Some(cause.clone()),
+                                trace:       None,
+                                duration_ms: 0.0,
+                            };
+                            on_progress(&o);
+                            outcomes.push(o);
+                        } else {
+                            for m in &bc.methods {
+                                let o = TestOutcome {
+                                    class:       bc.class.clone(),
+                                    method:      m.clone(),
+                                    dataset:     None,
+                                    status:      TestStatus::Error,
+                                    message:     Some(cause.clone()),
+                                    trace:       None,
+                                    duration_ms: 0.0,
+                                };
+                                on_progress(&o);
+                                outcomes.push(o);
+                            }
+                        }
+                    }
+                }
+                // Mark the slot ready to receive the next batch — the master
+                // has already forked a replacement child for us, waiting on
+                // its stdin pipe for fresh work.
+                slot_busy[slot] = false;
+                if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
+                    slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
+                    pool.write_batch(slot, &plan)?;
+                    slot_in_flight[slot] = Some(plan);
                     slot_busy[slot] = true;
                 } else if slot_open[slot] {
                     pool.close_slot(slot);

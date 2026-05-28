@@ -203,7 +203,10 @@ if (!empty($classMapExtra)
     // first batch — i.e. negligible when there are few files. Below the
     // threshold, lazy require_once in the child wins on cold runs by ~20ms.
     // Above the threshold, sharing compiled opcodes via COW dominates.
-    if (count($fileClassCount) >= 50) {
+    // Threshold overridable via PHPUNIT_RUST_OPCACHE_THRESHOLD for A/B
+    // benchmarking; 0 forces always-prewarm, a huge value forces never.
+    $opcacheThreshold = (int) (getenv('PHPUNIT_RUST_OPCACHE_THRESHOLD') ?: '50');
+    if (count($fileClassCount) >= $opcacheThreshold) {
         foreach ($fileClassCount as $rp => $count) {
             if ($count !== 1) continue;          // multi-class file → skip
             if (file_has_top_level_function($rp)) continue;  // file with fn → skip
@@ -348,7 +351,7 @@ if ($maxBatches === 0) {
 // across the entire run. The kernel-level FDs underlie them; fresh forked
 // children inherit those FDs only if the master still holds them.
 pcntl_signal(SIGCHLD, function () use (
-    &$slotPid, &$slotClosed, &$childPids, $forkChildForSlot
+    &$slotPid, &$slotClosed, &$childPids, &$childStdoutStreams, $forkChildForSlot
 ): void {
     while (($deadPid = pcntl_waitpid(-1, $status, WNOHANG)) > 0) {
         $slot = array_search($deadPid, $slotPid, true);
@@ -360,7 +363,27 @@ pcntl_signal(SIGCHLD, function () use (
             $slotPid[$slot] = 0;
             continue;
         }
-        // Any other exit: respawn for the next batch.
+        // Distinguish a CRASH (non-zero exit, killed by signal) from a clean
+        // recycle (exit 0 — K-batches limit or force_exit_after). Only crashes
+        // need a slot_died notice: a clean recycle has already emitted
+        // batch_done so Rust's in_flight[slot] is None and the previous batch
+        // is fully accounted for. Sending slot_died here would race with the
+        // NEXT batch's dispatch and make Rust attribute the death to the new
+        // in-flight plan → synthetic errors for tests that ran fine.
+        $exitedClean    = pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0;
+        $isCrash        = !$exitedClean;
+        if ($isCrash
+            && isset($childStdoutStreams[$slot])
+            && is_resource($childStdoutStreams[$slot])) {
+            $exitCode = pcntl_wifexited($status)   ? pcntl_wexitstatus($status) : -1;
+            $signal   = pcntl_wifsignaled($status) ? pcntl_wtermsig($status)    :  0;
+            @fwrite($childStdoutStreams[$slot], json_encode([
+                'slot_died' => true,
+                'exit_code' => $exitCode,
+                'signal'    => $signal,
+            ]) . "\n");
+            @fflush($childStdoutStreams[$slot]);
+        }
         $newPid = $forkChildForSlot($slot);
         if ($newPid === -1) {
             $slotClosed[$slot] = true;
@@ -546,7 +569,10 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // immediately regardless of $batchesProcessed. The master forks
         // a fresh child for the next batch, guaranteeing zero cross-batch
         // pollution from this class's global side effects.
-        if (!empty($plan['force_exit_after'])) {
+        // PHPUNIT_RUST_NO_ISOLATION=1 disables the per-batch fresh-fork
+        // for stateful classes — used only for A/B benchmarks to quantify
+        // the parity-vs-perf trade-off.
+        if (!empty($plan['force_exit_after']) && !getenv('PHPUNIT_RUST_NO_ISOLATION')) {
             exit(0);
         }
         if ($maxBatches > 0) {
