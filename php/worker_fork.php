@@ -157,12 +157,28 @@ if ($bootstrap !== null && is_file($bootstrap)) {
 //    the master already saw. Only runs when ext-opcache is loaded and
 //    opcache.enable_cli is on (we pass -d opcache.enable_cli=1 from Rust).
 // ---------------------------------------------------------------------------
+// Pre-compile every test file into opcache so children inherit compiled
+// opcodes via COW. We skip files that contain more than one top-level
+// class because opcache_compile_file on PHP 8.1 (and likely later) leaks
+// some class symbols into the master process — those symbols are then
+// inherited by forks and trigger "class already in use" fatals when the
+// child re-includes the file (observed on fakerphp/faker's BaseTest.php
+// which declares both BaseTest and a Collection helper in the same file).
 if (!empty($classMapExtra)
     && function_exists('opcache_compile_file')
     && filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN)) {
+    $fileClassCount = [];
     foreach ($classMapExtra as $file) {
         if (is_string($file) && is_file($file)) {
-            @opcache_compile_file($file);
+            $rp = realpath($file);
+            if ($rp !== false) {
+                $fileClassCount[$rp] = ($fileClassCount[$rp] ?? 0) + 1;
+            }
+        }
+    }
+    foreach ($fileClassCount as $rp => $count) {
+        if ($count === 1) {
+            @opcache_compile_file($rp);
         }
     }
 }
