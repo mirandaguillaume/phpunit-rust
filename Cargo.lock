@@ -453,7 +453,7 @@ checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
 
 [[package]]
 name = "discovery"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "rayon",
@@ -936,7 +936,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mock_baker"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1038,7 +1038,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "phpunit-rust"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "analyzer",
  "anyhow",

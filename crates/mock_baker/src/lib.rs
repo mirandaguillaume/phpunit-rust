@@ -231,8 +231,7 @@ fn detect_get_mock_builder<'a>(
 
     const BAIL: &[&str] = &["onlyMethods", "addMethods", "setMethods", "setConstructorArgs"];
     let mut cur = rhs;
-    let mut iface_name: Option<String> = None;
-    loop {
+    let iface_name: String = loop {
         if cur.kind() != "member_call_expression" { return None; }
         let call_name = text(cur.child_by_field_name("name")?, src);
         match call_name {
@@ -244,17 +243,16 @@ fn detect_get_mock_builder<'a>(
                 if cce.kind() != "class_constant_access_expression" { return None; }
                 let obj = cur.child_by_field_name("object")?;
                 if text(obj, src) != "$this" { return None; }
-                iface_name = Some(text(cce.named_child(0)?, src).to_string());
-                break;
+                break text(cce.named_child(0)?, src).to_string();
             }
             n if BAIL.contains(&n) => return None,
             _ => {}
         }
         cur = cur.child_by_field_name("object")?;
-    }
+    };
     Some(MockBlock {
         var,
-        iface_name:   iface_name?,
+        iface_name,
         byte_start:   stmt.start_byte(),
         create_end:   stmt.end_byte(),
         exp_stmts:    Vec::new(),

@@ -96,8 +96,6 @@ fn add_ns_block(
 ///    - Replace remaining backslashes with `/`, append `.php`.
 ///    - Return the path if the file exists on disk.
 /// 4. Return `None` if nothing matched or the file doesn't exist.
-///
-/// TODO: implement this function (5-10 lines of Rust).
 pub fn psr4_resolve(class: &str, map: &HashMap<String, Vec<PathBuf>>) -> Option<PathBuf> {
     let class = class.trim_start_matches('\\');
 

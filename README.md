@@ -6,7 +6,7 @@ project's autoloader and bootstrap once; N children are forked via
 `pcntl_fork()` so they inherit the warmed-up interpreter via copy-on-write.
 Tests delegate to the project's own PHPUnit installation.
 
-## Status: v0.7.0 — exact test-count parity on 4 of 5 benched OSS suites
+## Status: v0.8.0 — exact test-count parity on PHPUnit's own suite + 5 OSS projects
 
 The runner spawns one PHP master, forks N children, then streams test
 classes (and individual data-provider rows for heavy providers) over
@@ -20,6 +20,7 @@ Today's scoreboard:
 
 | Project | vanilla | phpunit-rust | Status |
 |---|---:|---:|:---|
+| phpunit (own suite) | 5029 | **5029** | EXACT ✓ |
 | carbon | 6169 | **6169** | EXACT ✓ |
 | doctrine-orm | 3478 | **3478** | EXACT ✓ |
 | php-parser | 1887 | **1887** | EXACT ✓ |
@@ -41,11 +42,14 @@ in our worker process) — these are not count-parity issues.
 - `expectException`, `expectExceptionMessage`, `expectExceptionCode`
 - `markTestSkipped`, `markTestIncomplete`
 - `setUp` / `tearDown`, `setUpBeforeClass` / `tearDownAfterClass`
+- PHPUnit 10 attribute-style lifecycle hooks: `#[Before]`, `#[After]`,
+  `#[BeforeClass]`, `#[AfterClass]`
 
 **Test discovery** (tree-sitter-based, our `discovery` crate):
 
 - `testXxx` naming, `/** @test */` PHPDoc, `#[Test]` attribute (including
   stacked with `#[Group(...)]` and other decorations)
+- `#[Ticket('...')]` attribute (parsed; used by some legacy suites for metadata)
 - Inheritance chains: fully-qualified extends, abstract base classes
   outside test dirs (resolved via `composer.json` autoload)
 - Custom-framework base classes: any FQCN whose last segment ends in
@@ -94,12 +98,21 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
   excluded by suite A but explicitly included by suite B is still walked
   via B)
 - `<php><const>` declarations
+- `<php><env>` and `<php><server>` (sets `$_ENV`/`$_SERVER`; `force`
+  attribute honoured for `<env>`)
+- `<php><ini>` (applied before autoload/bootstrap via `ini_set()`)
 - `<groups><exclude>`
 - `<listeners>` parsed but **not dispatched** (see "Not yet supported")
 
 **CLI flags:**
 
 - `--project`, `--bootstrap`, `--filter`, `--workers`, `--configuration`
+- `--group <name>`, `--exclude-group <name>` (filter by `#[Group]` / `@group`)
+- `--testsuite <name>` (run a named suite from `phpunit.xml`)
+- `--stop-on-failure` (halt after the first failing test)
+- `--list-tests` (print `Class::method` lines then exit, no tests run)
+- `--bake-mocks` (rewrite `createMock()` calls to anonymous-class stubs
+  before execution; requires PSR-4 resolvable interfaces)
 - `--coverage-format clover|json --coverage-out path` (build with
   `--features coverage`)
 
@@ -108,8 +121,15 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 - SIGINT / SIGKILL on `phpunit-rust` reliably kills the PHP master and
   every forked child via kernel `PR_SET_PDEATHSIG` + PHP signal handlers
   — no orphan workers, no zombie 100%-CPU PHP processes after a Ctrl-C
+- Each forked child becomes its own process-group leader (`posix_setpgid`);
+  shutdown sends `SIGKILL` to the entire process group so grandchildren
+  spawned by a test (via `proc_open`, `shell_exec`, etc.) are also reaped
 - `setUpBeforeClass` and `tearDownAfterClass` failures emit per-test
   error outcomes instead of swallowing every test in the class
+- Cross-class data-provider dependencies resolved via a secondary
+  autoloader (Rust writes the FQCN → file index, PHP registers it with
+  `spl_autoload_register`); provider exceptions are isolated per-method
+  rather than crashing the whole class
 
 **Static coverage** via the sibling `analyzer` crate (mago AST + per-test
 attribution; no Xdebug / PCOV needed).
@@ -172,12 +192,15 @@ Workspace (Cargo)
   │                       #[TestWith], @testWith, #[Group], @group
   │                     · custom-framework TestCase bases
   ├─ crates/runner      phpunit-rust binary
-  │   ├─ phpunit_xml    bootstrap, <testsuites>, <php><const>,
+  │   ├─ phpunit_xml    bootstrap, <testsuites>, <php><const/env/server/ini>,
   │   │                 <groups><exclude>, <listeners>
   │   ├─ provider_enum  pre-fork PHP pass to count provider rows
-  │   ├─ fork_pool      pipe-managed N-slot fork pool (CLOEXEC, PDEATHSIG)
-  │   ├─ runner         work-stealing queue, LPT scheduling, row split
+  │   ├─ fork_pool      pipe-managed N-slot fork pool (CLOEXEC, PDEATHSIG,
+  │   │                 process-group kill, class-map temp file)
+  │   ├─ runner         work-stealing queue, LPT bin-packing, row split
+  │   ├─ mock_bake      PSR-4 resolver + --bake-mocks preprocessing
   │   └─ reporter       TTY progress + summary (mpsc-driven)
+  ├─ crates/mock_baker  tree-sitter createMock() → anonymous-class rewriter
   └─ crates/analyzer    static PHP coverage via mago AST
                         · per-test attribution
                         · Clover / JSON output (--features coverage)
