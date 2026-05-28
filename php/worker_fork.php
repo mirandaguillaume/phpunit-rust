@@ -510,6 +510,16 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // Fork-server mode: exit voluntarily after $maxBatches batches so
         // the master can fork a fresh child for the next batch. This bounds
         // per-fork state accumulation (e.g. Symfony bridge collectors).
+        //
+        // Per-batch override: when the runner marks a batch with
+        // `force_exit_after` (set on batches whose class is is_stateful —
+        // it registers stream wrappers, error handlers, etc.), we exit
+        // immediately regardless of $batchesProcessed. The master forks
+        // a fresh child for the next batch, guaranteeing zero cross-batch
+        // pollution from this class's global side effects.
+        if (!empty($plan['force_exit_after'])) {
+            exit(0);
+        }
         if ($maxBatches > 0) {
             $batchesProcessed++;
             if ($batchesProcessed >= $maxBatches) {

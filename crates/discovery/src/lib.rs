@@ -44,6 +44,14 @@ pub struct TestCase {
     pub depends_on:      Vec<String>,
     /// Mirrors [`GroupedMethod::is_dispatch_safe`].
     pub is_dispatch_safe: bool,
+    /// Mirrors [`GroupedMethod::fingerprint`].
+    pub fingerprint:      std::collections::HashSet<String>,
+    /// True when the test class calls a PHP API that mutates process-global
+    /// state (stream wrapper registry, error handler, ini values, locale, …)
+    /// without a reliable restore mechanism. The runner forces a fresh fork
+    /// for each batch of such a class so cross-batch pollution can't carry
+    /// over. See [`TestClass::is_stateful`].
+    pub is_stateful:      bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -69,6 +77,13 @@ struct ParsedClass {
     /// when their chain reaches TestCase.
     is_abstract: bool,
     has_lifecycle_overrides: bool,
+    /// True when ANY method in the class (test or otherwise: setUp,
+    /// tearDown, helpers, setUpBeforeClass…) statically calls a
+    /// process-global mutator like `stream_wrapper_register`,
+    /// `set_error_handler`, `ini_set`, `setlocale`, etc. Such classes
+    /// can't safely share a recycled worker with other batches because
+    /// their global side effects bleed across tests.
+    is_stateful: bool,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -80,6 +95,11 @@ struct MethodInfo {
     external_providers: Vec<(String, String)>,
     is_tautological:    bool,
     depends_on:         Vec<String>,
+    /// FQCNs statically referenced in the method body — `new Foo(...)`,
+    /// `Foo::class`, `Foo::method()`, `createMock(Foo::class)`, etc. Used
+    /// by the runner's slot-affinity dispatcher to route batches to workers
+    /// that have already loaded matching classes (warm-cache routing).
+    fingerprint:        std::collections::HashSet<String>,
 }
 
 /// Maps every discovered class FQCN to its resolved parent FQCN (or None).
@@ -108,6 +128,10 @@ pub struct GroupedMethod {
     /// True when `depends_on` is empty — the method has no ordering constraint
     /// and can be dispatched to any worker independently.
     pub is_dispatch_safe:   bool,
+    /// FQCNs statically referenced in the method body. See
+    /// [`MethodInfo::fingerprint`]. Used by the runner's slot-affinity
+    /// dispatcher for warm-cache routing across batches.
+    pub fingerprint:        std::collections::HashSet<String>,
 }
 
 /// A discovered test class with all of its methods, grouped for batched
@@ -125,6 +149,13 @@ pub struct TestClass {
     pub class:                   String,
     pub methods:                 Vec<GroupedMethod>,
     pub has_lifecycle_overrides: bool,
+    /// True when the class statically references at least one PHP API that
+    /// mutates process-global state without a guaranteed restore (stream
+    /// wrapper registry, error/exception handler, ini values, locale, …).
+    /// Such classes must run in an isolated fork (one batch per process)
+    /// so cross-batch pollution can't bleed in. Detected at discovery by
+    /// walking ALL method bodies in the class (including setUp/tearDown).
+    pub is_stateful:             bool,
 }
 
 /// Group a flat list of TestCases by class. Preserves discovery order
@@ -140,6 +171,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     let mut groups: Vec<TestClass> = Vec::new();
     for case in cases {
         let has_lifecycle_overrides = case.has_lifecycle_overrides;
+        let is_stateful = case.is_stateful;
         let gm = GroupedMethod {
             name:               case.method,
             data_provider:      case.data_provider,
@@ -148,17 +180,22 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             is_tautological:    case.is_tautological,
             is_dispatch_safe:   case.is_dispatch_safe,
             depends_on:         case.depends_on,
+            fingerprint:        case.fingerprint,
         };
         if let Some(existing) = groups.iter_mut()
             .find(|g| g.class == case.class && g.file == case.file)
         {
             existing.methods.push(gm);
+            // Any TestCase from a stateful class makes the whole grouping
+            // stateful — pollution is per-class, not per-method.
+            existing.is_stateful = existing.is_stateful || is_stateful;
         } else {
             groups.push(TestClass {
                 file:                    case.file,
                 class:                   case.class,
                 methods:                 vec![gm],
                 has_lifecycle_overrides,
+                is_stateful,
             });
         }
     }
@@ -372,6 +409,7 @@ fn collect_parsed_classes(
         }
 
         let has_lifecycle_overrides = !has_no_lifecycle_overrides(body, bytes);
+        let is_stateful = class_has_stateful_calls(body, bytes);
 
         out.push(ParsedClass {
             file: path.to_path_buf(),
@@ -381,6 +419,7 @@ fn collect_parsed_classes(
             class_groups,
             is_abstract,
             has_lifecycle_overrides,
+            is_stateful,
         });
     }
     Ok(())
@@ -547,6 +586,151 @@ fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
     found_assertion
 }
 
+/// Walk a method body and collect every fully-qualified class name (FQCN)
+/// it statically references. Used by the runner's slot-affinity dispatch
+/// to route tests with similar class footprints to the same worker.
+///
+/// Sources of references:
+///   - `new Foo()` / `new \Some\Foo()`            → object_creation_expression
+///   - `Foo::class`, `Foo::CONST`, `Foo::method()` → class_constant_access_expression
+///                                                / scoped_call_expression
+///                                                / scoped_property_access_expression
+///   - `instanceof Foo`                            → binary_expression with `instanceof`
+///   - `createMock(Foo::class)` / `createStub(...)` / `getMockBuilder(...)`
+///     are subsumed by `Foo::class` resolution above.
+///
+/// Bare names are resolved through `aliases` (the file's `use` map) and the
+/// enclosing namespace. Names starting with `\` are absolute; we strip the
+/// leading backslash for normalisation. Unresolved short names (e.g. PHP
+/// builtins like `DateTime`, `stdClass`) are dropped since they don't
+/// influence per-worker caching meaningfully.
+fn extract_method_fingerprint(
+    method_node: Node,
+    bytes: &[u8],
+    namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
+) -> std::collections::HashSet<String> {
+    let mut result: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let body = match method_node.child_by_field_name("body") {
+        Some(b) => b,
+        None => return result,
+    };
+    let mut stack = vec![body];
+    while let Some(n) = stack.pop() {
+        // Recurse into all named children. Tree-sitter PHP nests deeply so we
+        // iterate in DFS using an explicit stack to avoid recursion overhead.
+        let mut cursor = n.walk();
+        for child in n.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        // Identify class references by node kind.
+        let class_name_text: Option<&str> = match n.kind() {
+            // `new Foo(...)` — the type sits in `name_node`/`type` field
+            "object_creation_expression" => {
+                n.child_by_field_name("type")
+                    .or_else(|| n.named_child(0))
+                    .and_then(|c| c.utf8_text(bytes).ok())
+            }
+            // `Foo::class` / `Foo::CONST` — first named child is the class name
+            "class_constant_access_expression" |
+            "scoped_call_expression" |
+            "scoped_property_access_expression" => {
+                n.named_child(0).and_then(|c| c.utf8_text(bytes).ok())
+            }
+            // `expr instanceof Foo` — Right operand if the op is `instanceof`
+            "binary_expression" => {
+                let op = n.child_by_field_name("operator")
+                    .and_then(|c| c.utf8_text(bytes).ok())
+                    .unwrap_or("");
+                if op == "instanceof" {
+                    n.child_by_field_name("right")
+                        .and_then(|c| c.utf8_text(bytes).ok())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(raw) = class_name_text {
+            let resolved = resolve_class_reference(raw, namespace, aliases);
+            // Only retain names that look like a FQCN (contain a backslash) —
+            // bare unresolved names match PHP builtins and add noise.
+            if resolved.contains('\\') {
+                result.insert(resolved);
+            }
+        }
+    }
+    result
+}
+
+/// Bare PHP function names that mutate process-global state without a
+/// reliable per-test restore. A class that calls any of these from any
+/// of its methods — test, setUp, helper, doesn't matter — gets marked
+/// `is_stateful` so the runner forks a fresh worker for each of its
+/// batches. The list is intentionally conservative: a false positive
+/// just costs perf (extra forks), a false negative costs parity.
+const STATEFUL_GLOBAL_APIS: &[&str] = &[
+    // Stream wrappers (the canonical guzzle-psr7 case)
+    "stream_wrapper_register",
+    "stream_wrapper_unregister",
+    "stream_wrapper_restore",
+    "stream_register_wrapper",          // pre-5.1 alias still in some codebases
+    // Error / exception handlers
+    "set_error_handler",
+    "restore_error_handler",
+    "set_exception_handler",
+    "restore_exception_handler",
+    // ini / env / locale
+    "ini_set",
+    "putenv",
+    "setlocale",
+    "date_default_timezone_set",
+    "mb_internal_encoding",
+    "mb_regex_encoding",
+    // Autoload chain
+    "spl_autoload_register",
+    "spl_autoload_unregister",
+];
+
+/// Walk every method body in a class (test methods AND helpers like setUp,
+/// tearDown, setUpBeforeClass) and return true if at least one of them
+/// statically calls one of [`STATEFUL_GLOBAL_APIS`].
+///
+/// This is intentionally syntactic, not semantic — we don't reason about
+/// whether the call is conditional, restored later, or behind an
+/// `if (false)`. The runner pays for any positive match by forking a
+/// fresh worker per batch; the cost is much smaller than running a
+/// polluting suite with K=20 recycling and silently losing tests.
+fn class_has_stateful_calls(class_body: Node, bytes: &[u8]) -> bool {
+    let mut cursor = class_body.walk();
+    for member in class_body.children(&mut cursor) {
+        if member.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(body) = member.child_by_field_name("body") else { continue };
+        let mut stack = vec![body];
+        while let Some(n) = stack.pop() {
+            let mut c2 = n.walk();
+            for child in n.named_children(&mut c2) {
+                stack.push(child);
+            }
+            if n.kind() == "function_call_expression" {
+                let fn_node = n.child_by_field_name("function")
+                    .or_else(|| n.named_child(0));
+                if let Some(fnn) = fn_node {
+                    if let Ok(name) = fnn.utf8_text(bytes) {
+                        let bare = name.trim_start_matches('\\');
+                        if STATEFUL_GLOBAL_APIS.contains(&bare) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn collect_test_methods(
     body: Node,
     bytes: &[u8],
@@ -599,6 +783,7 @@ fn collect_test_methods(
                 .map(|c| phpdoc_depends(c))
                 .unwrap_or_default();
             depends_on.extend(method_depends_attr(child, bytes));
+            let fingerprint = extract_method_fingerprint(child, bytes, namespace, aliases);
             methods.push(MethodInfo {
                 name:               name.to_string(),
                 data_provider:      dp,
@@ -606,6 +791,7 @@ fn collect_test_methods(
                 external_providers,
                 is_tautological,
                 depends_on,
+                fingerprint,
             });
         }
         prev_comment = None;
@@ -950,6 +1136,25 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
         // reflection-based discovery collapses them; we mirror that by
         // deduping on the lowercased name as we walk the inheritance chain.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Walk the chain once to OR every ancestor's is_stateful flag — a
+        // setUp() inherited from a parent class can pollute global state
+        // just as readily as one declared on the concrete subclass.
+        let chain_is_stateful = {
+            let mut visit = class.fqcn.as_str();
+            let mut d = 0;
+            let mut acc = false;
+            while d < 32 {
+                if let Some(c) = by_fqcn.get(visit) {
+                    acc = acc || c.is_stateful;
+                    match c.parent_fqcn.as_deref() {
+                        Some(p) => visit = p,
+                        None => break,
+                    }
+                } else { break; }
+                d += 1;
+            }
+            acc
+        };
         let mut visit = class.fqcn.as_str();
         let mut depth = 0;
         while depth < 32 {
@@ -975,6 +1180,8 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             has_lifecycle_overrides: class.has_lifecycle_overrides,
                             depends_on:              mi.depends_on.clone(),
                             is_dispatch_safe:        mi.depends_on.is_empty(),
+                            fingerprint:             mi.fingerprint.clone(),
+                            is_stateful:             chain_is_stateful,
                         });
                     }
                 }
@@ -1435,9 +1642,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -1457,9 +1664,9 @@ final class ConcreteTest extends AbstractBaseTest {
         // for another file, which previously caused ReflectionException crashes
         // when --workers 1 serialised all batches through one PHP process.
         let cases = vec![
-            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
-            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true },
+            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
+            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
+            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");

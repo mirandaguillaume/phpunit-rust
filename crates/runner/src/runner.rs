@@ -158,9 +158,44 @@ pub fn run(
     // Seed each slot with one chunk, then close any slots we can't feed.
     let mut slot_busy = vec![false; n];
     let mut slot_open = vec![true; n];
+    // Slot-affinity dispatch: track the union of FQCN fingerprints each slot
+    // has been fed. When a slot reports `batch_done`, prefer queuing the
+    // pending batch whose fingerprint overlaps most with `slot_loaded`. The
+    // intuition: re-routing related tests to the same worker keeps the
+    // process-local class table warm (classes already required → no
+    // require_once on the next batch), and bounds the *unique* classes each
+    // worker accumulates, which can reduce peak RSS on large suites.
+    let mut slot_loaded: Vec<std::collections::HashSet<String>> = vec![std::collections::HashSet::new(); n];
+    /// Cap the queue scan window so worst-case dispatch stays O(n_window)
+    /// rather than O(queue_len). 32 is large enough to find good matches in
+    /// the LPT-ordered head of the queue but small enough to keep the runner
+    /// loop bounded for big suites (thousands of batches).
+    const AFFINITY_SCAN_WINDOW: usize = 32;
+    let pick_best_for_slot = |queue: &mut VecDeque<BatchPlan>,
+                              slot_fp: &std::collections::HashSet<String>|
+                              -> Option<BatchPlan> {
+        if queue.is_empty() { return None; }
+        if slot_fp.is_empty() {
+            // No warmth yet — just take the head (preserves LPT order on the
+            // very first batch each slot processes).
+            return queue.pop_front();
+        }
+        let window = queue.len().min(AFFINITY_SCAN_WINDOW);
+        let mut best_idx = 0usize;
+        let mut best_score = 0usize;
+        for i in 0..window {
+            let score = queue[i].fingerprint.intersection(slot_fp).count();
+            if score > best_score {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+        queue.remove(best_idx)
+    };
     for slot in 0..n {
         match queue.pop_front() {
             Some(plan) => {
+                slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                 pool.write_batch(slot, &plan)?;
                 slot_busy[slot] = true;
             }
@@ -203,7 +238,8 @@ pub fn run(
             }
             WorkerEvent::Message(slot, WorkerMessage::BatchDone { .. }) => {
                 slot_busy[slot] = false;
-                if let Some(plan) = queue.pop_front() {
+                if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
+                    slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
                     slot_busy[slot] = true;
                 } else if slot_open[slot] {
@@ -391,12 +427,40 @@ fn build_queue(
     let mut synthetic:  Vec<TestOutcome>    = Vec::new();
     let mut bin_buf:    Vec<BatchClass>     = Vec::new();
     let mut bin_methods: usize              = 0;
+    // OR of every contributing class's `is_stateful` while the bin
+    // accumulates. Resets to false on flush. Used so a small stateful
+    // class can join a non-stateful bin without losing the "exit after
+    // this batch" marker — once anything stateful is in there, the
+    // whole bin's batch must force-exit.
+    let mut bin_stateful: bool              = false;
 
-    let mk_plan = |classes: Vec<BatchClass>| BatchPlan {
-        autoload:  cfg.autoload.clone(),
-        bootstrap: cfg.bootstrap.clone(),
-        defines:   cfg.defines.clone(),
-        classes,
+    // Pre-compute a (class, method) → fingerprint lookup so `mk_plan` can
+    // union per-class fingerprints into a per-batch fingerprint without
+    // re-walking the AST. Built from `by_cost`'s `TestClass.methods`.
+    let mut method_fp: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
+    for (_, g) in &by_cost {
+        for m in &g.methods {
+            method_fp.insert((g.class.clone(), m.name.clone()), m.fingerprint.clone());
+        }
+    }
+
+    let mk_plan = |classes: Vec<BatchClass>, force_exit_after: bool| {
+        let mut fp: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for bc in &classes {
+            for method in &bc.methods {
+                if let Some(m_fp) = method_fp.get(&(bc.class.clone(), method.clone())) {
+                    fp.extend(m_fp.iter().cloned());
+                }
+            }
+        }
+        BatchPlan {
+            autoload:    cfg.autoload.clone(),
+            bootstrap:   cfg.bootstrap.clone(),
+            defines:     cfg.defines.clone(),
+            classes,
+            fingerprint: fp,
+            force_exit_after,
+        }
     };
 
     for (cost, g) in by_cost {
@@ -438,7 +502,7 @@ fn build_queue(
                     row_filter:     Some(RowFilter { chunk_index, total_chunks: chunks }),
                     required_files: required_files_for(&[hm.name.clone()], &g.methods),
                 };
-                queue.push_back(mk_plan(vec![bc]));
+                queue.push_back(mk_plan(vec![bc], g.is_stateful));
             }
         }
 
@@ -457,7 +521,8 @@ fn build_queue(
             if !non_provider.is_empty() {
                 // Flush any accumulated bin first to preserve LPT order.
                 if !bin_buf.is_empty() {
-                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
+                    bin_stateful = false;
                     bin_methods = 0;
                 }
                 let non_provider_refs: Vec<&_> = non_provider.iter().collect();
@@ -472,7 +537,7 @@ fn build_queue(
                         row_filter:     None,
                         required_files: req_files,
                     };
-                    queue.push_back(mk_plan(vec![bc]));
+                    queue.push_back(mk_plan(vec![bc], g.is_stateful));
                 }
             }
 
@@ -501,15 +566,18 @@ fn build_queue(
             };
             if other_cost >= target {
                 if !bin_buf.is_empty() {
-                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
+                    bin_stateful = false;
                     bin_methods = 0;
                 }
-                queue.push_back(mk_plan(vec![bc]));
+                queue.push_back(mk_plan(vec![bc], g.is_stateful));
             } else {
                 bin_buf.push(bc);
+                bin_stateful = bin_stateful || g.is_stateful;
                 bin_methods += other_cost;
                 if bin_methods >= target {
-                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                    queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
+                    bin_stateful = false;
                     bin_methods = 0;
                 }
             }
@@ -539,21 +607,24 @@ fn build_queue(
         if other_cost >= target {
             // Flush any accumulated bin first to preserve LPT order.
             if !bin_buf.is_empty() {
-                queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
+                    bin_stateful = false;
                 bin_methods = 0;
             }
-            queue.push_back(mk_plan(vec![bc]));
+            queue.push_back(mk_plan(vec![bc], g.is_stateful));
         } else {
             bin_buf.push(bc);
+            bin_stateful = bin_stateful || g.is_stateful;
             bin_methods += other_cost;
             if bin_methods >= target {
-                queue.push_back(mk_plan(std::mem::take(&mut bin_buf)));
+                queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
+                    bin_stateful = false;
                 bin_methods = 0;
             }
         }
     }
     if !bin_buf.is_empty() {
-        queue.push_back(mk_plan(bin_buf));
+        queue.push_back(mk_plan(bin_buf, bin_stateful));
     }
     (queue, synthetic)
 }
@@ -595,6 +666,8 @@ mod tests {
             has_lifecycle_overrides: false,
             depends_on:              vec![],
             is_dispatch_safe:        true,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 
@@ -644,6 +717,8 @@ mod tests {
             has_lifecycle_overrides: false,
             depends_on:              vec![],
             is_dispatch_safe:        true,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 
@@ -705,6 +780,8 @@ mod tests {
             has_lifecycle_overrides: true,   // forces class-level dispatch path
             depends_on:              vec![],
             is_dispatch_safe:        true,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 
@@ -749,6 +826,8 @@ mod tests {
             has_lifecycle_overrides: false,
             depends_on:              vec![],
             is_dispatch_safe:        true,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 
@@ -842,6 +921,8 @@ mod tests {
             has_lifecycle_overrides: false,
             depends_on:              vec![],
             is_dispatch_safe:        true,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 
@@ -929,6 +1010,8 @@ mod tests {
             has_lifecycle_overrides: false,
             depends_on,
             is_dispatch_safe:        safe,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 

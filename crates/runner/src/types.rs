@@ -65,6 +65,19 @@ pub struct BatchPlan {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub defines: Vec<[String; 2]>,
     pub classes: Vec<BatchClass>,
+    /// Union of FQCNs statically referenced by this batch's methods. Used
+    /// by the runner's slot-affinity dispatcher for warm-cache routing.
+    /// Skipped from JSON since PHP workers don't need it.
+    #[serde(skip)]
+    pub fingerprint: std::collections::HashSet<String>,
+    /// When `true`, the worker child exits voluntarily after processing
+    /// this batch so the master can fork a clean replacement before the
+    /// next batch lands. Set on batches whose class is `is_stateful` (it
+    /// calls `stream_wrapper_register`, `set_error_handler`, etc.) — the
+    /// global side effects must not bleed into the next batch on the
+    /// same worker. Default `false` keeps the K-batches recycling path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_exit_after: bool,
 }
 
 #[cfg(test)]
@@ -121,6 +134,8 @@ mod batch_plan_tests {
                 row_filter:     None,
                 required_files: vec![],
             }],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
         };
         let v = serde_json::to_value(&plan).unwrap();
         assert_eq!(v["autoload"], "/proj/vendor/autoload.php");
@@ -163,6 +178,8 @@ mod batch_plan_tests {
             bootstrap: None,
             defines: vec![],
             classes: vec![],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
         };
         let v = serde_json::to_value(&plan).unwrap();
         assert!(v.get("bootstrap").is_none());

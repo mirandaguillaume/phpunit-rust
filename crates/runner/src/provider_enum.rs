@@ -116,6 +116,8 @@ mod tests {
             has_lifecycle_overrides: false,
             depends_on:              vec![],
             is_dispatch_safe:        true,
+            fingerprint:             std::collections::HashSet::new(),
+            is_stateful:             false,
         }
     }
 
