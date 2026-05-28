@@ -28,15 +28,18 @@ use walkdir::WalkDir;
 /// `<groups><exclude>` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestCase {
-    pub file:               PathBuf,
-    pub class:              String,
-    pub method:             String,
-    pub data_provider:      Option<String>,
-    pub groups:             Vec<String>,
-    pub external_providers: Vec<(String, String)>,
+    pub file:                 PathBuf,
+    pub class:                String,
+    pub method:               String,
+    pub data_provider:        Option<String>,
+    pub groups:               Vec<String>,
+    pub external_providers:   Vec<(String, String)>,
     /// True when the method body consists entirely of trivially-true assertions
     /// and has at least one such assertion. See [`GroupedMethod::is_tautological`].
-    pub is_tautological:    bool,
+    pub is_tautological:      bool,
+    /// Propagated from [`ParsedClass::method_dispatch_safe`].
+    /// See [`TestClass::method_dispatch_safe`] for semantics.
+    pub method_dispatch_safe: bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -61,6 +64,8 @@ struct ParsedClass {
     /// instantiated by PHPUnit; we skip emitting test cases for them even
     /// when their chain reaches TestCase.
     is_abstract: bool,
+    /// See [`TestClass::method_dispatch_safe`].
+    method_dispatch_safe: bool,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -95,11 +100,25 @@ pub struct GroupedMethod {
 
 /// A discovered test class with all of its methods, grouped for batched
 /// dispatch (one request per class to the worker).
+///
+/// `method_dispatch_safe` is `true` when every method in this class can be
+/// dispatched independently (one `BatchPlan` per method) without violating
+/// PHPUnit's test-lifecycle guarantees. The conditions are:
+///   - No `setUpBeforeClass` or `tearDownAfterClass` override (shared class-level
+///     state would break when the class is instantiated multiple times).
+///   - No method has a `#[DataProvider]` or `#[DataProviderExternal]` dependency
+///     (providers are resolved once per class run; splitting would duplicate work
+///     or miss rows).
+///   - `setUp()`, if overridden, assigns only fresh object-construction or scalar
+///     literals to `$this` properties — no shared mutable state escapes a single
+///     test method boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestClass {
-    pub file:    PathBuf,
-    pub class:   String,
-    pub methods: Vec<GroupedMethod>,
+    pub file:                 PathBuf,
+    pub class:                String,
+    pub methods:              Vec<GroupedMethod>,
+    /// See struct-level doc comment for semantics.
+    pub method_dispatch_safe: bool,
 }
 
 /// Group a flat list of TestCases by class. Preserves discovery order
@@ -114,6 +133,7 @@ pub struct TestClass {
 pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     let mut groups: Vec<TestClass> = Vec::new();
     for case in cases {
+        let method_dispatch_safe = case.method_dispatch_safe;
         let gm = GroupedMethod {
             name:               case.method,
             data_provider:      case.data_provider,
@@ -127,9 +147,10 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             existing.methods.push(gm);
         } else {
             groups.push(TestClass {
-                file:    case.file,
-                class:   case.class,
-                methods: vec![gm],
+                file:                 case.file,
+                class:                case.class,
+                methods:              vec![gm],
+                method_dispatch_safe,
             });
         }
     }
@@ -342,6 +363,10 @@ fn collect_parsed_classes(
             extract_groups_phpdoc(&doc, &mut class_groups);
         }
 
+        let method_dispatch_safe = has_no_lifecycle_overrides(body, bytes)
+            && test_methods.iter().all(|m| m.data_provider.is_none() && m.external_providers.is_empty())
+            && setUp_is_stateless(body, bytes);
+
         out.push(ParsedClass {
             file: path.to_path_buf(),
             fqcn,
@@ -349,6 +374,7 @@ fn collect_parsed_classes(
             test_methods,
             class_groups,
             is_abstract,
+            method_dispatch_safe,
         });
     }
     Ok(())
@@ -370,6 +396,135 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
     }
     false
 }
+
+// ── setUp-stateless helpers ────────────────────────────────────────────────
+
+/// True if the class body does NOT declare `setUpBeforeClass` or
+/// `tearDownAfterClass`. These are class-level lifecycle hooks that run once
+/// per class (not once per test); splitting such a class into per-method plans
+/// would either skip the hook entirely or run it once per method (wrong either way).
+fn has_no_lifecycle_overrides(class_body: Node, src: &[u8]) -> bool {
+    let mut cursor = class_body.walk();
+    for child in class_body.children(&mut cursor) {
+        if child.kind() != "method_declaration" { continue; }
+        let name = child.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+            .unwrap_or("");
+        if matches!(name, "setUpBeforeClass" | "tearDownAfterClass") {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when the class's `setUp()` body contains only "safe" statements:
+///   - `$this->x = new Foo(scalar_args...)`
+///   - `$this->x = scalar_literal`
+///   - `parent::setUp()`
+///
+/// Returns `true` if there is no `setUp` override at all (safe by definition,
+/// because PHPUnit's base `setUp()` is a no-op that only sets internal state).
+#[allow(non_snake_case)]
+fn setUp_is_stateless(class_body: Node, src: &[u8]) -> bool {
+    let mut cursor = class_body.walk();
+    for child in class_body.children(&mut cursor) {
+        if child.kind() != "method_declaration" { continue; }
+        let name = child.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+            .unwrap_or("");
+        if name != "setUp" { continue; }
+        let body = match child.child_by_field_name("body") {
+            Some(b) => b,
+            None => return true,
+        };
+        let mut bc = body.walk();
+        for stmt in body.children(&mut bc) {
+            match stmt.kind() {
+                "{" | "}" | "comment" => continue,
+                "expression_statement" => {
+                    let inner = match stmt.named_child(0) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    if !is_safe_setup_expr(inner, src) { return false; }
+                }
+                _ => return false,
+            }
+        }
+        return true;
+    }
+    true // no setUp override → safe
+}
+
+fn is_safe_setup_expr(expr: Node, src: &[u8]) -> bool {
+    // parent::setUp() — tree-sitter-php models `parent::foo()` as a
+    // `scoped_call_expression` with field `scope` = "parent" and `name` = "setUp".
+    if expr.kind() == "scoped_call_expression" {
+        let scope = expr.child_by_field_name("scope")
+            .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
+        let method = expr.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
+        return scope == "parent" && method == "setUp";
+    }
+    // $this->x = <safe_rhs>
+    if expr.kind() == "assignment_expression" {
+        let lhs = match expr.child_by_field_name("left") {
+            Some(l) => l,
+            None => return false,
+        };
+        let rhs = match expr.child_by_field_name("right") {
+            Some(r) => r,
+            None => return false,
+        };
+        if lhs.kind() != "member_access_expression" { return false; }
+        let obj = lhs.child_by_field_name("object")
+            .and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
+        if obj != "$this" { return false; }
+        return is_safe_rhs(rhs, src);
+    }
+    false
+}
+
+fn is_safe_rhs(node: Node, src: &[u8]) -> bool {
+    match node.kind() {
+        "integer" | "float" | "string" | "encapsed_string"
+        | "boolean" | "true" | "false" | "null" => true,
+        "object_creation_expression" => {
+            // Find the arguments node; if none, it's a bare `new Foo` — safe.
+            let mut cursor = node.walk();
+            let mut args_node: Option<Node> = None;
+            for child in node.children(&mut cursor) {
+                if child.kind() == "arguments" {
+                    args_node = Some(child);
+                    break;
+                }
+            }
+            match args_node {
+                None => true,
+                Some(an) => {
+                    let mut ac = an.walk();
+                    for arg in an.named_children(&mut ac) {
+                        if !is_safe_rhs(arg, src) { return false; }
+                    }
+                    true
+                }
+            }
+        }
+        "array_creation_expression" => {
+            let mut c = node.walk();
+            for el in node.named_children(&mut c) {
+                if !is_safe_rhs(el, src) { return false; }
+            }
+            true
+        }
+        "array_element_initializer" => {
+            node.named_child(0).map(|n| is_safe_rhs(n, src)).unwrap_or(true)
+        }
+        _ => false,
+    }
+}
+
+// ── end setUp-stateless helpers ────────────────────────────────────────────
 
 /// Returns `true` when the method body consists *entirely* of trivially-true
 /// PHPUnit assertions and contains at least one of them:
@@ -863,13 +1018,14 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                         groups.extend(c.class_groups.iter().cloned());
                         groups.extend(mi.groups.iter().cloned());
                         cases.push(TestCase {
-                            file:               class.file.clone(),
-                            class:              class.fqcn.clone(),
-                            method:             mi.name.clone(),
-                            data_provider:      mi.data_provider.clone(),
-                            groups:             groups.into_iter().collect(),
-                            external_providers: mi.external_providers.clone(),
-                            is_tautological:    mi.is_tautological,
+                            file:                 class.file.clone(),
+                            class:                class.fqcn.clone(),
+                            method:               mi.name.clone(),
+                            data_provider:        mi.data_provider.clone(),
+                            groups:               groups.into_iter().collect(),
+                            external_providers:   mi.external_providers.clone(),
+                            is_tautological:      mi.is_tautological,
+                            method_dispatch_safe: class.method_dispatch_safe,
                         });
                     }
                 }
@@ -1330,9 +1486,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, method_dispatch_safe: false },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, method_dispatch_safe: false },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, method_dispatch_safe: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -1352,9 +1508,9 @@ final class ConcreteTest extends AbstractBaseTest {
         // for another file, which previously caused ReflectionException crashes
         // when --workers 1 serialised all batches through one PHP process.
         let cases = vec![
-            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
-            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
-            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false },
+            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, method_dispatch_safe: false },
+            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, method_dispatch_safe: false },
+            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, method_dispatch_safe: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");
@@ -1469,6 +1625,65 @@ class Provider {
         std::fs::write(&path, src).unwrap();
         let idx = discover_class_file_index(&[dir.path().to_path_buf()]);
         assert_eq!(idx.get("App\\Data\\Provider"), Some(&path));
+    }
+
+    #[test]
+    fn stateless_setup_detected_correctly() {
+        // "Safe" class: setUp only does $this->x = new Foo() and parent::setUp().
+        // "Unsafe" class: setUp calls a method on $this->db (shared mutable state).
+        let src = r#"<?php
+namespace App\Tests;
+use PHPUnit\Framework\TestCase;
+
+class SafeSetUpTest extends TestCase {
+    public function setUp(): void {
+        parent::setUp();
+        $this->repo = new Repository();
+        $this->id = 42;
+    }
+    public function testOne(): void {}
+    public function testTwo(): void {}
+}
+
+class UnsafeSetUpTest extends TestCase {
+    public function setUp(): void {
+        $this->db = new Database();
+        $this->db->connect();
+    }
+    public function testA(): void {}
+}
+
+class NoSetUpTest extends TestCase {
+    public function testB(): void {}
+}
+
+class LifecycleTest extends TestCase {
+    public static function setUpBeforeClass(): void {}
+    public function testC(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let grouped = group_by_class(cases);
+        let by_class: std::collections::HashMap<&str, &TestClass> =
+            grouped.iter().map(|g| (g.class.as_str(), g)).collect();
+
+        assert!(
+            by_class["App\\Tests\\SafeSetUpTest"].method_dispatch_safe,
+            "setUp with only new Foo() and scalar assignments must be safe"
+        );
+        assert!(
+            !by_class["App\\Tests\\UnsafeSetUpTest"].method_dispatch_safe,
+            "setUp with method call on $this->db must be unsafe"
+        );
+        assert!(
+            by_class["App\\Tests\\NoSetUpTest"].method_dispatch_safe,
+            "no setUp override must be safe"
+        );
+        assert!(
+            !by_class["App\\Tests\\LifecycleTest"].method_dispatch_safe,
+            "class with setUpBeforeClass must be unsafe"
+        );
     }
 
     #[test]
