@@ -377,11 +377,13 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
 /// - `$this->assertTrue(true)`
 /// - `$this->assertFalse(false)`
 /// - `$this->assertNull(null)`
-/// - `$this->assertEquals(X, X)` — both args are identical source text
-/// - `$this->assertSame(X, X)` — both args are identical source text
+/// - `$this->assertEquals(X, X)` — both args are identical PHP literals
+/// - `$this->assertSame(X, X)` — both args are identical PHP literals
 ///
 /// Any non-assertion statement (assignment, if, foreach, return, …) or a
 /// method body with zero assertions causes this function to return `false`.
+/// Note: assertEquals/assertSame with variables (e.g., `$x, $x`) are NOT
+/// tautological because the variable could throw when evaluated.
 fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
     let body = match method_node.child_by_field_name("body") {
         Some(b) => b,
@@ -463,9 +465,16 @@ fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
                     }
                     "assertEquals" | "assertSame" => {
                         if args.len() == 2 {
-                            let a = args[0].utf8_text(src).unwrap_or("");
-                            let b = args[1].utf8_text(src).unwrap_or("");
-                            !a.is_empty() && a == b
+                            let a = &args[0];
+                            let b = &args[1];
+                            // Both args must be PHP literal nodes (not just textually equal)
+                            let both_literals = matches!(a.kind(),
+                                "integer" | "float" | "string" | "encapsed_string"
+                                | "boolean" | "true" | "false" | "null")
+                                && matches!(b.kind(),
+                                "integer" | "float" | "string" | "encapsed_string"
+                                | "boolean" | "true" | "false" | "null");
+                            both_literals && a.utf8_text(src).unwrap_or("a") == b.utf8_text(src).unwrap_or("b")
                         } else {
                             false
                         }
@@ -1493,6 +1502,10 @@ class TautologyTest extends TestCase {
     public function testNoAssertions(): void {
         // intentionally empty
     }
+    public function testVarEquals(): void {
+        $x = compute();
+        $this->assertEquals($x, $x);
+    }
 }
 "#;
         let (_dir, path) = write_tmp(src);
@@ -1509,5 +1522,6 @@ class TautologyTest extends TestCase {
         assert!(!by_method["testRealAssert"].is_tautological,  "body with assignment must NOT be tautological");
         assert!(!by_method["testAssertsTrue"].is_tautological, "assertTrue(false) must NOT be tautological");
         assert!(!by_method["testNoAssertions"].is_tautological,"zero assertions must NOT be tautological");
+        assert!(!by_method["testVarEquals"].is_tautological,   "assertEquals with variables must NOT be tautological");
     }
 }

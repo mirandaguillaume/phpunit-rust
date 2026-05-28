@@ -151,7 +151,23 @@ if ($bootstrap !== null && is_file($bootstrap)) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Open PHP stream handles for all child FDs BEFORE fork so children inherit
+// 4. OPcache pre-warm: compile every test file before forking so children
+//    inherit compiled opcodes via COW — no worker ever recompiles a file
+//    the master already saw. Only runs when ext-opcache is loaded and
+//    opcache.enable_cli is on (we pass -d opcache.enable_cli=1 from Rust).
+// ---------------------------------------------------------------------------
+if (!empty($classMapExtra)
+    && function_exists('opcache_compile_file')
+    && filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN)) {
+    foreach ($classMapExtra as $file) {
+        if (is_string($file) && is_file($file)) {
+            @opcache_compile_file($file);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Open PHP stream handles for all child FDs BEFORE fork so children inherit
 // ---------------------------------------------------------------------------
 $childStdinStreams  = [];
 $childStdoutStreams = [];
@@ -165,7 +181,7 @@ for ($i = 0; $i < $n; $i++) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Install master-side signal handlers
+// 7. Install master-side signal handlers
 // ---------------------------------------------------------------------------
 // Triggered by:
 //   - Rust's Drop sending SIGTERM during normal shutdown
@@ -188,7 +204,7 @@ pcntl_signal(SIGINT,  $signalHandler);
 pcntl_signal(SIGHUP,  $signalHandler);
 
 // ---------------------------------------------------------------------------
-// 6. Fork N children
+// 8. Fork N children
 // ---------------------------------------------------------------------------
 for ($i = 0; $i < $n; $i++) {
     $pid = pcntl_fork();

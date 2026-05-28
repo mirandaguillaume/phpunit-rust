@@ -91,7 +91,8 @@ impl PhpForkPool {
             .collect::<Vec<_>>().join(",");
 
         let mut cmd = Command::new("php");
-        cmd.arg(script)
+        cmd.arg("-d").arg("opcache.enable_cli=1")
+           .arg(script)
            .arg("--autoload").arg(autoload)
            .arg("--child-stdin-fds").arg(&stdin_fds_str)
            .arg("--child-stdout-fds").arg(&stdout_fds_str)

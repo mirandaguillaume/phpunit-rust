@@ -1,0 +1,5 @@
+ARG PHP_VERSION=8.2
+FROM php:${PHP_VERSION}-cli
+
+# pcntl is bundled but must be compiled in via configure — rebuild with it.
+RUN docker-php-ext-install pcntl

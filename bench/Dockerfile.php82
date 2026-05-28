@@ -1,0 +1,17 @@
+# PHP 8.2 image with pcntl, used to bench phpunit-rust against projects that
+# require PHP >= 8.2 (monolog, twig, php-cs-fixer).
+#
+# Build:  docker build -f bench/Dockerfile.php82 -t phpunit-rust-bench:php82 .
+# Run:    bench/bench_docker.sh <project>  IMAGE=phpunit-rust-bench:php82
+FROM php:8.2-cli
+
+RUN docker-php-ext-install pcntl \
+    && apt-get update \
+    && apt-get install --no-install-recommends -y git unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
+
+WORKDIR /work
+
+RUN php -r 'if (!extension_loaded("pcntl")) { fwrite(STDERR, "pcntl missing\n"); exit(1); } echo "pcntl OK\n";'
