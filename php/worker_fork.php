@@ -207,9 +207,22 @@ if (!empty($classMapExtra)
     // benchmarking; 0 forces always-prewarm, a huge value forces never.
     $opcacheThreshold = (int) (getenv('PHPUNIT_RUST_OPCACHE_THRESHOLD') ?: '50');
     if (count($fileClassCount) >= $opcacheThreshold) {
+        $dbgPath = getenv('PHPUNIT_RUST_OPCACHE_DEBUG') === '1' ? '/tmp/opcache_dbg.log' : null;
+        if ($dbgPath) @file_put_contents($dbgPath, "");
         foreach ($fileClassCount as $rp => $count) {
             if ($count !== 1) continue;          // multi-class file → skip
             if (file_has_top_level_function($rp)) continue;  // file with fn → skip
+            // Skip fixture/data PHP files: rector ships ~1500 such files
+            // under rules-tests/**/Fixture/, phpstan under
+            // tests/PHPStan/**/data/, doctrine under tests/Fixtures/.
+            // They register classes the discovery walker picked up via
+            // class_file_index, but no test ever require_once's them
+            // directly — they're loaded by code-rewriting fixtures or
+            // psalm-style include-pair tests. Pre-warming them only adds
+            // master compile time and burns memory we don't recover.
+            if (preg_match('#/(Fixture|Fixtures|fixtures|_fixtures|_files|data)/#', $rp)) continue;
+            if ($dbgPath) @file_put_contents($dbgPath,
+                sprintf("[%.3f] %s\n", microtime(true), $rp), FILE_APPEND);
             @opcache_compile_file($rp);
         }
     }

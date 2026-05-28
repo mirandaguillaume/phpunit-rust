@@ -93,6 +93,14 @@ impl PhpForkPool {
 
         let mut cmd = Command::new("php");
         cmd.arg("-d").arg("opcache.enable_cli=1")
+           // The master pre-warms opcache for every test file before forking,
+           // so each compile bumps the master's resident set. On large test
+           // suites (rector: ~1500 fixture files in class_file_index, phpstan
+           // similar) the default 128M memory_limit fills up and PHP fatals
+           // the master half-way through. -1 (unlimited) is safe here because
+           // the OS still enforces real limits and the master is short-lived
+           // — by design we strip the per-child cap via --worker-memory-limit.
+           .arg("-d").arg("memory_limit=-1")
            .arg(script)
            .arg("--autoload").arg(autoload)
            .arg("--child-stdin-fds").arg(&stdin_fds_str)
