@@ -120,6 +120,21 @@ if ($n !== count($childStdoutFds) || $n < 1) {
 ob_start();
 try {
     require_once $autoload;
+    // Walk registered autoloaders and disable classmap-authoritative mode
+    // on any Composer ClassLoader. Projects optimised for shipping (Composer
+    // itself, some PSR-4 .phars) enable this mode by default — it kills
+    // PSR-4 lookups for any class not in the pre-built classmap. Test
+    // classes live under `tests/` which is excluded from the production
+    // classmap, so they would be unloadable. Disabling the flag re-enables
+    // PSR-4 fallback without affecting normal classmap hits.
+    foreach (spl_autoload_functions() ?: [] as $fn) {
+        if (is_array($fn) && isset($fn[0]) && is_object($fn[0])
+            && $fn[0] instanceof \Composer\Autoload\ClassLoader
+            && method_exists($fn[0], 'isClassMapAuthoritative')
+            && $fn[0]->isClassMapAuthoritative()) {
+            $fn[0]->setClassMapAuthoritative(false);
+        }
+    }
     // Register a secondary autoloader for test classes that Composer's
     // classmap doesn't cover (e.g. test helpers whose providers call sibling
     // test classes). The map is built from the runner's discovery index.
@@ -311,6 +326,17 @@ $forkChildForSlot = static function (int $slot) use (
                 @fclose($childStdinStreams[$j]);
                 @fclose($childStdoutStreams[$j]);
             }
+        }
+        // Mark THIS slot's pipes close-on-exec so any proc_open() from a
+        // test method (PHPUnit's end-to-end fixtures intentionally exec()
+        // child PHP processes to verify their own runner behaviour) spawns
+        // a grandchild that does NOT inherit these FDs. Without CLOEXEC,
+        // the grandchild reads/writes our slot's pipe and deadlocks the
+        // master fork-pool — exactly the failure mode that hangs
+        // phpunit-itself even after @runInSeparateProcess parity is fixed.
+        if (function_exists('stream_set_close_on_exec')) {
+            @stream_set_close_on_exec($childStdinStreams[$slot],  true);
+            @stream_set_close_on_exec($childStdoutStreams[$slot], true);
         }
         runChild($childStdinStreams[$slot], $childStdoutStreams[$slot], $workerMemoryLimit, $maxBatches);
         exit(0);
@@ -568,7 +594,37 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                     $nextIdx = $i + 1;
                     continue;
                 }
-                $outcomes = TestExecutor::runClass($class, $methods, $rowFilter);
+                $isolated = !empty($entry['is_isolated']);
+                // Optional per-batch tracing — set PHPUNIT_RUST_TRACE_BATCHES=1
+                // to write START/END markers to a per-slot file. After a
+                // hang, the slot file whose last line is `START …` (no
+                // matching END) names the class that froze the worker.
+                static $traceFile;
+                if (!isset($traceFile)) {
+                    $dir = getenv('PHPUNIT_RUST_TRACE_BATCHES');
+                    // Accept "1" / "true" → default to /tmp; otherwise treat
+                    // the env value as the destination directory so the
+                    // caller can point traces at a bind-mounted host dir.
+                    if ($dir === '1' || $dir === 'true') {
+                        $dir = '/tmp';
+                    }
+                    $traceFile = ($dir && is_dir($dir))
+                        ? rtrim($dir, '/') . '/phpunit-rust-trace-' . getmypid() . '.txt'
+                        : false;
+                }
+                if ($traceFile !== false) {
+                    $t = sprintf('%.3f', microtime(true));
+                    @file_put_contents($traceFile,
+                        "$t START $class methods=" . count($methods) . "\n",
+                        FILE_APPEND);
+                }
+                $outcomes = TestExecutor::runClass($class, $methods, $rowFilter, $isolated);
+                if ($traceFile !== false) {
+                    $t = sprintf('%.3f', microtime(true));
+                    @file_put_contents($traceFile,
+                        "$t END   $class outcomes=" . count($outcomes) . "\n",
+                        FILE_APPEND);
+                }
             } catch (\Throwable $e) {
                 while (ob_get_level() > 0) ob_end_clean();
                 emitError($stdoutStream, $class, '<class>',

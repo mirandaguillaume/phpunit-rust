@@ -7,13 +7,44 @@
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
+/// One `<directory>` entry inside a `<testsuite>`. `suffix` is captured
+/// verbatim from the XML attribute (PHPUnit defaults to `Test.php` when
+/// absent). Non-`.php` suffixes (notably `.phpt` for end-to-end script
+/// tests) signal a directory we should not walk for class-based discovery
+/// — only PHPUnit's runtime knows how to invoke `.phpt` files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestSuiteDir {
+    pub path:   String,
+    pub suffix: Option<String>,
+}
+
+impl TestSuiteDir {
+    /// True when this directory's suffix is compatible with PHP class
+    /// discovery (i.e. the `suffix` attribute either is absent — PHPUnit's
+    /// default `Test.php` — or ends with `.php` case-insensitively). Returns
+    /// false for `.phpt` and other non-class suffixes so the caller can skip
+    /// the directory entirely. PHPUnit-itself's end-to-end testsuite uses
+    /// `suffix=".phpt"`; without this filter we descend into its fixture
+    /// `_files/` subtree and try to run scripts that hang waiting for input
+    /// they would normally receive from their parent test's `proc_open()`.
+    pub fn is_class_discoverable(&self) -> bool {
+        match &self.suffix {
+            None => true,
+            Some(s) => {
+                let lower = s.to_ascii_lowercase();
+                lower.ends_with(".php")
+            }
+        }
+    }
+}
+
 /// A `<testsuite>` block: include directories + exclude directories,
 /// all as relative path strings (caller resolves against phpunit.xml's dir).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TestSuite {
     /// The `name` attribute (used by `--testsuite NAME` to pick one).
     pub name: String,
-    pub directories: Vec<String>,
+    pub directories: Vec<TestSuiteDir>,
     pub excludes: Vec<String>,
 }
 
@@ -89,6 +120,9 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
     // belongs to an include or an exclude.
     let mut in_exclude = false;
     let mut active_tag: Option<Vec<u8>> = None;
+    // `suffix` attribute on the currently-open `<directory>` (None when
+    // the attribute is absent or we're not inside a directory tag).
+    let mut current_suffix: Option<String> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -116,6 +150,16 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
                         active_tag = Some(name);
                     }
                     b"directory" | b"file" => {
+                        // Capture `suffix` so the caller can skip directories
+                        // whose files we can't run (e.g. `.phpt`).
+                        current_suffix = None;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.local_name().as_ref() == b"suffix" {
+                                if let Ok(v) = std::str::from_utf8(&attr.value) {
+                                    current_suffix = Some(v.to_string());
+                                }
+                            }
+                        }
                         active_tag = Some(name);
                     }
                     _ => {}
@@ -137,7 +181,10 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
                         in_exclude = false;
                         active_tag = None;
                     }
-                    b"directory" | b"file" => active_tag = None,
+                    b"directory" | b"file" => {
+                        active_tag = None;
+                        current_suffix = None;
+                    }
                     _ => {}
                 }
             }
@@ -149,7 +196,10 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
                             if in_exclude {
                                 suite.excludes.push(trimmed.to_string());
                             } else {
-                                suite.directories.push(trimmed.to_string());
+                                suite.directories.push(TestSuiteDir {
+                                    path:   trimmed.to_string(),
+                                    suffix: current_suffix.clone(),
+                                });
                             }
                         }
                     }
@@ -380,10 +430,43 @@ mod tests {
 </phpunit>"#;
         let suites = parse_testsuites(xml);
         assert_eq!(suites.len(), 3);
-        assert_eq!(suites[0].directories, vec!["tests"]);
+        let paths: Vec<&str> = suites[0].directories.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["tests"]);
         assert_eq!(suites[0].excludes, vec!["tests/Integration"]);
-        assert_eq!(suites[1].directories, vec!["tests/Integration"]);
-        assert_eq!(suites[2].directories, vec!["./vendor/somepkg/tests"]);
+        let paths: Vec<&str> = suites[1].directories.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["tests/Integration"]);
+        let paths: Vec<&str> = suites[2].directories.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["./vendor/somepkg/tests"]);
+        // Default (no suffix attribute) → directory is class-discoverable.
+        assert!(suites[0].directories[0].is_class_discoverable());
+        assert_eq!(suites[0].directories[0].suffix, None);
+    }
+
+    #[test]
+    fn parses_directory_suffix_and_filters_non_php() {
+        let xml = r#"<?xml version="1.0"?>
+<phpunit>
+    <testsuites>
+        <testsuite name="end-to-end">
+            <directory suffix=".phpt">tests/end-to-end/baseline</directory>
+            <directory suffix="Test.php">tests/unit</directory>
+            <directory>tests/integration</directory>
+        </testsuite>
+    </testsuites>
+</phpunit>"#;
+        let suites = parse_testsuites(xml);
+        assert_eq!(suites.len(), 1);
+        let dirs = &suites[0].directories;
+        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs[0].suffix.as_deref(), Some(".phpt"));
+        assert!(!dirs[0].is_class_discoverable(),
+            ".phpt directory must be skipped for class discovery");
+        assert_eq!(dirs[1].suffix.as_deref(), Some("Test.php"));
+        assert!(dirs[1].is_class_discoverable(),
+            "Test.php suffix walks as normal");
+        assert_eq!(dirs[2].suffix, None);
+        assert!(dirs[2].is_class_discoverable(),
+            "absent suffix defaults to PHPUnit's Test.php — walk normally");
     }
 
     #[test]

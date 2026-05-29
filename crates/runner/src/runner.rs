@@ -122,6 +122,23 @@ pub fn run(
     row_counts: &RowCounts,
     on_progress: impl Fn(&TestOutcome) + Sync,
 ) -> Result<Report> {
+    // Convenience overload: callers that don't care about profiling pass a
+    // disabled profiler. `Profiler::new(false)` is essentially free.
+    let profiler = crate::profiler::Profiler::new(false);
+    run_with_profiler(pool, cases, cfg, row_counts, on_progress, &profiler)
+}
+
+/// Same as [`run`] but accepts a [`Profiler`] so the caller can record
+/// per-batch wall time and the build-queue / dispatch / drain breakdown.
+/// When `profiler.enabled() == false`, every span call is a noop branch.
+pub fn run_with_profiler(
+    pool: &mut PhpForkPool,
+    cases: Vec<TestCase>,
+    cfg: &RunConfig,
+    row_counts: &RowCounts,
+    on_progress: impl Fn(&TestOutcome) + Sync,
+    profiler: &crate::profiler::Profiler,
+) -> Result<Report> {
     let filtered: Vec<TestCase> = cases.into_iter()
         .filter(|c| match &cfg.filter {
             Some(f) => format!("{}::{}", c.class, c.method).contains(f.as_str()),
@@ -130,7 +147,22 @@ pub fn run(
         .collect();
 
     let n = pool.len();
-    let (mut queue, synthetic) = build_queue(filtered, cfg, row_counts);
+    let (mut queue, synthetic) = profiler.span_with(
+        "build_queue",
+        "run",
+        serde_json::json!({"cases": filtered.len(), "workers": n}),
+        || build_queue(filtered, cfg, row_counts),
+    );
+    profiler.mark(
+        "queue_built",
+        "run",
+    );
+    let _ = queue.len();
+    // Per-slot dispatch start time: stamped on write_batch, cleared on
+    // BatchDone. Lets us emit a `batch` span per (slot, batch) pair with
+    // the slot number as Chrome Trace `tid`, which gives one swim-lane per
+    // worker in the timeline view.
+    let mut slot_batch_start: Vec<Option<std::time::Instant>> = vec![None; n];
 
     // Spawn one reader thread per slot. Each owns its BufReader and forwards
     // parsed messages + EOF over a single mpsc to the main loop below.
@@ -213,6 +245,7 @@ pub fn run(
             Some(plan) => {
                 slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                 pool.write_batch(slot, &plan)?;
+                slot_batch_start[slot] = Some(std::time::Instant::now());
                 slot_in_flight[slot] = Some(plan);
                 slot_busy[slot] = true;
             }
@@ -254,11 +287,27 @@ pub fn run(
                 outcomes.push(o);
             }
             WorkerEvent::Message(slot, WorkerMessage::BatchDone { .. }) => {
+                // Close the previous batch's span with the slot as tid so
+                // chrome://tracing shows each worker as its own lane.
+                if let Some(start) = slot_batch_start[slot].take() {
+                    let classes = slot_in_flight[slot].as_ref()
+                        .map(|p| p.classes.iter().map(|c| c.class.clone()).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    profiler.record_on(
+                        "batch",
+                        "worker",
+                        start,
+                        std::time::Instant::now(),
+                        (slot as u32).saturating_add(1), // tid=0 is reserved for main
+                        Some(serde_json::json!({ "classes": classes })),
+                    );
+                }
                 slot_busy[slot] = false;
                 slot_in_flight[slot] = None;
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
+                    slot_batch_start[slot] = Some(std::time::Instant::now());
                     slot_in_flight[slot] = Some(plan);
                     slot_busy[slot] = true;
                 } else if slot_open[slot] {
@@ -314,6 +363,18 @@ pub fn run(
                         }
                     }
                 }
+                // Record the failed batch's span too — useful for spotting
+                // worker crashes in the timeline view.
+                if let Some(start) = slot_batch_start[slot].take() {
+                    profiler.record_on(
+                        "batch_died",
+                        "worker",
+                        start,
+                        std::time::Instant::now(),
+                        (slot as u32).saturating_add(1),
+                        Some(serde_json::json!({ "exit_code": exit_code, "signal": signal })),
+                    );
+                }
                 // Mark the slot ready to receive the next batch — the master
                 // has already forked a replacement child for us, waiting on
                 // its stdin pipe for fresh work.
@@ -321,6 +382,7 @@ pub fn run(
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
+                    slot_batch_start[slot] = Some(std::time::Instant::now());
                     slot_in_flight[slot] = Some(plan);
                     slot_busy[slot] = true;
                 } else if slot_open[slot] {
@@ -572,6 +634,13 @@ fn build_queue(
         let (heavy_methods, other_methods): (Vec<_>, Vec<_>) = real_methods.into_iter()
             .partition(|m| row_count_for(m).map(|n| n >= ROW_SPLIT_THRESHOLD).unwrap_or(false));
 
+        // Stateful classes need a fresh worker per batch (global side
+        // effects can't bleed). Isolated classes need force-exit too so the
+        // PHPUnit-requested process isolation maps to our worker boundary
+        // and our in-PHP override (clearing runTestInSeparateProcess) is
+        // the only thing handling per-test isolation. OR both into a single
+        // "must exit after this batch" bit.
+        let must_force_exit = g.is_stateful || g.is_isolated;
         for hm in &heavy_methods {
             let rows   = row_count_for(hm).unwrap_or(1);
             let chunks = rows.min(MAX_ROW_CHUNKS);
@@ -582,8 +651,9 @@ fn build_queue(
                     methods:        vec![hm.name.clone()],
                     row_filter:     Some(RowFilter { chunk_index, total_chunks: chunks }),
                     required_files: required_files_for(&[hm.name.clone()], &g.methods),
+                    is_isolated:    g.is_isolated,
                 };
-                queue.push_back(mk_plan(vec![bc], g.is_stateful));
+                queue.push_back(mk_plan(vec![bc], must_force_exit));
             }
         }
 
@@ -617,8 +687,9 @@ fn build_queue(
                         methods:        method_names,
                         row_filter:     None,
                         required_files: req_files,
+                        is_isolated:    g.is_isolated,
                     };
-                    queue.push_back(mk_plan(vec![bc], g.is_stateful));
+                    queue.push_back(mk_plan(vec![bc], must_force_exit));
                 }
             }
 
@@ -644,6 +715,7 @@ fn build_queue(
                 methods:        other_names,
                 row_filter:     None,
                 required_files: req_files,
+                is_isolated:    g.is_isolated,
             };
             if other_cost >= target {
                 if !bin_buf.is_empty() {
@@ -651,10 +723,13 @@ fn build_queue(
                     bin_stateful = false;
                     bin_methods = 0;
                 }
-                queue.push_back(mk_plan(vec![bc], g.is_stateful));
+                queue.push_back(mk_plan(vec![bc], must_force_exit));
             } else {
                 bin_buf.push(bc);
-                bin_stateful = bin_stateful || g.is_stateful;
+                // `bin_stateful` is named for history but now tracks the
+                // combined force-exit bit: any class in the bin (stateful
+                // OR isolated) makes the entire bin's batch force-exit.
+                bin_stateful = bin_stateful || must_force_exit;
                 bin_methods += other_cost;
                 if bin_methods >= target {
                     queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
@@ -681,6 +756,7 @@ fn build_queue(
             methods:        other_names,
             row_filter:     None,
             required_files: req_files,
+            is_isolated:    g.is_isolated,
         };
 
         // A class that already meets or exceeds the target on its own gets a
@@ -692,10 +768,10 @@ fn build_queue(
                     bin_stateful = false;
                 bin_methods = 0;
             }
-            queue.push_back(mk_plan(vec![bc], g.is_stateful));
+            queue.push_back(mk_plan(vec![bc], must_force_exit));
         } else {
             bin_buf.push(bc);
-            bin_stateful = bin_stateful || g.is_stateful;
+            bin_stateful = bin_stateful || must_force_exit;
             bin_methods += other_cost;
             if bin_methods >= target {
                 queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
@@ -749,6 +825,7 @@ mod tests {
             is_dispatch_safe:        true,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 
@@ -800,6 +877,7 @@ mod tests {
             is_dispatch_safe:        true,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 
@@ -863,6 +941,7 @@ mod tests {
             is_dispatch_safe:        true,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 
@@ -909,6 +988,7 @@ mod tests {
             is_dispatch_safe:        true,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 
@@ -989,6 +1069,40 @@ mod tests {
         assert_eq!(class_plans[0].classes[0].methods.len(), 3);
     }
 
+    #[test]
+    fn isolated_class_forces_exit_and_propagates_to_batchclass() {
+        // A class marked is_isolated (e.g. via @runInSeparateProcess) must:
+        //   1. Have its BatchPlan flagged force_exit_after=true so the worker
+        //      child exits after this batch (mirroring stateful behaviour).
+        //   2. Have its BatchClass.is_isolated=true so the PHP executor can
+        //      clear runTestInSeparateProcess on each TestCase instance and
+        //      prevent PHPUnit from spawning a nested sub-process.
+        let mut cases = vec![
+            make_lifecycle_case("IsolatedClass", "testOne"),
+            make_lifecycle_case("IsolatedClass", "testTwo"),
+        ];
+        for c in &mut cases { c.is_isolated = true; }
+        let cfg = RunConfig {
+            autoload:         PathBuf::from("/autoload.php"),
+            bootstrap:        None,
+            filter:           None,
+            defines:          vec![],
+            stop_on:          StopOn::default(),
+            class_file_index: HashMap::new(),
+            n_workers:        4,
+        };
+        let row_counts = RowCounts::new();
+        let (queue, _) = build_queue(cases, &cfg, &row_counts);
+        let plans: Vec<_> = queue.into_iter()
+            .filter(|p| p.classes.iter().any(|bc| bc.class == "IsolatedClass"))
+            .collect();
+        assert_eq!(plans.len(), 1, "isolated class dispatched as a single batch");
+        assert!(plans[0].force_exit_after,
+            "isolated class must trigger force_exit_after on the BatchPlan");
+        assert!(plans[0].classes[0].is_isolated,
+            "is_isolated must be stamped on the BatchClass for the PHP executor");
+    }
+
     /// Helper: safe case with a data provider (method_dispatch_safe=true).
     fn make_safe_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
         TestCase {
@@ -1004,6 +1118,7 @@ mod tests {
             is_dispatch_safe:        true,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 
@@ -1093,6 +1208,7 @@ mod tests {
             is_dispatch_safe:        safe,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 

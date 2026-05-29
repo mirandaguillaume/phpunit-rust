@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::{discover_class_file_index, discover_in_dir, discover_in_dirs};
+use phpunit_rust::discovery::discover_with_index;
 
 /// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
 /// into a list of directories, resolved relative to `project`. Used to build
@@ -58,7 +58,7 @@ use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fo
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
 use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_block, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
-use phpunit_rust::runner::{run, RunConfig};
+use phpunit_rust::runner::RunConfig;
 
 #[derive(Parser, Debug)]
 #[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner")]
@@ -129,6 +129,13 @@ struct Cli {
     /// workers, original behaviour). Counting happens in PHP master.
     #[arg(long, default_value = "20")]
     worker_max_batches: u32,
+    /// Write a Chrome Trace Format JSON file timing every meaningful phase
+    /// (discovery, autoload preload, fork pool spawn, per-batch dispatch and
+    /// wait, aggregation, output). Load the file in `chrome://tracing`,
+    /// Perfetto (perfetto.dev), or Speedscope (speedscope.app) to see where
+    /// wall clock is being spent. Quasi-zero overhead when unset.
+    #[arg(long)]
+    profile: Option<PathBuf>,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -152,6 +159,9 @@ fn main() -> ExitCode {
 
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    // Profiler clock starts at the earliest opportunity so wall-clock
+    // accounting includes config parsing, not just test execution.
+    let profiler = phpunit_rust::profiler::Profiler::new(cli.profile.is_some());
     let project = cli.project.canonicalize()
         .with_context(|| format!("project path invalid: {}", cli.project.display()))?;
     let autoload = project.join("vendor/autoload.php");
@@ -248,7 +258,15 @@ fn real_main() -> Result<ExitCode> {
                 let mut excls = Vec::new();
                 for s in suites {
                     for d in s.directories {
-                        let p = PathBuf::from(&d);
+                        if !d.is_class_discoverable() {
+                            // `.phpt` (and any other non-`.php` suffix) means
+                            // PHPUnit only invokes specific file types in this
+                            // dir — we don't support those formats, so skip
+                            // it entirely instead of finding spurious classes
+                            // (e.g. fixture files hidden in `_files/`).
+                            continue;
+                        }
+                        let p = PathBuf::from(&d.path);
                         roots.push(if p.is_absolute() { p } else { project.join(p) });
                     }
                     for d in s.excludes {
@@ -308,11 +326,20 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("Discovering tests across {} roots ({} excludes)...",
             test_roots.len(), excludes.len());
     }
-    let mut cases = if test_roots.len() == 1 && excludes.is_empty() && graph_supplement_dirs.is_empty() {
-        discover_in_dir(&test_roots[0])?
-    } else {
-        discover_in_dirs(&test_roots, &excludes, &graph_supplement_dirs)?
-    };
+    // Single-pass discovery + class-file index. Empirically faster than
+    // splitting into cases-then-index on every benched project (the
+    // double-parse cost on slow-path projects always exceeds the targeted
+    // filter savings on fast-path ones).
+    let (mut cases, class_file_index_full) = profiler.span_with(
+        "discovery_and_index",
+        "main",
+        serde_json::json!({
+            "roots": test_roots.len(),
+            "excludes": excludes.len(),
+            "supplement_dirs": graph_supplement_dirs.len(),
+        }),
+        || discover_with_index(&test_roots, &excludes, &graph_supplement_dirs),
+    )?;
 
     // Build a FQCN→file index over all PHP files in test roots and supplement
     // dirs so the runner can locate classes the test code references but the
@@ -327,9 +354,12 @@ fn real_main() -> Result<ExitCode> {
     // rector ships (~1500 entries), bloat the PHP master's classMapExtra
     // map, and make the opcache pre-warm loop fatal on suites with
     // thousands of fixture stubs.
-    let mut index_dirs = test_roots.clone();
-    index_dirs.extend(graph_supplement_dirs.iter().cloned());
-    let class_file_index_full = discover_class_file_index(&index_dirs);
+    // PSR-4 sufficiency check: if composer's autoload covers EVERY class
+    // the discovered tests reference (their own FQCN + fingerprint hits +
+    // external provider FQCNs), the runner doesn't need to ship its own
+    // file-path fallback to the worker — composer.php's PSR-4 autoload
+    // will find each class. We skip the file-tree walk entirely in that
+    // case (the dominant runtime cost on large projects).
     let mut wanted_fqcns: std::collections::HashSet<String> = cases.iter()
         .flat_map(|c| {
             c.external_providers.iter().map(|(fqcn, _)| fqcn.clone())
@@ -447,26 +477,39 @@ fn real_main() -> Result<ExitCode> {
     // A failed enumeration is non-fatal: missing entries fall back to
     // single-bucket dispatch.
     let provider_pairs = collect_provider_pairs(&cases);
-    let row_counts: RowCounts = if provider_pairs.is_empty() {
-        RowCounts::new()
-    } else {
-        let enum_script = find_enumerate_script()?;
-        match enumerate(&enum_script, &autoload, bootstrap.as_deref(), &defines, &provider_pairs) {
-            Ok(counts) => counts,
-            Err(e) => {
-                eprintln!("Provider enumeration failed (continuing with no row data): {e:#}");
-                RowCounts::new()
+    let row_counts: RowCounts = profiler.span_with(
+        "enumerate_providers",
+        "main",
+        serde_json::json!({"pairs": provider_pairs.len()}),
+        || -> Result<_> {
+            if provider_pairs.is_empty() {
+                return Ok(RowCounts::new());
             }
-        }
-    };
+            let enum_script = find_enumerate_script()?;
+            Ok(match enumerate(&enum_script, &autoload, bootstrap.as_deref(), &defines, &provider_pairs) {
+                Ok(counts) => counts,
+                Err(e) => {
+                    eprintln!("Provider enumeration failed (continuing with no row data): {e:#}");
+                    RowCounts::new()
+                }
+            })
+        },
+    )?;
 
     eprintln!("Spawning {} PHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
     let fork_script = find_fork_script()?;
-    let mut pool = PhpForkPool::spawn(
-        &fork_script, &autoload, bootstrap.as_deref(),
-        &defines, &env_triples, &server_pairs, &ini_pairs,
-        worker_count, &class_file_index, &cli.worker_memory_limit,
-        cli.worker_max_batches,
+    let mut pool = profiler.span_with(
+        "fork_pool_spawn",
+        "main",
+        serde_json::json!({"workers": worker_count}),
+        || -> Result<_> {
+            Ok(PhpForkPool::spawn(
+                &fork_script, &autoload, bootstrap.as_deref(),
+                &defines, &env_triples, &server_pairs, &ini_pairs,
+                worker_count, &class_file_index, &cli.worker_memory_limit,
+                cli.worker_max_batches,
+            )?)
+        },
     )?;
 
     let stop_on = if cli.stop_on_defect {
@@ -485,7 +528,17 @@ fn real_main() -> Result<ExitCode> {
         class_file_index,
         n_workers: worker_count,
     };
-    let mut report = run(&mut pool, cases, &cfg, &row_counts, |o| print_progress(o))?;
+    let n_cases = cases.len();
+    let mut report = profiler.span_with(
+        "run",
+        "main",
+        serde_json::json!({"cases": n_cases, "workers": worker_count}),
+        || phpunit_rust::runner::run_with_profiler(
+            &mut pool, cases, &cfg, &row_counts,
+            |o| print_progress(o),
+            &profiler,
+        ),
+    )?;
 
     // Append the synthetic skip outcomes for @group legacy under Symfony's
     // listener. They were never dispatched, so emit them now and adjust
@@ -508,6 +561,19 @@ fn real_main() -> Result<ExitCode> {
             .context("coverage analysis failed")?;
         if let Some(p) = &cli.coverage_out {
             eprintln!("Coverage written to {}", p.display());
+        }
+    }
+
+    // Write the profile JSON if requested. Done late so the trace covers
+    // every phase up to (but not including) this write — the write itself
+    // is fast (microseconds for a typical 50-event trace).
+    if let Some(out) = &cli.profile {
+        if let Err(e) = profiler.write_to(out) {
+            eprintln!("warning: writing profile to {} failed: {e}", out.display());
+        } else {
+            eprintln!("Profile written to {} ({} events). \
+                Open it in chrome://tracing, perfetto.dev, or speedscope.app.",
+                out.display(), profiler.event_count());
         }
     }
 

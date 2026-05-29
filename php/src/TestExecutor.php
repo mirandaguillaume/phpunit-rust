@@ -17,9 +17,17 @@ final class TestExecutor
     /**
      * @param class-string $class
      * @param list<string> $methods Empty = all `test*` methods on the class.
+     * @param bool $isolated When true, the Rust runner has marked this class
+     *        with a PHPUnit "run in separate process" annotation/attribute.
+     *        Our worker is already a separate process per batch (the runner
+     *        sets force_exit_after on these batches), so we must override
+     *        PHPUnit's request to spawn a nested sub-process — otherwise its
+     *        runtime would `proc_open()` a child PHP that hangs on FDs we
+     *        leak across forks. We clear `runTestInSeparateProcess` on every
+     *        instance before invocation.
      * @return list<array<string, mixed>>
      */
-    public static function runClass(string $class, array $methods, ?array $rowFilter = null): array
+    public static function runClass(string $class, array $methods, ?array $rowFilter = null, bool $isolated = false): array
     {
         if (!is_subclass_of($class, TestCase::class)) {
             throw new \InvalidArgumentException("$class does not extend PHPUnit\\Framework\\TestCase");
@@ -169,6 +177,20 @@ final class TestExecutor
 
             try {
                 $test = new $class($method);
+                if ($isolated) {
+                    // Bind a closure into the TestCase scope so we can write
+                    // the protected `runTestInSeparateProcess` flag directly.
+                    // PHPUnit 10+ exposes `setRunTestInSeparateProcess()`, but
+                    // the property exists on 9.x too and the closure path
+                    // works uniformly across versions without relying on
+                    // setter availability.
+                    \Closure::bind(function () {
+                        $this->runTestInSeparateProcess = false;
+                        if (property_exists($this, 'runClassInSeparateProcess')) {
+                            $this->runClassInSeparateProcess = false;
+                        }
+                    }, $test, TestCase::class)();
+                }
                 self::invokeOptional($test, 'setUp');
                 foreach ($hooks['before'] as $name)         self::invokeInstanceByName($test, $name);
                 foreach ($hooks['pre_condition'] as $name)  self::invokeInstanceByName($test, $name);

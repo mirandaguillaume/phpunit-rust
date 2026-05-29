@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// Reads the project's `composer.json` (autoload + autoload-dev) AND every
 /// installed package via `vendor/composer/installed.json` so that vendor
 /// interfaces (e.g. `Psr\Http\Message\*`, `Aws\*`) are resolvable too.
-fn psr4_map(project: &Path) -> HashMap<String, Vec<PathBuf>> {
+pub fn psr4_map(project: &Path) -> HashMap<String, Vec<PathBuf>> {
     let mut map: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     // 1. Project-level autoload entries.

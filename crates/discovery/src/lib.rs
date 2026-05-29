@@ -52,6 +52,15 @@ pub struct TestCase {
     /// for each batch of such a class so cross-batch pollution can't carry
     /// over. See [`TestClass::is_stateful`].
     pub is_stateful:      bool,
+    /// True when the class (or any of its methods) carries a PHPUnit
+    /// "run in separate process" marker — `@runInSeparateProcess`,
+    /// `@runTestsInSeparateProcesses`, `@runClassInSeparateProcess`, or the
+    /// equivalent PHP-8 attributes. Our worker is already a separate process
+    /// per batch, so we satisfy PHPUnit's request by routing the class
+    /// through K=1 (force_exit_after) and clearing the in-PHP flag before
+    /// invoking the test — preventing PHPUnit from `proc_open`-ing a nested
+    /// sub-process inside the worker. See [`TestClass::is_isolated`].
+    pub is_isolated:      bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -84,6 +93,10 @@ struct ParsedClass {
     /// can't safely share a recycled worker with other batches because
     /// their global side effects bleed across tests.
     is_stateful: bool,
+    /// True when the class is annotated with a PHPUnit "separate process"
+    /// marker (class-level docblock, attribute, or any method-level
+    /// equivalent). See [`TestCase::is_isolated`].
+    is_isolated: bool,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -156,6 +169,12 @@ pub struct TestClass {
     /// so cross-batch pollution can't bleed in. Detected at discovery by
     /// walking ALL method bodies in the class (including setUp/tearDown).
     pub is_stateful:             bool,
+    /// True when the class or any of its methods carries a PHPUnit
+    /// "separate process" annotation/attribute. The runner forces K=1
+    /// (force_exit_after) on these classes AND signals the PHP executor
+    /// to clear `runTestInSeparateProcess` on the test instance so PHPUnit
+    /// does not spawn a nested sub-process inside our already-forked worker.
+    pub is_isolated:             bool,
 }
 
 /// Group a flat list of TestCases by class. Preserves discovery order
@@ -172,6 +191,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     for case in cases {
         let has_lifecycle_overrides = case.has_lifecycle_overrides;
         let is_stateful = case.is_stateful;
+        let is_isolated = case.is_isolated;
         let gm = GroupedMethod {
             name:               case.method,
             data_provider:      case.data_provider,
@@ -189,6 +209,9 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             // Any TestCase from a stateful class makes the whole grouping
             // stateful — pollution is per-class, not per-method.
             existing.is_stateful = existing.is_stateful || is_stateful;
+            // Likewise for isolation: a single method-level
+            // @runInSeparateProcess promotes the whole class.
+            existing.is_isolated = existing.is_isolated || is_isolated;
         } else {
             groups.push(TestClass {
                 file:                    case.file,
@@ -196,6 +219,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
                 methods:                 vec![gm],
                 has_lifecycle_overrides,
                 is_stateful,
+                is_isolated,
             });
         }
     }
@@ -410,6 +434,7 @@ fn collect_parsed_classes(
 
         let has_lifecycle_overrides = !has_no_lifecycle_overrides(body, bytes);
         let is_stateful = class_has_stateful_calls(body, bytes);
+        let is_isolated = class_has_run_in_separate_process(decl, bytes);
 
         out.push(ParsedClass {
             file: path.to_path_buf(),
@@ -420,6 +445,7 @@ fn collect_parsed_classes(
             is_abstract,
             has_lifecycle_overrides,
             is_stateful,
+            is_isolated,
         });
     }
     Ok(())
@@ -474,8 +500,6 @@ fn has_no_lifecycle_overrides(class_body: Node, src: &[u8]) -> bool {
 ///
 /// Any non-assertion statement (assignment, if, foreach, return, …) or a
 /// method body with zero assertions causes this function to return `false`.
-/// Note: assertEquals/assertSame with variables (e.g., `$x, $x`) are NOT
-/// tautological because the variable could throw when evaluated.
 fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
     let body = match method_node.child_by_field_name("body") {
         Some(b) => b,
@@ -652,6 +676,7 @@ fn extract_method_fingerprint(
             _ => None,
         };
         if let Some(raw) = class_name_text {
+            if !is_valid_class_name(raw) { continue; }
             let resolved = resolve_class_reference(raw, namespace, aliases);
             // Only retain names that look like a FQCN (contain a backslash) —
             // bare unresolved names match PHP builtins and add noise.
@@ -661,6 +686,30 @@ fn extract_method_fingerprint(
         }
     }
     result
+}
+
+/// Reject anything that isn't a valid PHP identifier-shaped class reference.
+/// Catches:
+///   * PHP pseudo-classes (`self`, `static`, `parent`) that look like names
+///     to tree-sitter but get bogusly namespace-prefixed by the resolver.
+///   * Tree-sitter capture of literal content from `scoped_call_expression`
+///     subtrees where the "scope" was actually an array / string / call
+///     expression rather than a class name (produces multi-line strings
+///     starting with `(`, `[`, `'`, `"`).
+///
+/// A real class reference is a single line of ASCII identifier characters
+/// plus optional namespace separators (`\\`).
+fn is_valid_class_name(raw: &str) -> bool {
+    if matches!(raw, "self" | "static" | "parent") { return false; }
+    if raw.is_empty() { return false; }
+    if raw.contains('\n') || raw.contains('\r') { return false; }
+    // First char must be a letter, underscore, or backslash (absolute name).
+    let first = raw.chars().next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '\\') {
+        return false;
+    }
+    // Body must be identifier chars and namespace separators only.
+    raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\\')
 }
 
 /// Bare PHP function names that mutate process-global state without a
@@ -726,6 +775,62 @@ fn class_has_stateful_calls(class_body: Node, bytes: &[u8]) -> bool {
                     }
                 }
             }
+        }
+    }
+    false
+}
+
+/// Returns true if the class declaration (its preceding docblock OR any
+/// content inside the class — method docblocks, attributes, class-level
+/// attributes) carries a PHPUnit "run in separate process" marker.
+///
+/// We over-isolate at the class level: a single method annotated with
+/// `@runInSeparateProcess` promotes the whole class to isolated. The cost
+/// is at worst extra force_exit cycles for a class that mixes annotated and
+/// non-annotated methods (rare); the benefit is avoiding PHPUnit spawning a
+/// nested `proc_open()` sub-process inside our already-forked worker — which
+/// hangs on FD inheritance and was the root cause of phpunit-itself stalling.
+///
+/// Detection is purely textual: the markers are distinctive identifiers
+/// that only appear in docblock comments (`/** @runInSeparateProcess */`)
+/// or attribute names (`#[RunInSeparateProcess]`). They can't appear in
+/// executable code without being a syntax error, so a `contains()` scan
+/// is correct in practice. Substring overlap between
+/// `RunInSeparateProcess` / `RunTestsInSeparateProcesses` /
+/// `RunClassInSeparateProcess` is none — none is a substring of another.
+fn class_has_run_in_separate_process(class_decl: Node, bytes: &[u8]) -> bool {
+    // PHPDoc forms (PHPUnit ≤ 9 / legacy)
+    const PHPDOC_MARKERS: &[&str] = &[
+        "@runInSeparateProcess",
+        "@runTestsInSeparateProcesses",
+        "@runClassInSeparateProcess",
+    ];
+    // PHP-8 attribute names (PHPUnit 10+). Class-level
+    // `RunClassInSeparateProcess` is the strict official name (singular).
+    const ATTR_MARKERS: &[&str] = &[
+        "RunInSeparateProcess",
+        "RunTestsInSeparateProcesses",
+        "RunClassInSeparateProcess",
+    ];
+
+    let scan = |text: &str| -> bool {
+        PHPDOC_MARKERS.iter().any(|m| text.contains(m))
+            || ATTR_MARKERS.iter().any(|m| text.contains(m))
+    };
+
+    // Class-level docblock lives as a preceding sibling of the
+    // class_declaration node — pulled by the existing helper.
+    if let Some(doc) = preceding_docblock(class_decl, bytes) {
+        if scan(&doc) {
+            return true;
+        }
+    }
+    // Everything inside the class — class-level attribute groups,
+    // method-level attributes, method docblock comments — is part of
+    // class_decl's text. One scan covers all the in-class cases.
+    if let Ok(text) = class_decl.utf8_text(bytes) {
+        if scan(text) {
+            return true;
         }
     }
     false
@@ -1155,6 +1260,25 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
             }
             acc
         };
+        // Same walk for is_isolated: a parent class annotated with
+        // `@runTestsInSeparateProcesses` propagates to every concrete
+        // subclass, mirroring PHPUnit's runtime behaviour.
+        let chain_is_isolated = {
+            let mut visit = class.fqcn.as_str();
+            let mut d = 0;
+            let mut acc = false;
+            while d < 32 {
+                if let Some(c) = by_fqcn.get(visit) {
+                    acc = acc || c.is_isolated;
+                    match c.parent_fqcn.as_deref() {
+                        Some(p) => visit = p,
+                        None => break,
+                    }
+                } else { break; }
+                d += 1;
+            }
+            acc
+        };
         let mut visit = class.fqcn.as_str();
         let mut depth = 0;
         while depth < 32 {
@@ -1182,6 +1306,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             is_dispatch_safe:        mi.depends_on.is_empty(),
                             fingerprint:             mi.fingerprint.clone(),
                             is_stateful:             chain_is_stateful,
+                            is_isolated:             chain_is_isolated,
                         });
                     }
                 }
@@ -1293,12 +1418,171 @@ pub fn discover_in_dirs(
     emit_test_cases(&parsed[..emit_count], &graph)
 }
 
+/// Single-pass discovery + FQCN index. Replaces a sequential
+/// `discover_in_dirs(...)` + `discover_class_file_index(...)` pair: every
+/// `.php` file in `roots ∪ supplement_dirs` is parsed once, then the
+/// classes are split into the two outputs based on their origin bucket.
+///
+/// Semantics are preserved vs the two separate calls:
+///   * Only `*Test*.php` files in `roots` produce `TestCase` entries.
+///   * The inheritance graph includes `*Test*.php` from roots AND from
+///     supplement dirs (matching pre-merge behaviour).
+///   * The FQCN → file index includes ALL parsed files in both walks.
+///   * `excludes` skip emission AND index for matching root files
+///     (slightly stricter than the legacy split — `discover_class_file_index`
+///     used to include excluded files in the index. In practice, excluded
+///     dirs are explicit `_files/` fixtures whose classes the runner never
+///     needs to autoload, so dropping them is a tightening that costs
+///     nothing and saves spurious entries).
+pub fn discover_with_index(
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    supplement_dirs: &[PathBuf],
+) -> Result<(Vec<TestCase>, HashMap<String, PathBuf>)> {
+    #[derive(Copy, Clone)]
+    enum Bucket {
+        /// `*Test*.php` in roots — eligible for TestCase emission AND
+        /// contributes to graph + index.
+        TestRoot,
+        /// `*Test*.php` in supplement — graph + index only (no emission).
+        TestSupp,
+        /// Any other `.php` — index only.
+        IndexOnly,
+    }
+
+    let canon_excludes: Vec<PathBuf> = excludes
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+
+    // Single union walk: dedupe paths across `roots` and `supplement_dirs`
+    // (a file under both is seen once, with the bucket determined by its
+    // first occurrence).
+    let mut files: Vec<(PathBuf, Bucket)> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    let is_test_name = |p: &Path| -> bool {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.contains("Test"))
+            .unwrap_or(false)
+    };
+
+    for root in roots {
+        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
+            if let Ok(canon) = p.canonicalize() {
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) { continue; }
+            }
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) { continue; }
+            let bucket = if is_test_name(p) { Bucket::TestRoot } else { Bucket::IndexOnly };
+            files.push((buf, bucket));
+        }
+    }
+
+    for dir in supplement_dirs {
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) { continue; }
+            let bucket = if is_test_name(p) { Bucket::TestSupp } else { Bucket::IndexOnly };
+            files.push((buf, bucket));
+        }
+    }
+
+    // Parse every file ONCE in parallel. Failures (`parse_file_classes`
+    // returning Err) are silently skipped — the file likely isn't valid
+    // PHP and would have been ignored by the split path too.
+    let parsed: Vec<(ParsedClass, Bucket)> = files
+        .par_iter()
+        .flat_map(|(p, b)| {
+            parse_file_classes(p)
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |c| (c, *b))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Index: every parsed class, first occurrence wins.
+    let mut index: HashMap<String, PathBuf> = HashMap::with_capacity(parsed.len());
+    for (c, _) in &parsed {
+        index.entry(c.fqcn.clone()).or_insert_with(|| c.file.clone());
+    }
+
+    // Graph: only Test classes from roots + supplement (matches legacy).
+    let graph: ClassGraph = parsed
+        .iter()
+        .filter(|(_, b)| matches!(b, Bucket::TestRoot | Bucket::TestSupp))
+        .map(|(c, _)| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+
+    // Emission set: only TestRoot classes are eligible.
+    let root_test_classes: Vec<ParsedClass> = parsed
+        .into_iter()
+        .filter(|(_, b)| matches!(b, Bucket::TestRoot))
+        .map(|(c, _)| c)
+        .collect();
+
+    let cases = emit_test_cases(&root_test_classes, &graph)?;
+    Ok((cases, index))
+}
+
 /// Scan `dirs` for ALL `.php` files (not just `*Test*.php`) and return a
 /// map of FQCN → file path. Used by the runner to locate files for
 /// `#[DataProviderExternal]` provider classes that are not in the PSR-4
 /// autoloader.
 ///
 /// Only the first file seen for each FQCN is kept (stable, depth-first).
+/// Like [`discover_class_file_index`] but parses ONLY `.php` files whose
+/// stem (basename without extension) is in `candidate_stems`. Lets the
+/// caller pre-narrow the parse set when it knows the exact class names it
+/// is looking for — e.g. derived from the test cases' fingerprints after
+/// PSR-4-resolvable FQCNs have been filtered out via a cheap lookup.
+///
+/// The returned map is post-filtered to only keep entries whose FQCN is
+/// in `keep_fqcns`, mirroring the typical caller pattern.
+pub fn discover_class_file_index_targeted(
+    dirs: &[PathBuf],
+    candidate_stems: &HashSet<String>,
+    keep_fqcns: &HashSet<String>,
+) -> HashMap<String, PathBuf> {
+    if candidate_stems.is_empty() || keep_fqcns.is_empty() {
+        return HashMap::new();
+    }
+    let files: Vec<PathBuf> = dirs.iter()
+        .flat_map(|dir| WalkDir::new(dir).into_iter().filter_map(|e| e.ok()))
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("php"))
+        .filter_map(|e| {
+            let p = e.path();
+            let stem = p.file_stem()?.to_str()?;
+            if candidate_stems.contains(stem) {
+                Some(p.to_path_buf())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let pairs: Vec<(String, PathBuf)> = files
+        .par_iter()
+        .flat_map(|p| parse_file_classes(p).unwrap_or_default()
+            .into_iter()
+            .filter(|c| keep_fqcns.contains(&c.fqcn))
+            .map(|c| (c.fqcn, c.file))
+            .collect::<Vec<_>>())
+        .collect();
+
+    let mut index = HashMap::with_capacity(pairs.len());
+    for (fqcn, file) in pairs {
+        index.entry(fqcn).or_insert(file);
+    }
+    index
+}
+
 pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
     let files: Vec<PathBuf> = dirs.iter()
         .flat_map(|dir| WalkDir::new(dir).into_iter().filter_map(|e| e.ok()))
@@ -1497,6 +1781,82 @@ class DpTest extends TestCase {
     }
 
     #[test]
+    fn detects_run_in_separate_process_in_all_four_forms() {
+        // Each variant should mark the whole class isolated. We over-isolate
+        // (a single annotated method promotes the class) — same trade as
+        // is_stateful — because the runner only needs a class-level bit.
+        let variants = [
+            ("phpdoc_class_level", r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+
+/**
+ * @runTestsInSeparateProcesses
+ */
+class IsolatedClassPhpdoc extends TestCase {
+    public function testOne(): void {}
+}
+"#),
+            ("phpdoc_method_level", r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+
+class IsolatedMethodPhpdoc extends TestCase {
+    /** @runInSeparateProcess */
+    public function testOne(): void {}
+}
+"#),
+            ("attribute_class_level", r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\RunClassInSeparateProcess;
+
+#[RunClassInSeparateProcess]
+class IsolatedClassAttr extends TestCase {
+    public function testOne(): void {}
+}
+"#),
+            ("attribute_method_level", r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
+
+class IsolatedMethodAttr extends TestCase {
+    #[RunInSeparateProcess]
+    public function testOne(): void {}
+}
+"#),
+        ];
+        for (label, src) in variants {
+            let (_dir, path) = write_tmp(src);
+            let cases = discover_in_file(&path).unwrap();
+            assert_eq!(cases.len(), 1, "{label}: expected one test case");
+            assert!(cases[0].is_isolated, "{label}: expected is_isolated=true");
+        }
+    }
+
+    #[test]
+    fn non_isolated_class_is_not_marked_isolated() {
+        // A vanilla class with no separate-process marker stays
+        // is_isolated=false. Importantly, merely importing the attribute
+        // (use statement) must NOT trip the detection.
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
+
+class PlainTest extends TestCase {
+    public function testOne(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert!(!cases[0].is_isolated,
+            "merely importing the attribute without applying it must not promote the class");
+    }
+
+    #[test]
     fn looks_like_test_case_accepts_known_frameworks() {
         assert!(looks_like_test_case("TestCase"));
         assert!(looks_like_test_case("PHPUnit\\Framework\\TestCase"));
@@ -1642,9 +2002,9 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
+            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
+            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -1664,9 +2024,9 @@ final class ConcreteTest extends AbstractBaseTest {
         // for another file, which previously caused ReflectionException crashes
         // when --workers 1 serialised all batches through one PHP process.
         let cases = vec![
-            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
-            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
-            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false },
+            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
+            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
+            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");

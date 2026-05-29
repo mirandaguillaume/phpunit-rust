@@ -118,6 +118,7 @@ mod tests {
             is_dispatch_safe:        true,
             fingerprint:             std::collections::HashSet::new(),
             is_stateful:             false,
+            is_isolated:             false,
         }
     }
 

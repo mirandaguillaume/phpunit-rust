@@ -71,6 +71,7 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
             methods:        vec![],
             row_filter:     None,
             required_files: vec![],
+            is_isolated:    false,
         }],
         fingerprint: std::collections::HashSet::new(),
         force_exit_after: false,

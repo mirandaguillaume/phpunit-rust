@@ -55,6 +55,14 @@ pub struct BatchClass {
     /// PSR-4 autoloader.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub required_files: Vec<PathBuf>,
+    /// True when the class (or any of its methods) carries a PHPUnit
+    /// "run in separate process" annotation/attribute. Surfaced in the
+    /// JSON so the PHP-side executor can clear `runTestInSeparateProcess`
+    /// on the test instance before invocation — preventing PHPUnit from
+    /// spawning a nested sub-process inside our already-forked worker.
+    /// Omitted from the wire when false to keep the common case compact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_isolated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +141,7 @@ mod batch_plan_tests {
                 methods:        vec!["testA".to_string()],
                 row_filter:     None,
                 required_files: vec![],
+                is_isolated:    false,
             }],
             fingerprint: std::collections::HashSet::new(),
             force_exit_after: false,
@@ -153,6 +162,7 @@ mod batch_plan_tests {
             methods:        vec![],
             row_filter:     None,
             required_files: vec![],
+            is_isolated:    false,
         };
         let v = serde_json::to_value(&bc).unwrap();
         assert!(v.get("required_files").is_none());
@@ -166,6 +176,7 @@ mod batch_plan_tests {
             methods:        vec![],
             row_filter:     None,
             required_files: vec![PathBuf::from("/t/Provider.php")],
+            is_isolated:    false,
         };
         let v = serde_json::to_value(&bc).unwrap();
         assert_eq!(v["required_files"][0], "/t/Provider.php");

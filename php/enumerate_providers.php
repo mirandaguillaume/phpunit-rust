@@ -57,6 +57,16 @@ $defines = json_decode($definesJson, true) ?? [];
 ob_start();
 try {
     require_once $autoload;
+    // Disable classmap-authoritative on any Composer ClassLoader (see
+    // worker_fork.php for rationale).
+    foreach (spl_autoload_functions() ?: [] as $fn) {
+        if (is_array($fn) && isset($fn[0]) && is_object($fn[0])
+            && $fn[0] instanceof \Composer\Autoload\ClassLoader
+            && method_exists($fn[0], 'isClassMapAuthoritative')
+            && $fn[0]->isClassMapAuthoritative()) {
+            $fn[0]->setClassMapAuthoritative(false);
+        }
+    }
     foreach ($defines as $pair) {
         if (is_array($pair) && count($pair) === 2
             && is_string($pair[0]) && !defined($pair[0])) {
