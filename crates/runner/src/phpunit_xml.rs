@@ -58,7 +58,7 @@ pub struct PhpConstant {
 /// Everything we extract from the `<php>` block in one pass. PHPUnit
 /// supports `<const>`, `<env>`, `<server>`, `<ini>`, `<var>`, `<get>`,
 /// `<post>`, `<cookie>`, `<files>`, `<request>` — we currently handle
-/// the four most-used (const/env/server/ini); the others can be added
+/// the five most-used (const/env/server/ini/var); the others can be added
 /// the same way when a real project needs them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PhpBlock {
@@ -66,6 +66,10 @@ pub struct PhpBlock {
     pub env:       Vec<PhpEnv>,
     pub server:    Vec<PhpConstant>,
     pub ini:       Vec<PhpConstant>,
+    /// `<var name="..." value="..."/>` — PHPUnit's PhpHandler assigns these to
+    /// `$GLOBALS[$name]` (NOT the environment). Projects like doctrine-orm read
+    /// `$GLOBALS['db_driver']` to find their test database connection params.
+    pub vars:      Vec<PhpConstant>,
 }
 
 /// `<env name="..." value="..." force="true"/>`. `force` controls whether
@@ -251,6 +255,7 @@ pub fn parse_php_block(xml: &str) -> PhpBlock {
                     b"env"    => out.env.push(PhpEnv { name: n, value: v, force }),
                     b"server" => out.server.push(PhpConstant { name: n, value: v }),
                     b"ini"    => out.ini.push(PhpConstant { name: n, value: v }),
+                    b"var"    => out.vars.push(PhpConstant { name: n, value: v }),
                     _ => {}
                 }
             }
@@ -549,6 +554,30 @@ mod tests {
         assert_eq!(b.server[0].name, "HTTPS");
         assert_eq!(b.ini.len(), 2);
         assert_eq!(b.ini[1].value, "-1");
+    }
+
+    #[test]
+    fn parses_php_var_into_dedicated_bucket_not_env() {
+        // doctrine-orm pattern: PHPUnit's `<var>` populates $GLOBALS (NOT the
+        // environment). They must be captured in their own bucket, never dropped
+        // nor lumped into `<env>`. Regression for the 1558 "You must provide ...
+        // db_driver" errors caused by `<var>` being silently ignored.
+        let xml = r#"<?xml version="1.0"?>
+<phpunit>
+    <php>
+        <ini name="error_reporting" value="-1"/>
+        <var name="db_driver" value="pdo_sqlite"/>
+        <var name="db_memory" value="true"/>
+        <env name="COLUMNS" value="120"/>
+    </php>
+</phpunit>"#;
+        let b = parse_php_block(xml);
+        assert_eq!(b.vars.len(), 2, "both <var> entries captured");
+        assert_eq!(b.vars[0].name, "db_driver");
+        assert_eq!(b.vars[0].value, "pdo_sqlite");
+        assert_eq!(b.vars[1].name, "db_memory");
+        assert_eq!(b.env.len(), 1, "<var> must NOT be counted as <env>");
+        assert_eq!(b.env[0].name, "COLUMNS");
     }
 
     #[test]

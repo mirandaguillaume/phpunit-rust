@@ -61,6 +61,7 @@ $definesJson     = $args['defines']            ?? '[]';
 $envJson         = $args['env']                ?? '[]';
 $serverJson      = $args['server']             ?? '[]';
 $iniJson         = $args['ini']                ?? '[]';
+$varsJson        = $args['vars']               ?? '[]';
 $childStdinFdsStr  = $args['child-stdin-fds']    ?? '';
 $childStdoutFdsStr = $args['child-stdout-fds']   ?? '';
 $classMapFile      = $args['class-map-file']     ?? null;
@@ -76,6 +77,7 @@ $defines       = json_decode($definesJson, true) ?? [];
 $envVars       = json_decode($envJson,     true) ?? [];
 $serverVars    = json_decode($serverJson,  true) ?? [];
 $iniVars       = json_decode($iniJson,     true) ?? [];
+$varVars       = json_decode($varsJson,    true) ?? [];
 $classMapExtra = ($classMapFile !== null && is_file($classMapFile))
     ? (json_decode(file_get_contents($classMapFile), true) ?? [])
     : [];
@@ -103,6 +105,14 @@ foreach ($envVars as $entry) {
 foreach ($serverVars as $pair) {
     if (is_array($pair) && count($pair) === 2 && is_string($pair[0])) {
         $_SERVER[$pair[0]] = $pair[1];
+    }
+}
+// Apply <var>: PHPUnit's PhpHandler assigns each to $GLOBALS[$name] (NOT the
+// environment). We set it in the master so every forked child inherits it via
+// COW. doctrine-orm reads $GLOBALS['db_driver'] / 'db_memory' to find its test DB.
+foreach ($varVars as $pair) {
+    if (is_array($pair) && count($pair) === 2 && is_string($pair[0])) {
+        $GLOBALS[$pair[0]] = $pair[1];
     }
 }
 $childStdinFds  = array_map('intval', explode(',', $childStdinFdsStr));
