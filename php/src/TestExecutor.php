@@ -246,7 +246,13 @@ final class TestExecutor
                 $givenCache[$cacheKey] = end($outcomes);
             }
 
-            if ($error === null && $returnValue !== null) {
+            // A passing test satisfies @depends regardless of its return value:
+            // PHPUnit injects the return (null for a void dependency) into the
+            // dependent. The consumer side uses array_key_exists(), so recording
+            // even a null here is what makes a void-returning dependency count as
+            // satisfied. The old `!== null` guard wrongly skipped ~40 doctrine-orm
+            // tests as "missing dependency".
+            if ($error === null) {
                 $passedReturns[$method] = $returnValue;
             }
         }
