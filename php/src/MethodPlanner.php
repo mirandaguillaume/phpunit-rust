@@ -99,10 +99,21 @@ final class MethodPlanner
             $seenHashes = [];
             foreach ($kept as $key => $row) {
                 $rowData     = is_array($row) ? $row : iterator_to_array($row);
-                $encoded     = json_encode(array_values($rowData));
-                $rowHash     = md5($encoded !== false ? $encoded : serialize(array_values($rowData)));
-                $isDuplicate = isset($seenHashes[$rowHash]);
-                $seenHashes[$rowHash] = true;
+                // Hash the row for duplicate detection. Some provider values have
+                // side-effecting magic methods (e.g. Carbon\CarbonPeriod endless
+                // periods throw in jsonSerialize()); if hashing throws we must NOT
+                // take down the whole class — treat the row as unique (no dedup),
+                // exactly as vanilla PHPUnit runs every row.
+                try {
+                    $encoded = json_encode(array_values($rowData));
+                    $rowHash = md5($encoded !== false ? $encoded : serialize(array_values($rowData)));
+                } catch (\Throwable $e) {
+                    $rowHash = null;
+                }
+                $isDuplicate = $rowHash !== null && isset($seenHashes[$rowHash]);
+                if ($rowHash !== null) {
+                    $seenHashes[$rowHash] = true;
+                }
                 $steps[] = [
                     'method'       => $methodName,
                     'dataset'      => is_int($key) ? "#{$key}" : (string) $key,
