@@ -31,9 +31,15 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .init();
 
+    // Parsing + walking recurse with PHP nesting depth; run the parse-heavy
+    // commands on a large stack so deeply-nested source can't overflow.
     match cli.command {
-        cli::Command::Analyze(args) => cli::analyze::run(args),
-        cli::Command::TestDiscovery(args) => cli::test_discovery::run(args),
+        cli::Command::Analyze(args) => {
+            cli::analyze::with_deep_stack(|| cli::analyze::run(args))
+        }
+        cli::Command::TestDiscovery(args) => {
+            cli::analyze::with_deep_stack(|| cli::test_discovery::run(args))
+        }
         cli::Command::Cache(args) => cli::cache_cmd::run(args),
         cli::Command::Report(args) => cli::report::run(args),
     }

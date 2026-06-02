@@ -389,6 +389,9 @@ mod tests {
         assert_eq!(compute(&parse_expr("-42"), &mut ctx).unwrap(), PhpValue::Int(-42));
     }
 
+    // `3.14` is intentionally a bare literal (we are verifying the string
+    // "3.14" parses to the float 3.14), not an approximation of PI.
+    #[allow(clippy::approx_constant)]
     #[test]
     fn evaluates_float_literal() {
         let mut ctx = Context::new();

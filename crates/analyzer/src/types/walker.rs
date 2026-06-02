@@ -125,7 +125,18 @@ pub struct WalkerCtx<'a> {
     /// Consulted by `resolve_class_fqcn` (Task 2.5.2) to translate raw
     /// identifiers at class-name sites to FQCNs.
     pub names: mago_names::ResolvedNames,
+    /// Current AST recursion depth and the bound past which `walk_expression`
+    /// / `walk_statement_ctx` bail to `Type::Mixed` instead of recursing.
+    /// Guards against stack overflow on pathologically nested untrusted PHP
+    /// (mirrors the depth guard in `crate::concrete::expr::Context`).
+    pub depth: u32,
+    pub max_depth: u32,
 }
+
+/// Default recursion bound for the type walker. Far above any realistic
+/// hand-written or generated PHP expression/statement nesting, far below the
+/// depth that would overflow a worker thread's stack.
+pub const WALKER_MAX_DEPTH: u32 = 512;
 
 impl<'a> WalkerCtx<'a> {
     pub fn new(
@@ -141,6 +152,8 @@ impl<'a> WalkerCtx<'a> {
             events: Vec::new(),
             pending_narrowings: Vec::new(),
             names,
+            depth: 0,
+            max_depth: WALKER_MAX_DEPTH,
         }
     }
 
@@ -194,7 +207,22 @@ pub fn walk_expression_simple(
 }
 
 /// Walk an expression in a full `WalkerCtx` (env + interner + project + events).
+///
+/// Bounds recursion depth: past `ctx.max_depth` nested expressions/statements
+/// it bails to `Type::Mixed` (and stops walking the subtree) so pathologically
+/// nested untrusted PHP cannot overflow the stack. Mirrors the guard in
+/// `crate::concrete::expr::compute`.
 pub fn walk_expression(ctx: &mut WalkerCtx, expr: &Expression) -> Type {
+    if ctx.depth >= ctx.max_depth {
+        return Type::Mixed;
+    }
+    ctx.depth += 1;
+    let result = walk_expression_inner(ctx, expr);
+    ctx.depth -= 1;
+    result
+}
+
+fn walk_expression_inner(ctx: &mut WalkerCtx, expr: &Expression) -> Type {
     match expr {
         Expression::Literal(_) => Type::Mixed,
         Expression::Variable(v) => walk_variable(ctx, v),
@@ -204,6 +232,27 @@ pub fn walk_expression(ctx: &mut WalkerCtx, expr: &Expression) -> Type {
         Expression::Call(call) => walk_call(ctx, call),
         Expression::Access(access) => walk_access(ctx, access),
         Expression::Binary(b) => walk_binary(ctx, b),
+        // `match (subject) { conds => expr, default => expr }` (M1). Walk the
+        // subject plus every arm's condition and result expression so call
+        // sites reachable only through a match arm still emit events. Match is
+        // an expression, so this also covers `$r = match (...) { ... };`.
+        Expression::Match(m) => {
+            walk_expression(ctx, &m.expression);
+            for arm in m.arms.iter() {
+                match arm {
+                    mago_syntax::ast::MatchArm::Expression(a) => {
+                        for cond in a.conditions.iter() {
+                            walk_expression(ctx, cond);
+                        }
+                        walk_expression(ctx, &a.expression);
+                    }
+                    mago_syntax::ast::MatchArm::Default(a) => {
+                        walk_expression(ctx, &a.expression);
+                    }
+                }
+            }
+            Type::Mixed
+        }
         _ => Type::Mixed,
     }
 }
@@ -824,10 +873,10 @@ fn lookup_return_type(
         return Type::Mixed;
     }
 
-    let class_refl: &ClassLikeReflection = match project.class_likes().find(|(n, _)| {
-        project.class_name_str(n).to_lowercase() == fqcn.to_lowercase()
-    }) {
-        Some((_, r)) => r,
+    // O(1) index lookup (case-insensitive) — replaces an O(n) scan over all
+    // class reflections that re-lowercased every FQCN on each call site.
+    let class_refl: &ClassLikeReflection = match project.find_class_reflection(&fqcn) {
+        Some(r) => r,
         None => return Type::Mixed,
     };
 
@@ -1215,11 +1264,82 @@ fn var_name(interner: &ThreadedInterner, v: &Variable) -> Option<String> {
 /// It coexists with the legacy `walk_statement(env, interner, stmt)` used by
 /// the simple tests; the two paths are independent.
 pub fn walk_statement_ctx(ctx: &mut WalkerCtx, stmt: &Statement) {
+    if ctx.depth >= ctx.max_depth {
+        return;
+    }
+    ctx.depth += 1;
+    walk_statement_ctx_inner(ctx, stmt);
+    ctx.depth -= 1;
+}
+
+fn walk_statement_ctx_inner(ctx: &mut WalkerCtx, stmt: &Statement) {
     match stmt {
         Statement::Expression(e) => { walk_expression(ctx, &e.expression); }
         Statement::If(if_stmt) => walk_if(ctx, if_stmt),
         Statement::Return(ret) => walk_return(ctx, ret),
         Statement::Block(b) => walk_block(ctx, b),
+        // ── Loops / switch / match / try (M1) ──────────────────────────────
+        //
+        // Call sites inside these constructs must still emit CallSiteEvents so
+        // the tracer recurses into callees reachable only through them. We are
+        // flow-insensitive here: walk the loop/condition expressions and the
+        // inner statement sequences, without env-forking (loop bodies may run
+        // 0..n times, so narrowing them buys nothing). Nested statements go
+        // back through `walk_statement_ctx` so the depth guard keeps applying.
+        Statement::Foreach(f) => {
+            walk_expression(ctx, &f.expression);
+            if let Some(key) = f.target.key() {
+                walk_expression(ctx, key);
+            }
+            walk_expression(ctx, f.target.value());
+            for s in f.body.statements() {
+                walk_statement_ctx(ctx, s);
+            }
+        }
+        Statement::For(f) => {
+            for e in f.initializations.iter() {
+                walk_expression(ctx, e);
+            }
+            for e in f.conditions.iter() {
+                walk_expression(ctx, e);
+            }
+            for e in f.increments.iter() {
+                walk_expression(ctx, e);
+            }
+            for s in f.body.statements() {
+                walk_statement_ctx(ctx, s);
+            }
+        }
+        Statement::While(w) => {
+            walk_expression(ctx, &w.condition);
+            for s in w.body.statements() {
+                walk_statement_ctx(ctx, s);
+            }
+        }
+        Statement::DoWhile(d) => {
+            walk_statement_ctx(ctx, &d.statement);
+            walk_expression(ctx, &d.condition);
+        }
+        Statement::Switch(sw) => {
+            walk_expression(ctx, &sw.expression);
+            for case in sw.body.cases() {
+                if let mago_syntax::ast::SwitchCase::Expression(c) = case {
+                    walk_expression(ctx, &c.expression);
+                }
+                for s in case.statements() {
+                    walk_statement_ctx(ctx, s);
+                }
+            }
+        }
+        Statement::Try(t) => {
+            walk_block(ctx, &t.block);
+            for catch in t.catch_clauses.iter() {
+                walk_block(ctx, &catch.block);
+            }
+            if let Some(finally) = &t.finally_clause {
+                walk_block(ctx, &finally.block);
+            }
+        }
         _ => {}
     }
 }
@@ -1362,6 +1482,83 @@ pub(crate) mod tests {
         // The class name from the interner.
         let class_name = project.interner().lookup(&class.name.value).to_string();
         (program, class_name)
+    }
+
+    /// Build a PHP snippet whose single method nests `n` `new A(...)` calls,
+    /// e.g. `new A(new A(...))`. Each instantiation emits one `__construct`
+    /// CallSiteEvent, so the event count equals the reached nesting depth.
+    fn nested_new(n: usize) -> String {
+        let mut s = String::from("<?php\nclass A {\n  public function go(): void {\n    $x = ");
+        for _ in 0..n { s.push_str("new A("); }
+        for _ in 0..n { s.push(')'); }
+        s.push_str(";\n  }\n}\n");
+        s
+    }
+
+    /// Walk the first concrete method of the first class with a custom
+    /// `max_depth`, returning how many CallSiteEvents were emitted.
+    fn count_events_with_max_depth(php: &str, max_depth: u32) -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Test.php"), php).unwrap();
+        let project = MagoProject::load(dir.path()).expect("load ok");
+        let interner = project.interner();
+        let module = project.inner().modules.first().expect("module");
+        let program = module.parse(interner);
+        let class = program.statements.iter().find_map(|s| {
+            if let Statement::Class(c) = s { Some(c) } else { None }
+        }).expect("class");
+        let class_name = interner.lookup(&class.name.value).to_string();
+        let method = class.members.iter().find_map(|m| {
+            if let ClassLikeMember::Method(m) = m { Some(m) } else { None }
+        }).expect("method");
+        let block = match &method.body {
+            MethodBody::Concrete(b) => b,
+            _ => panic!("expected concrete body"),
+        };
+        let env = TypeEnv::for_class(&class_name);
+        let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
+        let mut ctx = WalkerCtx::new(env, interner, &project, names);
+        ctx.max_depth = max_depth;
+        for stmt in block.statements.iter() {
+            walk_statement_ctx(&mut ctx, stmt);
+        }
+        ctx.events.len()
+    }
+
+    /// H4: the walker must bound recursion depth on untrusted PHP. With a
+    /// small `max_depth`, walking deeply-nested expressions must stop early
+    /// (truncating events) rather than recursing without bound (stack overflow).
+    /// (n=20 parses cleanly in mago; this isolates the *walker* guard.)
+    #[test]
+    fn depth_guard_truncates_deeply_nested_expressions() {
+        let php = nested_new(20);
+        let events = count_events_with_max_depth(&php, 8);
+        assert!(
+            events >= 1 && events <= 8,
+            "expected the depth guard to truncate walking at max_depth=8 \
+             (1..=8 events), but got {events} events for 20 nested instantiations"
+        );
+    }
+
+    /// H4: the guard must not perturb normal-depth code — at the default
+    /// max_depth, all 20 nested instantiations are walked and emit events.
+    #[test]
+    fn depth_guard_does_not_affect_normal_depth() {
+        let php = nested_new(20);
+        let events = count_events_with_max_depth(&php, 512);
+        assert_eq!(events, 20, "default-depth walking must emit one event per instantiation");
+    }
+
+    /// H4 (parser stage): mago's recursive-descent parser overflows a default
+    /// 2 MB stack inside `MagoProject::load` at ~30–40 levels of nesting.
+    /// `with_deep_stack` must let such input load without aborting the process.
+    #[test]
+    fn deep_nesting_loads_on_big_stack() {
+        let php = nested_new(60);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Test.php"), &php).unwrap();
+        let ok = crate::cli::analyze::with_deep_stack(|| MagoProject::load(dir.path()).is_ok());
+        assert!(ok, "deeply-nested PHP must load on the deep stack without overflowing");
     }
 
     /// Walk the first method body of the first class, return the type of `$var_name`.
@@ -1507,8 +1704,6 @@ class B {
 
         for stmt in block.statements.iter() {
             if let Statement::Expression(e) = stmt {
-                walk_expression(&mut ctx, &e.expression);
-            } else if let Statement::Expression(e) = stmt {
                 walk_expression(&mut ctx, &e.expression);
             }
         }
@@ -2310,6 +2505,221 @@ class Caller {
             result,
             Type::Class("App\\Driver\\ConcreteDriver".to_string()),
             "expected narrowed FQCN via use-imported factory, got: {result:?}"
+        );
+    }
+
+    // ── M1: coverage walker must recurse into loops/switch/try/match ────────────
+
+    /// Walk the first concrete method of the named class with `walk_statement_ctx`
+    /// (the ctx-based statement path), returning every emitted `CallSiteEvent`.
+    fn collect_events_walking_method(php: &str, class_lc: &str, method_lc: &str) -> Vec<CallSiteEvent> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("M1.php"), php).unwrap();
+        let project = MagoProject::load(dir.path()).expect("load ok");
+        let interner = project.interner();
+        let module = project.inner().modules.first().expect("module");
+        let program = module.parse(interner);
+
+        let class = program.statements.iter().find_map(|s| {
+            if let Statement::Class(c) = s {
+                let n = interner.lookup(&c.name.value).to_lowercase();
+                if n == class_lc { Some(c) } else { None }
+            } else {
+                None
+            }
+        }).unwrap_or_else(|| panic!("class {class_lc} not found"));
+        let class_name = interner.lookup(&class.name.value).to_string();
+
+        let method = class.members.iter().find_map(|m| {
+            if let ClassLikeMember::Method(m) = m {
+                let n = interner.lookup(&m.name.value).to_lowercase();
+                if n == method_lc { Some(m) } else { None }
+            } else {
+                None
+            }
+        }).unwrap_or_else(|| panic!("method {method_lc} not found"));
+
+        let block = match &method.body {
+            MethodBody::Concrete(b) => b,
+            _ => panic!("expected concrete body"),
+        };
+
+        let env = TypeEnv::for_class(&class_name);
+        let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
+        let mut ctx = WalkerCtx::new(env, interner, &project, names);
+        for stmt in block.statements.iter() {
+            walk_statement_ctx(&mut ctx, stmt);
+        }
+        ctx.events
+    }
+
+    fn assert_helper_called(php: &str, helper: &str) {
+        let events = collect_events_walking_method(php, "a", "go");
+        assert!(
+            events.iter().any(|e| e.method_name == helper),
+            "expected a CallSiteEvent for `{helper}` reachable only through the \
+             control-flow construct, but none was emitted; events: {events:?}"
+        );
+    }
+
+    /// The only call to `helper` happens inside a `foreach` body. The walker
+    /// must recurse into the loop body and emit the call-site event.
+    #[test]
+    fn foreach_body_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(array $items): void {
+        foreach ($items as $i) {
+            $this->helper();
+        }
+    }
+    public function helper(): void {}
+}
+"#,
+            "helper",
+        );
+    }
+
+    #[test]
+    fn while_body_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(): void {
+        while (true) {
+            $this->helper();
+        }
+    }
+    public function helper(): void {}
+}
+"#,
+            "helper",
+        );
+    }
+
+    #[test]
+    fn for_body_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(): void {
+        for ($i = 0; $i < 10; $i++) {
+            $this->helper();
+        }
+    }
+    public function helper(): void {}
+}
+"#,
+            "helper",
+        );
+    }
+
+    #[test]
+    fn do_while_body_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(): void {
+        do {
+            $this->helper();
+        } while (false);
+    }
+    public function helper(): void {}
+}
+"#,
+            "helper",
+        );
+    }
+
+    #[test]
+    fn switch_case_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(int $x): void {
+        switch ($x) {
+            case 1:
+                $this->helper();
+                break;
+            default:
+                $this->fallback();
+        }
+    }
+    public function helper(): void {}
+    public function fallback(): void {}
+}
+"#,
+            "helper",
+        );
+    }
+
+    #[test]
+    fn switch_default_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(int $x): void {
+        switch ($x) {
+            case 1:
+                break;
+            default:
+                $this->fallback();
+        }
+    }
+    public function fallback(): void {}
+}
+"#,
+            "fallback",
+        );
+    }
+
+    #[test]
+    fn try_catch_finally_calls_emit_events() {
+        let events = collect_events_walking_method(
+            r#"<?php
+class A {
+    public function go(): void {
+        try {
+            $this->inTry();
+        } catch (\Throwable $e) {
+            $this->inCatch();
+        } finally {
+            $this->inFinally();
+        }
+    }
+    public function inTry(): void {}
+    public function inCatch(): void {}
+    public function inFinally(): void {}
+}
+"#,
+            "a",
+            "go",
+        );
+        for name in ["inTry", "inCatch", "inFinally"] {
+            assert!(
+                events.iter().any(|e| e.method_name == name),
+                "expected a CallSiteEvent for `{name}`; events: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_arm_call_emits_event() {
+        assert_helper_called(
+            r#"<?php
+class A {
+    public function go(int $x): void {
+        $r = match ($x) {
+            1 => $this->helper(),
+            default => $this->fallback(),
+        };
+    }
+    public function helper(): void {}
+    public function fallback(): void {}
+}
+"#,
+            "helper",
         );
     }
 }
