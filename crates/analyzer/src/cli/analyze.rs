@@ -97,6 +97,17 @@ pub fn analyze_filtered(
     cfg: &crate::config::ProjectConfig,
     allowed: Option<&std::collections::HashSet<(String, String)>>,
 ) -> anyhow::Result<crate::analyzer::Coverage> {
+    // Tier-1 result cache: a hit needs no parsing or walking, so probe it on
+    // the normal stack and skip building the (expensive) deep-stack worker
+    // pool. Only an actual parse/trace (a miss) enters `with_deep_stack`.
+    if allowed.is_none() {
+        let cache = CacheStore::open(&cfg.root, MagoProject::version())?;
+        let file_metas = collect_file_metas(&cfg.source_includes, &cfg.test_suites);
+        let fingerprint = fingerprint_from_metas(config_fingerprint(cfg).as_str(), &file_metas);
+        if let Ok(Some(e)) = cache.get::<ResultCacheEntry>("result", &fingerprint) {
+            return Ok(e.coverage);
+        }
+    }
     with_deep_stack(|| analyze_filtered_inner(cfg, allowed))
 }
 
@@ -209,59 +220,66 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // Tier 2/3: check which per-test trace entries are still valid.
-    let trace_check = if !args.no_cache {
-        check_trace_caches(&cache, cfg_fp.as_str(), &test_files, &file_metas)
-    } else {
-        None
-    };
+    // Tier 2/3 + load + trace: mago's parser and the type walker recurse with
+    // PHP nesting depth, so this work runs on a large-stack rayon pool (deeply
+    // nested source would otherwise overflow). The tier-1 hit above returns
+    // before we get here, so a warm "nothing changed" run never pays for the
+    // pool — only an actual parse/trace does.
+    with_deep_stack(move || -> anyhow::Result<()> {
+        // Tier 2/3: check which per-test trace entries are still valid.
+        let trace_check = if !args.no_cache {
+            check_trace_caches(&cache, cfg_fp.as_str(), &test_files, &file_metas)
+        } else {
+            None
+        };
 
-    // Load project: skip vendor when every trace is already valid.
-    let (project, tests, cached_traces) = match trace_check {
-        Some((tests, traces)) => {
-            let all_valid = traces.iter().all(Option::is_some);
-            let project = if all_valid {
-                MagoProject::load_excluding_vendor(&cfg.root)?
-            } else {
-                MagoProject::load(&cfg.root)?
-            };
-            (project, tests, traces)
-        }
-        None => {
-            let project = MagoProject::load(&cfg.root)?;
-            let tests = test_discovery::discover(&project, &cache, &test_files)?;
-            let n = tests.len();
-            (project, tests, vec![None::<Coverage>; n])
-        }
-    };
+        // Load project: skip vendor when every trace is already valid.
+        let (project, tests, cached_traces) = match trace_check {
+            Some((tests, traces)) => {
+                let all_valid = traces.iter().all(Option::is_some);
+                let project = if all_valid {
+                    MagoProject::load_excluding_vendor(&cfg.root)?
+                } else {
+                    MagoProject::load(&cfg.root)?
+                };
+                (project, tests, traces)
+            }
+            None => {
+                let project = MagoProject::load(&cfg.root)?;
+                let tests = test_discovery::discover(&project, &cache, &test_files)?;
+                let n = tests.len();
+                (project, tests, vec![None::<Coverage>; n])
+            }
+        };
 
-    // Per-test coverage: reuse valid cached entries; re-trace stale ones in parallel.
-    let all_coverages: Vec<Coverage> = {
-        use rayon::prelude::*;
-        let no_cache = args.no_cache;
-        tests
-            .par_iter()
-            .zip(cached_traces.into_par_iter())
-            .map(|(test, cached_cov)| {
-                cached_cov.unwrap_or_else(|| {
-                    trace_and_cache(&project, &boundary, cfg_fp.as_str(), test, &file_metas, &cache, no_cache)
+        // Per-test coverage: reuse valid cached entries; re-trace stale ones in parallel.
+        let all_coverages: Vec<Coverage> = {
+            use rayon::prelude::*;
+            let no_cache = args.no_cache;
+            tests
+                .par_iter()
+                .zip(cached_traces.into_par_iter())
+                .map(|(test, cached_cov)| {
+                    cached_cov.unwrap_or_else(|| {
+                        trace_and_cache(&project, &boundary, cfg_fp.as_str(), test, &file_metas, &cache, no_cache)
+                    })
                 })
-            })
-            .collect()
-    };
-    let mut coverage: Coverage = HashMap::new();
-    for cov in all_coverages {
-        analyzer::merge(&mut coverage, cov);
-    }
+                .collect()
+        };
+        let mut coverage: Coverage = HashMap::new();
+        for cov in all_coverages {
+            analyzer::merge(&mut coverage, cov);
+        }
 
-    analyzer::proxy::add_proxy_coverage(&project, &boundary, &mut coverage);
+        analyzer::proxy::add_proxy_coverage(&project, &boundary, &mut coverage);
 
-    // Store the baked result so the next run hits tier 1.
-    if !args.no_cache {
-        let _ = cache.put("result", &fingerprint, &ResultCacheEntry { coverage: coverage.clone() });
-    }
+        // Store the baked result so the next run hits tier 1.
+        if !args.no_cache {
+            let _ = cache.put("result", &fingerprint, &ResultCacheEntry { coverage: coverage.clone() });
+        }
 
-    emit(coverage, &args)
+        emit(coverage, &args)
+    })
 }
 
 /// Check discovery + per-test trace caches. Returns `None` on any discovery miss.

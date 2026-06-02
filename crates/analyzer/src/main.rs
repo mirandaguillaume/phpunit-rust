@@ -31,12 +31,12 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .init();
 
-    // Parsing + walking recurse with PHP nesting depth; run the parse-heavy
-    // commands on a large stack so deeply-nested source can't overflow.
+    // Parsing + walking recurse with PHP nesting depth and need a large stack.
+    // `analyze::run` wraps its own heavy section *after* the tier-1 cache probe
+    // (so a warm cache hit never builds the pool); test-discovery always
+    // parses, so wrap it wholesale here.
     match cli.command {
-        cli::Command::Analyze(args) => {
-            cli::analyze::with_deep_stack(|| cli::analyze::run(args))
-        }
+        cli::Command::Analyze(args) => cli::analyze::run(args),
         cli::Command::TestDiscovery(args) => {
             cli::analyze::with_deep_stack(|| cli::test_discovery::run(args))
         }
