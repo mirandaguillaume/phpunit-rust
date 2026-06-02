@@ -1,9 +1,15 @@
 /target
 **/vendor/
 **/.phpunit.cache/
+**/.phpunit.result.cache
 **/composer.lock
 *.swp
 .DS_Store
+
+# Secrets / local env — NEVER commit (a token was leaked here once; see AUDIT.md C1)
+.envrc
+.env
+.env.local
 
 # Plan/spec docs and tooling caches stay local (do not commit)
 docs/
