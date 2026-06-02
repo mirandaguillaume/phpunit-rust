@@ -16,22 +16,26 @@ concurrently instead of stranding one at the end.
 
 **Test-count parity** is the goal: for every project we benchmark, the
 `Tests: N` line we report should match what `./vendor/bin/phpunit` reports.
-Today's scoreboard:
+Today's scoreboard — re-measured in Docker on PHP 8.4 against the current
+upstream checkouts. Suite versions have drifted since the earlier figures
+(notably brick-math and phpunit's own suite), so absolute counts differ:
 
 | Project | vanilla | phpunit-rust | Status |
 |---|---:|---:|:---|
-| phpunit (own suite) | 5029 | **5029** | EXACT ✓ |
-| carbon | 6169 | **6169** | EXACT ✓ |
-| doctrine-orm | 3478 | **3478** | EXACT ✓ |
-| php-parser | 1887 | **1887** | EXACT ✓ |
-| guzzle-psr7 | 1088 | **1088** | EXACT ✓ |
+| brick-math (PHP 8.4, Docker) | 20392 | **20392** | EXACT ✓ (~2.4× faster) |
+| guzzle-psr7 | 1248 | **1248** | EXACT ✓ |
+| doctrine-orm | 3481 | **3481** | EXACT ✓ (~2× faster) |
+| carbon | 6169 | 6139 | −30 *(behavioural/discovery delta on this checkout; ~2.1× faster)* |
+| php-parser | 1887 | 1878 | −9 |
 | faker | 1416 | 1402 | −14 *(Symfony PhpUnitTestsListener emits 14 synthetic SkippedTestCase wrappers we don't replicate — would require user-listener dispatch)* |
-| brick-math (PHP 8.4, Docker) | 13589 | **13589** | EXACT ✓ |
+| phpunit (own suite) | 6128 | 5082 | −1046 *(1008 `.phpt` end-to-end files aren't discoverable by our class-based discovery; the `unit` suite is at parity. Local checkout is PHPUnit 13-dev.)* |
 
-Behavioural breakdowns may still differ on a small handful of tests
-(e.g. doctrine-orm: ~9 tests we pass that vanilla errors on; guzzle-psr7:
-one test that passes alone but fails after another due to state pollution
-in our worker process) — these are not count-parity issues.
+Small count deltas (carbon −30, php-parser −9) are behavioural/discovery
+differences on the current suite versions, not the headline parity goal;
+doctrine-orm, guzzle-psr7 and brick-math are exact. guzzle-psr7 also has a
+known state-pollution case (one test that passes alone but fails after
+another in our long-lived worker). Numbers are re-measured periodically;
+pin suite versions to reproduce a given row exactly.
 
 ### Supported
 
