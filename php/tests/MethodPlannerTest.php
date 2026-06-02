@@ -55,6 +55,26 @@ final class _MpGeneratorMultiSegment extends TestCase
     public function testGen(int $x): void {}
 }
 
+class _MpThrowingJson implements \JsonSerializable
+{
+    // Mirrors Carbon\CarbonPeriod (endless): jsonSerialize() throws, so
+    // json_encode() of a provider row holding this propagates the throwable.
+    public function jsonSerialize(): mixed
+    {
+        throw new \RuntimeException('cannot be converted to array');
+    }
+}
+
+final class _MpThrowingProvider extends TestCase
+{
+    public static function rows(): array
+    {
+        return [[new _MpThrowingJson()]];
+    }
+    #[DataProvider('rows')]
+    public function testWithThrowingArg(object $o): void {}
+}
+
 final class MethodPlannerTest extends TestCase
 {
     public function testNonProviderMethodEmitsSingleStep(): void
@@ -100,5 +120,16 @@ final class MethodPlannerTest extends TestCase
         $this->assertCount(5, $steps, 'all rows must be preserved across generator segments');
         $args = array_column($steps, 'args');
         $this->assertSame([[1], [2], [3], [10], [20]], $args);
+    }
+
+    public function testRowWithThrowingJsonSerializeDoesNotCrashPlanning(): void
+    {
+        // Regression for carbon: a provider row containing an object whose
+        // jsonSerialize() throws (Carbon\CarbonPeriod endless) made the dedup
+        // hash (json_encode) propagate the throwable and error the whole class.
+        // Planning must survive and keep the row (treated as unique, no dedup).
+        $steps = MethodPlanner::plan(_MpThrowingProvider::class, ['testWithThrowingArg']);
+        $this->assertCount(1, $steps);
+        $this->assertSame('testWithThrowingArg', $steps[0]['method']);
     }
 }

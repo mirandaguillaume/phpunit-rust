@@ -224,10 +224,15 @@ fn real_main() -> Result<ExitCode> {
     let ini_pairs: Vec<[String; 2]> = php_block.ini.iter()
         .map(|s| [s.name.clone(), s.value.clone()])
         .collect();
-    let total = defines.len() + env_triples.len() + server_pairs.len() + ini_pairs.len();
+    // `<var>` populates $GLOBALS (PHPUnit PhpHandler semantics) — distinct from
+    // `<env>`. Forwarded separately so the worker can set $GLOBALS, not putenv.
+    let var_pairs: Vec<[String; 2]> = php_block.vars.iter()
+        .map(|s| [s.name.clone(), s.value.clone()])
+        .collect();
+    let total = defines.len() + env_triples.len() + server_pairs.len() + ini_pairs.len() + var_pairs.len();
     if total > 0 {
-        eprintln!("Applying <php> block: {} const, {} env, {} server, {} ini",
-            defines.len(), env_triples.len(), server_pairs.len(), ini_pairs.len());
+        eprintln!("Applying <php> block: {} const, {} env, {} server, {} ini, {} var",
+            defines.len(), env_triples.len(), server_pairs.len(), ini_pairs.len(), var_pairs.len());
     }
 
     // <testsuites>: collect include directories + excludes, resolved relative
@@ -505,7 +510,7 @@ fn real_main() -> Result<ExitCode> {
         || -> Result<_> {
             Ok(PhpForkPool::spawn(
                 &fork_script, &autoload, bootstrap.as_deref(),
-                &defines, &env_triples, &server_pairs, &ini_pairs,
+                &defines, &env_triples, &server_pairs, &ini_pairs, &var_pairs,
                 worker_count, &class_file_index, &cli.worker_memory_limit,
                 cli.worker_max_batches,
             )?)

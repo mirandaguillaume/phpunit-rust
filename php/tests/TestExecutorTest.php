@@ -54,6 +54,18 @@ final class _ExecChain extends TestCase
     }
 }
 
+final class _ExecChainVoid extends TestCase
+{
+    // A dependency that PASSES but returns void (null). PHPUnit treats it as a
+    // satisfied dependency regardless of return value and injects null.
+    public function testProducer(): void { $this->assertTrue(true); }
+    #[Depends('testProducer')]
+    public function testConsumer(mixed $fromProducer = null): void
+    {
+        $this->assertNull($fromProducer);
+    }
+}
+
 final class TestExecutorTest extends TestCase
 {
     public function testPassingTestProducesPassOutcome(): void
@@ -104,5 +116,19 @@ final class TestExecutorTest extends TestCase
         $this->assertCount(2, $outcomes);
         $this->assertSame('pass', $outcomes[0]['status']);
         $this->assertSame('pass', $outcomes[1]['status'], var_export($outcomes[1], true));
+    }
+
+    public function testDependsOnVoidReturningDependencyStillRuns(): void
+    {
+        // Regression: a passing dependency that returns void/null must still
+        // satisfy @depends. Previously the dependent skipped with
+        // "missing dependency" because the return-value was guarded by
+        // `!== null` when recording it. (doctrine-orm: ~40 spurious skips.)
+        $outcomes = TestExecutor::runClass(_ExecChainVoid::class, ['testProducer', 'testConsumer']);
+        $this->assertCount(2, $outcomes);
+        $this->assertSame('pass', $outcomes[0]['status'], 'producer passes');
+        $this->assertSame('pass', $outcomes[1]['status'],
+            'consumer must run, not skip on a void-returning dependency: '
+            . var_export($outcomes[1], true));
     }
 }

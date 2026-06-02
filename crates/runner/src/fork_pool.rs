@@ -36,6 +36,7 @@ impl PhpForkPool {
         env: &[(String, String, bool)],
         server: &[[String; 2]],
         ini: &[[String; 2]],
+        vars: &[[String; 2]],
         n: usize,
         class_map: &std::collections::HashMap<String, std::path::PathBuf>,
         worker_memory_limit: &str,
@@ -151,6 +152,11 @@ impl PhpForkPool {
         if !ini.is_empty() {
             cmd.arg("--ini").arg(
                 serde_json::to_string(ini).context("serializing ini")?
+            );
+        }
+        if !vars.is_empty() {
+            cmd.arg("--vars").arg(
+                serde_json::to_string(vars).context("serializing vars")?
             );
         }
         // Write class map to a temp file to avoid ARG_MAX limits.
