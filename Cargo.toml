@@ -21,3 +21,12 @@ roxmltree    = "0.20"
 clap         = { version = "4", features = ["derive"] }
 tracing      = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Optimised release builds: LTO + a single codegen unit for maximum runtime
+# speed (this is a performance-focused test runner), and strip debug symbols to
+# keep the shipped binary small. `panic = "unwind"` is kept (the default) on
+# purpose: a panic in one reader/rayon thread must not abort the whole run.
+[profile.release]
+lto           = true
+codegen-units = 1
+strip         = true

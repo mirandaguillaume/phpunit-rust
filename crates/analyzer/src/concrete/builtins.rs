@@ -25,11 +25,13 @@ pub fn call_builtin(name: &str, args: &[PhpValue]) -> Result<PhpValue, ComputeEr
         // PHP's trim() default character set: " \t\n\r\0\x0B" — not Rust's full
         // Unicode whitespace. Match PHP exactly.
         ("trim", [PhpValue::String(s)]) => Ok(PhpValue::String(
-            s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\0' | '\x0B')).to_string(),
+            s.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\0' | '\x0B'))
+                .to_string(),
         )),
-        ("str_replace", [PhpValue::String(search), PhpValue::String(replace), PhpValue::String(subject)]) => {
-            Ok(PhpValue::String(subject.replace(search.as_str(), replace)))
-        }
+        (
+            "str_replace",
+            [PhpValue::String(search), PhpValue::String(replace), PhpValue::String(subject)],
+        ) => Ok(PhpValue::String(subject.replace(search.as_str(), replace))),
         ("count", [PhpValue::Array(a)]) => Ok(PhpValue::Int(a.len() as i64)),
         ("is_array", [v]) => Ok(PhpValue::Bool(matches!(v, PhpValue::Array(_)))),
         ("is_string", [v]) => Ok(PhpValue::Bool(matches!(v, PhpValue::String(_)))),
@@ -72,11 +74,14 @@ mod tests {
 
     #[test]
     fn str_replace_works() {
-        let r = call_builtin("str_replace", &[
-            PhpValue::String("o".into()),
-            PhpValue::String("0".into()),
-            PhpValue::String("hello".into()),
-        ]);
+        let r = call_builtin(
+            "str_replace",
+            &[
+                PhpValue::String("o".into()),
+                PhpValue::String("0".into()),
+                PhpValue::String("hello".into()),
+            ],
+        );
         assert_eq!(r.unwrap(), PhpValue::String("hell0".into()));
     }
 
@@ -91,12 +96,28 @@ mod tests {
 
     #[test]
     fn is_predicates_match_type() {
-        assert_eq!(call_builtin("is_string", &[PhpValue::String("x".into())]).unwrap(), PhpValue::Bool(true));
-        assert_eq!(call_builtin("is_string", &[PhpValue::Int(1)]).unwrap(), PhpValue::Bool(false));
-        assert_eq!(call_builtin("is_int", &[PhpValue::Int(1)]).unwrap(), PhpValue::Bool(true));
-        assert_eq!(call_builtin("is_int", &[PhpValue::String("1".into())]).unwrap(), PhpValue::Bool(false));
         assert_eq!(
-            call_builtin("is_array", &[PhpValue::Array(std::collections::BTreeMap::new())]).unwrap(),
+            call_builtin("is_string", &[PhpValue::String("x".into())]).unwrap(),
+            PhpValue::Bool(true)
+        );
+        assert_eq!(
+            call_builtin("is_string", &[PhpValue::Int(1)]).unwrap(),
+            PhpValue::Bool(false)
+        );
+        assert_eq!(
+            call_builtin("is_int", &[PhpValue::Int(1)]).unwrap(),
+            PhpValue::Bool(true)
+        );
+        assert_eq!(
+            call_builtin("is_int", &[PhpValue::String("1".into())]).unwrap(),
+            PhpValue::Bool(false)
+        );
+        assert_eq!(
+            call_builtin(
+                "is_array",
+                &[PhpValue::Array(std::collections::BTreeMap::new())]
+            )
+            .unwrap(),
             PhpValue::Bool(true)
         );
     }

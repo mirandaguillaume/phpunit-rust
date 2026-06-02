@@ -51,7 +51,8 @@ pub fn check_php_version(min_version_id: u32) -> Result<u32> {
     if id < min_version_id {
         return Err(anyhow!(
             "PHP version is too old: PHP_VERSION_ID={} (need >= {})",
-            id, min_version_id
+            id,
+            min_version_id
         ));
     }
     Ok(id)
@@ -71,7 +72,7 @@ mod tests {
     #[test]
     fn check_php_version_errs_when_too_old() {
         // 99999999 is "PHP 99.999.999" — no real php will be that new.
-        let err = check_php_version(990_000_00).unwrap_err();
+        let err = check_php_version(99_000_000).unwrap_err();
         let s = err.to_string();
         assert!(s.contains("too old") || s.contains("99"), "got: {s}");
     }

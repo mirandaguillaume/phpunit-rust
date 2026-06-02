@@ -27,13 +27,18 @@ fn data_provider_expands_to_three_cases() {
         .args(["analyze", "--format", "pcov-extended"])
         .output()
         .unwrap();
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let map = parsed.as_object().expect("object at top level");
 
     // Find the CalculatorTest.php entry.
-    let (test_file_key, test_file_lines) = map.iter()
+    let (test_file_key, test_file_lines) = map
+        .iter()
         .find(|(k, _)| k.ends_with("CalculatorTest.php"))
         .expect("expected CalculatorTest.php in output");
 
@@ -42,13 +47,21 @@ fn data_provider_expands_to_three_cases() {
     // At least one line in the test file body should be attributed to all 3 data sets.
     let mut found_all_three = false;
     for (line_num, attribution) in test_file_obj.iter() {
-        let ids: Vec<&str> = attribution.as_array().unwrap()
+        let ids: Vec<&str> = attribution
+            .as_array()
+            .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        let has_zero = ids.iter().any(|s| s.starts_with("CalculatorTest::testAdd#") && s.contains("zero_plus_one"));
-        let has_one = ids.iter().any(|s| s.starts_with("CalculatorTest::testAdd#") && s.contains("one_plus_one"));
-        let has_neg = ids.iter().any(|s| s.starts_with("CalculatorTest::testAdd#") && s.contains("negatives"));
+        let has_zero = ids
+            .iter()
+            .any(|s| s.starts_with("CalculatorTest::testAdd#") && s.contains("zero_plus_one"));
+        let has_one = ids
+            .iter()
+            .any(|s| s.starts_with("CalculatorTest::testAdd#") && s.contains("one_plus_one"));
+        let has_neg = ids
+            .iter()
+            .any(|s| s.starts_with("CalculatorTest::testAdd#") && s.contains("negatives"));
         if has_zero && has_one && has_neg {
             found_all_three = true;
             break;
@@ -62,7 +75,8 @@ fn data_provider_expands_to_three_cases() {
 
     // Phase 2: Calculator.php must appear in coverage — each data row calls
     // `new Calculator()` and `$calc->add(...)`, which the analyzer traces.
-    let (calc_key, calc_lines_val) = map.iter()
+    let (calc_key, calc_lines_val) = map
+        .iter()
         .find(|(k, _)| k.ends_with("Calculator.php") && !k.contains("Test"))
         .expect("Phase 2: Calculator.php should appear in coverage (production callee traced)");
 
@@ -71,13 +85,15 @@ fn data_provider_expands_to_three_cases() {
     // At least one line in Calculator.php must be attributed to all 3 data sets.
     let mut calc_has_all_three = false;
     for (_line_num, attribution) in calc_lines.iter() {
-        let ids: Vec<&str> = attribution.as_array().unwrap()
+        let ids: Vec<&str> = attribution
+            .as_array()
+            .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
         let has_zero = ids.iter().any(|s| s.contains("zero_plus_one"));
-        let has_one  = ids.iter().any(|s| s.contains("one_plus_one"));
-        let has_neg  = ids.iter().any(|s| s.contains("negatives"));
+        let has_one = ids.iter().any(|s| s.contains("one_plus_one"));
+        let has_neg = ids.iter().any(|s| s.contains("negatives"));
         if has_zero && has_one && has_neg {
             calc_has_all_three = true;
             break;

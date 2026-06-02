@@ -14,7 +14,7 @@ use quick_xml::reader::Reader;
 /// — only PHPUnit's runtime knows how to invoke `.phpt` files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestSuiteDir {
-    pub path:   String,
+    pub path: String,
     pub suffix: Option<String>,
 }
 
@@ -63,13 +63,13 @@ pub struct PhpConstant {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PhpBlock {
     pub constants: Vec<PhpConstant>,
-    pub env:       Vec<PhpEnv>,
-    pub server:    Vec<PhpConstant>,
-    pub ini:       Vec<PhpConstant>,
+    pub env: Vec<PhpEnv>,
+    pub server: Vec<PhpConstant>,
+    pub ini: Vec<PhpConstant>,
     /// `<var name="..." value="..."/>` — PHPUnit's PhpHandler assigns these to
     /// `$GLOBALS[$name]` (NOT the environment). Projects like doctrine-orm read
     /// `$GLOBALS['db_driver']` to find their test database connection params.
-    pub vars:      Vec<PhpConstant>,
+    pub vars: Vec<PhpConstant>,
 }
 
 /// `<env name="..." value="..." force="true"/>`. `force` controls whether
@@ -77,7 +77,7 @@ pub struct PhpBlock {
 /// false (do NOT clobber a value present in the shell).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhpEnv {
-    pub name:  String,
+    pub name: String,
     pub value: String,
     pub force: bool,
 }
@@ -90,15 +90,13 @@ pub fn parse_bootstrap(xml: &str) -> Option<String> {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"phpunit" {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.local_name().as_ref() == b"bootstrap" {
-                            return std::str::from_utf8(&attr.value).ok().map(String::from);
-                        }
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.local_name().as_ref() == b"phpunit" => {
+                for attr in e.attributes().flatten() {
+                    if attr.key.local_name().as_ref() == b"bootstrap" {
+                        return std::str::from_utf8(&attr.value).ok().map(String::from);
                     }
-                    return None;
                 }
+                return None;
             }
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
@@ -201,7 +199,7 @@ pub fn parse_testsuites(xml: &str) -> Vec<TestSuite> {
                                 suite.excludes.push(trimmed.to_string());
                             } else {
                                 suite.directories.push(TestSuiteDir {
-                                    path:   trimmed.to_string(),
+                                    path: trimmed.to_string(),
                                     suffix: current_suffix.clone(),
                                 });
                             }
@@ -234,7 +232,7 @@ pub fn parse_php_block(xml: &str) -> PhpBlock {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"php" => in_php = true,
-            Ok(Event::End(e))   if e.local_name().as_ref() == b"php" => in_php = false,
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"php" => in_php = false,
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_php => {
                 let tag = e.local_name().as_ref().to_vec();
                 let mut name = None;
@@ -243,19 +241,25 @@ pub fn parse_php_block(xml: &str) -> PhpBlock {
                 for attr in e.attributes().flatten() {
                     let k = attr.key.local_name();
                     match k.as_ref() {
-                        b"name"  => name  = std::str::from_utf8(&attr.value).ok().map(String::from),
+                        b"name" => name = std::str::from_utf8(&attr.value).ok().map(String::from),
                         b"value" => value = std::str::from_utf8(&attr.value).ok().map(String::from),
                         b"force" => force = matches!(attr.value.as_ref(), b"true" | b"1"),
                         _ => {}
                     }
                 }
-                let (Some(n), Some(v)) = (name, value) else { continue };
+                let (Some(n), Some(v)) = (name, value) else {
+                    continue;
+                };
                 match tag.as_slice() {
-                    b"const"  => out.constants.push(PhpConstant { name: n, value: v }),
-                    b"env"    => out.env.push(PhpEnv { name: n, value: v, force }),
+                    b"const" => out.constants.push(PhpConstant { name: n, value: v }),
+                    b"env" => out.env.push(PhpEnv {
+                        name: n,
+                        value: v,
+                        force,
+                    }),
                     b"server" => out.server.push(PhpConstant { name: n, value: v }),
-                    b"ini"    => out.ini.push(PhpConstant { name: n, value: v }),
-                    b"var"    => out.vars.push(PhpConstant { name: n, value: v }),
+                    b"ini" => out.ini.push(PhpConstant { name: n, value: v }),
+                    b"var" => out.vars.push(PhpConstant { name: n, value: v }),
                     _ => {}
                 }
             }
@@ -280,21 +284,21 @@ pub fn parse_php_constants(xml: &str) -> Vec<PhpConstant> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"php" => in_php = true,
             Ok(Event::End(e)) if e.local_name().as_ref() == b"php" => in_php = false,
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_php => {
-                if e.local_name().as_ref() == b"const" {
-                    let mut name = None;
-                    let mut value = None;
-                    for attr in e.attributes().flatten() {
-                        let key = attr.key.local_name();
-                        if key.as_ref() == b"name" {
-                            name = std::str::from_utf8(&attr.value).ok().map(String::from);
-                        } else if key.as_ref() == b"value" {
-                            value = std::str::from_utf8(&attr.value).ok().map(String::from);
-                        }
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_php && e.local_name().as_ref() == b"const" =>
+            {
+                let mut name = None;
+                let mut value = None;
+                for attr in e.attributes().flatten() {
+                    let key = attr.key.local_name();
+                    if key.as_ref() == b"name" {
+                        name = std::str::from_utf8(&attr.value).ok().map(String::from);
+                    } else if key.as_ref() == b"value" {
+                        value = std::str::from_utf8(&attr.value).ok().map(String::from);
                     }
-                    if let (Some(n), Some(v)) = (name, value) {
-                        out.push(PhpConstant { name: n, value: v });
-                    }
+                }
+                if let (Some(n), Some(v)) = (name, value) {
+                    out.push(PhpConstant { name: n, value: v });
                 }
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -352,31 +356,31 @@ pub fn parse_excluded_groups(xml: &str) -> Vec<String> {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                match e.local_name().as_ref() {
-                    b"groups"  => depth_groups += 1,
-                    b"exclude" if depth_groups > 0 => depth_exclude += 1,
-                    b"group"   if depth_exclude > 0 => {
-                        in_group_elem = true;
-                        current.clear();
-                    }
-                    _ => {}
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"groups" => depth_groups += 1,
+                b"exclude" if depth_groups > 0 => depth_exclude += 1,
+                b"group" if depth_exclude > 0 => {
+                    in_group_elem = true;
+                    current.clear();
                 }
-            }
-            Ok(Event::End(e)) => {
-                match e.local_name().as_ref() {
-                    b"groups"  => depth_groups -= 1,
-                    b"exclude" if depth_groups > 0 => depth_exclude -= 1,
-                    b"group"   if in_group_elem => {
-                        in_group_elem = false;
-                        let name = current.trim().to_string();
-                        if !name.is_empty() { out.push(name); }
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"groups" => depth_groups -= 1,
+                b"exclude" if depth_groups > 0 => depth_exclude -= 1,
+                b"group" if in_group_elem => {
+                    in_group_elem = false;
+                    let name = current.trim().to_string();
+                    if !name.is_empty() {
+                        out.push(name);
                     }
-                    _ => {}
                 }
-            }
+                _ => {}
+            },
             Ok(Event::Text(t)) if in_group_elem => {
-                if let Ok(s) = std::str::from_utf8(&t) { current.push_str(s); }
+                if let Ok(s) = std::str::from_utf8(&t) {
+                    current.push_str(s);
+                }
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -435,12 +439,24 @@ mod tests {
 </phpunit>"#;
         let suites = parse_testsuites(xml);
         assert_eq!(suites.len(), 3);
-        let paths: Vec<&str> = suites[0].directories.iter().map(|d| d.path.as_str()).collect();
+        let paths: Vec<&str> = suites[0]
+            .directories
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect();
         assert_eq!(paths, vec!["tests"]);
         assert_eq!(suites[0].excludes, vec!["tests/Integration"]);
-        let paths: Vec<&str> = suites[1].directories.iter().map(|d| d.path.as_str()).collect();
+        let paths: Vec<&str> = suites[1]
+            .directories
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect();
         assert_eq!(paths, vec!["tests/Integration"]);
-        let paths: Vec<&str> = suites[2].directories.iter().map(|d| d.path.as_str()).collect();
+        let paths: Vec<&str> = suites[2]
+            .directories
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect();
         assert_eq!(paths, vec!["./vendor/somepkg/tests"]);
         // Default (no suffix attribute) → directory is class-discoverable.
         assert!(suites[0].directories[0].is_class_discoverable());
@@ -464,14 +480,20 @@ mod tests {
         let dirs = &suites[0].directories;
         assert_eq!(dirs.len(), 3);
         assert_eq!(dirs[0].suffix.as_deref(), Some(".phpt"));
-        assert!(!dirs[0].is_class_discoverable(),
-            ".phpt directory must be skipped for class discovery");
+        assert!(
+            !dirs[0].is_class_discoverable(),
+            ".phpt directory must be skipped for class discovery"
+        );
         assert_eq!(dirs[1].suffix.as_deref(), Some("Test.php"));
-        assert!(dirs[1].is_class_discoverable(),
-            "Test.php suffix walks as normal");
+        assert!(
+            dirs[1].is_class_discoverable(),
+            "Test.php suffix walks as normal"
+        );
         assert_eq!(dirs[2].suffix, None);
-        assert!(dirs[2].is_class_discoverable(),
-            "absent suffix defaults to PHPUnit's Test.php — walk normally");
+        assert!(
+            dirs[2].is_class_discoverable(),
+            "absent suffix defaults to PHPUnit's Test.php — walk normally"
+        );
     }
 
     #[test]
@@ -519,7 +541,10 @@ mod tests {
     </groups>
 </phpunit>"#;
         let excl = parse_excluded_groups(xml);
-        assert_eq!(excl, vec!["performance".to_string(), "locking_functional".to_string()]);
+        assert_eq!(
+            excl,
+            vec!["performance".to_string(), "locking_functional".to_string()]
+        );
     }
 
     #[test]
@@ -584,8 +609,9 @@ mod tests {
     fn returns_empty_php_block_when_no_block() {
         let xml = r#"<?xml version="1.0"?><phpunit bootstrap="boot.php"></phpunit>"#;
         let b = parse_php_block(xml);
-        assert!(b.constants.is_empty() && b.env.is_empty()
-             && b.server.is_empty() && b.ini.is_empty());
+        assert!(
+            b.constants.is_empty() && b.env.is_empty() && b.server.is_empty() && b.ini.is_empty()
+        );
     }
 
     #[test]
@@ -599,10 +625,13 @@ mod tests {
     </listeners>
 </phpunit>"#;
         let listeners = parse_listeners(xml);
-        assert_eq!(listeners, vec![
-            "Symfony\\Bridge\\PhpUnit\\SymfonyTestsListener".to_string(),
-            "My\\Other\\Listener".to_string(),
-        ]);
+        assert_eq!(
+            listeners,
+            vec![
+                "Symfony\\Bridge\\PhpUnit\\SymfonyTestsListener".to_string(),
+                "My\\Other\\Listener".to_string(),
+            ]
+        );
     }
 
     #[test]

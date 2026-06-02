@@ -37,7 +37,7 @@ pub fn partition_by_depends(
     let n = methods.len();
     let mut parent: Vec<usize> = (0..n).collect();
 
-    fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
             parent[i] = parent[parent[i]]; // path compression
             i = parent[i];
@@ -45,7 +45,7 @@ pub fn partition_by_depends(
         i
     }
 
-    fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
+    fn union(parent: &mut [usize], a: usize, b: usize) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
@@ -88,14 +88,21 @@ mod tests {
 
     #[test]
     fn no_depends_yields_singleton_groups() {
-        let methods = vec!["testA".to_string(), "testB".to_string(), "testC".to_string()];
+        let methods = vec![
+            "testA".to_string(),
+            "testB".to_string(),
+            "testC".to_string(),
+        ];
         let depends = HashMap::new();
         let groups = partition_by_depends(&methods, &depends);
-        assert_eq!(groups, vec![
-            vec!["testA".to_string()],
-            vec!["testB".to_string()],
-            vec!["testC".to_string()],
-        ]);
+        assert_eq!(
+            groups,
+            vec![
+                vec!["testA".to_string()],
+                vec!["testB".to_string()],
+                vec!["testC".to_string()],
+            ]
+        );
     }
 
     #[test]
@@ -106,7 +113,10 @@ mod tests {
         depends.insert("c".to_string(), vec!["b".to_string()]);
         let groups = partition_by_depends(&methods, &depends);
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            groups[0],
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]

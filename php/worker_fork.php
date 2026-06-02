@@ -42,7 +42,28 @@ $__log_phase('start');
 require_once __DIR__ . '/vendor/autoload.php';
 $__log_phase('worker_vendor_autoload');
 
+use PhpunitRust\OutcomeBuilder;
 use PhpunitRust\TestExecutor;
+
+/**
+ * Write one worker payload to $stream as a newline-delimited JSON line.
+ *
+ * Centralizes every worker→Rust write so the JSON encoding goes through a
+ * single hardened path. The historical pattern `fwrite($stream,
+ * json_encode($x) . "\n")` silently lost a line whenever json_encode()
+ * returned false (invalid UTF-8 in an exception message / stack trace), which
+ * is a test-count parity violation. OutcomeBuilder::encodeLine() guarantees a
+ * non-empty, valid-JSON line is always produced (with a shape-preserving
+ * fallback when the payload is unencodable), so a TestOutcome is never dropped.
+ *
+ * @param resource             $stream
+ * @param array<string, mixed> $payload
+ */
+function write_line($stream, array $payload): void
+{
+    fwrite($stream, OutcomeBuilder::encodeLine($payload));
+    fflush($stream);
+}
 
 // ---------------------------------------------------------------------------
 // 1. Parse CLI args
@@ -413,12 +434,11 @@ pcntl_signal(SIGCHLD, function () use (
             && is_resource($childStdoutStreams[$slot])) {
             $exitCode = pcntl_wifexited($status)   ? pcntl_wexitstatus($status) : -1;
             $signal   = pcntl_wifsignaled($status) ? pcntl_wtermsig($status)    :  0;
-            @fwrite($childStdoutStreams[$slot], json_encode([
+            @write_line($childStdoutStreams[$slot], [
                 'slot_died' => true,
                 'exit_code' => $exitCode,
                 'signal'    => $signal,
-            ]) . "\n");
-            @fflush($childStdoutStreams[$slot]);
+            ]);
         }
         $newPid = $forkChildForSlot($slot);
         if ($newPid === -1) {
@@ -500,7 +520,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         for ($i = $nextIdx; $i < count($currentClasses); $i++) {
             $class = (string)($currentClasses[$i]['class'] ?? '');
             if ($class === '') continue;
-            @fwrite($stdoutStream, json_encode([
+            @write_line($stdoutStream, [
                 'class'       => $class,
                 'method'      => '<class>',
                 'dataset'     => null,
@@ -508,8 +528,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                 'message'     => 'worker process terminated before this class could run',
                 'trace'       => null,
                 'duration_ms' => 0.0,
-            ]) . "\n");
-            @fflush($stdoutStream);
+            ]);
         }
     });
 
@@ -527,8 +546,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         $plan = json_decode($line, true);
         if (!is_array($plan) || !isset($plan['classes'])) {
             // Malformed line: still ack so master doesn't deadlock on us.
-            fwrite($stdoutStream, json_encode(['batch_done' => true]) . "\n");
-            fflush($stdoutStream);
+            write_line($stdoutStream, ['batch_done' => true]);
             continue;
         }
 
@@ -645,8 +663,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
             ob_end_clean();
 
             foreach ($outcomes as $outcome) {
-                fwrite($stdoutStream, json_encode($outcome) . "\n");
-                fflush($stdoutStream);
+                write_line($stdoutStream, $outcome);
             }
             $nextIdx = $i + 1;
         }
@@ -655,8 +672,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // if the process exits naturally on the next read, then signal ready.
         $currentClasses = [];
         $nextIdx        = 0;
-        fwrite($stdoutStream, json_encode(['batch_done' => true]) . "\n");
-        fflush($stdoutStream);
+        write_line($stdoutStream, ['batch_done' => true]);
 
         // Fork-server mode: exit voluntarily after $maxBatches batches so
         // the master can fork a fresh child for the next batch. This bounds
@@ -689,7 +705,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
 function emitError($stream, string $class, string $method,
                    string $msg, ?string $trace = null): void
 {
-    fwrite($stream, json_encode([
+    write_line($stream, [
         'class'       => $class,
         'method'      => $method,
         'dataset'     => null,
@@ -697,6 +713,5 @@ function emitError($stream, string $class, string $method,
         'message'     => $msg,
         'trace'       => $trace,
         'duration_ms' => 0.0,
-    ]) . "\n");
-    fflush($stream);
+    ]);
 }

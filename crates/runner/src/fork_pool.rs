@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 pub struct PhpForkPool {
     master: Child,
     write_ends: Vec<Option<std::fs::File>>,
-    read_ends:  Vec<Option<std::fs::File>>,
+    read_ends: Vec<Option<std::fs::File>>,
     // Keep class-map temp file alive until the pool is dropped.
     _class_map_tmp: Option<tempfile::NamedTempFile>,
 }
@@ -28,6 +28,9 @@ impl PhpForkPool {
     /// Pipe pairs are wrapped in `File` immediately after creation so that
     /// any early return from this function automatically closes all allocated
     /// FDs. CLOEXEC errors are propagated rather than silently ignored.
+    // justification: these are the irreducible inputs to fork-master setup; bundling
+    // them into a struct would just move the arity without improving call sites.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         script: &Path,
         autoload: &Path,
@@ -49,9 +52,9 @@ impl PhpForkPool {
         // Create N stdin-pipes (Rust writes, PHP reads) and
         //        N stdout-pipes (PHP writes, Rust reads).
         // Wrap raw FDs into File immediately so early returns auto-close them.
-        let mut to_php_read:    Vec<std::fs::File> = Vec::with_capacity(n);
-        let mut to_php_write:   Vec<std::fs::File> = Vec::with_capacity(n);
-        let mut from_php_read:  Vec<std::fs::File> = Vec::with_capacity(n);
+        let mut to_php_read: Vec<std::fs::File> = Vec::with_capacity(n);
+        let mut to_php_write: Vec<std::fs::File> = Vec::with_capacity(n);
+        let mut from_php_read: Vec<std::fs::File> = Vec::with_capacity(n);
         let mut from_php_write: Vec<std::fs::File> = Vec::with_capacity(n);
 
         for _ in 0..n {
@@ -85,30 +88,39 @@ impl PhpForkPool {
             }
         }
 
-        let stdin_fds_str = to_php_read.iter()
+        let stdin_fds_str = to_php_read
+            .iter()
             .map(|f| f.as_raw_fd().to_string())
-            .collect::<Vec<_>>().join(",");
-        let stdout_fds_str = from_php_write.iter()
+            .collect::<Vec<_>>()
+            .join(",");
+        let stdout_fds_str = from_php_write
+            .iter()
             .map(|f| f.as_raw_fd().to_string())
-            .collect::<Vec<_>>().join(",");
+            .collect::<Vec<_>>()
+            .join(",");
 
         let mut cmd = Command::new("php");
-        cmd.arg("-d").arg("opcache.enable_cli=1")
-           // The master pre-warms opcache for every test file before forking,
-           // so each compile bumps the master's resident set. On large test
-           // suites (rector: ~1500 fixture files in class_file_index, phpstan
-           // similar) the default 128M memory_limit fills up and PHP fatals
-           // the master half-way through. -1 (unlimited) is safe here because
-           // the OS still enforces real limits and the master is short-lived
-           // — by design we strip the per-child cap via --worker-memory-limit.
-           .arg("-d").arg("memory_limit=-1")
-           .arg(script)
-           .arg("--autoload").arg(autoload)
-           .arg("--child-stdin-fds").arg(&stdin_fds_str)
-           .arg("--child-stdout-fds").arg(&stdout_fds_str)
-           .stdin(Stdio::null())
-           .stdout(Stdio::null())
-           .stderr(Stdio::inherit());
+        cmd.arg("-d")
+            .arg("opcache.enable_cli=1")
+            // The master pre-warms opcache for every test file before forking,
+            // so each compile bumps the master's resident set. On large test
+            // suites (rector: ~1500 fixture files in class_file_index, phpstan
+            // similar) the default 128M memory_limit fills up and PHP fatals
+            // the master half-way through. -1 (unlimited) is safe here because
+            // the OS still enforces real limits and the master is short-lived
+            // — by design we strip the per-child cap via --worker-memory-limit.
+            .arg("-d")
+            .arg("memory_limit=-1")
+            .arg(script)
+            .arg("--autoload")
+            .arg(autoload)
+            .arg("--child-stdin-fds")
+            .arg(&stdin_fds_str)
+            .arg("--child-stdout-fds")
+            .arg(&stdout_fds_str)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
 
         // Linux: ask the kernel to deliver SIGTERM to the PHP master when
         // *we* die for any reason — including SIGKILL on Rust where Drop
@@ -118,7 +130,14 @@ impl PhpForkPool {
         #[cfg(target_os = "linux")]
         unsafe {
             cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0) != 0 {
+                if libc::prctl(
+                    libc::PR_SET_PDEATHSIG,
+                    libc::SIGTERM as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                ) != 0
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -129,57 +148,52 @@ impl PhpForkPool {
             cmd.arg("--bootstrap").arg(bs);
         }
         if !defines.is_empty() {
-            cmd.arg("--defines").arg(
-                serde_json::to_string(defines).context("serializing defines")?
-            );
+            cmd.arg("--defines")
+                .arg(serde_json::to_string(defines).context("serializing defines")?);
         }
         if !env.is_empty() {
             // Wire each <env> as [name, value, force?] triples so the
             // master can honour the `force` semantics (don't clobber a
             // shell-provided value unless the XML says so).
-            let payload: Vec<(&str, &str, bool)> = env.iter()
+            let payload: Vec<(&str, &str, bool)> = env
+                .iter()
                 .map(|(n, v, f)| (n.as_str(), v.as_str(), *f))
                 .collect();
-            cmd.arg("--env").arg(
-                serde_json::to_string(&payload).context("serializing env")?
-            );
+            cmd.arg("--env")
+                .arg(serde_json::to_string(&payload).context("serializing env")?);
         }
         if !server.is_empty() {
-            cmd.arg("--server").arg(
-                serde_json::to_string(server).context("serializing server")?
-            );
+            cmd.arg("--server")
+                .arg(serde_json::to_string(server).context("serializing server")?);
         }
         if !ini.is_empty() {
-            cmd.arg("--ini").arg(
-                serde_json::to_string(ini).context("serializing ini")?
-            );
+            cmd.arg("--ini")
+                .arg(serde_json::to_string(ini).context("serializing ini")?);
         }
         if !vars.is_empty() {
-            cmd.arg("--vars").arg(
-                serde_json::to_string(vars).context("serializing vars")?
-            );
+            cmd.arg("--vars")
+                .arg(serde_json::to_string(vars).context("serializing vars")?);
         }
         // Write class map to a temp file to avoid ARG_MAX limits.
         // The file is deleted when the pool is dropped (or when the process exits).
-        let _class_map_tmp: Option<tempfile::NamedTempFile>;
-        if !class_map.is_empty() {
+        let _class_map_tmp: Option<tempfile::NamedTempFile> = if !class_map.is_empty() {
             let map_str: std::collections::HashMap<&str, &str> = class_map
                 .iter()
                 .filter_map(|(k, v)| v.to_str().map(|s| (k.as_str(), s)))
                 .collect();
             let json = serde_json::to_string(&map_str).context("serializing class-map")?;
-            let mut tmp = tempfile::NamedTempFile::new()
-                .context("creating class-map temp file")?;
+            let mut tmp = tempfile::NamedTempFile::new().context("creating class-map temp file")?;
             use std::io::Write as _;
             tmp.write_all(json.as_bytes())
                 .context("writing class-map temp file")?;
             cmd.arg("--class-map-file").arg(tmp.path());
-            _class_map_tmp = Some(tmp);
+            Some(tmp)
         } else {
-            _class_map_tmp = None;
-        }
+            None
+        };
         cmd.arg("--worker-memory-limit").arg(worker_memory_limit);
-        cmd.arg("--max-batches-per-child").arg(max_batches_per_child.to_string());
+        cmd.arg("--max-batches-per-child")
+            .arg(max_batches_per_child.to_string());
 
         let master = cmd.spawn().context("failed to spawn PHP master")?;
 
@@ -189,16 +203,22 @@ impl PhpForkPool {
         drop(from_php_write);
 
         let write_ends = to_php_write.into_iter().map(Some).collect();
-        let read_ends  = from_php_read.into_iter().map(Some).collect();
+        let read_ends = from_php_read.into_iter().map(Some).collect();
 
-        Ok(PhpForkPool { master, write_ends, read_ends, _class_map_tmp })
+        Ok(PhpForkPool {
+            master,
+            write_ends,
+            read_ends,
+            _class_map_tmp,
+        })
     }
 
     /// Write a `BatchPlan` to slot `i`. Can be called multiple times per slot
     /// (the worker reads newline-delimited plans in a loop). Call `close_slot`
     /// when you have no more work for this slot.
     pub fn write_batch(&mut self, slot: usize, plan: &BatchPlan) -> Result<()> {
-        let f = self.write_ends[slot].as_mut()
+        let f = self.write_ends[slot]
+            .as_mut()
             .ok_or_else(|| anyhow!("write end for slot {slot} already closed"))?;
         let json = serde_json::to_string(plan).context("serializing BatchPlan")?;
         f.write_all(json.as_bytes()).context("writing BatchPlan")?;
@@ -234,7 +254,7 @@ impl PhpForkPool {
         self.close_write_ends();
         std::mem::take(&mut self.read_ends)
             .into_iter()
-            .filter_map(|opt| opt)
+            .flatten()
             .map(BufReader::new)
             .collect()
     }
@@ -244,8 +264,50 @@ impl PhpForkPool {
         self.write_ends.len()
     }
 
+    /// Returns `true` if the pool has no worker slots.
+    pub fn is_empty(&self) -> bool {
+        self.write_ends.is_empty()
+    }
+
     /// Wait for the PHP master process to exit cleanly.
     pub fn wait(&mut self) {
+        let _ = self.master.wait();
+    }
+
+    /// Forcibly tear the pool down *now*: close all write ends and SIGTERM the
+    /// master so its handler kills every forked child's process group. Used by
+    /// the runner's inactivity watchdog to unblock the per-slot reader threads
+    /// — a stuck child never emits output, but once it is killed its pipe
+    /// write-end closes and the reader sees EOF. Best-effort; `Drop` still runs
+    /// the SIGTERM→SIGKILL escalation as a backstop. Safe to call before
+    /// `wait()`.
+    pub fn terminate(&mut self) {
+        self.close_write_ends();
+        let pid = self.master.id() as i32;
+        // Try graceful first: in fork-server mode (`--worker-max-batches > 0`)
+        // the master loops on `usleep`, so `pcntl_async_signals` can run its
+        // SIGTERM handler and reap its children. Give it a brief window.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            match self.master.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+        // Backstop for the *stuck-worker* case: in long-lived mode the master
+        // blocks in a non-dispatching `pcntl_waitpid` and never runs its
+        // SIGTERM handler, and even a SIGKILL of the master would leave a stuck
+        // child orphaned and alive — keeping its stdout pipe open so the
+        // runner's reader threads never see EOF. Kill the whole descendant
+        // tree directly so every child's pipe closes.
+        kill_process_tree(pid);
+        let _ = self.master.kill();
         let _ = self.master.wait();
     }
 }
@@ -258,7 +320,9 @@ impl Drop for PhpForkPool {
         // grandchildren orphaned, blocked in setUp/test. Give it 500ms,
         // then SIGKILL as a fallback.
         let pid = self.master.id() as i32;
-        unsafe { libc::kill(pid, libc::SIGTERM); }
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             match self.master.try_wait() {
@@ -284,3 +348,53 @@ fn raw_pipe() -> Result<[RawFd; 2]> {
     }
     Ok(fds)
 }
+
+/// SIGKILL every transitive descendant of `root` (children, grandchildren, …)
+/// and their process groups by walking `/proc`. Used to guarantee teardown of
+/// a stuck worker that the PHP master won't reap on its own (it may be parked
+/// in a non-dispatching `pcntl_waitpid`, so `pcntl_async_signals` never runs
+/// its SIGTERM handler). Linux-only; a no-op elsewhere (the caller still
+/// SIGKILLs the master directly).
+#[cfg(target_os = "linux")]
+fn kill_process_tree(root: i32) {
+    fn ppid_of(stat: &str) -> Option<i32> {
+        // /proc/<pid>/stat is "<pid> (comm) <state> <ppid> …". `comm` may
+        // contain spaces and parens, so scan past the last ')'.
+        let rparen = stat.rfind(')')?;
+        stat[rparen + 1..].split_whitespace().nth(1)?.parse().ok()
+    }
+    let procs: Vec<(i32, i32)> = match std::fs::read_dir("/proc") {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+            .filter_map(|pid| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                ppid_of(&stat).map(|pp| (pid, pp))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    // BFS from `root` to collect every descendant.
+    let mut descendants: Vec<i32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for &(pid, ppid) in &procs {
+            if ppid == parent && pid != root && !descendants.contains(&pid) {
+                descendants.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    for pid in descendants {
+        // Negative pid targets the child's process group (catches grandchildren
+        // a test spawned via proc_open); the bare pid covers any that did not
+        // setpgid. Both are best-effort.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_process_tree(_root: i32) {}

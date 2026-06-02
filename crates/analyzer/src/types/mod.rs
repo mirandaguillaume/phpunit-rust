@@ -7,12 +7,12 @@
 //! we can't track end up as `Type::Mixed` and downstream layers treat them
 //! as opaque.
 
-pub mod type_repr;
 pub mod env;
 pub mod narrowing;
-pub mod walker;
 pub mod resolver;
+pub mod type_repr;
+pub mod walker;
 
-pub use type_repr::Type;
 pub use env::TypeEnv;
 pub use resolver::type_to_receiver_type;
+pub use type_repr::Type;

@@ -7,7 +7,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Bake PHPUnit createMock() expectation chains into anonymous classes")]
+#[command(
+    version,
+    about = "Bake PHPUnit createMock() expectation chains into anonymous classes"
+)]
 struct Cli {
     #[arg(long)]
     test: PathBuf,
@@ -17,7 +20,7 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let test_src  = std::fs::read_to_string(&cli.test)
+    let test_src = std::fs::read_to_string(&cli.test)
         .with_context(|| format!("reading test {:?}", cli.test))?;
     let iface_src = std::fs::read_to_string(&cli.interface)
         .with_context(|| format!("reading interface {:?}", cli.interface))?;

@@ -15,55 +15,103 @@ use std::thread;
 /// further plans are sent. In-flight tests on other workers still finish.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StopOn {
-    pub failure:    bool,
-    pub error:      bool,
-    pub skipped:    bool,
+    pub failure: bool,
+    pub error: bool,
+    pub skipped: bool,
     pub incomplete: bool,
-    pub risky:      bool,
+    pub risky: bool,
 }
 
 impl StopOn {
     /// `--stop-on-failure` PHPUnit semantics: stop on Fail OR Error
     /// (both are "real" defects).
     pub fn on_failure() -> Self {
-        Self { failure: true, error: true, ..Self::default() }
+        Self {
+            failure: true,
+            error: true,
+            ..Self::default()
+        }
     }
     /// `--stop-on-defect` PHPUnit semantics: stop on anything not-pass.
     pub fn on_defect() -> Self {
         Self {
-            failure: true, error: true,
-            skipped: true, incomplete: true, risky: true,
+            failure: true,
+            error: true,
+            skipped: true,
+            incomplete: true,
+            risky: true,
         }
     }
     pub fn matches(&self, status: &TestStatus) -> bool {
         match status {
-            TestStatus::Fail       => self.failure,
-            TestStatus::Error      => self.error,
-            TestStatus::Skipped    => self.skipped,
+            TestStatus::Fail => self.failure,
+            TestStatus::Error => self.error,
+            TestStatus::Skipped => self.skipped,
             TestStatus::Incomplete => self.incomplete,
-            TestStatus::Risky      => self.risky,
-            TestStatus::Pass       => false,
+            TestStatus::Risky => self.risky,
+            TestStatus::Pass => false,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub autoload:         PathBuf,
-    pub bootstrap:        Option<PathBuf>,
-    pub filter:           Option<String>,
-    pub defines:          Vec<[String; 2]>,
-    pub stop_on:          StopOn,
+    pub autoload: PathBuf,
+    pub bootstrap: Option<PathBuf>,
+    pub filter: Option<String>,
+    pub defines: Vec<[String; 2]>,
+    pub stop_on: StopOn,
     /// FQCN → file path for all PHP classes in the test roots.
     /// Used to resolve `#[DataProviderExternal]` dependencies.
     pub class_file_index: HashMap<String, PathBuf>,
     /// Number of PHP workers — used to compute adaptive batch sizes.
-    pub n_workers:        usize,
+    pub n_workers: usize,
+    /// Inactivity watchdog: max time to wait for *any* worker to produce a
+    /// message before declaring the run stuck (a worker hung in an infinite
+    /// loop, a blocked syscall, or a nested sub-process that never returns —
+    /// no `SIGCHLD` fires because the child is still alive). On timeout the
+    /// in-flight + queued tests are reported as errors and the pool is torn
+    /// down, converting an unbounded hang into a bounded, recoverable
+    /// failure. `None` disables the watchdog (wait forever).
+    pub worker_timeout: Option<std::time::Duration>,
+}
+
+/// Synthesize one `Error` outcome per test method in `plan` (or one
+/// class-level error when the method list is unknown), reporting each via
+/// `on_progress`. Shared by the crash-recovery and inactivity-watchdog paths
+/// so a batch that can never complete still appears in the report — keeping
+/// test-count parity instead of silently dropping tests.
+fn synth_error_outcomes(
+    plan: &BatchPlan,
+    cause: &str,
+    on_progress: &impl Fn(&TestOutcome),
+    outcomes: &mut Vec<TestOutcome>,
+) {
+    for bc in &plan.classes {
+        let methods: Vec<String> = if bc.methods.is_empty() {
+            vec!["<class>".to_string()]
+        } else {
+            bc.methods.clone()
+        };
+        for m in methods {
+            let o = TestOutcome {
+                class: bc.class.clone(),
+                method: m,
+                dataset: None,
+                status: TestStatus::Error,
+                message: Some(cause.to_string()),
+                trace: None,
+                duration_ms: 0.0,
+            };
+            on_progress(&o);
+            outcomes.push(o);
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Report {
-    pub outcomes:          Vec<TestOutcome>,
+    pub outcomes: Vec<TestOutcome>,
     pub total_duration_ms: f64,
 }
 
@@ -71,12 +119,24 @@ impl Report {
     pub fn count(&self, status: TestStatus) -> usize {
         self.outcomes.iter().filter(|o| o.status == status).count()
     }
-    pub fn passed(&self)     -> usize { self.count(TestStatus::Pass) }
-    pub fn failed(&self)     -> usize { self.count(TestStatus::Fail) }
-    pub fn errored(&self)    -> usize { self.count(TestStatus::Error) }
-    pub fn skipped(&self)    -> usize { self.count(TestStatus::Skipped) }
-    pub fn incomplete(&self) -> usize { self.count(TestStatus::Incomplete) }
-    pub fn risky(&self)      -> usize { self.count(TestStatus::Risky) }
+    pub fn passed(&self) -> usize {
+        self.count(TestStatus::Pass)
+    }
+    pub fn failed(&self) -> usize {
+        self.count(TestStatus::Fail)
+    }
+    pub fn errored(&self) -> usize {
+        self.count(TestStatus::Error)
+    }
+    pub fn skipped(&self) -> usize {
+        self.count(TestStatus::Skipped)
+    }
+    pub fn incomplete(&self) -> usize {
+        self.count(TestStatus::Incomplete)
+    }
+    pub fn risky(&self) -> usize {
+        self.count(TestStatus::Risky)
+    }
 
     pub fn is_success(&self) -> bool {
         self.failed() == 0 && self.errored() == 0
@@ -99,7 +159,7 @@ enum WorkerMessage {
         #[allow(dead_code)]
         slot_died: bool,
         exit_code: i32,
-        signal:    i32,
+        signal: i32,
     },
     Outcome(TestOutcome),
 }
@@ -139,10 +199,11 @@ pub fn run_with_profiler(
     on_progress: impl Fn(&TestOutcome) + Sync,
     profiler: &crate::profiler::Profiler,
 ) -> Result<Report> {
-    let filtered: Vec<TestCase> = cases.into_iter()
+    let filtered: Vec<TestCase> = cases
+        .into_iter()
         .filter(|c| match &cfg.filter {
             Some(f) => format!("{}::{}", c.class, c.method).contains(f.as_str()),
-            None    => true,
+            None => true,
         })
         .collect();
 
@@ -153,10 +214,7 @@ pub fn run_with_profiler(
         serde_json::json!({"cases": filtered.len(), "workers": n}),
         || build_queue(filtered, cfg, row_counts),
     );
-    profiler.mark(
-        "queue_built",
-        "run",
-    );
+    profiler.mark("queue_built", "run");
     let _ = queue.len();
     // Per-slot dispatch start time: stamped on write_batch, cleared on
     // BatchDone. Lets us emit a `batch` span per (slot, batch) pair with
@@ -169,7 +227,8 @@ pub fn run_with_profiler(
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
     let mut reader_handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(n);
     for slot in 0..n {
-        let reader = pool.take_reader(slot)
+        let reader = pool
+            .take_reader(slot)
             .ok_or_else(|| anyhow::anyhow!("read end for slot {slot} missing"))?;
         let tx_slot = tx.clone();
         reader_handles.push(thread::spawn(move || {
@@ -178,17 +237,25 @@ pub fn run_with_profiler(
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
-                    Ok(0) => { let _ = tx_slot.send(WorkerEvent::Eof(slot)); break; }
+                    Ok(0) => {
+                        let _ = tx_slot.send(WorkerEvent::Eof(slot));
+                        break;
+                    }
                     Ok(_) => {
                         let trimmed = line.trim();
-                        if trimmed.is_empty() { continue; }
+                        if trimmed.is_empty() {
+                            continue;
+                        }
                         if let Ok(msg) = serde_json::from_str::<WorkerMessage>(trimmed) {
                             if tx_slot.send(WorkerEvent::Message(slot, msg)).is_err() {
                                 break;
                             }
                         }
                     }
-                    Err(_) => { let _ = tx_slot.send(WorkerEvent::Eof(slot)); break; }
+                    Err(_) => {
+                        let _ = tx_slot.send(WorkerEvent::Eof(slot));
+                        break;
+                    }
                 }
             }
         }));
@@ -196,7 +263,6 @@ pub fn run_with_profiler(
     drop(tx); // only reader threads hold senders now
 
     // Seed each slot with one chunk, then close any slots we can't feed.
-    let mut slot_busy = vec![false; n];
     let mut slot_open = vec![true; n];
     // Per-slot bookkeeping of the batch we've handed to a worker but not yet
     // seen `batch_done` for. If the master reports `slot_died` (the child
@@ -213,7 +279,8 @@ pub fn run_with_profiler(
     // process-local class table warm (classes already required → no
     // require_once on the next batch), and bounds the *unique* classes each
     // worker accumulates, which can reduce peak RSS on large suites.
-    let mut slot_loaded: Vec<std::collections::HashSet<String>> = vec![std::collections::HashSet::new(); n];
+    let mut slot_loaded: Vec<std::collections::HashSet<String>> =
+        vec![std::collections::HashSet::new(); n];
     /// Cap the queue scan window so worst-case dispatch stays O(n_window)
     /// rather than O(queue_len). 32 is large enough to find good matches in
     /// the LPT-ordered head of the queue but small enough to keep the runner
@@ -221,8 +288,10 @@ pub fn run_with_profiler(
     const AFFINITY_SCAN_WINDOW: usize = 32;
     let pick_best_for_slot = |queue: &mut VecDeque<BatchPlan>,
                               slot_fp: &std::collections::HashSet<String>|
-                              -> Option<BatchPlan> {
-        if queue.is_empty() { return None; }
+     -> Option<BatchPlan> {
+        if queue.is_empty() {
+            return None;
+        }
         if slot_fp.is_empty() {
             // No warmth yet — just take the head (preserves LPT order on the
             // very first batch each slot processes).
@@ -231,8 +300,8 @@ pub fn run_with_profiler(
         let window = queue.len().min(AFFINITY_SCAN_WINDOW);
         let mut best_idx = 0usize;
         let mut best_score = 0usize;
-        for i in 0..window {
-            let score = queue[i].fingerprint.intersection(slot_fp).count();
+        for (i, plan) in queue.iter().enumerate().take(window) {
+            let score = plan.fingerprint.intersection(slot_fp).count();
             if score > best_score {
                 best_score = score;
                 best_idx = i;
@@ -247,7 +316,6 @@ pub fn run_with_profiler(
                 pool.write_batch(slot, &plan)?;
                 slot_batch_start[slot] = Some(std::time::Instant::now());
                 slot_in_flight[slot] = Some(plan);
-                slot_busy[slot] = true;
             }
             None => {
                 pool.close_slot(slot);
@@ -267,10 +335,31 @@ pub fn run_with_profiler(
     let mut total = 0.0f64;
     let mut live_readers = n;
     let mut stopping = false;
+    let mut watchdog_fired = false;
     while live_readers > 0 {
-        let ev = match rx.recv() {
-            Ok(e) => e,
-            Err(_) => break,
+        let ev = match cfg.worker_timeout {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(e) => e,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No worker produced a message for `timeout`. If work is
+                    // still in flight, a worker is stuck (infinite loop,
+                    // blocked syscall, or a hung sub-process it spawned): it
+                    // will never emit an outcome, batch_done, or EOF, and no
+                    // SIGCHLD fires because it is still alive. Abort with
+                    // errors so the run is bounded instead of hanging forever.
+                    if slot_in_flight.iter().any(Option::is_some) {
+                        watchdog_fired = true;
+                        break;
+                    }
+                    // Nothing in flight — just awaiting reader EOF; keep waiting.
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(e) => e,
+                Err(_) => break,
+            },
         };
         match ev {
             WorkerEvent::Message(_slot, WorkerMessage::Outcome(o)) => {
@@ -290,8 +379,14 @@ pub fn run_with_profiler(
                 // Close the previous batch's span with the slot as tid so
                 // chrome://tracing shows each worker as its own lane.
                 if let Some(start) = slot_batch_start[slot].take() {
-                    let classes = slot_in_flight[slot].as_ref()
-                        .map(|p| p.classes.iter().map(|c| c.class.clone()).collect::<Vec<_>>())
+                    let classes = slot_in_flight[slot]
+                        .as_ref()
+                        .map(|p| {
+                            p.classes
+                                .iter()
+                                .map(|c| c.class.clone())
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default();
                     profiler.record_on(
                         "batch",
@@ -302,20 +397,23 @@ pub fn run_with_profiler(
                         Some(serde_json::json!({ "classes": classes })),
                     );
                 }
-                slot_busy[slot] = false;
                 slot_in_flight[slot] = None;
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
                     slot_batch_start[slot] = Some(std::time::Instant::now());
                     slot_in_flight[slot] = Some(plan);
-                    slot_busy[slot] = true;
                 } else if slot_open[slot] {
                     pool.close_slot(slot);
                     slot_open[slot] = false;
                 }
             }
-            WorkerEvent::Message(slot, WorkerMessage::SlotDied { exit_code, signal, .. }) => {
+            WorkerEvent::Message(
+                slot,
+                WorkerMessage::SlotDied {
+                    exit_code, signal, ..
+                },
+            ) => {
                 // Master telegraphs that the child PID for this slot died.
                 // If the previous batch had already emitted `batch_done`, the
                 // in_flight slot is None and there's nothing to recover — the
@@ -336,12 +434,12 @@ pub fn run_with_profiler(
                         // class shows up in the report.
                         if bc.methods.is_empty() {
                             let o = TestOutcome {
-                                class:       bc.class.clone(),
-                                method:      "<class>".to_string(),
-                                dataset:     None,
-                                status:      TestStatus::Error,
-                                message:     Some(cause.clone()),
-                                trace:       None,
+                                class: bc.class.clone(),
+                                method: "<class>".to_string(),
+                                dataset: None,
+                                status: TestStatus::Error,
+                                message: Some(cause.clone()),
+                                trace: None,
                                 duration_ms: 0.0,
                             };
                             on_progress(&o);
@@ -349,12 +447,12 @@ pub fn run_with_profiler(
                         } else {
                             for m in &bc.methods {
                                 let o = TestOutcome {
-                                    class:       bc.class.clone(),
-                                    method:      m.clone(),
-                                    dataset:     None,
-                                    status:      TestStatus::Error,
-                                    message:     Some(cause.clone()),
-                                    trace:       None,
+                                    class: bc.class.clone(),
+                                    method: m.clone(),
+                                    dataset: None,
+                                    status: TestStatus::Error,
+                                    message: Some(cause.clone()),
+                                    trace: None,
                                     duration_ms: 0.0,
                                 };
                                 on_progress(&o);
@@ -378,13 +476,11 @@ pub fn run_with_profiler(
                 // Mark the slot ready to receive the next batch — the master
                 // has already forked a replacement child for us, waiting on
                 // its stdin pipe for fresh work.
-                slot_busy[slot] = false;
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
                     slot_batch_start[slot] = Some(std::time::Instant::now());
                     slot_in_flight[slot] = Some(plan);
-                    slot_busy[slot] = true;
                 } else if slot_open[slot] {
                     pool.close_slot(slot);
                     slot_open[slot] = false;
@@ -401,14 +497,14 @@ pub fn run_with_profiler(
                         for bc in &plan.classes {
                             for method in &bc.methods {
                                 let o = TestOutcome {
-                                    class:       bc.class.clone(),
-                                    method:      method.clone(),
-                                    dataset:     None,
-                                    status:      TestStatus::Error,
-                                    message:     Some(
-                                        "worker process crashed before reaching this test".into()
+                                    class: bc.class.clone(),
+                                    method: method.clone(),
+                                    dataset: None,
+                                    status: TestStatus::Error,
+                                    message: Some(
+                                        "worker process crashed before reaching this test".into(),
                                     ),
-                                    trace:       None,
+                                    trace: None,
                                     duration_ms: 0.0,
                                 };
                                 on_progress(&o);
@@ -421,10 +517,38 @@ pub fn run_with_profiler(
         }
     }
 
-    for h in reader_handles { let _ = h.join(); }
+    if watchdog_fired {
+        let secs = cfg.worker_timeout.map(|d| d.as_secs()).unwrap_or(0);
+        let cause = format!(
+            "worker stuck: no output for {secs}s — aborted by the inactivity \
+             watchdog (raise or disable with --worker-timeout)"
+        );
+        // Report every test that can never complete: the in-flight batches
+        // (the stuck worker plus any peers mid-batch) and the queued batches
+        // never dispatched. Without this they would silently vanish from the
+        // report, breaking test-count parity.
+        for in_flight in slot_in_flight.iter_mut().take(n) {
+            if let Some(lost) = in_flight.take() {
+                synth_error_outcomes(&lost, &cause, &on_progress, &mut outcomes);
+            }
+        }
+        while let Some(plan) = queue.pop_front() {
+            synth_error_outcomes(&plan, &cause, &on_progress, &mut outcomes);
+        }
+        // Kill the workers so their pipe write-ends close and the reader
+        // threads below observe EOF and exit — a stuck child never would.
+        pool.terminate();
+    }
+
+    for h in reader_handles {
+        let _ = h.join();
+    }
     pool.wait();
 
-    Ok(Report { outcomes, total_duration_ms: total })
+    Ok(Report {
+        outcomes,
+        total_duration_ms: total,
+    })
 }
 
 /// Static weight of one test method for LPT cost estimation.
@@ -436,7 +560,11 @@ pub fn run_with_profiler(
 /// count is still consulted — but only to decide whether to *split*
 /// a heavy method into per-row plans (see ROW_SPLIT_THRESHOLD), not
 /// to bias the LPT ordering.
-fn method_weight(_class: &str, _m: &crate::discovery::GroupedMethod, _row_counts: &RowCounts) -> u32 {
+fn method_weight(
+    _class: &str,
+    _m: &crate::discovery::GroupedMethod,
+    _row_counts: &RowCounts,
+) -> u32 {
     1
 }
 
@@ -450,24 +578,24 @@ const ROW_SPLIT_THRESHOLD: u32 = 15;
 /// a 1000-row provider into 1000 single-row plans (each pays setUpBeforeClass).
 const MAX_ROW_CHUNKS: u32 = 4;
 
-/// Build the work queue.
-///
-/// Targets a uniform number of test methods per `BatchPlan` so every worker
-/// gets roughly the same amount of work regardless of how tests are distributed
-/// across classes.
-///
-/// Algorithm (bin-packing LPT):
-///   target = total_methods / (n_workers × OVERSATURATION)
-///   Sort classes descending by method count (LPT order).
-///   Accumulate classes into the current batch until it reaches `target`;
-///   then flush as a BatchPlan and start a new one.
-///   Classes with row-split data providers are extracted first and each
-///   chunk is still dispatched as a solo plan (fine-grained parallelism).
-///   Classes whose non-split method count exceeds `target` are dispatched
-///   solo regardless (they are already "full" batches on their own).
-///
-/// OVERSATURATION ensures more batches than workers so work-stealing has
-/// granularity to keep all workers busy even with variance in test duration.
+// Build the work queue.
+//
+// Targets a uniform number of test methods per `BatchPlan` so every worker
+// gets roughly the same amount of work regardless of how tests are distributed
+// across classes.
+//
+// Algorithm (bin-packing LPT):
+//   target = total_methods / (n_workers × OVERSATURATION)
+//   Sort classes descending by method count (LPT order).
+//   Accumulate classes into the current batch until it reaches `target`;
+//   then flush as a BatchPlan and start a new one.
+//   Classes with row-split data providers are extracted first and each
+//   chunk is still dispatched as a solo plan (fine-grained parallelism).
+//   Classes whose non-split method count exceeds `target` are dispatched
+//   solo regardless (they are already "full" batches on their own).
+//
+// OVERSATURATION ensures more batches than workers so work-stealing has
+// granularity to keep all workers busy even with variance in test duration.
 
 /// Group a slice of methods into dependency chains using union-find.
 ///
@@ -484,9 +612,12 @@ fn dependency_chains<'a>(
     methods: &'a [&'a discovery::GroupedMethod],
 ) -> Vec<Vec<&'a discovery::GroupedMethod>> {
     let n = methods.len();
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
 
-    let name_to_idx: HashMap<&str, usize> = methods.iter()
+    let name_to_idx: HashMap<&str, usize> = methods
+        .iter()
         .enumerate()
         .map(|(i, m)| (m.name.as_str(), i))
         .collect();
@@ -506,7 +637,9 @@ fn dependency_chains<'a>(
             if let Some(&j) = name_to_idx.get(dep.as_str()) {
                 let ri = find(&mut parent, i);
                 let rj = find(&mut parent, j);
-                if ri != rj { parent[ri] = rj; }
+                if ri != rj {
+                    parent[ri] = rj;
+                }
             }
         }
     }
@@ -529,7 +662,7 @@ fn build_queue(
 
     // Collect required files for a set of method names from the class-file index.
     let required_files_for = |method_names: &[String],
-                               all_methods: &[crate::discovery::GroupedMethod]|
+                              all_methods: &[crate::discovery::GroupedMethod]|
      -> Vec<PathBuf> {
         let name_set: std::collections::HashSet<&str> =
             method_names.iter().map(String::as_str).collect();
@@ -556,31 +689,35 @@ fn build_queue(
     let target: usize = (total_methods / (n_workers * OVERSATURATION)).max(1);
 
     // Sort LPT (largest class first) to minimise leftover waste in each bin.
-    let mut by_cost: Vec<(u32, crate::discovery::TestClass)> = groups.into_iter()
+    let mut by_cost: Vec<(u32, crate::discovery::TestClass)> = groups
+        .into_iter()
         .map(|g| {
-            let cost: u32 = g.methods.iter()
+            let cost: u32 = g
+                .methods
+                .iter()
                 .map(|m| method_weight(&g.class, m, row_counts))
                 .sum();
             (cost, g)
         })
         .collect();
-    by_cost.sort_by(|a, b| b.0.cmp(&a.0));
+    by_cost.sort_by_key(|b| std::cmp::Reverse(b.0));
 
-    let mut queue:      VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
-    let mut synthetic:  Vec<TestOutcome>    = Vec::new();
-    let mut bin_buf:    Vec<BatchClass>     = Vec::new();
-    let mut bin_methods: usize              = 0;
+    let mut queue: VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
+    let mut synthetic: Vec<TestOutcome> = Vec::new();
+    let mut bin_buf: Vec<BatchClass> = Vec::new();
+    let mut bin_methods: usize = 0;
     // OR of every contributing class's `is_stateful` while the bin
     // accumulates. Resets to false on flush. Used so a small stateful
     // class can join a non-stateful bin without losing the "exit after
     // this batch" marker — once anything stateful is in there, the
     // whole bin's batch must force-exit.
-    let mut bin_stateful: bool              = false;
+    let mut bin_stateful: bool = false;
 
     // Pre-compute a (class, method) → fingerprint lookup so `mk_plan` can
     // union per-class fingerprints into a per-batch fingerprint without
     // re-walking the AST. Built from `by_cost`'s `TestClass.methods`.
-    let mut method_fp: HashMap<(String, String), std::collections::HashSet<String>> = HashMap::new();
+    let mut method_fp: HashMap<(String, String), std::collections::HashSet<String>> =
+        HashMap::new();
     for (_, g) in &by_cost {
         for m in &g.methods {
             method_fp.insert((g.class.clone(), m.name.clone()), m.fingerprint.clone());
@@ -597,9 +734,9 @@ fn build_queue(
             }
         }
         BatchPlan {
-            autoload:    cfg.autoload.clone(),
-            bootstrap:   cfg.bootstrap.clone(),
-            defines:     cfg.defines.clone(),
+            autoload: cfg.autoload.clone(),
+            bootstrap: cfg.bootstrap.clone(),
+            defines: cfg.defines.clone(),
             classes,
             fingerprint: fp,
             force_exit_after,
@@ -612,27 +749,31 @@ fn build_queue(
             let dp = m.data_provider.as_ref()?;
             match row_counts.get(&(g.class.clone(), dp.clone())) {
                 Some(Some(n)) => Some(*n as u32),
-                _             => None,
+                _ => None,
             }
         };
 
         // Partition: tautological methods never go to workers.
-        let (tauto_methods, real_methods): (Vec<_>, Vec<_>) = g.methods.iter().cloned()
-            .partition(|m| m.is_tautological);
+        let (tauto_methods, real_methods): (Vec<_>, Vec<_>) =
+            g.methods.iter().cloned().partition(|m| m.is_tautological);
         for tm in tauto_methods {
             synthetic.push(TestOutcome {
-                class:       g.class.clone(),
-                method:      tm.name.clone(),
-                dataset:     None,
-                status:      TestStatus::Pass,
-                message:     Some("tautological — skipped execution".into()),
-                trace:       None,
+                class: g.class.clone(),
+                method: tm.name.clone(),
+                dataset: None,
+                status: TestStatus::Pass,
+                message: Some("tautological — skipped execution".into()),
+                trace: None,
                 duration_ms: 0.0,
             });
         }
 
-        let (heavy_methods, other_methods): (Vec<_>, Vec<_>) = real_methods.into_iter()
-            .partition(|m| row_count_for(m).map(|n| n >= ROW_SPLIT_THRESHOLD).unwrap_or(false));
+        let (heavy_methods, other_methods): (Vec<_>, Vec<_>) =
+            real_methods.into_iter().partition(|m| {
+                row_count_for(m)
+                    .map(|n| n >= ROW_SPLIT_THRESHOLD)
+                    .unwrap_or(false)
+            });
 
         // Stateful classes need a fresh worker per batch (global side
         // effects can't bleed). Isolated classes need force-exit too so the
@@ -642,22 +783,27 @@ fn build_queue(
         // "must exit after this batch" bit.
         let must_force_exit = g.is_stateful || g.is_isolated;
         for hm in &heavy_methods {
-            let rows   = row_count_for(hm).unwrap_or(1);
+            let rows = row_count_for(hm).unwrap_or(1);
             let chunks = rows.min(MAX_ROW_CHUNKS);
             for chunk_index in 0..chunks {
                 let bc = BatchClass {
-                    file:           g.file.clone(),
-                    class:          g.class.clone(),
-                    methods:        vec![hm.name.clone()],
-                    row_filter:     Some(RowFilter { chunk_index, total_chunks: chunks }),
-                    required_files: required_files_for(&[hm.name.clone()], &g.methods),
-                    is_isolated:    g.is_isolated,
+                    file: g.file.clone(),
+                    class: g.class.clone(),
+                    methods: vec![hm.name.clone()],
+                    row_filter: Some(RowFilter {
+                        chunk_index,
+                        total_chunks: chunks,
+                    }),
+                    required_files: required_files_for(std::slice::from_ref(&hm.name), &g.methods),
+                    is_isolated: g.is_isolated,
                 };
                 queue.push_back(mk_plan(vec![bc], must_force_exit));
             }
         }
 
-        if other_methods.is_empty() { continue; }
+        if other_methods.is_empty() {
+            continue;
+        }
 
         // For classes without lifecycle overrides: partition into
         // (a) provider methods  → existing LPT/stride path
@@ -682,12 +828,12 @@ fn build_queue(
                     let method_names: Vec<String> = chain.iter().map(|m| m.name.clone()).collect();
                     let req_files = required_files_for(&method_names, &g.methods);
                     let bc = BatchClass {
-                        file:           g.file.clone(),
-                        class:          g.class.clone(),
-                        methods:        method_names,
-                        row_filter:     None,
+                        file: g.file.clone(),
+                        class: g.class.clone(),
+                        methods: method_names,
+                        row_filter: None,
                         required_files: req_files,
-                        is_isolated:    g.is_isolated,
+                        is_isolated: g.is_isolated,
                     };
                     queue.push_back(mk_plan(vec![bc], must_force_exit));
                 }
@@ -700,22 +846,27 @@ fn build_queue(
             // Fall through to the class-level LPT logic with only provider methods.
             let other_methods = with_providers;
 
-            let real_cost: u32 = heavy_methods.iter().chain(other_methods.iter())
+            let real_cost: u32 = heavy_methods
+                .iter()
+                .chain(other_methods.iter())
                 .map(|m| method_weight(&g.class, m, row_counts))
                 .sum();
             let _ = cost;
             let other_cost = real_cost.saturating_sub(
-                heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
+                heavy_methods
+                    .iter()
+                    .map(|m| method_weight(&g.class, m, row_counts))
+                    .sum::<u32>(),
             ) as usize;
             let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
-            let req_files   = required_files_for(&other_names, &g.methods);
+            let req_files = required_files_for(&other_names, &g.methods);
             let bc = BatchClass {
-                file:           g.file,
-                class:          g.class,
-                methods:        other_names,
-                row_filter:     None,
+                file: g.file,
+                class: g.class,
+                methods: other_names,
+                row_filter: None,
                 required_files: req_files,
-                is_isolated:    g.is_isolated,
+                is_isolated: g.is_isolated,
             };
             if other_cost >= target {
                 if !bin_buf.is_empty() {
@@ -741,22 +892,27 @@ fn build_queue(
         }
 
         // Recompute other_cost from real (non-tautological) methods only.
-        let real_cost: u32 = heavy_methods.iter().chain(other_methods.iter())
+        let real_cost: u32 = heavy_methods
+            .iter()
+            .chain(other_methods.iter())
             .map(|m| method_weight(&g.class, m, row_counts))
             .sum();
         let _ = cost; // original cost included tautological methods; unused now
         let other_cost = real_cost.saturating_sub(
-            heavy_methods.iter().map(|m| method_weight(&g.class, m, row_counts)).sum::<u32>()
+            heavy_methods
+                .iter()
+                .map(|m| method_weight(&g.class, m, row_counts))
+                .sum::<u32>(),
         ) as usize;
         let other_names: Vec<String> = other_methods.into_iter().map(|m| m.name).collect();
-        let req_files   = required_files_for(&other_names, &g.methods);
+        let req_files = required_files_for(&other_names, &g.methods);
         let bc = BatchClass {
-            file:           g.file,
-            class:          g.class,
-            methods:        other_names,
-            row_filter:     None,
+            file: g.file,
+            class: g.class,
+            methods: other_names,
+            row_filter: None,
             required_files: req_files,
-            is_isolated:    g.is_isolated,
+            is_isolated: g.is_isolated,
         };
 
         // A class that already meets or exceeds the target on its own gets a
@@ -765,7 +921,7 @@ fn build_queue(
             // Flush any accumulated bin first to preserve LPT order.
             if !bin_buf.is_empty() {
                 queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
-                    bin_stateful = false;
+                bin_stateful = false;
                 bin_methods = 0;
             }
             queue.push_back(mk_plan(vec![bc], must_force_exit));
@@ -775,7 +931,7 @@ fn build_queue(
             bin_methods += other_cost;
             if bin_methods >= target {
                 queue.push_back(mk_plan(std::mem::take(&mut bin_buf), bin_stateful));
-                    bin_stateful = false;
+                bin_stateful = false;
                 bin_methods = 0;
             }
         }
@@ -786,7 +942,6 @@ fn build_queue(
     (queue, synthetic)
 }
 
-
 /// Distribute `cases` across `n` slots without splitting any class.
 /// Kept for any external callers; the runner itself no longer needs it.
 pub fn chunk_by_class(cases: Vec<TestCase>, n: usize) -> Vec<Vec<TestCase>> {
@@ -794,8 +949,12 @@ pub fn chunk_by_class(cases: Vec<TestCase>, n: usize) -> Vec<Vec<TestCase>> {
     let mut class_order: Vec<String> = Vec::new();
     let mut by_class: HashMap<String, Vec<TestCase>> = HashMap::new();
     for c in cases {
-        by_class.entry(c.class.clone())
-            .or_insert_with(|| { class_order.push(c.class.clone()); Vec::new() })
+        by_class
+            .entry(c.class.clone())
+            .or_insert_with(|| {
+                class_order.push(c.class.clone());
+                Vec::new()
+            })
             .push(c);
     }
     let mut slots: Vec<Vec<TestCase>> = vec![Vec::new(); n];
@@ -813,26 +972,27 @@ mod tests {
 
     fn make_case(class: &str, method: &str) -> TestCase {
         TestCase {
-            file:                 PathBuf::from("/f.php"),
-            class:                class.to_string(),
-            method:               method.to_string(),
-            data_provider:        None,
-            groups:               vec![],
-            external_providers:   vec![],
-            is_tautological:         false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
             has_lifecycle_overrides: false,
-            depends_on:              vec![],
-            is_dispatch_safe:        true,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
     #[test]
     fn chunk_preserves_all_cases() {
         let cases = vec![
-            make_case("A", "t1"), make_case("A", "t2"),
+            make_case("A", "t1"),
+            make_case("A", "t2"),
             make_case("B", "t1"),
             make_case("C", "t1"),
         ];
@@ -844,14 +1004,18 @@ mod tests {
     #[test]
     fn chunk_never_splits_a_class() {
         let cases = vec![
-            make_case("Alpha", "t1"), make_case("Alpha", "t2"), make_case("Alpha", "t3"),
+            make_case("Alpha", "t1"),
+            make_case("Alpha", "t2"),
+            make_case("Alpha", "t3"),
             make_case("Beta", "t1"),
         ];
         let chunks = chunk_by_class(cases, 3);
         for chunk in &chunks {
             let alpha = chunk.iter().filter(|c| c.class == "Alpha").count();
-            assert!(alpha == 0 || alpha == 3,
-                "Alpha was split: found {alpha} in one slot");
+            assert!(
+                alpha == 0 || alpha == 3,
+                "Alpha was split: found {alpha} in one slot"
+            );
         }
     }
 
@@ -865,19 +1029,19 @@ mod tests {
 
     fn make_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
         TestCase {
-            file:                 PathBuf::from("/f.php"),
-            class:                class.to_string(),
-            method:               method.to_string(),
-            data_provider:        Some(dp.to_string()),
-            groups:               vec![],
-            external_providers:   vec![],
-            is_tautological:         false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: Some(dp.to_string()),
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
             has_lifecycle_overrides: false,
-            depends_on:              vec![],
-            is_dispatch_safe:        true,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
@@ -892,26 +1056,33 @@ mod tests {
             make_case("BigDp", "testSimple"),
         ];
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let mut row_counts = RowCounts::new();
         row_counts.insert(("BigDp".to_string(), "provideMany".to_string()), Some(20));
 
         let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
         let q: Vec<_> = queue.into_iter().collect();
-        let row_split_plans: Vec<_> = q.iter()
+        let row_split_plans: Vec<_> = q
+            .iter()
             .filter(|p| p.classes.iter().any(|c| c.row_filter.is_some()))
             .collect();
         assert_eq!(row_split_plans.len(), 4, "20 rows split into 4 chunks");
         // Each chunk gets a unique chunk_index 0..4 with total_chunks=4.
-        let indices: std::collections::BTreeSet<u32> = row_split_plans.iter()
-            .flat_map(|p| p.classes.iter().filter_map(|c| c.row_filter.as_ref().map(|f| f.chunk_index)))
+        let indices: std::collections::BTreeSet<u32> = row_split_plans
+            .iter()
+            .flat_map(|p| {
+                p.classes
+                    .iter()
+                    .filter_map(|c| c.row_filter.as_ref().map(|f| f.chunk_index))
+            })
             .collect();
         assert_eq!(indices, [0, 1, 2, 3].iter().copied().collect());
         for p in &row_split_plans {
@@ -920,28 +1091,31 @@ mod tests {
             assert_eq!(p.classes[0].methods, vec!["testFat".to_string()]);
         }
         // And one filterless plan with the remaining method.
-        let plain_plans: Vec<_> = q.iter()
+        let plain_plans: Vec<_> = q
+            .iter()
             .filter(|p| p.classes.iter().all(|c| c.row_filter.is_none()))
             .collect();
         assert_eq!(plain_plans.len(), 1);
-        assert!(plain_plans[0].classes[0].methods.contains(&"testSimple".to_string()));
+        assert!(plain_plans[0].classes[0]
+            .methods
+            .contains(&"testSimple".to_string()));
     }
 
     fn make_lifecycle_case(class: &str, method: &str) -> TestCase {
         TestCase {
-            file:                    PathBuf::from("/f.php"),
-            class:                   class.to_string(),
-            method:                  method.to_string(),
-            data_provider:           None,
-            groups:                  vec![],
-            external_providers:      vec![],
-            is_tautological:         false,
-            has_lifecycle_overrides: true,   // forces class-level dispatch path
-            depends_on:              vec![],
-            is_dispatch_safe:        true,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
+            has_lifecycle_overrides: true, // forces class-level dispatch path
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
@@ -952,43 +1126,51 @@ mod tests {
         // Every class (cost ≥ target=1) gets its own solo plan; Heavy comes first (LPT).
         // Classes have lifecycle overrides to exercise the class-level LPT path.
         let mut cases = Vec::new();
-        for m in 0..5 { cases.push(make_lifecycle_case("Heavy", &format!("t{m}"))); }
-        for c in 0..5 { cases.push(make_lifecycle_case(&format!("Light{c}"), "t1")); }
+        for m in 0..5 {
+            cases.push(make_lifecycle_case("Heavy", &format!("t{m}")));
+        }
+        for c in 0..5 {
+            cases.push(make_lifecycle_case(&format!("Light{c}"), "t1"));
+        }
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let row_counts = RowCounts::new();
         let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
         let q: Vec<_> = queue.into_iter().collect();
         assert_eq!(q.len(), 6, "1 heavy solo + 5 light solos (target=1)");
         assert_eq!(q[0].classes.len(), 1);
-        assert_eq!(q[0].classes[0].class, "Heavy", "heavy class scheduled first (LPT)");
-        for i in 1..6 {
-            assert_eq!(q[i].classes.len(), 1, "each light class is its own plan");
+        assert_eq!(
+            q[0].classes[0].class, "Heavy",
+            "heavy class scheduled first (LPT)"
+        );
+        for plan in q.iter().take(6).skip(1) {
+            assert_eq!(plan.classes.len(), 1, "each light class is its own plan");
         }
     }
 
     fn make_safe_case(class: &str, method: &str) -> TestCase {
         TestCase {
-            file:                 PathBuf::from("/f.php"),
-            class:                class.to_string(),
-            method:               method.to_string(),
-            data_provider:        None,
-            groups:               vec![],
-            external_providers:   vec![],
-            is_tautological:         false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
             has_lifecycle_overrides: false,
-            depends_on:              vec![],
-            is_dispatch_safe:        true,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
@@ -1002,13 +1184,14 @@ mod tests {
             make_safe_case("SafeClass", "testGamma"),
         ];
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let row_counts = RowCounts::new();
         let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
@@ -1016,15 +1199,25 @@ mod tests {
 
         assert_eq!(q.len(), 3, "3 methods → 3 separate BatchPlans");
         for plan in &q {
-            assert_eq!(plan.classes.len(), 1, "each plan wraps exactly one class entry");
-            assert_eq!(plan.classes[0].methods.len(), 1, "each BatchClass has exactly one method");
+            assert_eq!(
+                plan.classes.len(),
+                1,
+                "each plan wraps exactly one class entry"
+            );
+            assert_eq!(
+                plan.classes[0].methods.len(),
+                1,
+                "each BatchClass has exactly one method"
+            );
             assert_eq!(plan.classes[0].class, "SafeClass");
         }
-        let mut dispatched_methods: Vec<&str> = q.iter()
-            .map(|p| p.classes[0].methods[0].as_str())
-            .collect();
+        let mut dispatched_methods: Vec<&str> =
+            q.iter().map(|p| p.classes[0].methods[0].as_str()).collect();
         dispatched_methods.sort_unstable();
-        assert_eq!(dispatched_methods, vec!["testAlpha", "testBeta", "testGamma"]);
+        assert_eq!(
+            dispatched_methods,
+            vec!["testAlpha", "testBeta", "testGamma"]
+        );
     }
 
     #[test]
@@ -1037,13 +1230,14 @@ mod tests {
             make_lifecycle_case("StatefulClass", "testThree"),
         ];
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let row_counts = RowCounts::new();
         let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
@@ -1052,20 +1246,30 @@ mod tests {
         // With target=1 (3 methods / (4 workers × 4 oversaturation) → max(1,0) = 1),
         // each single-class group gets its own solo plan, but still as ONE BatchClass
         // with all methods together.
-        let all_methods: Vec<&str> = q.iter()
+        let all_methods: Vec<&str> = q
+            .iter()
             .flat_map(|p| p.classes.iter())
             .filter(|bc| bc.class == "StatefulClass")
             .flat_map(|bc| bc.methods.iter().map(String::as_str))
             .collect();
-        assert_eq!(all_methods.len(), 3, "all 3 methods must appear exactly once");
+        assert_eq!(
+            all_methods.len(),
+            3,
+            "all 3 methods must appear exactly once"
+        );
 
         // Verify they are NOT split across 3 separate single-method plans:
         // at least one BatchClass must contain more than 1 method, OR
         // we verify there is exactly 1 plan for this class (class-level batch).
-        let class_plans: Vec<_> = q.iter()
+        let class_plans: Vec<_> = q
+            .iter()
             .filter(|p| p.classes.iter().any(|bc| bc.class == "StatefulClass"))
             .collect();
-        assert_eq!(class_plans.len(), 1, "stateful class must be dispatched as one batch");
+        assert_eq!(
+            class_plans.len(),
+            1,
+            "stateful class must be dispatched as one batch"
+        );
         assert_eq!(class_plans[0].classes[0].methods.len(), 3);
     }
 
@@ -1081,44 +1285,56 @@ mod tests {
             make_lifecycle_case("IsolatedClass", "testOne"),
             make_lifecycle_case("IsolatedClass", "testTwo"),
         ];
-        for c in &mut cases { c.is_isolated = true; }
+        for c in &mut cases {
+            c.is_isolated = true;
+        }
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let row_counts = RowCounts::new();
         let (queue, _) = build_queue(cases, &cfg, &row_counts);
-        let plans: Vec<_> = queue.into_iter()
+        let plans: Vec<_> = queue
+            .into_iter()
             .filter(|p| p.classes.iter().any(|bc| bc.class == "IsolatedClass"))
             .collect();
-        assert_eq!(plans.len(), 1, "isolated class dispatched as a single batch");
-        assert!(plans[0].force_exit_after,
-            "isolated class must trigger force_exit_after on the BatchPlan");
-        assert!(plans[0].classes[0].is_isolated,
-            "is_isolated must be stamped on the BatchClass for the PHP executor");
+        assert_eq!(
+            plans.len(),
+            1,
+            "isolated class dispatched as a single batch"
+        );
+        assert!(
+            plans[0].force_exit_after,
+            "isolated class must trigger force_exit_after on the BatchPlan"
+        );
+        assert!(
+            plans[0].classes[0].is_isolated,
+            "is_isolated must be stamped on the BatchClass for the PHP executor"
+        );
     }
 
     /// Helper: safe case with a data provider (method_dispatch_safe=true).
     fn make_safe_case_dp(class: &str, method: &str, dp: &str) -> TestCase {
         TestCase {
-            file:                 PathBuf::from("/f.php"),
-            class:                class.to_string(),
-            method:               method.to_string(),
-            data_provider:        Some(dp.to_string()),
-            groups:               vec![],
-            external_providers:   vec![],
-            is_tautological:         false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: Some(dp.to_string()),
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
             has_lifecycle_overrides: false,
-            depends_on:              vec![],
-            is_dispatch_safe:        true,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
@@ -1136,20 +1352,25 @@ mod tests {
             make_safe_case_dp("MixedClass", "testWithProvider", "providerRows"),
         ];
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let row_counts = RowCounts::new();
         let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
         let q: Vec<_> = queue.into_iter().collect();
 
         // 2 solo plans for plain methods + 1 class-level plan for the provider method.
-        assert_eq!(q.len(), 3, "2 plain solo plans + 1 provider class-level plan");
+        assert_eq!(
+            q.len(),
+            3,
+            "2 plain solo plans + 1 provider class-level plan"
+        );
 
         // Each plan must target MixedClass.
         for plan in &q {
@@ -1158,8 +1379,13 @@ mod tests {
         }
 
         // Collect all dispatched method names.
-        let mut all_methods: Vec<&str> = q.iter()
-            .flat_map(|p| p.classes.iter().flat_map(|bc| bc.methods.iter().map(String::as_str)))
+        let mut all_methods: Vec<&str> = q
+            .iter()
+            .flat_map(|p| {
+                p.classes
+                    .iter()
+                    .flat_map(|bc| bc.methods.iter().map(String::as_str))
+            })
             .collect();
         all_methods.sort_unstable();
         assert_eq!(
@@ -1169,7 +1395,8 @@ mod tests {
         );
 
         // The two plain methods must each be in their own single-method plan.
-        let plain_solo_plans: Vec<_> = q.iter()
+        let plain_solo_plans: Vec<_> = q
+            .iter()
             .filter(|p| {
                 p.classes[0].methods.len() == 1
                     && p.classes[0].row_filter.is_none()
@@ -1177,15 +1404,28 @@ mod tests {
                         || p.classes[0].methods[0] == "testPlainB")
             })
             .collect();
-        assert_eq!(plain_solo_plans.len(), 2, "plain methods each get a solo BatchPlan");
+        assert_eq!(
+            plain_solo_plans.len(),
+            2,
+            "plain methods each get a solo BatchPlan"
+        );
 
         // The provider method must appear in a plan without a row_filter (below
         // ROW_SPLIT_THRESHOLD since row_counts is empty) and must be the only
         // remaining plan.
-        let provider_plans: Vec<_> = q.iter()
-            .filter(|p| p.classes[0].methods.contains(&"testWithProvider".to_string()))
+        let provider_plans: Vec<_> = q
+            .iter()
+            .filter(|p| {
+                p.classes[0]
+                    .methods
+                    .contains(&"testWithProvider".to_string())
+            })
             .collect();
-        assert_eq!(provider_plans.len(), 1, "provider method dispatched in one class-level plan");
+        assert_eq!(
+            provider_plans.len(),
+            1,
+            "provider method dispatched in one class-level plan"
+        );
         assert!(
             provider_plans[0].classes[0].row_filter.is_none(),
             "no row split when row_counts is empty (below threshold)"
@@ -1196,19 +1436,19 @@ mod tests {
         let depends_on: Vec<String> = deps.iter().map(|s| s.to_string()).collect();
         let safe = depends_on.is_empty();
         TestCase {
-            file:                    PathBuf::from("/f.php"),
-            class:                   class.to_string(),
-            method:                  method.to_string(),
-            data_provider:           None,
-            groups:                  vec![],
-            external_providers:      vec![],
-            is_tautological:         false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
             has_lifecycle_overrides: false,
             depends_on,
-            is_dispatch_safe:        safe,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            is_dispatch_safe: safe,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
@@ -1225,29 +1465,38 @@ mod tests {
             make_depends_case("ChainClass", "testE", vec![]),
         ];
         let cfg = RunConfig {
-            autoload:         PathBuf::from("/autoload.php"),
-            bootstrap:        None,
-            filter:           None,
-            defines:          vec![],
-            stop_on:          StopOn::default(),
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
             class_file_index: HashMap::new(),
-            n_workers:        4,
+            n_workers: 4,
         };
         let (queue, _) = build_queue(cases, &cfg, &RowCounts::new());
         let q: Vec<_> = queue.into_iter().collect();
 
         assert_eq!(q.len(), 3, "chain A→B→C + solo D + solo E = 3 plans");
 
-        let chain = q.iter().find(|p| p.classes[0].methods.len() == 3)
+        let chain = q
+            .iter()
+            .find(|p| p.classes[0].methods.len() == 3)
             .expect("chain plan A+B+C must exist");
-        let mut cm = chain.classes[0].methods.clone(); cm.sort_unstable();
+        let mut cm = chain.classes[0].methods.clone();
+        cm.sort_unstable();
         assert_eq!(cm, vec!["testA", "testB", "testC"]);
 
-        let solos: Vec<_> = q.iter().filter(|p| p.classes[0].methods.len() == 1).collect();
+        let solos: Vec<_> = q
+            .iter()
+            .filter(|p| p.classes[0].methods.len() == 1)
+            .collect();
         assert_eq!(solos.len(), 2);
-        let mut sm: Vec<&str> = solos.iter().map(|p| p.classes[0].methods[0].as_str()).collect();
+        let mut sm: Vec<&str> = solos
+            .iter()
+            .map(|p| p.classes[0].methods[0].as_str())
+            .collect();
         sm.sort_unstable();
         assert_eq!(sm, vec!["testD", "testE"]);
     }
-
 }

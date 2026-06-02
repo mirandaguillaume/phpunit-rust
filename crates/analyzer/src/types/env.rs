@@ -95,10 +95,13 @@ mod tests {
     #[test]
     fn apply_narrowing_overwrites_bindings() {
         let mut env = TypeEnv::new();
-        env.set("$x".into(), Type::Union(
-            Box::new(Type::Class("A".into())),
-            Box::new(Type::Class("B".into())),
-        ));
+        env.set(
+            "$x".into(),
+            Type::Union(
+                Box::new(Type::Class("A".into())),
+                Box::new(Type::Class("B".into())),
+            ),
+        );
         env.apply_narrowing(&[("$x".into(), Type::Class("A".into()))]);
         assert_eq!(env.lookup("$x"), Type::Class("A".into()));
     }

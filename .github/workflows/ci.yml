@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug builds can overflow the default 8 MB stack during coverage
+  # serialisation; 64 MB is safe for debug and release alike.
+  RUST_MIN_STACK: "67108864"
+
+jobs:
+  build-test:
+    name: build / test / lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # PHP is required by parts of the test suite (e.g. `php -l` syntax checks
+      # and the fork-pool integration test that drives the sample fixture).
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      # Build the optional coverage feature so it can't bit-rot unnoticed.
+      - name: cargo build -p phpunit-rust --features coverage
+        run: cargo build -p phpunit-rust --features coverage
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # Blocking: the workspace is fmt- and clippy-clean, so any new warning
+      # (or unformatted code) fails CI.
+      - name: cargo clippy --workspace --all-targets -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  parity:
+    name: parity regression (vanilla phpunit vs phpunit-rust)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+
+      - name: Build phpunit-rust binary
+        run: cargo build -p phpunit-rust
+
+      # Fails CI if vanilla PHPUnit and phpunit-rust disagree on the
+      # Tests/Assertions summary counts for the bundled sample project.
+      - name: Parity check against sample_project
+        run: bash scripts/parity_check.sh crates/runner/fixtures/sample_project

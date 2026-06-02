@@ -1,6 +1,6 @@
-pub mod testcase;
-pub mod methods;
 pub mod lifecycle;
+pub mod methods;
+pub mod testcase;
 
 use std::path::PathBuf;
 
@@ -22,8 +22,8 @@ pub struct LifecycleBinding {
     pub tear_down_after_class: bool,
 }
 
-use crate::cache::{CacheStore, ContentHash};
 use crate::cache::store::CacheError;
+use crate::cache::{CacheStore, ContentHash};
 use crate::mago_bridge::{BridgeError, MagoProject};
 
 #[derive(Debug, thiserror::Error)]
@@ -117,9 +117,11 @@ mod cache_tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
-        ).unwrap();
+        )
+        .unwrap();
         let test_file = dir.path().join("MyTest.php");
         fs::write(&test_file, test_php).unwrap();
         let project = MagoProject::load(dir.path()).unwrap();
@@ -133,8 +135,8 @@ mod cache_tests {
         );
         let cache = CacheStore::open(dir.path(), MagoProject::version()).unwrap();
 
-        let first = discover(&project, &cache, &[file.clone()]).unwrap();
-        let second = discover(&project, &cache, &[file.clone()]).unwrap();
+        let first = discover(&project, &cache, std::slice::from_ref(&file)).unwrap();
+        let second = discover(&project, &cache, std::slice::from_ref(&file)).unwrap();
 
         assert_eq!(first.len(), 1, "expected 1 test method");
         assert_eq!(first, second, "cached result must match fresh result");
@@ -146,7 +148,7 @@ mod cache_tests {
             "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass MyTest extends TestCase {\n  public function testFoo(): void {}\n}",
         );
         let cache = CacheStore::open(dir.path(), MagoProject::version()).unwrap();
-        let _first = discover(&project, &cache, &[file.clone()]).unwrap();
+        let _first = discover(&project, &cache, std::slice::from_ref(&file)).unwrap();
 
         // Rewrite the file with an additional test method.
         fs::write(&file,
@@ -156,6 +158,10 @@ mod cache_tests {
         let project2 = MagoProject::load(dir.path()).unwrap();
         let second = discover(&project2, &cache, &[file]).unwrap();
 
-        assert_eq!(second.len(), 2, "cache should have invalidated on file change; got: {second:?}");
+        assert_eq!(
+            second.len(),
+            2,
+            "cache should have invalidated on file change; got: {second:?}"
+        );
     }
 }

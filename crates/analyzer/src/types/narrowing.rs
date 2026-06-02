@@ -32,7 +32,10 @@ impl NarrowingSet {
     }
 
     pub fn as_tuples(&self) -> Vec<(String, Type)> {
-        self.facts.iter().map(|n| (n.var.clone(), n.ty.clone())).collect()
+        self.facts
+            .iter()
+            .map(|n| (n.var.clone(), n.ty.clone()))
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -70,14 +70,23 @@ mod tests {
         let inner = Type::Class("Foo".into());
         let nullable = Type::Nullable(Box::new(inner.clone()));
         assert_eq!(nullable.non_nullable(), inner);
-        assert_eq!(Type::Class("Foo".into()).non_nullable(), Type::Class("Foo".into()));
+        assert_eq!(
+            Type::Class("Foo".into()).non_nullable(),
+            Type::Class("Foo".into())
+        );
     }
 
     #[test]
     fn concrete_class_fqcn_returns_for_class_self_static() {
         assert_eq!(Type::Class("Foo".into()).concrete_class_fqcn(), Some("Foo"));
-        assert_eq!(Type::SelfRef("Bar".into()).concrete_class_fqcn(), Some("Bar"));
-        assert_eq!(Type::StaticRef("Baz".into()).concrete_class_fqcn(), Some("Baz"));
+        assert_eq!(
+            Type::SelfRef("Bar".into()).concrete_class_fqcn(),
+            Some("Bar")
+        );
+        assert_eq!(
+            Type::StaticRef("Baz".into()).concrete_class_fqcn(),
+            Some("Baz")
+        );
         assert_eq!(Type::This.concrete_class_fqcn(), None);
         assert_eq!(Type::Interface("X".into()).concrete_class_fqcn(), None);
         assert_eq!(Type::Mixed.concrete_class_fqcn(), None);

@@ -30,7 +30,8 @@ pub fn psr4_map(project: &Path) -> HashMap<String, Vec<PathBuf>> {
     let installed_path = project.join("vendor/composer/installed.json");
     if let Ok(text) = std::fs::read_to_string(&installed_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-            let packages = val.get("packages")
+            let packages = val
+                .get("packages")
                 .and_then(|v| v.as_array())
                 .map(|a| a.as_slice())
                 .unwrap_or(&[]);
@@ -65,10 +66,7 @@ fn add_ns_block(
     base: &Path,
     map: &mut HashMap<String, Vec<PathBuf>>,
 ) {
-    let Some(entries) = block
-        .and_then(|b| b.get(key))
-        .and_then(|v| v.as_object())
-    else {
+    let Some(entries) = block.and_then(|b| b.get(key)).and_then(|v| v.as_object()) else {
         return;
     };
     for (ns, dirs_val) in entries {
@@ -102,11 +100,11 @@ pub fn psr4_resolve(class: &str, map: &HashMap<String, Vec<PathBuf>>) -> Option<
     // Longest-prefix wins: sort prefixes by length descending.
     let mut prefixes: Vec<(&str, &Vec<PathBuf>)> =
         map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    prefixes.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
 
     for (prefix, dirs) in prefixes {
-        if class.starts_with(prefix) {
-            let relative = class[prefix.len()..].replace('\\', "/") + ".php";
+        if let Some(stripped) = class.strip_prefix(prefix) {
+            let relative = stripped.replace('\\', "/") + ".php";
             for dir in dirs {
                 let candidate = dir.join(&relative);
                 if candidate.is_file() {
@@ -125,9 +123,28 @@ fn qualify_single_type(raw: &str, ns: &str, use_map: &HashMap<String, String>) -
     // Already FQN, nullable marker, or primitive — pass through unchanged.
     if t.starts_with('\\')
         || t.is_empty()
-        || matches!(t, "int"|"string"|"bool"|"float"|"array"|"callable"|"iterable"
-                      |"null"|"void"|"never"|"mixed"|"self"|"static"|"object"
-                      |"false"|"true"|"resource"|"numeric"|"scalar")
+        || matches!(
+            t,
+            "int"
+                | "string"
+                | "bool"
+                | "float"
+                | "array"
+                | "callable"
+                | "iterable"
+                | "null"
+                | "void"
+                | "never"
+                | "mixed"
+                | "self"
+                | "static"
+                | "object"
+                | "false"
+                | "true"
+                | "resource"
+                | "numeric"
+                | "scalar"
+        )
     {
         return t.to_string();
     }
@@ -138,7 +155,8 @@ fn qualify_single_type(raw: &str, ns: &str, use_map: &HashMap<String, String>) -
     // Union / intersection — split on | or & and qualify each part.
     for sep in ['|', '&'] {
         if t.contains(sep) {
-            return t.split(sep)
+            return t
+                .split(sep)
                 .map(|p| qualify_single_type(p.trim(), ns, use_map))
                 .collect::<Vec<_>>()
                 .join(&sep.to_string());
@@ -174,7 +192,12 @@ fn qualify_sig(
     // Strategy: tokenize, qualify word-tokens that are directly before `$`.
     let params = qualify_param_types(&sig.params, ns, use_map);
 
-    mock_baker::MethodSig { name: sig.name, params, return_ty, is_static: sig.is_static }
+    mock_baker::MethodSig {
+        name: sig.name,
+        params,
+        return_ty,
+        is_static: sig.is_static,
+    }
 }
 
 fn qualify_param_types(params: &str, ns: &str, use_map: &HashMap<String, String>) -> String {
@@ -182,7 +205,10 @@ fn qualify_param_types(params: &str, ns: &str, use_map: &HashMap<String, String>
     let mut result = Vec::new();
     for param in params.split(',') {
         let p = param.trim();
-        if p.is_empty() { result.push(p.to_string()); continue; }
+        if p.is_empty() {
+            result.push(p.to_string());
+            continue;
+        }
         // Strip leading PHP 8.x attribute groups (#[...]) before qualifying the type.
         let (attr_prefix, p_rest) = extract_attr_prefix(p);
         let p_rest = p_rest.trim();
@@ -191,13 +217,17 @@ fn qualify_param_types(params: &str, ns: &str, use_map: &HashMap<String, String>
         if let Some(dollar_pos) = p_rest.find('$') {
             let type_part = p_rest[..dollar_pos].trim();
             let rest = &p_rest[dollar_pos..];
-            let prefix = if attr_prefix.is_empty() { String::new() } else { format!("{} ", attr_prefix) };
+            let prefix = if attr_prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", attr_prefix)
+            };
             if type_part.is_empty() {
                 result.push(format!("{}{}", prefix, p_rest));
             } else {
                 // Strip variadic marker `...` before qualifying — it's not part of the type.
-                let (type_core, variadic) = if type_part.ends_with("...") {
-                    (type_part[..type_part.len() - 3].trim(), "...")
+                let (type_core, variadic) = if let Some(stripped) = type_part.strip_suffix("...") {
+                    (stripped.trim(), "...")
                 } else {
                     (type_part, "")
                 };
@@ -219,10 +249,14 @@ fn extract_attr_prefix(p: &str) -> (String, &str) {
     let mut s = p;
     loop {
         let t = s.trim_start();
-        if !t.starts_with("#[") { return (attrs, s); }
+        if !t.starts_with("#[") {
+            return (attrs, s);
+        }
         if let Some(close) = t[1..].find(']') {
             let end = close + 2; // '#' + content + ']'
-            if !attrs.is_empty() { attrs.push(' '); }
+            if !attrs.is_empty() {
+                attrs.push(' ');
+            }
             attrs.push_str(&t[..end]);
             s = &t[end..];
         } else {
@@ -241,14 +275,17 @@ fn collect_all_methods(
     visited: &mut std::collections::HashSet<String>,
 ) -> Vec<mock_baker::MethodSig> {
     // Qualify the current interface's own methods using its namespace + use-map.
-    let mut all: Vec<mock_baker::MethodSig> = iface.methods.iter()
+    let mut all: Vec<mock_baker::MethodSig> = iface
+        .methods
+        .iter()
         .map(|m| qualify_sig(m.clone(), &iface.namespace, iface_use_map))
         .collect();
 
     for short in &iface.extends_names {
         // Expand the short parent name via the current interface's use-map.
         // If not found there, check whether it's in the same namespace (no use needed).
-        let fqn = iface_use_map.get(short.as_str())
+        let fqn = iface_use_map
+            .get(short.as_str())
             .cloned()
             .unwrap_or_else(|| {
                 if !iface.namespace.is_empty() && !short.contains('\\') {
@@ -258,11 +295,21 @@ fn collect_all_methods(
                 }
             });
         let fqn_norm = fqn.trim_start_matches('\\').to_string();
-        if !visited.insert(fqn_norm.clone()) { continue; }
-        let Some(file) = psr4_resolve(&fqn_norm, psr4) else { continue };
-        let Ok(src) = std::fs::read_to_string(&file) else { continue };
-        let Ok(parent) = parse_interface(&src) else { continue };
-        if !parent.is_interface { continue; }
+        if !visited.insert(fqn_norm.clone()) {
+            continue;
+        }
+        let Some(file) = psr4_resolve(&fqn_norm, psr4) else {
+            continue;
+        };
+        let Ok(src) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(parent) = parse_interface(&src) else {
+            continue;
+        };
+        if !parent.is_interface {
+            continue;
+        }
         let parent_use_map = mock_baker::extract_use_map(&src).unwrap_or_default();
         let parent_methods = collect_all_methods(&parent, &parent_use_map, psr4, visited);
         for m in parent_methods {
@@ -295,7 +342,8 @@ fn resolve_ifaces(
         if ifaces.contains_key(&block.iface_name) {
             continue;
         }
-        let fqn = use_map.get(&block.iface_name)
+        let fqn = use_map
+            .get(&block.iface_name)
             .cloned()
             .unwrap_or_else(|| block.iface_name.clone());
 
@@ -306,14 +354,20 @@ fn resolve_ifaces(
             || src.contains(&format!("MockObject&{}", block.iface_name))
         {
             if std::env::var("BAKE_DEBUG").is_ok() {
-                eprintln!("[bake]   skip (MockObject intersection) '{}'", block.iface_name);
+                eprintln!(
+                    "[bake]   skip (MockObject intersection) '{}'",
+                    block.iface_name
+                );
             }
             continue;
         }
 
         let Some(file) = psr4_resolve(&fqn, psr4) else {
             if std::env::var("BAKE_DEBUG").is_ok() {
-                eprintln!("[bake]   skip (unresolvable) '{}' (fqn='{}')", block.iface_name, fqn);
+                eprintln!(
+                    "[bake]   skip (unresolvable) '{}' (fqn='{}')",
+                    block.iface_name, fqn
+                );
             }
             continue; // leave this mock as createMock(), try the rest
         };
@@ -321,7 +375,11 @@ fn resolve_ifaces(
         let parsed = parse_interface(&iface_src)?;
         if !parsed.is_interface && !parsed.is_abstract {
             if std::env::var("BAKE_DEBUG").is_ok() {
-                eprintln!("[bake]   skip (concrete class) '{}' ({})", block.iface_name, file.display());
+                eprintln!(
+                    "[bake]   skip (concrete class) '{}' ({})",
+                    block.iface_name,
+                    file.display()
+                );
             }
             continue; // leave this mock as createMock(), try the rest
         }
@@ -334,7 +392,9 @@ fn resolve_ifaces(
             visited.insert(fqn.trim_start_matches('\\').to_string());
             collect_all_methods(&parsed, &iface_use_map, psr4, &mut visited)
         } else {
-            parsed.methods.iter()
+            parsed
+                .methods
+                .iter()
                 .map(|m| qualify_sig(m.clone(), &parsed.namespace, &iface_use_map))
                 .collect()
         };
@@ -391,7 +451,10 @@ pub fn bake_test_cases(
     cases
         .iter()
         .map(|tc| match rewrites.get(&tc.file) {
-            Some(Some(new_file)) => TestCase { file: new_file.clone(), ..tc.clone() },
+            Some(Some(new_file)) => TestCase {
+                file: new_file.clone(),
+                ..tc.clone()
+            },
             _ => tc.clone(),
         })
         .collect()
@@ -427,18 +490,27 @@ fn try_bake_file(
             let stem = tc.class.replace('\\', "_");
             let dest = temp_dir.path().join(format!("{stem}.php"));
             if std::fs::copy(&cached, &dest).is_ok() {
-                if debug { eprintln!("[bake] cache hit → {}", tc.file.display()); }
+                if debug {
+                    eprintln!("[bake] cache hit → {}", tc.file.display());
+                }
                 return Some(dest);
             }
         }
     }
     match resolve_ifaces(&src, psr4) {
         Ok(None) => {
-            if debug { eprintln!("[bake] skip (no mock / unresolvable): {}", tc.file.display()); }
+            if debug {
+                eprintln!(
+                    "[bake] skip (no mock / unresolvable): {}",
+                    tc.file.display()
+                );
+            }
             return None;
         }
         Err(e) => {
-            if debug { eprintln!("[bake] error {}: {e:#}", tc.file.display()); }
+            if debug {
+                eprintln!("[bake] error {}: {e:#}", tc.file.display());
+            }
             return None;
         }
         Ok(Some(_)) => {}
@@ -447,7 +519,9 @@ fn try_bake_file(
     let mut baked = match mock_baker::bake(&src, &ifaces) {
         Ok(b) => b,
         Err(e) => {
-            if debug { eprintln!("[bake] bake() failed {}: {e:#}", tc.file.display()); }
+            if debug {
+                eprintln!("[bake] bake() failed {}: {e:#}", tc.file.display());
+            }
             return None;
         }
     };
@@ -457,7 +531,10 @@ fn try_bake_file(
     if let Ok(abs) = tc.file.canonicalize() {
         let orig_dir = abs.parent().unwrap_or(&abs);
         let escape = |s: &str| s.replace('\\', "\\\\").replace('\'', "\\'");
-        baked = baked.replace("__DIR__", &format!("'{}'", escape(&orig_dir.to_string_lossy())));
+        baked = baked.replace(
+            "__DIR__",
+            &format!("'{}'", escape(&orig_dir.to_string_lossy())),
+        );
         baked = baked.replace("__FILE__", &format!("'{}'", escape(&abs.to_string_lossy())));
     }
 
@@ -466,7 +543,9 @@ fn try_bake_file(
     let stem = tc.class.replace('\\', "_");
     let dest = temp_dir.path().join(format!("{stem}.php"));
     if let Err(e) = std::fs::write(&dest, &baked) {
-        if debug { eprintln!("[bake] write failed {}: {e}", tc.file.display()); }
+        if debug {
+            eprintln!("[bake] write failed {}: {e}", tc.file.display());
+        }
         return None;
     }
     // Persist to disk cache so subsequent runs skip re-parsing.
@@ -477,6 +556,8 @@ fn try_bake_file(
         let dump_name = format!("{}.php", tc.class.replace('\\', "_"));
         let _ = std::fs::write(std::path::Path::new(&dump_dir).join(&dump_name), &baked);
     }
-    if debug { eprintln!("[bake] OK → {}", tc.file.display()); }
+    if debug {
+        eprintln!("[bake] OK → {}", tc.file.display());
+    }
     Some(dest)
 }

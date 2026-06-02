@@ -41,7 +41,9 @@ fn namespaced_service_method_is_covered() {
     let map = parsed.as_object().expect("top-level object");
 
     // Service.php should be in coverage.
-    let service_key = map.keys().find(|k| k.ends_with("Service.php") && !k.contains("Test"));
+    let service_key = map
+        .keys()
+        .find(|k| k.ends_with("Service.php") && !k.contains("Test"));
     assert!(
         service_key.is_some(),
         "src/App/Service.php should be in coverage (namespace resolution worked); keys: {:?}",
@@ -53,7 +55,7 @@ fn namespaced_service_method_is_covered() {
     let attributed = service_lines.values().any(|tests| {
         tests.as_array().unwrap().iter().any(|v| {
             v.as_str()
-                .map_or(false, |s| s.contains("App\\Tests\\ServiceTest::testGo"))
+                .is_some_and(|s| s.contains("App\\Tests\\ServiceTest::testGo"))
         })
     });
     assert!(

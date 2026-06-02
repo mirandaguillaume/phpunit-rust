@@ -31,10 +31,21 @@ mod tests {
     fn renders_per_test_attribution() {
         let mut cov: Coverage = HashMap::new();
         let mut lines = HashMap::new();
-        lines.insert(47, vec![
-            TestId { class: "T".into(), method: "testA".into(), data_set: Some("0".into()) },
-            TestId { class: "T".into(), method: "testA".into(), data_set: Some("1".into()) },
-        ]);
+        lines.insert(
+            47,
+            vec![
+                TestId {
+                    class: "T".into(),
+                    method: "testA".into(),
+                    data_set: Some("0".into()),
+                },
+                TestId {
+                    class: "T".into(),
+                    method: "testA".into(),
+                    data_set: Some("1".into()),
+                },
+            ],
+        );
         cov.insert(PathBuf::from("src/U.php"), lines);
 
         let s = render(&cov);

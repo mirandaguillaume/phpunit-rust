@@ -36,10 +36,18 @@ fn ascends_to_testcase(
         if current == TESTCASE_FQCN_LOWER {
             return true;
         }
-        let Some(refl) = index.get(&current) else { return false; };
-        let Some(parent_name) = &refl.inheritance.direct_extended_class else { return false; };
-        let parent_fqcn = project.interner().lookup(&parent_name.value).to_string()
-            .trim_start_matches('\\').to_lowercase();
+        let Some(refl) = index.get(&current) else {
+            return false;
+        };
+        let Some(parent_name) = &refl.inheritance.direct_extended_class else {
+            return false;
+        };
+        let parent_fqcn = project
+            .interner()
+            .lookup(&parent_name.value)
+            .to_string()
+            .trim_start_matches('\\')
+            .to_lowercase();
         if parent_fqcn == current {
             // Defensive: self-loop, bail.
             return false;
@@ -57,9 +65,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
-        ).unwrap();
+        )
+        .unwrap();
         for (path, content) in files {
             let target = dir.path().join(path);
             std::fs::create_dir_all(target.parent().unwrap()).ok();
@@ -71,9 +81,10 @@ mod tests {
 
     #[test]
     fn finds_direct_subclass() {
-        let (_d, project) = project_with(&[
-            ("UserTest.php", "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass UserTest extends TestCase {}"),
-        ]);
+        let (_d, project) = project_with(&[(
+            "UserTest.php",
+            "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass UserTest extends TestCase {}",
+        )]);
         let classes = find_testcase_subclasses(&project);
         assert!(
             classes.iter().any(|c| c.to_lowercase() == "usertest"),
@@ -89,21 +100,36 @@ mod tests {
         ]);
         let classes = find_testcase_subclasses(&project);
         let lc: Vec<String> = classes.iter().map(|c| c.to_lowercase()).collect();
-        assert!(lc.iter().any(|c| c == "concretetest"), "expected ConcreteTest; got: {classes:?}");
-        assert!(lc.iter().any(|c| c == "basetest"), "expected BaseTest; got: {classes:?}");
+        assert!(
+            lc.iter().any(|c| c == "concretetest"),
+            "expected ConcreteTest; got: {classes:?}"
+        );
+        assert!(
+            lc.iter().any(|c| c == "basetest"),
+            "expected BaseTest; got: {classes:?}"
+        );
     }
 
     #[test]
     fn excludes_non_test_classes() {
         let (_d, project) = project_with(&[
             ("Plain.php", "<?php\nclass Plain {}"),
-            ("User.php", "<?php\nclass User { public function name(): string { return 'x'; } }"),
+            (
+                "User.php",
+                "<?php\nclass User { public function name(): string { return 'x'; } }",
+            ),
         ]);
         let classes = find_testcase_subclasses(&project);
         // TestCase itself may or may not appear in results — that's fine.
         // What MUST NOT appear: Plain or User.
         let lc: Vec<String> = classes.iter().map(|c| c.to_lowercase()).collect();
-        assert!(!lc.iter().any(|c| c == "plain"), "Plain should not be in results: {classes:?}");
-        assert!(!lc.iter().any(|c| c == "user"), "User should not be in results: {classes:?}");
+        assert!(
+            !lc.iter().any(|c| c == "plain"),
+            "Plain should not be in results: {classes:?}"
+        );
+        assert!(
+            !lc.iter().any(|c| c == "user"),
+            "User should not be in results: {classes:?}"
+        );
     }
 }

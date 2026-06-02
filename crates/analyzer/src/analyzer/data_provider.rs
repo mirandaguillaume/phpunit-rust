@@ -19,8 +19,8 @@
 //!               → first Statement::Return → Return.value
 
 use mago_syntax::ast::ast::class_like::member::ClassLikeMember;
-use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::ast::expression::Expression;
+use mago_syntax::ast::ast::statement::Statement;
 
 use crate::concrete::{compute, ArrayKey, Context, PhpValue};
 use crate::mago_bridge::MagoProject;
@@ -43,16 +43,18 @@ pub struct ExpandedTest {
 /// back to the same no-data variant.
 pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
     let no_data = || {
-        vec![ExpandedTest { test: test.clone(), data_set: None, args: vec![] }]
+        vec![ExpandedTest {
+            test: test.clone(),
+            data_set: None,
+            args: vec![],
+        }]
     };
 
     let Some(provider_name) = &test.has_data_provider else {
         return no_data();
     };
 
-    let Some(return_expr) =
-        find_provider_return_expr(project, &test.class, provider_name)
-    else {
+    let Some(return_expr) = find_provider_return_expr(project, &test.class, provider_name) else {
         return no_data();
     };
 
@@ -77,7 +79,11 @@ pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
                 PhpValue::Array(a) => a.into_values().collect(),
                 other => vec![other],
             };
-            ExpandedTest { test: test.clone(), data_set: Some(data_set), args }
+            ExpandedTest {
+                test: test.clone(),
+                data_set: Some(data_set),
+                args,
+            }
         })
         .collect()
 }
@@ -159,12 +165,9 @@ where
                     NamespaceBody::Implicit(b) => b.statements.iter(),
                     NamespaceBody::BraceDelimited(b) => b.statements.iter(),
                 };
-                if let Some(expr) = find_return_in_statements(
-                    inner_stmts,
-                    class_name,
-                    provider_name,
-                    interner,
-                ) {
+                if let Some(expr) =
+                    find_return_in_statements(inner_stmts, class_name, provider_name, interner)
+                {
                     return Some(expr);
                 }
             }
@@ -224,7 +227,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
         )
         .unwrap();
@@ -256,11 +260,13 @@ class MyTest extends TestCase {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::create_dir_all(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/Attributes"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/Attributes"),
         )
         .unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
         )
         .unwrap();
@@ -302,10 +308,16 @@ class MyTest extends TestCase {
         assert_eq!(test.has_data_provider.as_deref(), Some("provider"));
 
         let expanded = expand(&project, test);
-        assert_eq!(expanded.len(), 2, "expected 2 expansions; got: {expanded:?}");
+        assert_eq!(
+            expanded.len(),
+            2,
+            "expected 2 expansions; got: {expanded:?}"
+        );
 
-        let data_sets: Vec<&str> =
-            expanded.iter().filter_map(|e| e.data_set.as_deref()).collect();
+        let data_sets: Vec<&str> = expanded
+            .iter()
+            .filter_map(|e| e.data_set.as_deref())
+            .collect();
         assert!(data_sets.contains(&"first"), "expected 'first' data set");
         assert!(data_sets.contains(&"second"), "expected 'second' data set");
     }

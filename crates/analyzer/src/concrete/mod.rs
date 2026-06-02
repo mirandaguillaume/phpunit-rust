@@ -5,9 +5,9 @@
 //! like static data providers. Constructs outside the supported subset return
 //! `ComputeError::Unsupported`, and callers must treat the input as opaque.
 
-pub mod value;
-pub mod expr;
 pub mod builtins;
+pub mod expr;
+pub mod value;
 
-pub use value::{PhpValue, ArrayKey};
-pub use expr::{compute, Context, ComputeError};
+pub use expr::{compute, ComputeError, Context};
+pub use value::{ArrayKey, PhpValue};

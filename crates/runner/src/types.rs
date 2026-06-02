@@ -32,7 +32,7 @@ pub struct TestOutcome {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RowFilter {
-    pub chunk_index:  u32,
+    pub chunk_index: u32,
     pub total_chunks: u32,
 }
 
@@ -118,7 +118,10 @@ mod tests {
             ("incomplete", TestStatus::Incomplete),
             ("risky", TestStatus::Risky),
         ] {
-            let raw = format!(r#"{{"class":"A","method":"b","status":"{}","message":null,"trace":null,"duration_ms":0.0}}"#, raw_status);
+            let raw = format!(
+                r#"{{"class":"A","method":"b","status":"{}","message":null,"trace":null,"duration_ms":0.0}}"#,
+                raw_status
+            );
             let outcome: TestOutcome = serde_json::from_str(&raw).unwrap();
             assert_eq!(outcome.status, expected);
         }
@@ -136,12 +139,12 @@ mod batch_plan_tests {
             bootstrap: Some(PathBuf::from("/proj/bootstrap.php")),
             defines: vec![["FOO".to_string(), "bar".to_string()]],
             classes: vec![BatchClass {
-                file:           PathBuf::from("/proj/tests/FooTest.php"),
-                class:          "App\\FooTest".to_string(),
-                methods:        vec!["testA".to_string()],
-                row_filter:     None,
+                file: PathBuf::from("/proj/tests/FooTest.php"),
+                class: "App\\FooTest".to_string(),
+                methods: vec!["testA".to_string()],
+                row_filter: None,
                 required_files: vec![],
-                is_isolated:    false,
+                is_isolated: false,
             }],
             fingerprint: std::collections::HashSet::new(),
             force_exit_after: false,
@@ -157,12 +160,12 @@ mod batch_plan_tests {
     #[test]
     fn batch_class_required_files_omitted_when_empty() {
         let bc = BatchClass {
-            file:           PathBuf::from("/t/FooTest.php"),
-            class:          "FooTest".to_string(),
-            methods:        vec![],
-            row_filter:     None,
+            file: PathBuf::from("/t/FooTest.php"),
+            class: "FooTest".to_string(),
+            methods: vec![],
+            row_filter: None,
             required_files: vec![],
-            is_isolated:    false,
+            is_isolated: false,
         };
         let v = serde_json::to_value(&bc).unwrap();
         assert!(v.get("required_files").is_none());
@@ -171,12 +174,12 @@ mod batch_plan_tests {
     #[test]
     fn batch_class_required_files_present_when_non_empty() {
         let bc = BatchClass {
-            file:           PathBuf::from("/t/FooTest.php"),
-            class:          "FooTest".to_string(),
-            methods:        vec![],
-            row_filter:     None,
+            file: PathBuf::from("/t/FooTest.php"),
+            class: "FooTest".to_string(),
+            methods: vec![],
+            row_filter: None,
             required_files: vec![PathBuf::from("/t/Provider.php")],
-            is_isolated:    false,
+            is_isolated: false,
         };
         let v = serde_json::to_value(&bc).unwrap();
         assert_eq!(v["required_files"][0], "/t/Provider.php");

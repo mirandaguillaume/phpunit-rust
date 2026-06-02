@@ -5,10 +5,10 @@
 //! lexical type tracker; currently all calls are treated as opaque (mark call
 //! site, don't recurse).
 
-pub mod trace;
-pub mod dispatch;
 pub mod data_provider;
+pub mod dispatch;
 pub mod proxy;
+pub mod trace;
 
 pub use data_provider::ExpandedTest;
 
@@ -53,13 +53,21 @@ mod tests {
 
     #[test]
     fn test_id_display_without_data_set() {
-        let id = TestId { class: "Foo".into(), method: "testBar".into(), data_set: None };
+        let id = TestId {
+            class: "Foo".into(),
+            method: "testBar".into(),
+            data_set: None,
+        };
         assert_eq!(id.display(), "Foo::testBar");
     }
 
     #[test]
     fn test_id_display_with_data_set() {
-        let id = TestId { class: "Foo".into(), method: "testBar".into(), data_set: Some("0".into()) };
+        let id = TestId {
+            class: "Foo".into(),
+            method: "testBar".into(),
+            data_set: Some("0".into()),
+        };
         assert_eq!(id.display(), "Foo::testBar#0");
     }
 
@@ -68,12 +76,26 @@ mod tests {
         let mut a: Coverage = HashMap::new();
         let f = PathBuf::from("a.php");
         let mut a_lines = HashMap::new();
-        a_lines.insert(1, vec![TestId { class: "T".into(), method: "testA".into(), data_set: None }]);
+        a_lines.insert(
+            1,
+            vec![TestId {
+                class: "T".into(),
+                method: "testA".into(),
+                data_set: None,
+            }],
+        );
         a.insert(f.clone(), a_lines);
 
         let mut b: Coverage = HashMap::new();
         let mut b_lines = HashMap::new();
-        b_lines.insert(1, vec![TestId { class: "T".into(), method: "testB".into(), data_set: None }]);
+        b_lines.insert(
+            1,
+            vec![TestId {
+                class: "T".into(),
+                method: "testB".into(),
+                data_set: None,
+            }],
+        );
         b.insert(f.clone(), b_lines);
 
         merge(&mut a, b);

@@ -28,7 +28,12 @@ impl CacheStore {
         Ok(Self { root })
     }
 
-    pub fn put<T: Serialize>(&self, kind: &str, key: &ContentHash, value: &T) -> Result<(), CacheError> {
+    pub fn put<T: Serialize>(
+        &self,
+        kind: &str,
+        key: &ContentHash,
+        value: &T,
+    ) -> Result<(), CacheError> {
         let path = self.entry_path(kind, key);
         std::fs::create_dir_all(path.parent().unwrap())?;
         let bytes = bincode::serialize(value)?;
@@ -36,7 +41,11 @@ impl CacheStore {
         Ok(())
     }
 
-    pub fn get<T: DeserializeOwned>(&self, kind: &str, key: &ContentHash) -> Result<Option<T>, CacheError> {
+    pub fn get<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        key: &ContentHash,
+    ) -> Result<Option<T>, CacheError> {
         let path = self.entry_path(kind, key);
         if !path.exists() {
             return Ok(None);
@@ -46,7 +55,9 @@ impl CacheStore {
         Ok(Some(value))
     }
 
-    pub fn root(&self) -> &Path { &self.root }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     fn entry_path(&self, kind: &str, key: &ContentHash) -> PathBuf {
         let hex = key.as_str();
@@ -60,14 +71,20 @@ mod tests {
     use serde::Deserialize;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq)]
-    struct Sample { name: String, count: u32 }
+    struct Sample {
+        name: String,
+        count: u32,
+    }
 
     #[test]
     fn put_get_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = CacheStore::open(dir.path(), "0.26.1").unwrap();
         let key = ContentHash::of_bytes(b"some-file");
-        let value = Sample { name: "alice".into(), count: 42 };
+        let value = Sample {
+            name: "alice".into(),
+            count: 42,
+        };
         store.put("discovery", &key, &value).unwrap();
         let got: Option<Sample> = store.get("discovery", &key).unwrap();
         assert_eq!(got, Some(value));
@@ -77,7 +94,9 @@ mod tests {
     fn missing_entry_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let store = CacheStore::open(dir.path(), "0.26.1").unwrap();
-        let got: Option<Sample> = store.get("discovery", &ContentHash::of_bytes(b"no-such")).unwrap();
+        let got: Option<Sample> = store
+            .get("discovery", &ContentHash::of_bytes(b"no-such"))
+            .unwrap();
         assert_eq!(got, None);
     }
 
@@ -87,7 +106,10 @@ mod tests {
         let a = CacheStore::open(dir.path(), "0.26.1").unwrap();
         let b = CacheStore::open(dir.path(), "0.27.0").unwrap();
         let key = ContentHash::of_bytes(b"same-file");
-        let value = Sample { name: "x".into(), count: 1 };
+        let value = Sample {
+            name: "x".into(),
+            count: 1,
+        };
         a.put("discovery", &key, &value).unwrap();
         let got: Option<Sample> = b.get("discovery", &key).unwrap();
         assert_eq!(got, None, "different mago versions must not share cache");

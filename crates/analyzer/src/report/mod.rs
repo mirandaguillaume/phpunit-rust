@@ -25,8 +25,7 @@ pub struct MethodRisk {
 /// Only includes methods with at least one coverable line (total_lines > 0).
 pub fn build(coverage: &Coverage, methods: &[MethodComplexity]) -> Vec<MethodRisk> {
     // Pre-index covered lines by file for O(1) lookup.
-    let covered_by_file: HashMap<&PathBuf, &HashMap<u32, _>> =
-        coverage.iter().map(|(f, lm)| (f, lm)).collect();
+    let covered_by_file: HashMap<&PathBuf, &HashMap<u32, _>> = coverage.iter().collect();
 
     let mut report: Vec<MethodRisk> = methods
         .iter()
@@ -97,7 +96,11 @@ pub fn render_table(methods: &[MethodRisk], threshold: f64) -> String {
 
     let header = format!(
         "{:<6}  {:<5}  {:<2}  {:<method_col$}  {:<file_col$}",
-        "RISK", "COV%", "CC", "METHOD", "FILE",
+        "RISK",
+        "COV%",
+        "CC",
+        "METHOD",
+        "FILE",
         method_col = method_col,
         file_col = file_col,
     );

@@ -52,7 +52,7 @@ impl TraceCacheEntry {
         self.dep_snapshots.iter().all(|(p, s)| {
             current
                 .get(p)
-                .map_or(false, |m| m.size == s.size && m.mtime_nanos == s.mtime_nanos)
+                .is_some_and(|m| m.size == s.size && m.mtime_nanos == s.mtime_nanos)
         })
     }
 }
@@ -74,13 +74,53 @@ struct ResultCacheEntry {
 ///
 /// The per-test trace cache is always consulted (no `no_cache` escape hatch).
 /// Stale entries are invalidated automatically via file-mtime snapshots.
+/// Run analysis work on a rayon pool with a large stack.
+///
+/// mago's recursive-descent parser (invoked by `MagoProject::load`) and the
+/// type walker recurse with depth proportional to PHP expression/statement
+/// nesting; on a default ~2–8 MB stack, deeply-nested source (long boolean
+/// chains, nested array literals) can overflow and **abort the whole process**
+/// — observed crashing inside `load()` at ~30–40 levels on a 2 MB stack.
+/// Running the work inside a pool with a generous stack raises the safe
+/// nesting bound far beyond any realistic code. The nested `par_iter` in
+/// `analyze_filtered_inner` runs on this same pool, so the per-test walk
+/// workers inherit the large stack too.
+pub fn with_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    const DEEP_STACK: usize = 128 * 1024 * 1024;
+    match rayon::ThreadPoolBuilder::new()
+        .stack_size(DEEP_STACK)
+        .build()
+    {
+        Ok(pool) => pool.install(f),
+        Err(_) => f(), // fall back to the current thread if pool creation fails
+    }
+}
+
 pub fn analyze_filtered(
     cfg: &crate::config::ProjectConfig,
     allowed: Option<&std::collections::HashSet<(String, String)>>,
 ) -> anyhow::Result<crate::analyzer::Coverage> {
+    // Tier-1 result cache: a hit needs no parsing or walking, so probe it on
+    // the normal stack and skip building the (expensive) deep-stack worker
+    // pool. Only an actual parse/trace (a miss) enters `with_deep_stack`.
+    if allowed.is_none() {
+        let cache = CacheStore::open(&cfg.root, MagoProject::version())?;
+        let file_metas = collect_file_metas(&cfg.source_includes, &cfg.test_suites);
+        let fingerprint = fingerprint_from_metas(config_fingerprint(cfg).as_str(), &file_metas);
+        if let Ok(Some(e)) = cache.get::<ResultCacheEntry>("result", &fingerprint) {
+            return Ok(e.coverage);
+        }
+    }
+    with_deep_stack(|| analyze_filtered_inner(cfg, allowed))
+}
 
+fn analyze_filtered_inner(
+    cfg: &crate::config::ProjectConfig,
+    allowed: Option<&std::collections::HashSet<(String, String)>>,
+) -> anyhow::Result<crate::analyzer::Coverage> {
     let boundary = BoundaryResolver::from_config(cfg);
     let cache = CacheStore::open(&cfg.root, MagoProject::version())?;
+    let cfg_fp = config_fingerprint(cfg);
 
     let mut test_files = Vec::new();
     for suite in &cfg.test_suites {
@@ -91,14 +131,14 @@ pub fn analyze_filtered(
 
     // Tier 1 result cache: only valid when no filter is applied.
     if allowed.is_none() {
-        let fingerprint = fingerprint_from_metas(&file_metas);
+        let fingerprint = fingerprint_from_metas(cfg_fp.as_str(), &file_metas);
         if let Ok(Some(e)) = cache.get::<ResultCacheEntry>("result", &fingerprint) {
             return Ok(e.coverage);
         }
     }
 
     // Tier 2/3: per-test trace cache.
-    let trace_check = check_trace_caches(&cache, &test_files, &file_metas);
+    let trace_check = check_trace_caches(&cache, cfg_fp.as_str(), &test_files, &file_metas);
     let (project, tests, cached_traces) = match trace_check {
         Some((tests, traces)) => {
             let all_valid = traces.iter().all(Option::is_some);
@@ -129,7 +169,15 @@ pub fn analyze_filtered(
                     }
                 }
                 Some(cached_cov.unwrap_or_else(|| {
-                    trace_and_cache(&project, &boundary, test, &file_metas, &cache, false)
+                    trace_and_cache(
+                        &project,
+                        &boundary,
+                        cfg_fp.as_str(),
+                        test,
+                        &file_metas,
+                        &cache,
+                        false,
+                    )
                 }))
             })
             .collect()
@@ -143,11 +191,13 @@ pub fn analyze_filtered(
 
     // Store result cache only for unfiltered runs.
     if allowed.is_none() {
-        let fingerprint = fingerprint_from_metas(&file_metas);
+        let fingerprint = fingerprint_from_metas(cfg_fp.as_str(), &file_metas);
         let _ = cache.put(
             "result",
             &fingerprint,
-            &ResultCacheEntry { coverage: coverage.clone() },
+            &ResultCacheEntry {
+                coverage: coverage.clone(),
+            },
         );
     }
 
@@ -165,6 +215,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let boundary = BoundaryResolver::from_config(&cfg);
     let cache = CacheStore::open(&cfg.root, MagoProject::version())?;
+    let cfg_fp = config_fingerprint(&cfg);
 
     let mut test_files = Vec::new();
     for suite in &cfg.test_suites {
@@ -172,7 +223,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let file_metas = collect_file_metas(&cfg.source_includes, &cfg.test_suites);
-    let fingerprint = fingerprint_from_metas(&file_metas);
+    let fingerprint = fingerprint_from_metas(cfg_fp.as_str(), &file_metas);
 
     // Tier 1: fully-baked result cache — no PHP load, no trace work.
     if !args.no_cache {
@@ -181,65 +232,87 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // Tier 2/3: check which per-test trace entries are still valid.
-    let trace_check = if !args.no_cache {
-        check_trace_caches(&cache, &test_files, &file_metas)
-    } else {
-        None
-    };
+    // Tier 2/3 + load + trace: mago's parser and the type walker recurse with
+    // PHP nesting depth, so this work runs on a large-stack rayon pool (deeply
+    // nested source would otherwise overflow). The tier-1 hit above returns
+    // before we get here, so a warm "nothing changed" run never pays for the
+    // pool — only an actual parse/trace does.
+    with_deep_stack(move || -> anyhow::Result<()> {
+        // Tier 2/3: check which per-test trace entries are still valid.
+        let trace_check = if !args.no_cache {
+            check_trace_caches(&cache, cfg_fp.as_str(), &test_files, &file_metas)
+        } else {
+            None
+        };
 
-    // Load project: skip vendor when every trace is already valid.
-    let (project, tests, cached_traces) = match trace_check {
-        Some((tests, traces)) => {
-            let all_valid = traces.iter().all(Option::is_some);
-            let project = if all_valid {
-                MagoProject::load_excluding_vendor(&cfg.root)?
-            } else {
-                MagoProject::load(&cfg.root)?
-            };
-            (project, tests, traces)
-        }
-        None => {
-            let project = MagoProject::load(&cfg.root)?;
-            let tests = test_discovery::discover(&project, &cache, &test_files)?;
-            let n = tests.len();
-            (project, tests, vec![None::<Coverage>; n])
-        }
-    };
+        // Load project: skip vendor when every trace is already valid.
+        let (project, tests, cached_traces) = match trace_check {
+            Some((tests, traces)) => {
+                let all_valid = traces.iter().all(Option::is_some);
+                let project = if all_valid {
+                    MagoProject::load_excluding_vendor(&cfg.root)?
+                } else {
+                    MagoProject::load(&cfg.root)?
+                };
+                (project, tests, traces)
+            }
+            None => {
+                let project = MagoProject::load(&cfg.root)?;
+                let tests = test_discovery::discover(&project, &cache, &test_files)?;
+                let n = tests.len();
+                (project, tests, vec![None::<Coverage>; n])
+            }
+        };
 
-    // Per-test coverage: reuse valid cached entries; re-trace stale ones in parallel.
-    let all_coverages: Vec<Coverage> = {
-        use rayon::prelude::*;
-        let no_cache = args.no_cache;
-        tests
-            .par_iter()
-            .zip(cached_traces.into_par_iter())
-            .map(|(test, cached_cov)| {
-                cached_cov.unwrap_or_else(|| {
-                    trace_and_cache(&project, &boundary, test, &file_metas, &cache, no_cache)
+        // Per-test coverage: reuse valid cached entries; re-trace stale ones in parallel.
+        let all_coverages: Vec<Coverage> = {
+            use rayon::prelude::*;
+            let no_cache = args.no_cache;
+            tests
+                .par_iter()
+                .zip(cached_traces.into_par_iter())
+                .map(|(test, cached_cov)| {
+                    cached_cov.unwrap_or_else(|| {
+                        trace_and_cache(
+                            &project,
+                            &boundary,
+                            cfg_fp.as_str(),
+                            test,
+                            &file_metas,
+                            &cache,
+                            no_cache,
+                        )
+                    })
                 })
-            })
-            .collect()
-    };
-    let mut coverage: Coverage = HashMap::new();
-    for cov in all_coverages {
-        analyzer::merge(&mut coverage, cov);
-    }
+                .collect()
+        };
+        let mut coverage: Coverage = HashMap::new();
+        for cov in all_coverages {
+            analyzer::merge(&mut coverage, cov);
+        }
 
-    analyzer::proxy::add_proxy_coverage(&project, &boundary, &mut coverage);
+        analyzer::proxy::add_proxy_coverage(&project, &boundary, &mut coverage);
 
-    // Store the baked result so the next run hits tier 1.
-    if !args.no_cache {
-        let _ = cache.put("result", &fingerprint, &ResultCacheEntry { coverage: coverage.clone() });
-    }
+        // Store the baked result so the next run hits tier 1.
+        if !args.no_cache {
+            let _ = cache.put(
+                "result",
+                &fingerprint,
+                &ResultCacheEntry {
+                    coverage: coverage.clone(),
+                },
+            );
+        }
 
-    emit(coverage, &args)
+        emit(coverage, &args)
+    })
 }
 
 /// Check discovery + per-test trace caches. Returns `None` on any discovery miss.
 /// For each test, `Some(coverage)` = still valid; `None` = must re-trace.
 fn check_trace_caches(
     cache: &CacheStore,
+    cfg_fp: &str,
     test_files: &[PathBuf],
     file_metas: &HashMap<PathBuf, FileMeta>,
 ) -> Option<(Vec<TestMethod>, Vec<Option<Coverage>>)> {
@@ -247,7 +320,7 @@ fn check_trace_caches(
     let traces = tests
         .iter()
         .map(|t| {
-            let key = trace_v2_key(&t.class, &t.method);
+            let key = trace_v2_key(cfg_fp, &t.class, &t.method);
             match cache.get::<TraceCacheEntry>("trace_v2", &key) {
                 Ok(Some(e)) if e.still_valid(file_metas) => Some(e.coverage),
                 _ => None,
@@ -261,6 +334,7 @@ fn check_trace_caches(
 fn trace_and_cache(
     project: &MagoProject,
     boundary: &BoundaryResolver,
+    cfg_fp: &str,
     test: &TestMethod,
     file_metas: &HashMap<PathBuf, FileMeta>,
     cache: &CacheStore,
@@ -279,17 +353,42 @@ fn trace_and_cache(
             .filter_map(|p| file_metas.get(p).map(|m| (p.clone(), m.clone())))
             .collect();
         if let Some(m) = file_metas.get(&test.file) {
-            dep_snapshots.entry(test.file.clone()).or_insert_with(|| m.clone());
+            dep_snapshots
+                .entry(test.file.clone())
+                .or_insert_with(|| m.clone());
         }
-        let entry = TraceCacheEntry { coverage: test_cov.clone(), dep_snapshots };
-        let _ = cache.put("trace_v2", &trace_v2_key(&test.class, &test.method), &entry);
+        let entry = TraceCacheEntry {
+            coverage: test_cov.clone(),
+            dep_snapshots,
+        };
+        let _ = cache.put(
+            "trace_v2",
+            &trace_v2_key(cfg_fp, &test.class, &test.method),
+            &entry,
+        );
     }
 
     test_cov
 }
 
-fn trace_v2_key(class: &str, method: &str) -> ContentHash {
-    ContentHash::of_bytes(format!("trace_v2\x00{class}\x00{method}").as_bytes())
+/// Stable fingerprint of the resolved project config's source boundaries.
+///
+/// `opacity::decide` routes Trace-vs-Opaque off `source_includes` /
+/// `source_excludes`, so editing those (or pointing `--config` at a file with
+/// different boundaries) changes the coverage map with NO PHP-file mtime
+/// change. Folding this fingerprint into the derived cache keys ensures any
+/// boundary change invalidates the trace_v2 and result caches.
+fn config_fingerprint(cfg: &crate::config::ProjectConfig) -> ContentHash {
+    ContentHash::of_config(
+        &cfg.root,
+        &cfg.source_includes,
+        &cfg.source_excludes,
+        &cfg.test_suites,
+    )
+}
+
+fn trace_v2_key(cfg_fp: &str, class: &str, method: &str) -> ContentHash {
+    ContentHash::of_bytes(format!("trace_v2\x00{cfg_fp}\x00{class}\x00{method}").as_bytes())
 }
 
 fn emit(coverage: Coverage, args: &Args) -> anyhow::Result<()> {
@@ -304,7 +403,10 @@ fn emit(coverage: Coverage, args: &Args) -> anyhow::Result<()> {
 }
 
 /// Build a flat map of all PHP files under the given dirs with their (size, mtime) snapshots.
-fn collect_file_metas(source_includes: &[PathBuf], test_suites: &[PathBuf]) -> HashMap<PathBuf, FileMeta> {
+fn collect_file_metas(
+    source_includes: &[PathBuf],
+    test_suites: &[PathBuf],
+) -> HashMap<PathBuf, FileMeta> {
     let mut metas = HashMap::new();
     for dir in source_includes.iter().chain(test_suites.iter()) {
         collect_php_file_metas_rec(dir, &mut metas);
@@ -318,7 +420,7 @@ fn collect_php_file_metas_rec(dir: &Path, out: &mut HashMap<PathBuf, FileMeta>) 
             let path = entry.path();
             if path.is_dir() {
                 collect_php_file_metas_rec(&path, out);
-            } else if path.extension().map_or(false, |e| e == "php") {
+            } else if path.extension().is_some_and(|e| e == "php") {
                 if let Ok(meta) = std::fs::metadata(&path) {
                     let mtime_nanos = meta
                         .modified()
@@ -326,19 +428,30 @@ fn collect_php_file_metas_rec(dir: &Path, out: &mut HashMap<PathBuf, FileMeta>) 
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
-                    out.insert(path, FileMeta { size: meta.len(), mtime_nanos });
+                    out.insert(
+                        path,
+                        FileMeta {
+                            size: meta.len(),
+                            mtime_nanos,
+                        },
+                    );
                 }
             }
         }
     }
 }
 
-/// BLAKE3 fingerprint of sorted (path, size, mtime) for all tracked PHP files.
-/// Any file change (add, edit, delete) produces a new hash, invalidating the result cache.
-fn fingerprint_from_metas(metas: &HashMap<PathBuf, FileMeta>) -> ContentHash {
+/// BLAKE3 fingerprint of the config boundary plus sorted (path, size, mtime)
+/// for all tracked PHP files. Any file change (add, edit, delete) — or any
+/// source-boundary change (`cfg_fp`) — produces a new hash, invalidating the
+/// result cache. `cfg_fp` must be the hex output of [`config_fingerprint`].
+fn fingerprint_from_metas(cfg_fp: &str, metas: &HashMap<PathBuf, FileMeta>) -> ContentHash {
     let mut paths: Vec<&PathBuf> = metas.keys().collect();
     paths.sort();
     let mut buf = Vec::new();
+    buf.extend_from_slice(b"result\x00");
+    buf.extend_from_slice(cfg_fp.as_bytes());
+    buf.push(0);
     for p in paths {
         buf.extend_from_slice(p.to_string_lossy().as_bytes());
         buf.push(0);
@@ -355,9 +468,99 @@ fn collect_php_files(dir: &Path, out: &mut Vec<PathBuf>) {
             let path = entry.path();
             if path.is_dir() {
                 collect_php_files(&path, out);
-            } else if path.extension().map_or(false, |e| e == "php") {
+            } else if path.extension().is_some_and(|e| e == "php") {
                 out.push(path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProjectConfig;
+
+    fn cfg_with(includes: Vec<PathBuf>, excludes: Vec<PathBuf>) -> ProjectConfig {
+        ProjectConfig {
+            root: PathBuf::from("/proj"),
+            test_suites: vec![PathBuf::from("/proj/tests")],
+            source_includes: includes,
+            source_excludes: excludes,
+        }
+    }
+
+    /// Two configs over the SAME files on disk but with different source
+    /// boundaries must produce different derived cache keys, otherwise editing
+    /// `<source><include>/<exclude>` returns stale coverage (bug H5).
+    #[test]
+    fn config_fingerprint_differs_on_boundary_change() {
+        let a = cfg_with(vec![PathBuf::from("/proj/src")], vec![]);
+        let b = cfg_with(
+            vec![PathBuf::from("/proj/src")],
+            vec![PathBuf::from("/proj/src/Migrations")],
+        );
+        assert_ne!(
+            config_fingerprint(&a),
+            config_fingerprint(&b),
+            "adding a source <exclude> must change the config fingerprint",
+        );
+
+        let c = cfg_with(vec![PathBuf::from("/proj/app")], vec![]);
+        assert_ne!(
+            config_fingerprint(&a),
+            config_fingerprint(&c),
+            "changing a source <include> must change the config fingerprint",
+        );
+    }
+
+    #[test]
+    fn config_fingerprint_same_for_identical_config() {
+        let a = cfg_with(vec![PathBuf::from("/proj/src")], vec![]);
+        let b = cfg_with(vec![PathBuf::from("/proj/src")], vec![]);
+        assert_eq!(config_fingerprint(&a), config_fingerprint(&b));
+    }
+
+    /// The per-test trace_v2 key must be namespaced by config so that a
+    /// boundary change invalidates the per-test trace cache for the same
+    /// (class, method).
+    #[test]
+    fn trace_v2_key_namespaced_by_config() {
+        let a = config_fingerprint(&cfg_with(vec![PathBuf::from("/proj/src")], vec![]));
+        let b = config_fingerprint(&cfg_with(
+            vec![PathBuf::from("/proj/src")],
+            vec![PathBuf::from("/proj/src/Migrations")],
+        ));
+        assert_ne!(
+            trace_v2_key(a.as_str(), "FooTest", "testBar"),
+            trace_v2_key(b.as_str(), "FooTest", "testBar"),
+            "trace_v2 key must change when the config boundary changes",
+        );
+        // Same config, same (class, method) => same key.
+        assert_eq!(
+            trace_v2_key(a.as_str(), "FooTest", "testBar"),
+            trace_v2_key(a.as_str(), "FooTest", "testBar"),
+        );
+    }
+
+    /// The tier-1 result fingerprint must be namespaced by config so that a
+    /// boundary change invalidates the baked result cache even when no PHP
+    /// file mtime changed.
+    #[test]
+    fn result_fingerprint_namespaced_by_config() {
+        let metas: HashMap<PathBuf, FileMeta> = HashMap::new();
+        let a = config_fingerprint(&cfg_with(vec![PathBuf::from("/proj/src")], vec![]));
+        let b = config_fingerprint(&cfg_with(
+            vec![PathBuf::from("/proj/src")],
+            vec![PathBuf::from("/proj/src/Migrations")],
+        ));
+        assert_ne!(
+            fingerprint_from_metas(a.as_str(), &metas),
+            fingerprint_from_metas(b.as_str(), &metas),
+            "result fingerprint must change when the config boundary changes",
+        );
+        assert_eq!(
+            fingerprint_from_metas(a.as_str(), &metas),
+            fingerprint_from_metas(a.as_str(), &metas),
+        );
     }
 }

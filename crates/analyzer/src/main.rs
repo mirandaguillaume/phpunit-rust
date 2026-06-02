@@ -1,8 +1,12 @@
-use clap::Parser;
 use analyzer::cli;
+use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "pcov-rs", version, about = "Fast PHP test coverage via static analysis")]
+#[command(
+    name = "pcov-rs",
+    version,
+    about = "Fast PHP test coverage via static analysis"
+)]
 struct Cli {
     #[command(subcommand)]
     command: cli::Command,
@@ -31,9 +35,15 @@ fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .init();
 
+    // Parsing + walking recurse with PHP nesting depth and need a large stack.
+    // `analyze::run` wraps its own heavy section *after* the tier-1 cache probe
+    // (so a warm cache hit never builds the pool); test-discovery always
+    // parses, so wrap it wholesale here.
     match cli.command {
         cli::Command::Analyze(args) => cli::analyze::run(args),
-        cli::Command::TestDiscovery(args) => cli::test_discovery::run(args),
+        cli::Command::TestDiscovery(args) => {
+            cli::analyze::with_deep_stack(|| cli::test_discovery::run(args))
+        }
         cli::Command::Cache(args) => cli::cache_cmd::run(args),
         cli::Command::Report(args) => cli::report::run(args),
     }

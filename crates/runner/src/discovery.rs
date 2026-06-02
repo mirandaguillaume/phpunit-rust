@@ -7,14 +7,7 @@
 //! don't have to switch their use-statements.
 
 pub use discovery::{
-    discover_class_file_index,
-    discover_class_file_index_targeted,
-    discover_in_dir,
-    discover_in_dirs,
-    discover_in_file,
-    discover_with_index,
-    group_by_class,
-    GroupedMethod,
-    TestCase,
-    TestClass,
+    discover_class_file_index, discover_class_file_index_targeted, discover_in_dir,
+    discover_in_dirs, discover_in_file, discover_with_index, group_by_class, GroupedMethod,
+    TestCase, TestClass,
 };
