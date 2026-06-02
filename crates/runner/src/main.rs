@@ -53,6 +53,71 @@ fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, o
         }
     }
 }
+
+/// True if a test (its `class` FQCN, its `file`, and its `fingerprint` — the set
+/// of FQCNs it references) is impacted by a change to any file in `changed_files`
+/// or any class in `changed_fqcns`: its own file changed, its class is a changed
+/// FQCN, or it references one. Pure; the heart of --dirty.
+fn is_impacted(
+    class: &str,
+    file: &std::path::Path,
+    fingerprint: &std::collections::HashSet<String>,
+    changed_files: &std::collections::HashSet<PathBuf>,
+    changed_fqcns: &std::collections::HashSet<String>,
+) -> bool {
+    changed_files.contains(file)
+        || changed_fqcns.contains(class)
+        || fingerprint.iter().any(|f| changed_fqcns.contains(f))
+}
+
+/// Files with uncommitted changes in `project`'s git repo (tracked diff vs HEAD
+/// + untracked, gitignored excluded), as absolute paths under the canonical repo
+/// root. Empty if not a git repo / git fails — the caller decides what that means.
+fn git_changed_files(project: &std::path::Path) -> std::collections::HashSet<PathBuf> {
+    use std::process::Command;
+    let root = Command::new("git").arg("-C").arg(project)
+        .args(["rev-parse", "--show-toplevel"]).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| project.to_path_buf());
+    let lines = |args: &[&str]| -> Vec<String> {
+        Command::new("git").arg("-C").arg(project).args(args).output().ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let mut rel = lines(&["diff", "--name-only", "HEAD"]);
+    rel.extend(lines(&["ls-files", "--others", "--exclude-standard"]));
+    rel.into_iter().map(|r| root.join(r)).collect()
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    fn fps(xs: &[&str]) -> HashSet<String> { xs.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn impacted_when_file_class_or_fingerprint_changed() {
+        let changed_files: HashSet<PathBuf> =
+            ["/p/src/Calc.php"].iter().map(PathBuf::from).collect();
+        let changed_fqcns: HashSet<String> = fps(&["App\\Calc"]);
+
+        // (c) fingerprint references a changed class → impacted
+        assert!(is_impacted("Tests\\CalcTest", Path::new("/p/tests/CalcTest.php"),
+            &fps(&["App\\Calc"]), &changed_files, &changed_fqcns));
+        // (a) the test's own file changed → impacted
+        assert!(is_impacted("Tests\\InSrc", Path::new("/p/src/Calc.php"),
+            &fps(&[]), &changed_files, &changed_fqcns));
+        // unrelated test → NOT impacted
+        assert!(!is_impacted("Tests\\OtherTest", Path::new("/p/tests/OtherTest.php"),
+            &fps(&["App\\Other"]), &changed_files, &changed_fqcns));
+    }
+}
+
 use phpunit_rust::fork_pool::PhpForkPool;
 use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
@@ -110,6 +175,13 @@ struct Cli {
     /// --list-tests format.
     #[arg(long)]
     list_tests: bool,
+    /// Run only tests impacted by uncommitted git changes: a changed source file
+    /// maps (via the class graph) to the test classes whose fingerprint references
+    /// it, plus changed test files themselves. Like Pest's --dirty but graph-based
+    /// (changed source → dependent tests), not just changed test files. Not a git
+    /// repo / no changes → nothing to run.
+    #[arg(long)]
+    dirty: bool,
     /// Rewrite `createMock()` patterns in test files into anonymous-class stubs
     /// before execution. Requires that mocked interfaces are resolvable via
     /// the project's PSR-4 autoload map in composer.json.
@@ -345,6 +417,31 @@ fn real_main() -> Result<ExitCode> {
         }),
         || discover_with_index(&test_roots, &excludes, &graph_supplement_dirs),
     )?;
+
+    // --dirty: keep only tests impacted by uncommitted git changes. Reverse the
+    // full class→file index to map each changed file to the FQCNs it defines,
+    // then retain a test whose own file changed, whose class is a changed FQCN,
+    // or whose fingerprint references one. Graph-based impact (changed *source* →
+    // dependent tests), unlike Pest's file-only --dirty. Runs before the index is
+    // narrowed so the reduced case set drives the rest of the pipeline.
+    if cli.dirty {
+        let changed_files = git_changed_files(&project);
+        if changed_files.is_empty() {
+            eprintln!("--dirty: no uncommitted changes (or not a git repo); nothing to run.");
+            cases.clear();
+        } else {
+            let mut changed_fqcns: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (fqcn, file) in &class_file_index_full {
+                if changed_files.contains(file) { changed_fqcns.insert(fqcn.clone()); }
+            }
+            let before = cases.len();
+            cases.retain(|c| is_impacted(&c.class, &c.file, &c.fingerprint,
+                &changed_files, &changed_fqcns));
+            eprintln!("--dirty: {} of {} test methods impacted by {} changed file(s).",
+                cases.len(), before, changed_files.len());
+        }
+    }
 
     // Build a FQCN→file index over all PHP files in test roots and supplement
     // dirs so the runner can locate classes the test code references but the
