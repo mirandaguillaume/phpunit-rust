@@ -91,8 +91,9 @@ fn is_impacted(
 }
 
 /// Files with uncommitted changes in `project`'s git repo (tracked diff vs HEAD
-/// + untracked, gitignored excluded), as absolute paths under the canonical repo
-/// root. Empty if not a git repo / git fails — the caller decides what that means.
+/// plus untracked, gitignored excluded), as absolute paths under the canonical
+/// repo root. Empty if not a git repo / git fails — the caller decides what that
+/// means.
 fn git_changed_files(project: &std::path::Path) -> std::collections::HashSet<PathBuf> {
     use std::process::Command;
     let root = Command::new("git")
@@ -749,7 +750,7 @@ fn real_main() -> Result<ExitCode> {
         "main",
         serde_json::json!({"workers": worker_count}),
         || -> Result<_> {
-            Ok(PhpForkPool::spawn(
+            PhpForkPool::spawn(
                 &fork_script,
                 &autoload,
                 bootstrap.as_deref(),
@@ -762,7 +763,7 @@ fn real_main() -> Result<ExitCode> {
                 &class_file_index,
                 &cli.worker_memory_limit,
                 cli.worker_max_batches,
-            )?)
+            )
         },
     )?;
 
@@ -795,7 +796,7 @@ fn real_main() -> Result<ExitCode> {
                 cases,
                 &cfg,
                 &row_counts,
-                |o| print_progress(o),
+                print_progress,
                 &profiler,
             )
         },

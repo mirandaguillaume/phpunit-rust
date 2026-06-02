@@ -447,7 +447,7 @@ fn collect_parsed_classes(
         };
         let parent_fqcn =
             base_name.map(|b| resolve_class_reference(b, class_ns.as_deref(), aliases));
-        let test_methods = collect_test_methods(body, bytes, class_ns.as_deref(), &aliases);
+        let test_methods = collect_test_methods(body, bytes, class_ns.as_deref(), aliases);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
         // Class-level groups apply to every test method in the class.
@@ -657,8 +657,8 @@ fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
 /// Sources of references:
 ///   - `new Foo()` / `new \Some\Foo()`            → object_creation_expression
 ///   - `Foo::class`, `Foo::CONST`, `Foo::method()` → class_constant_access_expression
-///                                                / scoped_call_expression
-///                                                / scoped_property_access_expression
+///     / scoped_call_expression
+///     / scoped_property_access_expression
 ///   - `instanceof Foo`                            → binary_expression with `instanceof`
 ///   - `createMock(Foo::class)` / `createStub(...)` / `getMockBuilder(...)`
 ///     are subsumed by `Foo::class` resolution above.
@@ -941,7 +941,7 @@ fn collect_test_methods(
             let is_tautological = is_tautological_method(child, bytes);
             let mut depends_on = prev_comment
                 .as_deref()
-                .map(|c| phpdoc_depends(c))
+                .map(phpdoc_depends)
                 .unwrap_or_default();
             depends_on.extend(method_depends_attr(child, bytes));
             let fingerprint = extract_method_fingerprint(child, bytes, namespace, aliases);
@@ -1789,6 +1789,7 @@ pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
 ///   terminal name check to that string and stop. Returning `false` when the
 ///   parent is unknown AND doesn't match terminal patterns is correct: we
 ///   simply don't have enough information to claim it's a TestCase.
+///
 /// Last-segment heuristic for "this class looks like a PHPUnit TestCase".
 ///
 /// Accepts: `TestCase` (bare), `PHPUnit\Framework\TestCase`, `My\Custom\TestCase`,

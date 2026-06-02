@@ -37,7 +37,7 @@ pub fn partition_by_depends(
     let n = methods.len();
     let mut parent: Vec<usize> = (0..n).collect();
 
-    fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
             parent[i] = parent[parent[i]]; // path compression
             i = parent[i];
@@ -45,7 +45,7 @@ pub fn partition_by_depends(
         i
     }
 
-    fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
+    fn union(parent: &mut [usize], a: usize, b: usize) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {

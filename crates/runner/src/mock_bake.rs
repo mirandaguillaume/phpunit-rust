@@ -100,11 +100,11 @@ pub fn psr4_resolve(class: &str, map: &HashMap<String, Vec<PathBuf>>) -> Option<
     // Longest-prefix wins: sort prefixes by length descending.
     let mut prefixes: Vec<(&str, &Vec<PathBuf>)> =
         map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    prefixes.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
 
     for (prefix, dirs) in prefixes {
-        if class.starts_with(prefix) {
-            let relative = class[prefix.len()..].replace('\\', "/") + ".php";
+        if let Some(stripped) = class.strip_prefix(prefix) {
+            let relative = stripped.replace('\\', "/") + ".php";
             for dir in dirs {
                 let candidate = dir.join(&relative);
                 if candidate.is_file() {
@@ -226,8 +226,8 @@ fn qualify_param_types(params: &str, ns: &str, use_map: &HashMap<String, String>
                 result.push(format!("{}{}", prefix, p_rest));
             } else {
                 // Strip variadic marker `...` before qualifying — it's not part of the type.
-                let (type_core, variadic) = if type_part.ends_with("...") {
-                    (type_part[..type_part.len() - 3].trim(), "...")
+                let (type_core, variadic) = if let Some(stripped) = type_part.strip_suffix("...") {
+                    (stripped.trim(), "...")
                 } else {
                     (type_part, "")
                 };

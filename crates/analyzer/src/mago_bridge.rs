@@ -21,6 +21,7 @@
 //!   - mago-database::file::File (not mago-source::Source)
 //!   - mago-span 1.27 where Span has a FileId field (from mago-database) — incompatible with mago-span 0.26
 //!   - mago-syntax 1.27 AST (not mago-syntax 0.26 AST)
+//!
 //! These crates cannot interoperate with mago-project 0.26 — different AST, source, and span types.
 //! Resolution: use only mago-project 0.26 for parsing and reflection.
 
@@ -126,7 +127,7 @@ impl MagoProject {
             .reflection
             .class_like_reflections
             .keys()
-            .map(|name| (name.get_key(&interner).to_lowercase(), name.clone()))
+            .map(|name| (name.get_key(&interner).to_lowercase(), *name))
             .collect();
         Ok(Self {
             inner: project,

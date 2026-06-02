@@ -78,7 +78,7 @@ pub fn find_test_methods(project: &MagoProject, test_classes: &[String]) -> Vec<
                 // Fall back to raw source scan for `@test` PHPDoc annotations.
                 // (mago-reflection 0.26 does not expose doc comments.)
                 let src_id = method_refl.span.start.source;
-                project.source_by_id(src_id).map_or(false, |src| {
+                project.source_by_id(src_id).is_some_and(|src| {
                     let text = interner.lookup(&src.content);
                     has_doc_test_annotation(text, method_refl.span.start.offset)
                 })
@@ -121,7 +121,7 @@ fn has_attribute(
 ) -> bool {
     method_refl.attribute_reflections.iter().any(|attr| {
         let name = interner.lookup(&attr.name.value);
-        names_match(name.as_ref(), attr_fqcn)
+        names_match(name, attr_fqcn)
     })
 }
 
@@ -133,7 +133,7 @@ fn extract_data_provider(
 ) -> Option<String> {
     for attr in &method_refl.attribute_reflections {
         let attr_name = interner.lookup(&attr.name.value);
-        if !names_match(attr_name.as_ref(), ATTR_DATA_PROVIDER) {
+        if !names_match(attr_name, ATTR_DATA_PROVIDER) {
             continue;
         }
         // Found the DataProvider attribute — look for the first positional string arg.

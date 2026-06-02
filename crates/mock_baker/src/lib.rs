@@ -591,11 +591,7 @@ fn primitive_default_body(ret: &str) -> String {
     // Strip nullable prefix for the base type check (after the above checks).
     let base = t.trim_start_matches('?').trim();
     // For union types, use the first component's default.
-    let first = base
-        .split(|c: char| c == '|' || c == '&')
-        .next()
-        .unwrap_or(base)
-        .trim();
+    let first = base.split(['|', '&']).next().unwrap_or(base).trim();
     match first {
         "bool" | "true" | "false" => " return false;".to_string(),
         "int" => " return 0;".to_string(),
@@ -616,11 +612,7 @@ fn object_return_fqn(ret: &str) -> Option<String> {
     let t = ret.trim().trim_start_matches(':').trim();
     let t = t.strip_prefix('?').unwrap_or(t).trim();
     // Take the first part of a union/intersection (e.g. `\Foo|\Bar` → `\Foo`).
-    let t = t
-        .split(|c: char| c == '|' || c == '&')
-        .next()
-        .unwrap_or(t)
-        .trim();
+    let t = t.split(['|', '&']).next().unwrap_or(t).trim();
     if t.starts_with('\\') {
         Some(t.to_string())
     } else {

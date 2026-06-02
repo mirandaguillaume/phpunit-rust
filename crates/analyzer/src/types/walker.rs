@@ -1023,39 +1023,37 @@ fn find_method_block_in_stmts<'a>(
 
     for stmt in stmts {
         match stmt {
-            Statement::Class(c) => {
+            Statement::Class(c)
                 if interner
                     .lookup(&c.name.value)
-                    .eq_ignore_ascii_case(class_simple)
-                {
-                    for member in c.members.iter() {
-                        if let ClassLikeMember::Method(m) = member {
-                            if interner.lookup(&m.name.value).to_lowercase() == method_lc {
-                                if let MethodBody::Concrete(block) = &m.body {
-                                    return Some(block);
-                                }
+                    .eq_ignore_ascii_case(class_simple) =>
+            {
+                for member in c.members.iter() {
+                    if let ClassLikeMember::Method(m) = member {
+                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                            if let MethodBody::Concrete(block) = &m.body {
+                                return Some(block);
                             }
                         }
                     }
-                    return None;
                 }
+                return None;
             }
-            Statement::Trait(t) => {
+            Statement::Trait(t)
                 if interner
                     .lookup(&t.name.value)
-                    .eq_ignore_ascii_case(class_simple)
-                {
-                    for member in t.members.iter() {
-                        if let ClassLikeMember::Method(m) = member {
-                            if interner.lookup(&m.name.value).to_lowercase() == method_lc {
-                                if let MethodBody::Concrete(block) = &m.body {
-                                    return Some(block);
-                                }
+                    .eq_ignore_ascii_case(class_simple) =>
+            {
+                for member in t.members.iter() {
+                    if let ClassLikeMember::Method(m) = member {
+                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                            if let MethodBody::Concrete(block) = &m.body {
+                                return Some(block);
                             }
                         }
                     }
-                    return None;
                 }
+                return None;
             }
             Statement::Namespace(ns) => {
                 let found = match &ns.body {
@@ -1160,6 +1158,9 @@ fn narrow_resolve_fqcn(
 ///   - `Union { kinds }` where exactly one non-null kind exists → `Type::Nullable(inner)`
 ///   - `Union { kinds }` of two non-null → `Type::Union(a, b)` (first two)
 ///   - Everything else (Void, Never, Mixed, Scalar, Array, etc.) → `Type::Mixed`
+// justification: `env` is threaded for API consistency and future use across the
+// recursive type-resolution arms; keep it even though it is currently only forwarded.
+#[allow(clippy::only_used_in_recursion)]
 fn type_kind_to_type(
     project: &crate::mago_bridge::MagoProject,
     interner: &ThreadedInterner,
@@ -1621,7 +1622,7 @@ pub(crate) mod tests {
         let php = nested_new(20);
         let events = count_events_with_max_depth(&php, 8);
         assert!(
-            events >= 1 && events <= 8,
+            (1..=8).contains(&events),
             "expected the depth guard to truncate walking at max_depth=8 \
              (1..=8 events), but got {events} events for 20 nested instantiations"
         );
@@ -1843,11 +1844,8 @@ class B {
         let names2 = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
         let mut ctx2 = WalkerCtx::new(env2, &interner, &project, names2);
         for stmt in block.statements.iter() {
-            match stmt {
-                Statement::Expression(e) => {
-                    walk_expression(&mut ctx2, &e.expression);
-                }
-                _ => {}
+            if let Statement::Expression(e) = stmt {
+                walk_expression(&mut ctx2, &e.expression);
             }
         }
 
@@ -1949,11 +1947,8 @@ class Client {
         let mut ctx = WalkerCtx::new(env, &interner, &project, names);
 
         for stmt in block.statements.iter() {
-            match stmt {
-                Statement::Expression(e) => {
-                    walk_expression(&mut ctx, &e.expression);
-                }
-                _ => {}
+            if let Statement::Expression(e) = stmt {
+                walk_expression(&mut ctx, &e.expression);
             }
         }
 
@@ -2023,11 +2018,8 @@ class Client {
         let mut ctx = WalkerCtx::new(env, interner, project, names);
 
         for stmt in block.statements.iter() {
-            match stmt {
-                Statement::Expression(e) => {
-                    walk_expression(&mut ctx, &e.expression);
-                }
-                _ => {}
+            if let Statement::Expression(e) = stmt {
+                walk_expression(&mut ctx, &e.expression);
             }
         }
 

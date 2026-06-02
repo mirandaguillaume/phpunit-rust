@@ -90,15 +90,13 @@ pub fn parse_bootstrap(xml: &str) -> Option<String> {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() == b"phpunit" {
-                    for attr in e.attributes().flatten() {
-                        if attr.key.local_name().as_ref() == b"bootstrap" {
-                            return std::str::from_utf8(&attr.value).ok().map(String::from);
-                        }
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.local_name().as_ref() == b"phpunit" => {
+                for attr in e.attributes().flatten() {
+                    if attr.key.local_name().as_ref() == b"bootstrap" {
+                        return std::str::from_utf8(&attr.value).ok().map(String::from);
                     }
-                    return None;
                 }
+                return None;
             }
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
@@ -286,21 +284,21 @@ pub fn parse_php_constants(xml: &str) -> Vec<PhpConstant> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"php" => in_php = true,
             Ok(Event::End(e)) if e.local_name().as_ref() == b"php" => in_php = false,
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_php => {
-                if e.local_name().as_ref() == b"const" {
-                    let mut name = None;
-                    let mut value = None;
-                    for attr in e.attributes().flatten() {
-                        let key = attr.key.local_name();
-                        if key.as_ref() == b"name" {
-                            name = std::str::from_utf8(&attr.value).ok().map(String::from);
-                        } else if key.as_ref() == b"value" {
-                            value = std::str::from_utf8(&attr.value).ok().map(String::from);
-                        }
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_php && e.local_name().as_ref() == b"const" =>
+            {
+                let mut name = None;
+                let mut value = None;
+                for attr in e.attributes().flatten() {
+                    let key = attr.key.local_name();
+                    if key.as_ref() == b"name" {
+                        name = std::str::from_utf8(&attr.value).ok().map(String::from);
+                    } else if key.as_ref() == b"value" {
+                        value = std::str::from_utf8(&attr.value).ok().map(String::from);
                     }
-                    if let (Some(n), Some(v)) = (name, value) {
-                        out.push(PhpConstant { name: n, value: v });
-                    }
+                }
+                if let (Some(n), Some(v)) = (name, value) {
+                    out.push(PhpConstant { name: n, value: v });
                 }
             }
             Ok(Event::Eof) | Err(_) => break,

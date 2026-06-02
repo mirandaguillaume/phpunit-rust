@@ -135,8 +135,8 @@ mod cache_tests {
         );
         let cache = CacheStore::open(dir.path(), MagoProject::version()).unwrap();
 
-        let first = discover(&project, &cache, &[file.clone()]).unwrap();
-        let second = discover(&project, &cache, &[file.clone()]).unwrap();
+        let first = discover(&project, &cache, std::slice::from_ref(&file)).unwrap();
+        let second = discover(&project, &cache, std::slice::from_ref(&file)).unwrap();
 
         assert_eq!(first.len(), 1, "expected 1 test method");
         assert_eq!(first, second, "cached result must match fresh result");
@@ -148,7 +148,7 @@ mod cache_tests {
             "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass MyTest extends TestCase {\n  public function testFoo(): void {}\n}",
         );
         let cache = CacheStore::open(dir.path(), MagoProject::version()).unwrap();
-        let _first = discover(&project, &cache, &[file.clone()]).unwrap();
+        let _first = discover(&project, &cache, std::slice::from_ref(&file)).unwrap();
 
         // Rewrite the file with an additional test method.
         fs::write(&file,

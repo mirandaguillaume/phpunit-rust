@@ -55,7 +55,7 @@ fn namespaced_service_method_is_covered() {
     let attributed = service_lines.values().any(|tests| {
         tests.as_array().unwrap().iter().any(|v| {
             v.as_str()
-                .map_or(false, |s| s.contains("App\\Tests\\ServiceTest::testGo"))
+                .is_some_and(|s| s.contains("App\\Tests\\ServiceTest::testGo"))
         })
     });
     assert!(

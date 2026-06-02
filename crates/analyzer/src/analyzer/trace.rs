@@ -51,6 +51,9 @@ pub fn trace_test(
     coverage
 }
 
+// justification: recursive call-graph walker; each argument is distinct state threaded
+// through the recursion, and a context struct would only relocate the arity.
+#[allow(clippy::too_many_arguments)]
 fn trace_method(
     project: &MagoProject,
     boundary: &BoundaryResolver,

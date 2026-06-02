@@ -300,8 +300,8 @@ pub fn run_with_profiler(
         let window = queue.len().min(AFFINITY_SCAN_WINDOW);
         let mut best_idx = 0usize;
         let mut best_score = 0usize;
-        for i in 0..window {
-            let score = queue[i].fingerprint.intersection(slot_fp).count();
+        for (i, plan) in queue.iter().enumerate().take(window) {
+            let score = plan.fingerprint.intersection(slot_fp).count();
             if score > best_score {
                 best_score = score;
                 best_idx = i;
@@ -527,8 +527,8 @@ pub fn run_with_profiler(
         // (the stuck worker plus any peers mid-batch) and the queued batches
         // never dispatched. Without this they would silently vanish from the
         // report, breaking test-count parity.
-        for slot in 0..n {
-            if let Some(lost) = slot_in_flight[slot].take() {
+        for in_flight in slot_in_flight.iter_mut().take(n) {
+            if let Some(lost) = in_flight.take() {
                 synth_error_outcomes(&lost, &cause, &on_progress, &mut outcomes);
             }
         }
@@ -578,24 +578,24 @@ const ROW_SPLIT_THRESHOLD: u32 = 15;
 /// a 1000-row provider into 1000 single-row plans (each pays setUpBeforeClass).
 const MAX_ROW_CHUNKS: u32 = 4;
 
-/// Build the work queue.
-///
-/// Targets a uniform number of test methods per `BatchPlan` so every worker
-/// gets roughly the same amount of work regardless of how tests are distributed
-/// across classes.
-///
-/// Algorithm (bin-packing LPT):
-///   target = total_methods / (n_workers × OVERSATURATION)
-///   Sort classes descending by method count (LPT order).
-///   Accumulate classes into the current batch until it reaches `target`;
-///   then flush as a BatchPlan and start a new one.
-///   Classes with row-split data providers are extracted first and each
-///   chunk is still dispatched as a solo plan (fine-grained parallelism).
-///   Classes whose non-split method count exceeds `target` are dispatched
-///   solo regardless (they are already "full" batches on their own).
-///
-/// OVERSATURATION ensures more batches than workers so work-stealing has
-/// granularity to keep all workers busy even with variance in test duration.
+// Build the work queue.
+//
+// Targets a uniform number of test methods per `BatchPlan` so every worker
+// gets roughly the same amount of work regardless of how tests are distributed
+// across classes.
+//
+// Algorithm (bin-packing LPT):
+//   target = total_methods / (n_workers × OVERSATURATION)
+//   Sort classes descending by method count (LPT order).
+//   Accumulate classes into the current batch until it reaches `target`;
+//   then flush as a BatchPlan and start a new one.
+//   Classes with row-split data providers are extracted first and each
+//   chunk is still dispatched as a solo plan (fine-grained parallelism).
+//   Classes whose non-split method count exceeds `target` are dispatched
+//   solo regardless (they are already "full" batches on their own).
+//
+// OVERSATURATION ensures more batches than workers so work-stealing has
+// granularity to keep all workers busy even with variance in test duration.
 
 /// Group a slice of methods into dependency chains using union-find.
 ///
@@ -700,7 +700,7 @@ fn build_queue(
             (cost, g)
         })
         .collect();
-    by_cost.sort_by(|a, b| b.0.cmp(&a.0));
+    by_cost.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     let mut queue: VecDeque<BatchPlan> = VecDeque::with_capacity(by_cost.len());
     let mut synthetic: Vec<TestOutcome> = Vec::new();
@@ -794,7 +794,7 @@ fn build_queue(
                         chunk_index,
                         total_chunks: chunks,
                     }),
-                    required_files: required_files_for(&[hm.name.clone()], &g.methods),
+                    required_files: required_files_for(std::slice::from_ref(&hm.name), &g.methods),
                     is_isolated: g.is_isolated,
                 };
                 queue.push_back(mk_plan(vec![bc], must_force_exit));
@@ -1151,8 +1151,8 @@ mod tests {
             q[0].classes[0].class, "Heavy",
             "heavy class scheduled first (LPT)"
         );
-        for i in 1..6 {
-            assert_eq!(q[i].classes.len(), 1, "each light class is its own plan");
+        for plan in q.iter().take(6).skip(1) {
+            assert_eq!(plan.classes.len(), 1, "each light class is its own plan");
         }
     }
 

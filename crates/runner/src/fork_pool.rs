@@ -28,6 +28,9 @@ impl PhpForkPool {
     /// Pipe pairs are wrapped in `File` immediately after creation so that
     /// any early return from this function automatically closes all allocated
     /// FDs. CLOEXEC errors are propagated rather than silently ignored.
+    // justification: these are the irreducible inputs to fork-master setup; bundling
+    // them into a struct would just move the arity without improving call sites.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         script: &Path,
         autoload: &Path,
@@ -173,8 +176,7 @@ impl PhpForkPool {
         }
         // Write class map to a temp file to avoid ARG_MAX limits.
         // The file is deleted when the pool is dropped (or when the process exits).
-        let _class_map_tmp: Option<tempfile::NamedTempFile>;
-        if !class_map.is_empty() {
+        let _class_map_tmp: Option<tempfile::NamedTempFile> = if !class_map.is_empty() {
             let map_str: std::collections::HashMap<&str, &str> = class_map
                 .iter()
                 .filter_map(|(k, v)| v.to_str().map(|s| (k.as_str(), s)))
@@ -185,10 +187,10 @@ impl PhpForkPool {
             tmp.write_all(json.as_bytes())
                 .context("writing class-map temp file")?;
             cmd.arg("--class-map-file").arg(tmp.path());
-            _class_map_tmp = Some(tmp);
+            Some(tmp)
         } else {
-            _class_map_tmp = None;
-        }
+            None
+        };
         cmd.arg("--worker-memory-limit").arg(worker_memory_limit);
         cmd.arg("--max-batches-per-child")
             .arg(max_batches_per_child.to_string());
@@ -252,7 +254,7 @@ impl PhpForkPool {
         self.close_write_ends();
         std::mem::take(&mut self.read_ends)
             .into_iter()
-            .filter_map(|opt| opt)
+            .flatten()
             .map(BufReader::new)
             .collect()
     }
@@ -260,6 +262,11 @@ impl PhpForkPool {
     /// Returns the number of worker slots in this pool.
     pub fn len(&self) -> usize {
         self.write_ends.len()
+    }
+
+    /// Returns `true` if the pool has no worker slots.
+    pub fn is_empty(&self) -> bool {
+        self.write_ends.is_empty()
     }
 
     /// Wait for the PHP master process to exit cleanly.

@@ -93,35 +93,31 @@ fn navigate<'s>(
 
     for stmt in stmts {
         match stmt {
-            Statement::Class(c) => {
-                if interner.lookup(&c.name.value).eq_ignore_ascii_case(simple) {
-                    for member in c.members.iter() {
-                        if let ClassLikeMember::Method(m) = member {
-                            if interner.lookup(&m.name.value).to_lowercase() == method_lc {
-                                if let MethodBody::Concrete(block) = &m.body {
-                                    return Some(count_block(block, interner));
-                                }
-                                return Some(0);
+            Statement::Class(c) if interner.lookup(&c.name.value).eq_ignore_ascii_case(simple) => {
+                for member in c.members.iter() {
+                    if let ClassLikeMember::Method(m) = member {
+                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                            if let MethodBody::Concrete(block) = &m.body {
+                                return Some(count_block(block, interner));
                             }
+                            return Some(0);
                         }
                     }
-                    return None;
                 }
+                return None;
             }
-            Statement::Trait(t) => {
-                if interner.lookup(&t.name.value).eq_ignore_ascii_case(simple) {
-                    for member in t.members.iter() {
-                        if let ClassLikeMember::Method(m) = member {
-                            if interner.lookup(&m.name.value).to_lowercase() == method_lc {
-                                if let MethodBody::Concrete(block) = &m.body {
-                                    return Some(count_block(block, interner));
-                                }
-                                return Some(0);
+            Statement::Trait(t) if interner.lookup(&t.name.value).eq_ignore_ascii_case(simple) => {
+                for member in t.members.iter() {
+                    if let ClassLikeMember::Method(m) = member {
+                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                            if let MethodBody::Concrete(block) = &m.body {
+                                return Some(count_block(block, interner));
                             }
+                            return Some(0);
                         }
                     }
-                    return None;
                 }
+                return None;
             }
             Statement::Namespace(ns) => {
                 use mago_syntax::ast::namespace::NamespaceBody;

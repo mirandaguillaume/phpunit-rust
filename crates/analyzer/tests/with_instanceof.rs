@@ -47,7 +47,7 @@ fn instanceof_narrowing_covers_dog_bark() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v.as_str().map_or(false, |s| s.contains("testNarrowsToDog")))
+            .any(|v| v.as_str().is_some_and(|s| s.contains("testNarrowsToDog")))
     });
     assert!(has_bark_attribution,
         "Dog.php should have at least one line attributed to testNarrowsToDog (the bark() call traces into Dog::bark via narrowed receiver)");

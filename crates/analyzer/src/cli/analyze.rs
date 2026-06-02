@@ -50,9 +50,9 @@ struct TraceCacheEntry {
 impl TraceCacheEntry {
     fn still_valid(&self, current: &HashMap<PathBuf, FileMeta>) -> bool {
         self.dep_snapshots.iter().all(|(p, s)| {
-            current.get(p).map_or(false, |m| {
-                m.size == s.size && m.mtime_nanos == s.mtime_nanos
-            })
+            current
+                .get(p)
+                .is_some_and(|m| m.size == s.size && m.mtime_nanos == s.mtime_nanos)
         })
     }
 }
@@ -420,7 +420,7 @@ fn collect_php_file_metas_rec(dir: &Path, out: &mut HashMap<PathBuf, FileMeta>) 
             let path = entry.path();
             if path.is_dir() {
                 collect_php_file_metas_rec(&path, out);
-            } else if path.extension().map_or(false, |e| e == "php") {
+            } else if path.extension().is_some_and(|e| e == "php") {
                 if let Ok(meta) = std::fs::metadata(&path) {
                     let mtime_nanos = meta
                         .modified()
@@ -468,7 +468,7 @@ fn collect_php_files(dir: &Path, out: &mut Vec<PathBuf>) {
             let path = entry.path();
             if path.is_dir() {
                 collect_php_files(&path, out);
-            } else if path.extension().map_or(false, |e| e == "php") {
+            } else if path.extension().is_some_and(|e| e == "php") {
                 out.push(path);
             }
         }
