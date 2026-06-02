@@ -200,6 +200,7 @@ fn worker_timeout_aborts_stuck_run() {
             &[],
             &[],
             &[],
+            &[],
             1,
             &std::collections::HashMap::new(),
             "512M",
