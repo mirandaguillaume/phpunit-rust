@@ -39,13 +39,7 @@ jobs:
         with:
           php-version: "8.1"
 
-      # NON-BLOCKING for now: the committed tree is not yet rustfmt-clean
-      # (pre-existing formatting drift across crates/**, e.g. unsorted `use`
-      # imports). We surface it for visibility but do not red the build on it.
-      # TODO: once the workspace-wide lint/format cleanup task lands (run
-      # `cargo fmt --all`), drop `continue-on-error` to enforce a formatted tree.
-      - name: cargo fmt --all --check (non-blocking)
-        continue-on-error: true
+      - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
       - name: cargo build --workspace
@@ -58,16 +52,10 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      # Clippy is NON-BLOCKING for now: the workspace currently has pre-existing
-      # clippy findings (including a few deny-by-default lints such as
-      # clippy::approx_constant that surface as hard errors regardless of
-      # `-D warnings`). We run clippy for visibility but do not fail the build
-      # on it yet.
-      # TODO: once the workspace-wide lint cleanup task lands, drop
-      # `continue-on-error` and append `-- -D warnings` to enforce a clean tree.
-      - name: cargo clippy --workspace --all-targets (non-blocking)
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets
+      # Blocking: the workspace is fmt- and clippy-clean, so any new warning
+      # (or unformatted code) fails CI.
+      - name: cargo clippy --workspace --all-targets -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   parity:
     name: parity regression (vanilla phpunit vs phpunit-rust)
