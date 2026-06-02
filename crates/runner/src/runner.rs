@@ -59,6 +59,47 @@ pub struct RunConfig {
     pub class_file_index: HashMap<String, PathBuf>,
     /// Number of PHP workers — used to compute adaptive batch sizes.
     pub n_workers:        usize,
+    /// Inactivity watchdog: max time to wait for *any* worker to produce a
+    /// message before declaring the run stuck (a worker hung in an infinite
+    /// loop, a blocked syscall, or a nested sub-process that never returns —
+    /// no `SIGCHLD` fires because the child is still alive). On timeout the
+    /// in-flight + queued tests are reported as errors and the pool is torn
+    /// down, converting an unbounded hang into a bounded, recoverable
+    /// failure. `None` disables the watchdog (wait forever).
+    pub worker_timeout:   Option<std::time::Duration>,
+}
+
+/// Synthesize one `Error` outcome per test method in `plan` (or one
+/// class-level error when the method list is unknown), reporting each via
+/// `on_progress`. Shared by the crash-recovery and inactivity-watchdog paths
+/// so a batch that can never complete still appears in the report — keeping
+/// test-count parity instead of silently dropping tests.
+fn synth_error_outcomes(
+    plan: &BatchPlan,
+    cause: &str,
+    on_progress: &impl Fn(&TestOutcome),
+    outcomes: &mut Vec<TestOutcome>,
+) {
+    for bc in &plan.classes {
+        let methods: Vec<String> = if bc.methods.is_empty() {
+            vec!["<class>".to_string()]
+        } else {
+            bc.methods.clone()
+        };
+        for m in methods {
+            let o = TestOutcome {
+                class:       bc.class.clone(),
+                method:      m,
+                dataset:     None,
+                status:      TestStatus::Error,
+                message:     Some(cause.to_string()),
+                trace:       None,
+                duration_ms: 0.0,
+            };
+            on_progress(&o);
+            outcomes.push(o);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -196,7 +237,6 @@ pub fn run_with_profiler(
     drop(tx); // only reader threads hold senders now
 
     // Seed each slot with one chunk, then close any slots we can't feed.
-    let mut slot_busy = vec![false; n];
     let mut slot_open = vec![true; n];
     // Per-slot bookkeeping of the batch we've handed to a worker but not yet
     // seen `batch_done` for. If the master reports `slot_died` (the child
@@ -247,7 +287,6 @@ pub fn run_with_profiler(
                 pool.write_batch(slot, &plan)?;
                 slot_batch_start[slot] = Some(std::time::Instant::now());
                 slot_in_flight[slot] = Some(plan);
-                slot_busy[slot] = true;
             }
             None => {
                 pool.close_slot(slot);
@@ -267,10 +306,31 @@ pub fn run_with_profiler(
     let mut total = 0.0f64;
     let mut live_readers = n;
     let mut stopping = false;
+    let mut watchdog_fired = false;
     while live_readers > 0 {
-        let ev = match rx.recv() {
-            Ok(e) => e,
-            Err(_) => break,
+        let ev = match cfg.worker_timeout {
+            Some(timeout) => match rx.recv_timeout(timeout) {
+                Ok(e) => e,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No worker produced a message for `timeout`. If work is
+                    // still in flight, a worker is stuck (infinite loop,
+                    // blocked syscall, or a hung sub-process it spawned): it
+                    // will never emit an outcome, batch_done, or EOF, and no
+                    // SIGCHLD fires because it is still alive. Abort with
+                    // errors so the run is bounded instead of hanging forever.
+                    if slot_in_flight.iter().any(Option::is_some) {
+                        watchdog_fired = true;
+                        break;
+                    }
+                    // Nothing in flight — just awaiting reader EOF; keep waiting.
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(e) => e,
+                Err(_) => break,
+            },
         };
         match ev {
             WorkerEvent::Message(_slot, WorkerMessage::Outcome(o)) => {
@@ -302,14 +362,12 @@ pub fn run_with_profiler(
                         Some(serde_json::json!({ "classes": classes })),
                     );
                 }
-                slot_busy[slot] = false;
                 slot_in_flight[slot] = None;
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
                     slot_batch_start[slot] = Some(std::time::Instant::now());
                     slot_in_flight[slot] = Some(plan);
-                    slot_busy[slot] = true;
                 } else if slot_open[slot] {
                     pool.close_slot(slot);
                     slot_open[slot] = false;
@@ -378,13 +436,11 @@ pub fn run_with_profiler(
                 // Mark the slot ready to receive the next batch — the master
                 // has already forked a replacement child for us, waiting on
                 // its stdin pipe for fresh work.
-                slot_busy[slot] = false;
                 if let Some(plan) = pick_best_for_slot(&mut queue, &slot_loaded[slot]) {
                     slot_loaded[slot].extend(plan.fingerprint.iter().cloned());
                     pool.write_batch(slot, &plan)?;
                     slot_batch_start[slot] = Some(std::time::Instant::now());
                     slot_in_flight[slot] = Some(plan);
-                    slot_busy[slot] = true;
                 } else if slot_open[slot] {
                     pool.close_slot(slot);
                     slot_open[slot] = false;
@@ -419,6 +475,29 @@ pub fn run_with_profiler(
                 }
             }
         }
+    }
+
+    if watchdog_fired {
+        let secs = cfg.worker_timeout.map(|d| d.as_secs()).unwrap_or(0);
+        let cause = format!(
+            "worker stuck: no output for {secs}s — aborted by the inactivity \
+             watchdog (raise or disable with --worker-timeout)"
+        );
+        // Report every test that can never complete: the in-flight batches
+        // (the stuck worker plus any peers mid-batch) and the queued batches
+        // never dispatched. Without this they would silently vanish from the
+        // report, breaking test-count parity.
+        for slot in 0..n {
+            if let Some(lost) = slot_in_flight[slot].take() {
+                synth_error_outcomes(&lost, &cause, &on_progress, &mut outcomes);
+            }
+        }
+        while let Some(plan) = queue.pop_front() {
+            synth_error_outcomes(&plan, &cause, &on_progress, &mut outcomes);
+        }
+        // Kill the workers so their pipe write-ends close and the reader
+        // threads below observe EOF and exit — a stuck child never would.
+        pool.terminate();
     }
 
     for h in reader_handles { let _ = h.join(); }
@@ -897,6 +976,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };
@@ -960,6 +1040,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };
@@ -1007,6 +1088,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };
@@ -1042,6 +1124,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };
@@ -1088,6 +1171,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };
@@ -1141,6 +1225,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };
@@ -1230,6 +1315,7 @@ mod tests {
             filter:           None,
             defines:          vec![],
             stop_on:          StopOn::default(),
+            worker_timeout:   None,
             class_file_index: HashMap::new(),
             n_workers:        4,
         };

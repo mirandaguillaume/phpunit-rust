@@ -248,6 +248,39 @@ impl PhpForkPool {
     pub fn wait(&mut self) {
         let _ = self.master.wait();
     }
+
+    /// Forcibly tear the pool down *now*: close all write ends and SIGTERM the
+    /// master so its handler kills every forked child's process group. Used by
+    /// the runner's inactivity watchdog to unblock the per-slot reader threads
+    /// — a stuck child never emits output, but once it is killed its pipe
+    /// write-end closes and the reader sees EOF. Best-effort; `Drop` still runs
+    /// the SIGTERM→SIGKILL escalation as a backstop. Safe to call before
+    /// `wait()`.
+    pub fn terminate(&mut self) {
+        self.close_write_ends();
+        let pid = self.master.id() as i32;
+        // Try graceful first: in fork-server mode (`--worker-max-batches > 0`)
+        // the master loops on `usleep`, so `pcntl_async_signals` can run its
+        // SIGTERM handler and reap its children. Give it a brief window.
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            match self.master.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                _ => break,
+            }
+        }
+        // Backstop for the *stuck-worker* case: in long-lived mode the master
+        // blocks in a non-dispatching `pcntl_waitpid` and never runs its
+        // SIGTERM handler, and even a SIGKILL of the master would leave a stuck
+        // child orphaned and alive — keeping its stdout pipe open so the
+        // runner's reader threads never see EOF. Kill the whole descendant
+        // tree directly so every child's pipe closes.
+        kill_process_tree(pid);
+        let _ = self.master.kill();
+        let _ = self.master.wait();
+    }
 }
 
 impl Drop for PhpForkPool {
@@ -284,3 +317,53 @@ fn raw_pipe() -> Result<[RawFd; 2]> {
     }
     Ok(fds)
 }
+
+/// SIGKILL every transitive descendant of `root` (children, grandchildren, …)
+/// and their process groups by walking `/proc`. Used to guarantee teardown of
+/// a stuck worker that the PHP master won't reap on its own (it may be parked
+/// in a non-dispatching `pcntl_waitpid`, so `pcntl_async_signals` never runs
+/// its SIGTERM handler). Linux-only; a no-op elsewhere (the caller still
+/// SIGKILLs the master directly).
+#[cfg(target_os = "linux")]
+fn kill_process_tree(root: i32) {
+    fn ppid_of(stat: &str) -> Option<i32> {
+        // /proc/<pid>/stat is "<pid> (comm) <state> <ppid> …". `comm` may
+        // contain spaces and parens, so scan past the last ')'.
+        let rparen = stat.rfind(')')?;
+        stat[rparen + 1..].split_whitespace().nth(1)?.parse().ok()
+    }
+    let procs: Vec<(i32, i32)> = match std::fs::read_dir("/proc") {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()))
+            .filter_map(|pid| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                ppid_of(&stat).map(|pp| (pid, pp))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    // BFS from `root` to collect every descendant.
+    let mut descendants: Vec<i32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for &(pid, ppid) in &procs {
+            if ppid == parent && pid != root && !descendants.contains(&pid) {
+                descendants.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    for pid in descendants {
+        // Negative pid targets the child's process group (catches grandchildren
+        // a test spawned via proc_open); the bare pid covers any that did not
+        // setpgid. Both are best-effort.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_process_tree(_root: i32) {}

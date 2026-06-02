@@ -169,6 +169,14 @@ struct Cli {
     /// risky outcomes. Convenience for "stop on anything not-pass".
     #[arg(long)]
     stop_on_defect: bool,
+    /// Inactivity watchdog: abort the run if no worker emits any output for
+    /// this many seconds while tests are still in flight — catches a worker
+    /// stuck in an infinite loop, a blocked syscall, or a hung sub-process
+    /// (no SIGCHLD fires because the child is still alive). The stuck and
+    /// not-yet-dispatched tests are reported as errors so the run finishes
+    /// instead of hanging forever. Set to 0 to disable. Default: 600.
+    #[arg(long, default_value_t = 600)]
+    worker_timeout: u64,
     /// Print the full list of (class, method) tests that would be run
     /// for the current config (after group filtering and testsuite
     /// selection), then exit without running anything. Matches vanilla's
@@ -629,6 +637,8 @@ fn real_main() -> Result<ExitCode> {
         stop_on,
         class_file_index,
         n_workers: worker_count,
+        worker_timeout: (cli.worker_timeout > 0)
+            .then(|| std::time::Duration::from_secs(cli.worker_timeout)),
     };
     let n_cases = cases.len();
     let mut report = profiler.span_with(

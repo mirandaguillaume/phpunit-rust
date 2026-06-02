@@ -111,3 +111,91 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     assert!(classes.contains("SampleTest"),
         "SampleTest outcomes missing; got: {classes:?}");
 }
+
+/// C2: a worker that hangs (alive but never emits output) must NOT hang the
+/// whole run. With `worker_timeout` set, the inactivity watchdog kills the
+/// pool and reports the stuck test as an error within a bounded time.
+///
+/// The test guards itself with a 25 s wall-clock deadline: without the
+/// watchdog the run would block on `sleep(3600)` and this test would fail at
+/// the deadline rather than hanging the suite forever.
+#[test]
+fn worker_timeout_aborts_stuck_run() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
+    let autoload = project.join("vendor/autoload.php");
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+
+    // A test that blocks far longer than both the watchdog and the deadline.
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_hang_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let test_file = dir.join("HangTest.php");
+    std::fs::write(
+        &test_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass HangTest extends TestCase {\n    public function testHang(): void { sleep(3600); }\n}\n",
+    ).unwrap();
+
+    let case = TestCase {
+        file: test_file.clone(),
+        class: "HangTest".to_string(),
+        method: "testHang".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+    };
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        let mut pool = PhpForkPool::spawn(
+            &script, &autoload_t, None, &[], &[], &[], &[], 1,
+            &std::collections::HashMap::new(), "512M", 0,
+        ).expect("PhpForkPool::spawn failed");
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: Some(Duration::from_secs(2)),
+        };
+        run(&mut pool, vec![case], &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    // Deadline guard: a broken watchdog fails the test instead of hanging.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "run did not return within 25s — the inactivity watchdog failed to fire"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let report = handle.join().expect("run thread panicked").expect("run returned Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stuck = report
+        .outcomes
+        .iter()
+        .find(|o| o.class == "HangTest" && o.status == TestStatus::Error)
+        .unwrap_or_else(|| panic!("stuck HangTest must be reported as an Error; got: {:?}", report.outcomes));
+    assert!(
+        stuck.message.as_deref().unwrap_or("").contains("watchdog"),
+        "the synthesised error should mention the watchdog; got: {:?}",
+        stuck.message
+    );
+}
