@@ -81,12 +81,36 @@ fn text<'a>(n: Node<'a>, src: &'a [u8]) -> &'a str {
     n.utf8_text(src).unwrap_or("")
 }
 
+/// True when the parsed tree contains any tree-sitter ERROR/missing node.
+///
+/// tree-sitter only returns `None` from `parse` on incompatible-language or
+/// timeout; for syntactically broken (or grammar-unrecognised) PHP it returns
+/// `Some(tree)` built via error recovery, with the bad region flagged on the
+/// root. The mock baker parses arbitrary project source, so a partial tree
+/// here means use-imports / interface signatures / createMock chains may be
+/// silently dropped.
+fn has_syntax_errors(tree: &tree_sitter::Tree) -> bool {
+    tree.root_node().has_error()
+}
+
+/// Emit a visible stderr warning when `tree` parsed with errors. `context`
+/// names the parse operation so the resulting bake discrepancy is observable
+/// rather than silent (these entry points receive a `&str`, not a path).
+fn warn_on_syntax_errors(tree: &tree_sitter::Tree, context: &str) {
+    if has_syntax_errors(tree) {
+        eprintln!(
+            "phpunit-rust: warning: tree-sitter found syntax errors while {context} \u{2014} mock baking may be incomplete"
+        );
+    }
+}
+
 /// Extract a `short_name → fully_qualified_name` map from a PHP file's
 /// `use` statements. E.g. `use Aws\S3\S3Client;` → `("S3Client", "Aws\\S3\\S3Client")`.
 /// Also handles aliased imports: `use Foo\Bar as Baz;` → `("Baz", "Foo\\Bar")`.
 pub fn extract_use_map(src: &str) -> Result<HashMap<String, String>> {
     let mut p = new_parser()?;
     let tree = p.parse(src, None).ok_or_else(|| anyhow!("php parse failed"))?;
+    warn_on_syntax_errors(&tree, "extracting use imports");
     let bytes = src.as_bytes();
     let mut map = HashMap::new();
 
@@ -120,6 +144,7 @@ pub fn extract_use_map(src: &str) -> Result<HashMap<String, String>> {
 pub fn parse_interface(src: &str) -> Result<Interface> {
     let mut p = new_parser()?;
     let tree = p.parse(src, None).ok_or_else(|| anyhow!("php parse failed"))?;
+    warn_on_syntax_errors(&tree, "parsing interface");
     let root = tree.root_node();
     let bytes = src.as_bytes();
 
@@ -207,11 +232,27 @@ fn normalize_params(raw: &str) -> String {
     s
 }
 
-fn walk<F: FnMut(Node)>(n: Node, f: &mut F) {
-    f(n);
-    let mut c = n.walk();
-    for child in n.named_children(&mut c) {
-        walk(child, f);
+/// Pre-order traversal over named children using an explicit stack.
+///
+/// Deliberately iterative (not recursive): under `--bake-mocks` this walks
+/// arbitrary project test files, and deeply-nested PHP (e.g. thousands of
+/// nested `[...]`) would otherwise consume one stack frame per AST level and
+/// overflow the thread stack. tree-sitter itself parses iteratively and never
+/// overflows; this keeps the walk equally bounded in stack usage.
+///
+/// Visitation order matches the previous recursive version exactly: `f(n)` is
+/// called before any of `n`'s named children, and named children are visited
+/// left-to-right. We achieve that with a LIFO stack by pushing a node's named
+/// children in reverse so they pop back in source order.
+fn walk<F: FnMut(Node)>(root: Node, f: &mut F) {
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        f(n);
+        let mut c = n.walk();
+        // Collect this node's named children, then push them reversed so the
+        // first child is on top of the stack (popped — hence visited — first).
+        let children: Vec<Node> = n.named_children(&mut c).collect();
+        stack.extend(children.into_iter().rev());
     }
 }
 
@@ -265,6 +306,7 @@ fn detect_get_mock_builder<'a>(
 pub fn parse_test(src: &str) -> Result<Vec<MockBlock>> {
     let mut p = new_parser()?;
     let tree = p.parse(src, None).ok_or_else(|| anyhow!("php parse failed"))?;
+    warn_on_syntax_errors(&tree, "parsing test for mock baking");
     let bytes = src.as_bytes();
 
     let mut blocks: Vec<MockBlock> = Vec::new();
@@ -792,5 +834,87 @@ mod tests {
         let map = extract_use_map(src).unwrap();
         assert_eq!(map.get("DriverConnection").map(|s| s.as_str()), Some("Doctrine\\DBAL\\Driver\\Connection"), "alias not resolved: {:?}", map);
         assert_eq!(map.get("Bar").map(|s| s.as_str()), Some("Foo\\Bar"), "non-alias not resolved: {:?}", map);
+    }
+
+    /// `walk` is invoked over arbitrary project test files under --bake-mocks.
+    /// tree-sitter parses iteratively and never overflows, but a recursive
+    /// `walk` consumes one stack frame per AST level — deeply-nested PHP
+    /// (here 5000 nested array literals) would blow the stack and abort the
+    /// process. An explicit-stack iterative traversal must complete instead.
+    #[test]
+    fn test_walk_deeply_nested_does_not_overflow() {
+        let depth = 5000usize;
+        let mut src = String::from("<?php\n$x = ");
+        src.push_str(&"[".repeat(depth));
+        src.push_str(&"]".repeat(depth));
+        src.push_str(";\n");
+
+        let mut p = new_parser().unwrap();
+        let tree = p.parse(&src, None).unwrap();
+
+        // Drive `walk` directly over the deeply-nested tree. With the recursive
+        // implementation this overflows the stack; with the iterative one it
+        // must complete and visit every node.
+        let mut visited = 0usize;
+        walk(tree.root_node(), &mut |_n: Node| {
+            visited += 1;
+        });
+
+        assert!(
+            visited > depth,
+            "walk should visit more nodes than the nesting depth ({depth}), got {visited}"
+        );
+
+        // The public entry that relies on `walk` must also complete without
+        // overflowing on the same deeply-nested input.
+        let blocks = parse_test(&src).unwrap();
+        assert!(blocks.is_empty(), "no createMock pattern present");
+    }
+
+    /// Behaviour-preservation guard: the iterative `walk` must produce the
+    /// exact same pre-order sequence of node kinds the recursive version did
+    /// (f(n) before its named children, children left-to-right).
+    #[test]
+    fn test_walk_preorder_named_children_order() {
+        let src = "<?php\nfunction f($a, $b) { return [$a, $b]; }\n";
+        let mut p = new_parser().unwrap();
+        let tree = p.parse(src, None).unwrap();
+
+        // Reference pre-order computed with an inline recursive walk.
+        fn rec<'a>(n: Node<'a>, out: &mut Vec<&'static str>) {
+            // Leak the kind str into a 'static slot via a small interning set is
+            // overkill; instead push the kind via the tree's static kind table.
+            out.push(n.kind());
+            let mut c = n.walk();
+            for child in n.named_children(&mut c) {
+                rec(child, out);
+            }
+        }
+        let mut expected: Vec<&str> = Vec::new();
+        rec(tree.root_node(), &mut expected);
+
+        let mut got: Vec<&str> = Vec::new();
+        walk(tree.root_node(), &mut |n: Node| got.push(n.kind()));
+
+        assert_eq!(got, expected, "iterative walk must match recursive pre-order");
+    }
+
+    /// tree-sitter recovers from syntax errors and returns a partial tree, so
+    /// `parse_test` / `parse_interface` could silently bake against incomplete
+    /// data. `has_syntax_errors` is the predicate used to warn the user.
+    #[test]
+    fn detects_syntax_errors_in_broken_php() {
+        let broken = "<?php class Foo { public function bar() { ";
+        let mut p = new_parser().unwrap();
+        let tree = p.parse(broken, None).unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "tree-sitter should flag the broken snippet as containing an ERROR node",
+        );
+        assert!(has_syntax_errors(&tree), "helper must report broken input as having errors");
+
+        let valid = "<?php class Foo { public function bar(): void {} }";
+        let tree_ok = p.parse(valid, None).unwrap();
+        assert!(!has_syntax_errors(&tree_ok), "helper must report valid input as clean");
     }
 }

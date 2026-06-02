@@ -226,6 +226,17 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
     groups
 }
 
+/// True when the parsed tree contains any tree-sitter ERROR/missing node.
+///
+/// tree-sitter only returns `None` from `parse` on incompatible-language or
+/// timeout; for syntactically broken (or grammar-unrecognised) PHP it returns
+/// `Some(tree)` built via error recovery, with the bad region flagged on the
+/// root. Callers use this to warn that the resulting partial tree may drop
+/// classes/methods, rather than silently under-counting tests.
+fn has_syntax_errors(tree: &tree_sitter::Tree) -> bool {
+    tree.root_node().has_error()
+}
+
 /// Pass 1 (per file): parse a PHP source file and return every class
 /// declaration in it, with its resolved parent FQCN and test methods.
 ///
@@ -242,6 +253,17 @@ fn parse_file_classes(path: &Path) -> Result<Vec<ParsedClass>> {
     let tree = parser
         .parse(&src, None)
         .ok_or_else(|| anyhow!("tree-sitter failed to parse {}", path.display()))?;
+
+    // tree-sitter is error-recovering: a broken (or unrecognised) PHP file
+    // still yields a *partial* tree, so classes/methods can be silently
+    // dropped. Surface that to the user so the resulting test-count
+    // discrepancy is observable rather than silent.
+    if has_syntax_errors(&tree) {
+        eprintln!(
+            "phpunit-rust: warning: tree-sitter found syntax errors in {} \u{2014} some tests may be missed",
+            path.display()
+        );
+    }
 
     let root = tree.root_node();
     let bytes = src.as_bytes();
@@ -2281,5 +2303,28 @@ class TautologyTest extends TestCase {
         assert!(!by_method["testAssertsTrue"].is_tautological, "assertTrue(false) must NOT be tautological");
         assert!(!by_method["testNoAssertions"].is_tautological,"zero assertions must NOT be tautological");
         assert!(!by_method["testVarEquals"].is_tautological,   "assertEquals with variables must NOT be tautological");
+    }
+
+    /// tree-sitter is error-recovering: a broken file still yields a partial
+    /// tree, so classes/methods can be silently dropped. `has_syntax_errors`
+    /// is the predicate that lets us surface that to the user. It must be true
+    /// for broken input and false for valid input.
+    #[test]
+    fn detects_syntax_errors_in_broken_php() {
+        // Unclosed method body — tree-sitter parses with error recovery but
+        // flags the tree as containing an ERROR node.
+        let broken = "<?php class Foo { public function bar() { ";
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_php::language_php()).unwrap();
+        let tree = parser.parse(broken, None).unwrap();
+        assert!(
+            tree.root_node().has_error(),
+            "tree-sitter should flag the broken snippet as containing an ERROR node",
+        );
+        assert!(has_syntax_errors(&tree), "helper must report broken input as having errors");
+
+        let valid = "<?php class Foo { public function bar(): void {} }";
+        let tree_ok = parser.parse(valid, None).unwrap();
+        assert!(!has_syntax_errors(&tree_ok), "helper must report valid input as clean");
     }
 }
