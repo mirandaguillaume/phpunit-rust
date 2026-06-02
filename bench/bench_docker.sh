@@ -30,8 +30,16 @@ PROJ_DIR="$SMOKE/$PROJECT"
 # Detect where vanilla phpunit lives (varies by project layout).
 # phpunit-itself: top-level ./phpunit
 # everyone else:  vendor/bin/phpunit
-if   [ -x "$PROJ_DIR/phpunit" ];           then VANILLA="php phpunit"
-elif [ -x "$PROJ_DIR/vendor/bin/phpunit" ]; then VANILLA="php vendor/bin/phpunit"
+#
+# `-d memory_limit=-1`: the bench image ships PHP's default 128M limit, which
+# carbon's full 6169-test suite blows through near the end (Fatal error:
+# Allowed memory size exhausted), so vanilla dies before printing a summary
+# and the count shows "?". phpunit-rust never hit this because each forked
+# worker gets --worker-memory-limit. Lift the cap for vanilla so the
+# comparison is apples-to-apples.
+PHP_VANILLA="php -d memory_limit=-1"
+if   [ -x "$PROJ_DIR/phpunit" ];           then VANILLA="$PHP_VANILLA phpunit"
+elif [ -x "$PROJ_DIR/vendor/bin/phpunit" ]; then VANILLA="$PHP_VANILLA vendor/bin/phpunit"
 else
     echo "no phpunit binary in $PROJ_DIR (top-level ./phpunit or vendor/bin/phpunit expected)" >&2
     exit 1
@@ -57,8 +65,16 @@ median() {
 # Filter through `tr -d '\0' | sed 's/\x1b\[[0-9;]*m//g'` first so the
 # regex sees clean text.
 parse_tests_file() {
-    tr -d '\0' < "$1" | sed 's/\x1b\[[0-9;]*m//g' \
-        | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+' || true
+    local clean tests
+    clean=$(tr -d '\0' < "$1" | sed 's/\x1b\[[0-9;]*m//g')
+    # PHPUnit prints "Tests: N" only when the run is NOT all-green; a fully
+    # passing run prints "OK (N tests, ...)" instead. brick-math (all-green)
+    # hits the second case, so fall back to it or the count stays "?".
+    tests=$(printf '%s\n' "$clean" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+' || true)
+    if [ -z "$tests" ]; then
+        tests=$(printf '%s\n' "$clean" | grep -oE 'OK \([0-9]+' | tail -1 | grep -oE '[0-9]+' || true)
+    fi
+    printf '%s' "$tests"
 }
 
 # `--init` runs tini (or docker's built-in init) as PID 1 so that signals
@@ -84,6 +100,20 @@ DOCKER_FLAGS=(
     -v "$PHP_SCRIPTS":/opt/php:ro
     -w /proj
 )
+
+# Some suites read configuration from the environment in their bootstrap.
+# brick-math's phpunit.php hard-`exit(1)`s unless CALCULATOR is set
+# (GMP|BCMath|Native) — without it vanilla aborts before any test runs and
+# every forked phpunit-rust worker crashes (265 errored). The container must
+# pass these through to BOTH vanilla and phpunit-rust so the comparison is
+# faithful. Per-project defaults below; override via `ENV_VARS="FOO=bar BAZ=1"`.
+declare -A PROJECT_ENV=(
+    [brick-math]="CALCULATOR=GMP"
+)
+ENV_VARS="${ENV_VARS:-${PROJECT_ENV[$PROJECT]:-}}"
+for kv in $ENV_VARS; do
+    DOCKER_FLAGS+=( -e "$kv" )
+done
 
 # Track every container we start so we can docker-stop them on interrupt.
 # `docker run --rm` doesn't help if the daemon never sees the SIGTERM —
