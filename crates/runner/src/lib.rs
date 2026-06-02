@@ -12,8 +12,9 @@ compile_error!(
 
 pub mod components;
 pub mod coverage;
-pub mod fork_pool;
 pub mod discovery;
+pub mod fork_pool;
+pub mod mock_bake;
 pub mod php_worker;
 pub mod phpunit_xml;
 pub mod profiler;
@@ -21,4 +22,3 @@ pub mod provider_enum;
 pub mod reporter;
 pub mod runner;
 pub mod types;
-pub mod mock_bake;

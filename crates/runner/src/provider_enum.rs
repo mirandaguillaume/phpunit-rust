@@ -53,30 +53,31 @@ pub fn enumerate(
 
     let mut cmd = Command::new("php");
     cmd.arg(script)
-       .arg("--autoload").arg(autoload)
-       .stdin(Stdio::piped())
-       .stdout(Stdio::piped())
-       .stderr(Stdio::inherit());
+        .arg("--autoload")
+        .arg(autoload)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
     if let Some(bs) = bootstrap {
         cmd.arg("--bootstrap").arg(bs);
     }
     if !defines.is_empty() {
-        cmd.arg("--defines").arg(
-            serde_json::to_string(defines).context("serializing defines")?
-        );
+        cmd.arg("--defines")
+            .arg(serde_json::to_string(defines).context("serializing defines")?);
     }
 
     let mut child = cmd.spawn().context("spawning enumerate_providers.php")?;
-    let payload: Vec<[&String; 2]> = pairs.iter()
-        .map(|(c, m)| [c, m])
-        .collect();
+    let payload: Vec<[&String; 2]> = pairs.iter().map(|(c, m)| [c, m]).collect();
     let json = serde_json::to_string(&payload).context("serializing provider pairs")?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(json.as_bytes()).context("writing pairs to PHP stdin")?;
+        stdin
+            .write_all(json.as_bytes())
+            .context("writing pairs to PHP stdin")?;
         // stdin is dropped here, closing it so PHP can exit its read loop.
     }
 
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .context("waiting for enumerate_providers.php")?;
     if !output.status.success() {
         return Err(anyhow!(
@@ -106,19 +107,19 @@ mod tests {
 
     fn case(class: &str, method: &str, dp: Option<&str>) -> TestCase {
         TestCase {
-            file:                 PathBuf::from("/f.php"),
-            class:                class.to_string(),
-            method:               method.to_string(),
-            data_provider:        dp.map(String::from),
-            groups:               vec![],
-            external_providers:   vec![],
-            is_tautological:         false,
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: dp.map(String::from),
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
             has_lifecycle_overrides: false,
-            depends_on:              vec![],
-            is_dispatch_safe:        true,
-            fingerprint:             std::collections::HashSet::new(),
-            is_stateful:             false,
-            is_isolated:             false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
         }
     }
 
@@ -145,7 +146,8 @@ mod tests {
             None,
             &[],
             &[],
-        ).unwrap();
+        )
+        .unwrap();
         assert!(counts.is_empty());
     }
 }

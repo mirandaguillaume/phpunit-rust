@@ -31,7 +31,14 @@ mod tests {
     fn renders_covered_and_uncovered() {
         let mut cov: Coverage = HashMap::new();
         let mut lines = HashMap::new();
-        lines.insert(47, vec![TestId { class: "T".into(), method: "testA".into(), data_set: None }]);
+        lines.insert(
+            47,
+            vec![TestId {
+                class: "T".into(),
+                method: "testA".into(),
+                data_set: None,
+            }],
+        );
         lines.insert(48, vec![]);
         cov.insert(PathBuf::from("src/U.php"), lines);
 

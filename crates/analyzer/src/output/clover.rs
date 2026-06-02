@@ -11,15 +11,24 @@ pub fn render(coverage: &Coverage) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<coverage>\n  <project>\n");
     for (file, lines) in coverage {
-        let _ = writeln!(s, "    <file name=\"{}\">", escape_xml(&file.display().to_string()));
+        let _ = writeln!(
+            s,
+            "    <file name=\"{}\">",
+            escape_xml(&file.display().to_string())
+        );
         for (line, tests) in lines {
             let _ = writeln!(
                 s,
                 "      <line num=\"{}\" type=\"stmt\" count=\"{}\"/>",
-                line, tests.len()
+                line,
+                tests.len()
             );
             for t in tests {
-                let _ = writeln!(s, "        <testref name=\"{}\"/>", escape_xml(&t.display()));
+                let _ = writeln!(
+                    s,
+                    "        <testref name=\"{}\"/>",
+                    escape_xml(&t.display())
+                );
             }
         }
         s.push_str("    </file>\n");
@@ -47,7 +56,14 @@ mod tests {
     fn renders_clover_xml() {
         let mut cov: Coverage = HashMap::new();
         let mut lines = HashMap::new();
-        lines.insert(47, vec![TestId { class: "T".into(), method: "testA".into(), data_set: None }]);
+        lines.insert(
+            47,
+            vec![TestId {
+                class: "T".into(),
+                method: "testA".into(),
+                data_set: None,
+            }],
+        );
         cov.insert(PathBuf::from("src/U.php"), lines);
         let s = render(&cov);
         assert!(s.contains("<?xml"));

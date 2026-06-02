@@ -77,24 +77,26 @@ use std::path::PathBuf;
 use super::env::TypeEnv;
 use super::type_repr::Type;
 use mago_interner::ThreadedInterner;
-use mago_reflection::class_like::ClassLikeReflection;
 use mago_reflection::class_like::property::PropertyReflection;
+use mago_reflection::class_like::ClassLikeReflection;
 use mago_reflection::function_like::FunctionLikeReflection;
 use mago_reflection::r#type::kind::{ObjectTypeKind, TypeKind};
-use mago_syntax::ast::Expression;
-use mago_syntax::ast::Statement;
-use mago_syntax::ast::binary::{Binary, BinaryOperator};
-use mago_syntax::ast::block::Block;
-use mago_syntax::ast::control_flow::r#if::{If, IfBody};
-use mago_syntax::ast::r#return::Return;
+use mago_span::HasSpan;
 use mago_syntax::ast::access::Access;
 use mago_syntax::ast::assignment::Assignment;
-use mago_syntax::ast::call::{Call, FunctionCall, MethodCall, NullSafeMethodCall, StaticMethodCall};
+use mago_syntax::ast::binary::{Binary, BinaryOperator};
+use mago_syntax::ast::block::Block;
+use mago_syntax::ast::call::{
+    Call, FunctionCall, MethodCall, NullSafeMethodCall, StaticMethodCall,
+};
 use mago_syntax::ast::class_like::member::ClassLikeMemberSelector;
+use mago_syntax::ast::control_flow::r#if::{If, IfBody};
 use mago_syntax::ast::expression::Parenthesized;
 use mago_syntax::ast::instantiation::Instantiation;
+use mago_syntax::ast::r#return::Return;
 use mago_syntax::ast::variable::Variable;
-use mago_span::HasSpan;
+use mago_syntax::ast::Expression;
+use mago_syntax::ast::Statement;
 
 // ── CallSiteEvent ─────────────────────────────────────────────────────────────
 
@@ -286,11 +288,7 @@ fn walk_instantiation_simple(
     }
 }
 
-fn walk_assignment_simple(
-    env: &mut TypeEnv,
-    interner: &ThreadedInterner,
-    a: &Assignment,
-) -> Type {
+fn walk_assignment_simple(env: &mut TypeEnv, interner: &ThreadedInterner, a: &Assignment) -> Type {
     let rhs_type = walk_expression_simple(env, interner, &a.rhs);
     use mago_syntax::ast::assignment::AssignmentOperator;
     if matches!(a.operator, AssignmentOperator::Assign(_)) {
@@ -403,8 +401,15 @@ fn walk_method_call(ctx: &mut WalkerCtx, call: &MethodCall) -> Type {
     };
 
     let line = line_of_span(ctx, call.object.span().join(call.argument_list.span()));
-    let (callee_class, callee_file) = resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
-    let return_type = lookup_return_type(ctx.project, ctx.interner, &recv_type, &method_name, &ctx.env);
+    let (callee_class, callee_file) =
+        resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
+    let return_type = lookup_return_type(
+        ctx.project,
+        ctx.interner,
+        &recv_type,
+        &method_name,
+        &ctx.env,
+    );
 
     // Walk arguments for side effects (nested calls).
     walk_argument_list(ctx, &call.argument_list);
@@ -430,8 +435,15 @@ fn walk_null_safe_method_call(ctx: &mut WalkerCtx, call: &NullSafeMethodCall) ->
     };
 
     let line = line_of_span(ctx, call.object.span().join(call.argument_list.span()));
-    let (callee_class, callee_file) = resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
-    let return_type = lookup_return_type(ctx.project, ctx.interner, &recv_type, &method_name, &ctx.env);
+    let (callee_class, callee_file) =
+        resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
+    let return_type = lookup_return_type(
+        ctx.project,
+        ctx.interner,
+        &recv_type,
+        &method_name,
+        &ctx.env,
+    );
 
     walk_argument_list(ctx, &call.argument_list);
 
@@ -484,8 +496,15 @@ fn walk_static_method_call(ctx: &mut WalkerCtx, call: &StaticMethodCall) -> Type
     };
 
     let line = line_of_span(ctx, call.class.span().join(call.argument_list.span()));
-    let (callee_class, callee_file) = resolve_callee(ctx.project, ctx.interner, &class_type, &ctx.env);
-    let return_type = lookup_return_type(ctx.project, ctx.interner, &class_type, &method_name, &ctx.env);
+    let (callee_class, callee_file) =
+        resolve_callee(ctx.project, ctx.interner, &class_type, &ctx.env);
+    let return_type = lookup_return_type(
+        ctx.project,
+        ctx.interner,
+        &class_type,
+        &method_name,
+        &ctx.env,
+    );
 
     walk_argument_list(ctx, &call.argument_list);
 
@@ -505,8 +524,10 @@ fn walk_function_call(ctx: &mut WalkerCtx, call: &FunctionCall) -> Type {
     // When the callee is a variable holding a class type, emit a __invoke call site.
     if let Expression::Variable(_) = call.function.as_ref() {
         let recv_type = walk_expression(ctx, &call.function);
-        if matches!(recv_type, Type::Class(_) | Type::SelfRef(_) | Type::StaticRef(_)
-                             | Type::This | Type::Nullable(_)) {
+        if matches!(
+            recv_type,
+            Type::Class(_) | Type::SelfRef(_) | Type::StaticRef(_) | Type::This | Type::Nullable(_)
+        ) {
             let line = line_of_span(ctx, call.function.span().join(call.argument_list.span()));
             let (callee_class, callee_file) =
                 resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
@@ -641,25 +662,37 @@ fn walk_instanceof(ctx: &mut WalkerCtx, b: &Binary) -> Type {
         Expression::Identifier(id) => {
             let name = resolve_class_fqcn(ctx, id);
             match name.to_lowercase().as_str() {
-                "self" => ctx.env.enclosing_class()
+                "self" => ctx
+                    .env
+                    .enclosing_class()
                     .map(|c| Type::SelfRef(c.to_string()))
                     .unwrap_or(Type::Mixed),
-                "static" => ctx.env.enclosing_class()
+                "static" => ctx
+                    .env
+                    .enclosing_class()
                     .map(|c| Type::StaticRef(c.to_string()))
                     .unwrap_or(Type::Mixed),
                 _ => Type::Class(name),
             }
         }
-        Expression::Self_(_) => ctx.env.enclosing_class()
+        Expression::Self_(_) => ctx
+            .env
+            .enclosing_class()
             .map(|c| Type::SelfRef(c.to_string()))
             .unwrap_or(Type::Mixed),
-        Expression::Static(_) => ctx.env.enclosing_class()
+        Expression::Static(_) => ctx
+            .env
+            .enclosing_class()
             .map(|c| Type::StaticRef(c.to_string()))
             .unwrap_or(Type::Mixed),
         _ => return Type::Mixed,
     };
 
-    ctx.pending_narrowings.push(crate::types::narrowing::Narrowing { var, ty: class_type });
+    ctx.pending_narrowings
+        .push(crate::types::narrowing::Narrowing {
+            var,
+            ty: class_type,
+        });
     Type::Mixed
 }
 
@@ -735,7 +768,11 @@ fn lookup_property_type(
         // `interner.get` may not have "__construct" if it wasn't interned by this interner.
         let construct_refl = refl.methods.members.iter().find_map(|(mid, m)| {
             let name = interner.lookup(mid);
-            if name == "__construct" { Some(m) } else { None }
+            if name == "__construct" {
+                Some(m)
+            } else {
+                None
+            }
         });
         if let Some(ctor) = construct_refl {
             for param in &ctor.parameters {
@@ -754,9 +791,11 @@ fn lookup_property_type(
         }
 
         // Climb to parent.
-        current = refl.inheritance.direct_extended_class.as_ref().map(|n| {
-            interner.lookup(&n.value).to_string().to_lowercase()
-        });
+        current = refl
+            .inheritance
+            .direct_extended_class
+            .as_ref()
+            .map(|n| interner.lookup(&n.value).to_string().to_lowercase());
     }
     Type::Mixed
 }
@@ -787,10 +826,7 @@ fn selector_name(interner: &ThreadedInterner, sel: &ClassLikeMemberSelector) -> 
 }
 
 /// Walk all arguments of an argument list (for side effects: nested calls → events).
-fn walk_argument_list(
-    ctx: &mut WalkerCtx,
-    arg_list: &mago_syntax::ast::argument::ArgumentList,
-) {
+fn walk_argument_list(ctx: &mut WalkerCtx, arg_list: &mago_syntax::ast::argument::ArgumentList) {
     use mago_syntax::ast::argument::Argument;
     for arg in arg_list.arguments.iter() {
         let expr = match arg {
@@ -834,7 +870,9 @@ fn resolve_callee(
         Type::Mixed | Type::Union(_, _) => None,
     };
 
-    let Some(fqcn) = fqcn else { return (None, None) };
+    let Some(fqcn) = fqcn else {
+        return (None, None);
+    };
 
     // Find the class-like reflection whose name matches the FQCN (case-insensitive,
     // PHP class names are case-insensitive).
@@ -864,7 +902,10 @@ fn lookup_return_type(
 ) -> Type {
     let fqcn = match recv_type {
         Type::Class(c) | Type::SelfRef(c) | Type::StaticRef(c) => c.clone(),
-        Type::This => env.enclosing_class().map(|c| c.to_string()).unwrap_or_default(),
+        Type::This => env
+            .enclosing_class()
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
         Type::Nullable(inner) => return lookup_return_type(project, interner, inner, method, env),
         Type::Interface(c) | Type::Mock(c) => c.clone(),
         _ => return Type::Mixed,
@@ -941,12 +982,7 @@ fn narrow_return_type_from_body(
     let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
 
     let simple = class_fqcn.rsplit('\\').next().unwrap_or(class_fqcn);
-    let block = find_method_block_in_stmts(
-        program.statements.iter(),
-        simple,
-        method_lc,
-        interner,
-    )?;
+    let block = find_method_block_in_stmts(program.statements.iter(), simple, method_lc, interner)?;
 
     let return_types: Vec<Type> = block
         .statements
@@ -988,7 +1024,10 @@ fn find_method_block_in_stmts<'a>(
     for stmt in stmts {
         match stmt {
             Statement::Class(c) => {
-                if interner.lookup(&c.name.value).eq_ignore_ascii_case(class_simple) {
+                if interner
+                    .lookup(&c.name.value)
+                    .eq_ignore_ascii_case(class_simple)
+                {
                     for member in c.members.iter() {
                         if let ClassLikeMember::Method(m) = member {
                             if interner.lookup(&m.name.value).to_lowercase() == method_lc {
@@ -1002,7 +1041,10 @@ fn find_method_block_in_stmts<'a>(
                 }
             }
             Statement::Trait(t) => {
-                if interner.lookup(&t.name.value).eq_ignore_ascii_case(class_simple) {
+                if interner
+                    .lookup(&t.name.value)
+                    .eq_ignore_ascii_case(class_simple)
+                {
                     for member in t.members.iter() {
                         if let ClassLikeMember::Method(m) = member {
                             if interner.lookup(&m.name.value).to_lowercase() == method_lc {
@@ -1132,24 +1174,37 @@ fn type_kind_to_type(
                     .find_class_reflection(&name_str)
                     .map(|r| r.is_interface())
                     .unwrap_or(false);
-                if is_iface { Type::Interface(name_str) } else { Type::Class(name_str) }
+                if is_iface {
+                    Type::Interface(name_str)
+                } else {
+                    Type::Class(name_str)
+                }
             }
-            ObjectTypeKind::Self_ { scope } => {
-                Type::SelfRef(interner.lookup(scope).to_string())
-            }
-            ObjectTypeKind::Static { scope } => {
-                Type::StaticRef(interner.lookup(scope).to_string())
-            }
+            ObjectTypeKind::Self_ { scope } => Type::SelfRef(interner.lookup(scope).to_string()),
+            ObjectTypeKind::Static { scope } => Type::StaticRef(interner.lookup(scope).to_string()),
             // AnyObject, TypedObject, AnonymousObject, EnumCase, Generator, Parent → Mixed
             _ => Type::Mixed,
         },
 
         TypeKind::Union { kinds } => {
             // Check for nullable pattern: Union of [T, null] or [null, T].
-            let null_count = kinds.iter().filter(|k| matches!(k, TypeKind::Value(mago_reflection::r#type::kind::ValueTypeKind::Null))).count();
+            let null_count = kinds
+                .iter()
+                .filter(|k| {
+                    matches!(
+                        k,
+                        TypeKind::Value(mago_reflection::r#type::kind::ValueTypeKind::Null)
+                    )
+                })
+                .count();
             let non_nulls: Vec<&TypeKind> = kinds
                 .iter()
-                .filter(|k| !matches!(k, TypeKind::Value(mago_reflection::r#type::kind::ValueTypeKind::Null)))
+                .filter(|k| {
+                    !matches!(
+                        k,
+                        TypeKind::Value(mago_reflection::r#type::kind::ValueTypeKind::Null)
+                    )
+                })
                 .collect();
 
             if null_count > 0 && non_nulls.len() == 1 {
@@ -1225,10 +1280,7 @@ fn line_of_span(ctx: &WalkerCtx, span: mago_span::Span) -> u32 {
 /// mago-project's reflection FQCNs don't carry one. Example: identifier
 /// `Logger` in `namespace Monolog;` resolves to `"Monolog\\Logger"`, NOT
 /// `"\\Monolog\\Logger"`.
-fn resolve_class_fqcn(
-    ctx: &WalkerCtx,
-    id: &mago_syntax::ast::Identifier,
-) -> String {
+fn resolve_class_fqcn(ctx: &WalkerCtx, id: &mago_syntax::ast::Identifier) -> String {
     use mago_span::HasSpan;
     let position = id.span().start;
 
@@ -1274,7 +1326,9 @@ pub fn walk_statement_ctx(ctx: &mut WalkerCtx, stmt: &Statement) {
 
 fn walk_statement_ctx_inner(ctx: &mut WalkerCtx, stmt: &Statement) {
     match stmt {
-        Statement::Expression(e) => { walk_expression(ctx, &e.expression); }
+        Statement::Expression(e) => {
+            walk_expression(ctx, &e.expression);
+        }
         Statement::If(if_stmt) => walk_if(ctx, if_stmt),
         Statement::Return(ret) => walk_return(ctx, ret),
         Statement::Block(b) => walk_block(ctx, b),
@@ -1386,7 +1440,8 @@ fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
     // True branch: save env, apply narrowings, walk body, restore env.
     {
         let saved = ctx.env.clone();
-        let tuples: Vec<(String, Type)> = narrowings.iter()
+        let tuples: Vec<(String, Type)> = narrowings
+            .iter()
             .map(|n| (n.var.clone(), n.ty.clone()))
             .collect();
         ctx.env.apply_narrowing(&tuples);
@@ -1403,7 +1458,8 @@ fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
                 let ei_narrowings: Vec<crate::types::narrowing::Narrowing> =
                     std::mem::take(&mut ctx.pending_narrowings);
                 let saved = ctx.env.clone();
-                let tuples: Vec<(String, Type)> = ei_narrowings.iter()
+                let tuples: Vec<(String, Type)> = ei_narrowings
+                    .iter()
                     .map(|n| (n.var.clone(), n.ty.clone()))
                     .collect();
                 ctx.env.apply_narrowing(&tuples);
@@ -1424,7 +1480,8 @@ fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
                 let ei_narrowings: Vec<crate::types::narrowing::Narrowing> =
                     std::mem::take(&mut ctx.pending_narrowings);
                 let saved = ctx.env.clone();
-                let tuples: Vec<(String, Type)> = ei_narrowings.iter()
+                let tuples: Vec<(String, Type)> = ei_narrowings
+                    .iter()
                     .map(|n| (n.var.clone(), n.ty.clone()))
                     .collect();
                 ctx.env.apply_narrowing(&tuples);
@@ -1470,15 +1527,25 @@ pub(crate) mod tests {
 
     /// Parse the first class's first method body from a PHP snippet.
     /// Returns `(Program, enclosing_class_name)` so callers can walk it.
-    pub fn find_first_method_body(
-        project: &MagoProject,
-    ) -> (mago_syntax::ast::Program, String) {
-        let module = project.inner().modules.first().expect("at least one module");
+    pub fn find_first_method_body(project: &MagoProject) -> (mago_syntax::ast::Program, String) {
+        let module = project
+            .inner()
+            .modules
+            .first()
+            .expect("at least one module");
         let program = module.parse(project.interner());
         // Find the first class statement.
-        let class = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s { Some(c) } else { None }
-        }).expect("a class statement");
+        let class = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .expect("a class statement");
         // The class name from the interner.
         let class_name = project.interner().lookup(&class.name.value).to_string();
         (program, class_name)
@@ -1489,8 +1556,12 @@ pub(crate) mod tests {
     /// CallSiteEvent, so the event count equals the reached nesting depth.
     fn nested_new(n: usize) -> String {
         let mut s = String::from("<?php\nclass A {\n  public function go(): void {\n    $x = ");
-        for _ in 0..n { s.push_str("new A("); }
-        for _ in 0..n { s.push(')'); }
+        for _ in 0..n {
+            s.push_str("new A(");
+        }
+        for _ in 0..n {
+            s.push(')');
+        }
         s.push_str(";\n  }\n}\n");
         s
     }
@@ -1504,13 +1575,29 @@ pub(crate) mod tests {
         let interner = project.interner();
         let module = project.inner().modules.first().expect("module");
         let program = module.parse(interner);
-        let class = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s { Some(c) } else { None }
-        }).expect("class");
+        let class = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .expect("class");
         let class_name = interner.lookup(&class.name.value).to_string();
-        let method = class.members.iter().find_map(|m| {
-            if let ClassLikeMember::Method(m) = m { Some(m) } else { None }
-        }).expect("method");
+        let method = class
+            .members
+            .iter()
+            .find_map(|m| {
+                if let ClassLikeMember::Method(m) = m {
+                    Some(m)
+                } else {
+                    None
+                }
+            })
+            .expect("method");
         let block = match &method.body {
             MethodBody::Concrete(b) => b,
             _ => panic!("expected concrete body"),
@@ -1546,7 +1633,10 @@ pub(crate) mod tests {
     fn depth_guard_does_not_affect_normal_depth() {
         let php = nested_new(20);
         let events = count_events_with_max_depth(&php, 512);
-        assert_eq!(events, 20, "default-depth walking must emit one event per instantiation");
+        assert_eq!(
+            events, 20,
+            "default-depth walking must emit one event per instantiation"
+        );
     }
 
     /// H4 (parser stage): mago's recursive-descent parser overflows a default
@@ -1558,7 +1648,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Test.php"), &php).unwrap();
         let ok = crate::cli::analyze::with_deep_stack(|| MagoProject::load(dir.path()).is_ok());
-        assert!(ok, "deeply-nested PHP must load on the deep stack without overflowing");
+        assert!(
+            ok,
+            "deeply-nested PHP must load on the deep stack without overflowing"
+        );
     }
 
     /// Walk the first method body of the first class, return the type of `$var_name`.
@@ -1570,14 +1663,30 @@ pub(crate) mod tests {
         let (program, class_name) = find_first_method_body(&project);
 
         // Find the class node again from the program.
-        let class = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s { Some(c) } else { None }
-        }).expect("class");
+        let class = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .expect("class");
 
         // Find first concrete method.
-        let method = class.members.iter().find_map(|m| {
-            if let ClassLikeMember::Method(m) = m { Some(m) } else { None }
-        }).expect("method");
+        let method = class
+            .members
+            .iter()
+            .find_map(|m| {
+                if let ClassLikeMember::Method(m) = m {
+                    Some(m)
+                } else {
+                    None
+                }
+            })
+            .expect("method");
 
         let block = match &method.body {
             MethodBody::Concrete(b) => b,
@@ -1656,7 +1765,9 @@ class D {
     #[test]
     fn method_call_emits_call_site_event() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("A.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("A.php"),
+            r#"<?php
 class A {
     public function caller(): void {
         $b = new B();
@@ -1666,7 +1777,9 @@ class A {
 class B {
     public function doIt(): void {}
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
@@ -1675,23 +1788,39 @@ class B {
         let module = project.inner().modules.first().expect("module");
         let program = module.parse(&interner);
 
-        let class_a = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s {
-                let name = interner.lookup(&c.name.value).to_string();
-                if name.to_lowercase() == "a" { Some(c) } else { None }
-            } else {
-                None
-            }
-        }).expect("class A");
+        let class_a = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    let name = interner.lookup(&c.name.value).to_string();
+                    if name.to_lowercase() == "a" {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("class A");
 
-        let caller_method = class_a.members.iter().find_map(|m| {
-            if let ClassLikeMember::Method(m) = m {
-                let name = interner.lookup(&m.name.value).to_string();
-                if name.to_lowercase() == "caller" { Some(m) } else { None }
-            } else {
-                None
-            }
-        }).expect("caller method");
+        let caller_method = class_a
+            .members
+            .iter()
+            .find_map(|m| {
+                if let ClassLikeMember::Method(m) = m {
+                    let name = interner.lookup(&m.name.value).to_string();
+                    if name.to_lowercase() == "caller" {
+                        Some(m)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("caller method");
 
         let block = match &caller_method.body {
             MethodBody::Concrete(b) => b,
@@ -1722,7 +1851,9 @@ class B {
             }
         }
 
-        let do_it_events: Vec<&CallSiteEvent> = ctx2.events.iter()
+        let do_it_events: Vec<&CallSiteEvent> = ctx2
+            .events
+            .iter()
             .filter(|e| e.method_name == "doIt")
             .collect();
 
@@ -1751,7 +1882,9 @@ class B {
     #[test]
     fn method_call_return_type_resolved_from_reflection() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Chain.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Chain.php"),
+            r#"<?php
 class Builder {
     public function build(): Result {}
 }
@@ -1762,7 +1895,9 @@ class Client {
         $result = $builder->build();
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
@@ -1770,23 +1905,39 @@ class Client {
         let module = project.inner().modules.first().expect("module");
         let program = module.parse(&interner);
 
-        let client = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s {
-                let name = interner.lookup(&c.name.value).to_string();
-                if name.to_lowercase() == "client" { Some(c) } else { None }
-            } else {
-                None
-            }
-        }).expect("Client class");
+        let client = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    let name = interner.lookup(&c.name.value).to_string();
+                    if name.to_lowercase() == "client" {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("Client class");
 
-        let run_method = client.members.iter().find_map(|m| {
-            if let ClassLikeMember::Method(m) = m {
-                let name = interner.lookup(&m.name.value).to_string();
-                if name.to_lowercase() == "run" { Some(m) } else { None }
-            } else {
-                None
-            }
-        }).expect("run method");
+        let run_method = client
+            .members
+            .iter()
+            .find_map(|m| {
+                if let ClassLikeMember::Method(m) = m {
+                    let name = interner.lookup(&m.name.value).to_string();
+                    if name.to_lowercase() == "run" {
+                        Some(m)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("run method");
 
         let block = match &run_method.body {
             MethodBody::Concrete(b) => b,
@@ -1825,26 +1976,42 @@ class Client {
         let program = module.parse(interner);
 
         // Find the target class.
-        let class = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s {
-                let n = interner.lookup(&c.name.value).to_lowercase();
-                if n == class_lc { Some(c) } else { None }
-            } else {
-                None
-            }
-        }).unwrap_or_else(|| panic!("class {class_lc} not found"));
+        let class = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    let n = interner.lookup(&c.name.value).to_lowercase();
+                    if n == class_lc {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("class {class_lc} not found"));
 
         let class_name = interner.lookup(&class.name.value).to_string();
 
         // Find the target method.
-        let method = class.members.iter().find_map(|m| {
-            if let ClassLikeMember::Method(m) = m {
-                let n = interner.lookup(&m.name.value).to_lowercase();
-                if n == method_lc { Some(m) } else { None }
-            } else {
-                None
-            }
-        }).unwrap_or_else(|| panic!("method {method_lc} not found"));
+        let method = class
+            .members
+            .iter()
+            .find_map(|m| {
+                if let ClassLikeMember::Method(m) = m {
+                    let n = interner.lookup(&m.name.value).to_lowercase();
+                    if n == method_lc {
+                        Some(m)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("method {method_lc} not found"));
 
         let block = match &method.body {
             MethodBody::Concrete(b) => b,
@@ -1857,7 +2024,9 @@ class Client {
 
         for stmt in block.statements.iter() {
             match stmt {
-                Statement::Expression(e) => { walk_expression(&mut ctx, &e.expression); }
+                Statement::Expression(e) => {
+                    walk_expression(&mut ctx, &e.expression);
+                }
                 _ => {}
             }
         }
@@ -1868,7 +2037,9 @@ class Client {
     #[test]
     fn this_property_resolves_to_declared_type() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Service.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Service.php"),
+            r#"<?php
 class Repo {}
 class Service {
     public Repo $repo;
@@ -1876,7 +2047,9 @@ class Service {
         $r = $this->repo;
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
 
@@ -1894,7 +2067,9 @@ class Service {
     #[test]
     fn this_promoted_property_resolves_to_declared_type() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Service2.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Service2.php"),
+            r#"<?php
 class Repo {}
 class Service2 {
     public function __construct(private Repo $repo) {}
@@ -1902,7 +2077,9 @@ class Service2 {
         $r = $this->repo;
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
 
@@ -1920,7 +2097,9 @@ class Service2 {
     #[test]
     fn null_safe_property_access_resolves_type() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("NullSafe.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("NullSafe.php"),
+            r#"<?php
 class Inner {}
 class Outer {
     public Inner $inner;
@@ -1928,7 +2107,9 @@ class Outer {
         $i = $this?->inner;
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
 
@@ -1946,7 +2127,9 @@ class Outer {
     #[test]
     fn inherited_property_resolves_via_parent() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Inherit.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Inherit.php"),
+            r#"<?php
 class Dep {}
 class Base {
     public Dep $dep;
@@ -1956,7 +2139,9 @@ class Child extends Base {
         $d = $this->dep;
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
 
@@ -1976,7 +2161,9 @@ class Child extends Base {
     #[test]
     fn method_chain_resolves_through_declared_return_types() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Chain.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Chain.php"),
+            r#"<?php
 class C {
     public function returnsB(): B { return new B(); }
 }
@@ -1992,17 +2179,25 @@ class Caller {
         $c->returnsB()->returnsA()->done();
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
         let env = TypeEnv::for_class("Caller");
 
-        let caller_source = project.class_likes()
+        let caller_source = project
+            .class_likes()
             .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source).unwrap();
-        let module = project.inner().modules.iter()
-            .find(|m| m.source.identifier == caller_source).unwrap();
+            .map(|(_, r)| r.span.start.source)
+            .unwrap();
+        let module = project
+            .inner()
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == caller_source)
+            .unwrap();
         let program = module.parse(&interner);
         let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
 
@@ -2012,10 +2207,14 @@ class Caller {
         let mut found = false;
         for stmt in program.statements.iter() {
             if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" { continue; }
+                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
+                    continue;
+                }
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" { continue; }
+                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
+                            continue;
+                        }
                         if let MethodBody::Concrete(block) = &m.body {
                             for s in block.statements.iter() {
                                 if let Statement::Expression(e) = s {
@@ -2036,14 +2235,30 @@ class Caller {
         assert_eq!(method_names, vec!["__construct", "returnsB", "returnsA", "done"],
             "expected events for __construct, returnsB, returnsA, done in order; got: {method_names:?}");
 
-        assert_eq!(ctx.events[0].receiver, Type::Class("C".into()),
-            "__construct receiver should be C (instantiation); got {:?}", ctx.events[0].receiver);
-        assert_eq!(ctx.events[1].receiver, Type::Class("C".into()),
-            "returnsB receiver should be C; got {:?}", ctx.events[1].receiver);
-        assert_eq!(ctx.events[2].receiver, Type::Class("B".into()),
-            "returnsA receiver should be B (from returnsB's declared return type); got {:?}", ctx.events[2].receiver);
-        assert_eq!(ctx.events[3].receiver, Type::Class("A".into()),
-            "done receiver should be A (from returnsA's declared return type); got {:?}", ctx.events[3].receiver);
+        assert_eq!(
+            ctx.events[0].receiver,
+            Type::Class("C".into()),
+            "__construct receiver should be C (instantiation); got {:?}",
+            ctx.events[0].receiver
+        );
+        assert_eq!(
+            ctx.events[1].receiver,
+            Type::Class("C".into()),
+            "returnsB receiver should be C; got {:?}",
+            ctx.events[1].receiver
+        );
+        assert_eq!(
+            ctx.events[2].receiver,
+            Type::Class("B".into()),
+            "returnsA receiver should be B (from returnsB's declared return type); got {:?}",
+            ctx.events[2].receiver
+        );
+        assert_eq!(
+            ctx.events[3].receiver,
+            Type::Class("A".into()),
+            "done receiver should be A (from returnsA's declared return type); got {:?}",
+            ctx.events[3].receiver
+        );
     }
 
     // ── Task 2.8 tests ─────────────────────────────────────────────────────────
@@ -2051,7 +2266,9 @@ class Caller {
     #[test]
     fn instanceof_narrows_inside_if_body() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Narrow.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Narrow.php"),
+            r#"<?php
 class Base { public function baseMethod(): void {} }
 class Dog extends Base { public function bark(): void {} }
 class Caller {
@@ -2061,17 +2278,25 @@ class Caller {
         }
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
         let env = TypeEnv::for_class("Caller");
 
-        let caller_source = project.class_likes()
+        let caller_source = project
+            .class_likes()
             .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source).unwrap();
-        let module = project.inner().modules.iter()
-            .find(|m| m.source.identifier == caller_source).unwrap();
+            .map(|(_, r)| r.span.start.source)
+            .unwrap();
+        let module = project
+            .inner()
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == caller_source)
+            .unwrap();
         let program = module.parse(&interner);
         let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
 
@@ -2082,10 +2307,14 @@ class Caller {
         // Find Caller class and its go() method.
         for stmt in program.statements.iter() {
             if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" { continue; }
+                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
+                    continue;
+                }
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" { continue; }
+                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
+                            continue;
+                        }
                         if let MethodBody::Concrete(block) = &m.body {
                             walk_block(&mut ctx, block);
                         }
@@ -2096,14 +2325,23 @@ class Caller {
 
         // The bark() call should have been emitted with receiver = Class(Dog).
         let bark_event = ctx.events.iter().find(|e| e.method_name == "bark");
-        assert!(bark_event.is_some(),
-            "expected bark() call site emitted; got events: {:?}", ctx.events);
-        assert_eq!(bark_event.unwrap().receiver, Type::Class("Dog".into()),
-            "bark() receiver should be narrowed Dog (not Base)");
+        assert!(
+            bark_event.is_some(),
+            "expected bark() call site emitted; got events: {:?}",
+            ctx.events
+        );
+        assert_eq!(
+            bark_event.unwrap().receiver,
+            Type::Class("Dog".into()),
+            "bark() receiver should be narrowed Dog (not Base)"
+        );
 
         // After the if-body, $animal should be Base again.
-        assert_eq!(ctx.env.lookup("$animal"), Type::Class("Base".into()),
-            "$animal should restore to Base after the if-body");
+        assert_eq!(
+            ctx.env.lookup("$animal"),
+            Type::Class("Base".into()),
+            "$animal should restore to Base after the if-body"
+        );
     }
 
     #[test]
@@ -2124,7 +2362,9 @@ class Caller {
     #[test]
     fn union_return_type_resolves_through_walker() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("UR.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("UR.php"),
+            r#"<?php
 class A {}
 class B {}
 class Factory {
@@ -2136,17 +2376,25 @@ class Caller {
         $x = $f->make();
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
         let env = TypeEnv::for_class("Caller");
 
-        let caller_source = project.class_likes()
+        let caller_source = project
+            .class_likes()
             .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source).unwrap();
-        let module = project.inner().modules.iter()
-            .find(|m| m.source.identifier == caller_source).unwrap();
+            .map(|(_, r)| r.span.start.source)
+            .unwrap();
+        let module = project
+            .inner()
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == caller_source)
+            .unwrap();
         let program = module.parse(&interner);
         let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
 
@@ -2154,10 +2402,14 @@ class Caller {
 
         for stmt in program.statements.iter() {
             if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" { continue; }
+                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
+                    continue;
+                }
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" { continue; }
+                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
+                            continue;
+                        }
                         if let MethodBody::Concrete(block) = &m.body {
                             for s in block.statements.iter() {
                                 if let Statement::Expression(e) = s {
@@ -2198,7 +2450,9 @@ class Caller {
     #[test]
     fn nullable_return_type_resolves_through_walker() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("NR.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("NR.php"),
+            r#"<?php
 class Foo {}
 class Builder {
     public function build(): ?Foo { return new Foo(); }
@@ -2209,17 +2463,25 @@ class Caller {
         $result = $b->build();
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
         let env = TypeEnv::for_class("Caller");
 
-        let caller_source = project.class_likes()
+        let caller_source = project
+            .class_likes()
             .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source).unwrap();
-        let module = project.inner().modules.iter()
-            .find(|m| m.source.identifier == caller_source).unwrap();
+            .map(|(_, r)| r.span.start.source)
+            .unwrap();
+        let module = project
+            .inner()
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == caller_source)
+            .unwrap();
         let program = module.parse(&interner);
         let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
 
@@ -2227,10 +2489,14 @@ class Caller {
 
         for stmt in program.statements.iter() {
             if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" { continue; }
+                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
+                    continue;
+                }
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" { continue; }
+                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
+                            continue;
+                        }
                         if let MethodBody::Concrete(block) = &m.body {
                             for s in block.statements.iter() {
                                 if let Statement::Expression(e) = s {
@@ -2246,14 +2512,12 @@ class Caller {
         // $result should have Type::Nullable(Box::new(Type::Class("Foo")))
         let result_type = ctx.env.lookup("$result");
         match &result_type {
-            Type::Nullable(inner) => {
-                match inner.as_ref() {
-                    Type::Class(c) => {
-                        assert_eq!(c, "Foo", "expected nullable Foo; got: {result_type:?}");
-                    }
-                    _other => panic!("expected Nullable(Class(Foo)), got: {result_type:?}"),
+            Type::Nullable(inner) => match inner.as_ref() {
+                Type::Class(c) => {
+                    assert_eq!(c, "Foo", "expected nullable Foo; got: {result_type:?}");
                 }
-            }
+                _other => panic!("expected Nullable(Class(Foo)), got: {result_type:?}"),
+            },
             other => panic!("expected Type::Nullable, got: {other:?}"),
         }
     }
@@ -2263,7 +2527,9 @@ class Caller {
         // A union with only one actual non-null kind should unwrap to that kind.
         // This is a tricky edge case from type_kind_to_type's logic.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Degen.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Degen.php"),
+            r#"<?php
 class OnlyOne {}
 class Wrapper {
     public function get(): OnlyOne { return new OnlyOne(); }
@@ -2274,17 +2540,25 @@ class Caller {
         $x = $w->get();
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
         let env = TypeEnv::for_class("Caller");
 
-        let caller_source = project.class_likes()
+        let caller_source = project
+            .class_likes()
             .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source).unwrap();
-        let module = project.inner().modules.iter()
-            .find(|m| m.source.identifier == caller_source).unwrap();
+            .map(|(_, r)| r.span.start.source)
+            .unwrap();
+        let module = project
+            .inner()
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == caller_source)
+            .unwrap();
         let program = module.parse(&interner);
         let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
 
@@ -2292,10 +2566,14 @@ class Caller {
 
         for stmt in program.statements.iter() {
             if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" { continue; }
+                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
+                    continue;
+                }
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" { continue; }
+                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
+                            continue;
+                        }
                         if let MethodBody::Concrete(block) = &m.body {
                             for s in block.statements.iter() {
                                 if let Statement::Expression(e) = s {
@@ -2321,7 +2599,9 @@ class Caller {
     fn three_way_union_becomes_mixed() {
         // Union with 3+ non-null kinds should produce Type::Mixed in Phase 2.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Three.php"), r#"<?php
+        std::fs::write(
+            dir.path().join("Three.php"),
+            r#"<?php
 class A {}
 class B {}
 class C {}
@@ -2334,17 +2614,25 @@ class Caller {
         $x = $f->make();
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
         let interner = project.interner().clone();
         let env = TypeEnv::for_class("Caller");
 
-        let caller_source = project.class_likes()
+        let caller_source = project
+            .class_likes()
             .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source).unwrap();
-        let module = project.inner().modules.iter()
-            .find(|m| m.source.identifier == caller_source).unwrap();
+            .map(|(_, r)| r.span.start.source)
+            .unwrap();
+        let module = project
+            .inner()
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == caller_source)
+            .unwrap();
         let program = module.parse(&interner);
         let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
 
@@ -2352,10 +2640,14 @@ class Caller {
 
         for stmt in program.statements.iter() {
             if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" { continue; }
+                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
+                    continue;
+                }
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" { continue; }
+                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
+                            continue;
+                        }
                         if let MethodBody::Concrete(block) = &m.body {
                             for s in block.statements.iter() {
                                 if let Statement::Expression(e) = s {
@@ -2389,7 +2681,8 @@ class Caller {
         std::fs::write(
             dir.path().join("Driver.php"),
             "<?php\ninterface DriverInterface { public function work(): void; }\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("ConcreteDriver.php"),
             "<?php\nclass ConcreteDriver implements DriverInterface { public function work(): void {} }\n",
@@ -2430,11 +2723,13 @@ class Caller {
         std::fs::write(
             dir.path().join("DriverInterface.php"),
             "<?php\ninterface DriverInterface {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("ConcreteDriver.php"),
             "<?php\nclass ConcreteDriver implements DriverInterface {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("Factory.php"),
             "<?php\nclass Factory {\n  public static function create(): ConcreteDriver { return new ConcreteDriver(); }\n}\n",
@@ -2472,7 +2767,8 @@ class Caller {
         std::fs::write(
             dir.path().join("DriverInterface.php"),
             "<?php\nnamespace App\\Contracts;\ninterface DriverInterface {}\n",
-        ).unwrap();
+        )
+        .unwrap();
         // ConcreteDriver in App\Driver
         std::fs::write(
             dir.path().join("ConcreteDriver.php"),
@@ -2512,7 +2808,11 @@ class Caller {
 
     /// Walk the first concrete method of the named class with `walk_statement_ctx`
     /// (the ctx-based statement path), returning every emitted `CallSiteEvent`.
-    fn collect_events_walking_method(php: &str, class_lc: &str, method_lc: &str) -> Vec<CallSiteEvent> {
+    fn collect_events_walking_method(
+        php: &str,
+        class_lc: &str,
+        method_lc: &str,
+    ) -> Vec<CallSiteEvent> {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("M1.php"), php).unwrap();
         let project = MagoProject::load(dir.path()).expect("load ok");
@@ -2520,24 +2820,40 @@ class Caller {
         let module = project.inner().modules.first().expect("module");
         let program = module.parse(interner);
 
-        let class = program.statements.iter().find_map(|s| {
-            if let Statement::Class(c) = s {
-                let n = interner.lookup(&c.name.value).to_lowercase();
-                if n == class_lc { Some(c) } else { None }
-            } else {
-                None
-            }
-        }).unwrap_or_else(|| panic!("class {class_lc} not found"));
+        let class = program
+            .statements
+            .iter()
+            .find_map(|s| {
+                if let Statement::Class(c) = s {
+                    let n = interner.lookup(&c.name.value).to_lowercase();
+                    if n == class_lc {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("class {class_lc} not found"));
         let class_name = interner.lookup(&class.name.value).to_string();
 
-        let method = class.members.iter().find_map(|m| {
-            if let ClassLikeMember::Method(m) = m {
-                let n = interner.lookup(&m.name.value).to_lowercase();
-                if n == method_lc { Some(m) } else { None }
-            } else {
-                None
-            }
-        }).unwrap_or_else(|| panic!("method {method_lc} not found"));
+        let method = class
+            .members
+            .iter()
+            .find_map(|m| {
+                if let ClassLikeMember::Method(m) = m {
+                    let n = interner.lookup(&m.name.value).to_lowercase();
+                    if n == method_lc {
+                        Some(m)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("method {method_lc} not found"));
 
         let block = match &method.body {
             MethodBody::Concrete(b) => b,

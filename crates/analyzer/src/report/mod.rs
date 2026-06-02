@@ -97,7 +97,11 @@ pub fn render_table(methods: &[MethodRisk], threshold: f64) -> String {
 
     let header = format!(
         "{:<6}  {:<5}  {:<2}  {:<method_col$}  {:<file_col$}",
-        "RISK", "COV%", "CC", "METHOD", "FILE",
+        "RISK",
+        "COV%",
+        "CC",
+        "METHOD",
+        "FILE",
         method_col = method_col,
         file_col = file_col,
     );

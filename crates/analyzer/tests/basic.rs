@@ -51,7 +51,8 @@ fn analyze_reports_test_method_lines() {
     // Phase 2: src/Money.php MUST appear — the analyzer now recurses into
     // production callees (constructor + method dispatch).
     assert!(
-        keys.iter().any(|k| k.ends_with("Money.php") && !k.contains("Test")),
+        keys.iter()
+            .any(|k| k.ends_with("Money.php") && !k.contains("Test")),
         "Phase 2: src/Money.php should appear in coverage; got keys: {keys:?}"
     );
 
@@ -89,9 +90,9 @@ fn analyze_reports_test_method_lines() {
         .expect("Money.php entry must be a line-map object");
 
     assert!(
-        money_lines.values().any(|tests| {
-            tests.as_array().map(|a| !a.is_empty()).unwrap_or(false)
-        }),
+        money_lines
+            .values()
+            .any(|tests| { tests.as_array().map(|a| !a.is_empty()).unwrap_or(false) }),
         "Money.php must have at least one line attributed to a test; got: {money_lines:?}"
     );
 

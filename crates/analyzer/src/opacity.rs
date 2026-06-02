@@ -58,7 +58,9 @@ pub fn decide(call: &CallSite, boundary: &BoundaryResolver) -> Opacity {
     // 2. Receiver-type rules.
     match &call.receiver_type {
         ReceiverType::Mock | ReceiverType::Interface(_) | ReceiverType::Mixed => Opacity::Opaque,
-        ReceiverType::Concrete(_) | ReceiverType::Static | ReceiverType::LocalClosure => Opacity::Trace,
+        ReceiverType::Concrete(_) | ReceiverType::Static | ReceiverType::LocalClosure => {
+            Opacity::Trace
+        }
     }
 }
 

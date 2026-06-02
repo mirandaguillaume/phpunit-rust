@@ -12,10 +12,14 @@ fn coverage_clover_smoke() {
     let status = std::process::Command::new(bin)
         .env("RUST_MIN_STACK", "67108864")
         .args([
-            "--project", project.to_str().unwrap(),
-            "--workers", "1",
-            "--coverage-format", "json",
-            "--coverage-out", out.to_str().unwrap(),
+            "--project",
+            project.to_str().unwrap(),
+            "--workers",
+            "1",
+            "--coverage-format",
+            "json",
+            "--coverage-out",
+            out.to_str().unwrap(),
         ])
         .status()
         .expect("failed to spawn phpunit-rust");
@@ -25,15 +29,21 @@ fn coverage_clover_smoke() {
     let raw = std::fs::read_to_string(&out).expect("coverage output not written");
     let map: std::collections::HashMap<String, serde_json::Value> =
         serde_json::from_str(&raw).expect("coverage output is not valid JSON");
-    assert!(!map.is_empty(), "coverage map must contain at least one file");
+    assert!(
+        !map.is_empty(),
+        "coverage map must contain at least one file"
+    );
     let _ = std::fs::remove_file(&out);
 }
 
 #[test]
 fn fork_worker_php_script_exists_and_is_valid_syntax() {
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../php/worker_fork.php");
-    assert!(script.exists(), "php/worker_fork.php not found at {:?}", script);
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../php/worker_fork.php");
+    assert!(
+        script.exists(),
+        "php/worker_fork.php not found at {:?}",
+        script
+    );
 
     let output = std::process::Command::new("php")
         .args(["-l", script.to_str().unwrap()])
@@ -52,39 +62,58 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     use phpunit_rust::fork_pool::PhpForkPool;
     use phpunit_rust::types::{BatchClass, BatchPlan};
 
-    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/sample_project");
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script()
-        .expect("worker_fork.php not found");
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
 
-    let mut pool = PhpForkPool::spawn(&script, &autoload, None, &[], &[], &[], &[], &[], 2, &std::collections::HashMap::new(), "512M", 0)
-        .expect("PhpForkPool::spawn failed");
+    let mut pool = PhpForkPool::spawn(
+        &script,
+        &autoload,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        2,
+        &std::collections::HashMap::new(),
+        "512M",
+        0,
+    )
+    .expect("PhpForkPool::spawn failed");
 
-    pool.write_batch(0, &BatchPlan {
-        autoload: autoload.clone(),
-        bootstrap: None,
-        defines: vec![],
-        classes: vec![BatchClass {
-            file:           project.join("tests/SampleTest.php"),
-            class:          "SampleTest".to_string(),
-            methods:        vec![],
-            row_filter:     None,
-            required_files: vec![],
-            is_isolated:    false,
-        }],
-        fingerprint: std::collections::HashSet::new(),
-        force_exit_after: false,
-    }).expect("write_batch slot 0");
+    pool.write_batch(
+        0,
+        &BatchPlan {
+            autoload: autoload.clone(),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![BatchClass {
+                file: project.join("tests/SampleTest.php"),
+                class: "SampleTest".to_string(),
+                methods: vec![],
+                row_filter: None,
+                required_files: vec![],
+                is_isolated: false,
+            }],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
+        },
+    )
+    .expect("write_batch slot 0");
 
-    pool.write_batch(1, &BatchPlan {
-        autoload: autoload.clone(),
-        bootstrap: None,
-        defines: vec![],
-        classes: vec![],
-        fingerprint: std::collections::HashSet::new(),
-        force_exit_after: false,
-    }).expect("write_batch slot 1");
+    pool.write_batch(
+        1,
+        &BatchPlan {
+            autoload: autoload.clone(),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
+        },
+    )
+    .expect("write_batch slot 1");
 
     pool.close_write_ends();
 
@@ -105,11 +134,16 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     }
     pool.wait();
 
-    assert!(!all_outcomes.is_empty(), "expected at least one outcome from SampleTest");
+    assert!(
+        !all_outcomes.is_empty(),
+        "expected at least one outcome from SampleTest"
+    );
     let classes: std::collections::HashSet<&str> =
         all_outcomes.iter().map(|o| o.class.as_str()).collect();
-    assert!(classes.contains("SampleTest"),
-        "SampleTest outcomes missing; got: {classes:?}");
+    assert!(
+        classes.contains("SampleTest"),
+        "SampleTest outcomes missing; got: {classes:?}"
+    );
 }
 
 /// C2: a worker that hangs (alive but never emits output) must NOT hang the
@@ -159,9 +193,19 @@ fn worker_timeout_aborts_stuck_run() {
     let autoload_t = autoload.clone();
     let handle = std::thread::spawn(move || {
         let mut pool = PhpForkPool::spawn(
-            &script, &autoload_t, None, &[], &[], &[], &[], 1,
-            &std::collections::HashMap::new(), "512M", 0,
-        ).expect("PhpForkPool::spawn failed");
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            0,
+        )
+        .expect("PhpForkPool::spawn failed");
         let cfg = RunConfig {
             autoload: autoload_t.clone(),
             bootstrap: None,
@@ -185,14 +229,22 @@ fn worker_timeout_aborts_stuck_run() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let report = handle.join().expect("run thread panicked").expect("run returned Err");
+    let report = handle
+        .join()
+        .expect("run thread panicked")
+        .expect("run returned Err");
     let _ = std::fs::remove_dir_all(&dir);
 
     let stuck = report
         .outcomes
         .iter()
         .find(|o| o.class == "HangTest" && o.status == TestStatus::Error)
-        .unwrap_or_else(|| panic!("stuck HangTest must be reported as an Error; got: {:?}", report.outcomes));
+        .unwrap_or_else(|| {
+            panic!(
+                "stuck HangTest must be reported as an Error; got: {:?}",
+                report.outcomes
+            )
+        });
     assert!(
         stuck.message.as_deref().unwrap_or("").contains("watchdog"),
         "the synthesised error should mention the watchdog; got: {:?}",

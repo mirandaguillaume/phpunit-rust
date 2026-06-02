@@ -28,16 +28,22 @@ mod tests {
     fn renders_coverage_with_test_ids() {
         let mut cov: Coverage = HashMap::new();
         let mut lines = HashMap::new();
-        lines.insert(10u32, vec![TestId {
-            class: "T".into(),
-            method: "testA".into(),
-            data_set: None,
-        }]);
+        lines.insert(
+            10u32,
+            vec![TestId {
+                class: "T".into(),
+                method: "testA".into(),
+                data_set: None,
+            }],
+        );
         cov.insert(PathBuf::from("a.php"), lines);
 
         let s = render(&cov);
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         // The structure has PathBuf as key (serialized as string), then HashMap<u32, Vec<TestId>>.
-        assert!(parsed.get("a.php").is_some(), "expected a.php key, got: {parsed}");
+        assert!(
+            parsed.get("a.php").is_some(),
+            "expected a.php key, got: {parsed}"
+        );
     }
 }

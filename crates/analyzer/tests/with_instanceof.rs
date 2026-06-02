@@ -27,18 +27,26 @@ fn instanceof_narrowing_covers_dog_bark() {
         .args(["analyze", "--format", "pcov-extended"])
         .output()
         .unwrap();
-    assert!(output.status.success(),
-        "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let map = parsed.as_object().expect("top-level object");
 
     // Dog.php should be in coverage (its bark() method called via narrowed receiver).
-    let dog_key = map.keys().find(|k| k.ends_with("Dog.php"))
+    let dog_key = map
+        .keys()
+        .find(|k| k.ends_with("Dog.php"))
         .expect("Dog.php should be in coverage");
     let dog_lines = parsed[dog_key].as_object().unwrap();
     let has_bark_attribution = dog_lines.values().any(|tests| {
-        tests.as_array().unwrap().iter()
+        tests
+            .as_array()
+            .unwrap()
+            .iter()
             .any(|v| v.as_str().map_or(false, |s| s.contains("testNarrowsToDog")))
     });
     assert!(has_bark_attribution,
@@ -46,6 +54,8 @@ fn instanceof_narrowing_covers_dog_bark() {
 
     // Cat.php should NOT be in coverage (test only narrowed to Dog).
     let cat_present = map.keys().any(|k| k.ends_with("Cat.php"));
-    assert!(!cat_present,
-        "Cat.php should not be covered — the test only narrowed to Dog");
+    assert!(
+        !cat_present,
+        "Cat.php should not be covered — the test only narrowed to Dog"
+    );
 }

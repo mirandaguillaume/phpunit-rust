@@ -65,12 +65,18 @@ mod tests {
 
     #[test]
     fn deterministic_for_same_bytes() {
-        assert_eq!(ContentHash::of_bytes(b"hello"), ContentHash::of_bytes(b"hello"));
+        assert_eq!(
+            ContentHash::of_bytes(b"hello"),
+            ContentHash::of_bytes(b"hello")
+        );
     }
 
     #[test]
     fn differs_for_different_bytes() {
-        assert_ne!(ContentHash::of_bytes(b"hello"), ContentHash::of_bytes(b"world"));
+        assert_ne!(
+            ContentHash::of_bytes(b"hello"),
+            ContentHash::of_bytes(b"world")
+        );
     }
 
     #[test]
@@ -78,7 +84,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.txt");
         std::fs::write(&file, "hello").unwrap();
-        assert_eq!(ContentHash::of_file(&file).unwrap(), ContentHash::of_bytes(b"hello"));
+        assert_eq!(
+            ContentHash::of_file(&file).unwrap(),
+            ContentHash::of_bytes(b"hello")
+        );
     }
 
     #[test]
@@ -147,10 +156,8 @@ mod tests {
         let root = PathBuf::from("/proj");
         let suites: Vec<PathBuf> = vec![];
         let p = PathBuf::from("/proj/x");
-        let as_include =
-            ContentHash::of_config(&root, std::slice::from_ref(&p), &[], &suites);
-        let as_exclude =
-            ContentHash::of_config(&root, &[], std::slice::from_ref(&p), &suites);
+        let as_include = ContentHash::of_config(&root, std::slice::from_ref(&p), &[], &suites);
+        let as_exclude = ContentHash::of_config(&root, &[], std::slice::from_ref(&p), &suites);
         assert_ne!(as_include, as_exclude);
     }
 }

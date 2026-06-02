@@ -1,8 +1,12 @@
-use clap::Parser;
 use analyzer::cli;
+use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "pcov-rs", version, about = "Fast PHP test coverage via static analysis")]
+#[command(
+    name = "pcov-rs",
+    version,
+    about = "Fast PHP test coverage via static analysis"
+)]
 struct Cli {
     #[command(subcommand)]
     command: cli::Command,

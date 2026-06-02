@@ -68,7 +68,10 @@ pub struct Context {
 
 impl Context {
     pub fn new() -> Self {
-        Self { depth: 0, max_depth: 100 }
+        Self {
+            depth: 0,
+            max_depth: 100,
+        }
     }
 }
 
@@ -133,21 +136,30 @@ fn compute_unary_prefix(
             match val {
                 PhpValue::Int(n) => Ok(PhpValue::Int(n.wrapping_neg())),
                 PhpValue::Float(f) => Ok(PhpValue::Float(-f)),
-                _ => Err(ComputeError::TypeError(format!("cannot negate {}", val.type_name()))),
+                _ => Err(ComputeError::TypeError(format!(
+                    "cannot negate {}",
+                    val.type_name()
+                ))),
             }
         }
         UnaryPrefixOperator::Plus(_) => {
             let val = compute(operand, ctx)?;
             match &val {
                 PhpValue::Int(_) | PhpValue::Float(_) => Ok(val),
-                _ => Err(ComputeError::TypeError(format!("unary + on {}", val.type_name()))),
+                _ => Err(ComputeError::TypeError(format!(
+                    "unary + on {}",
+                    val.type_name()
+                ))),
             }
         }
         UnaryPrefixOperator::Not(_) => {
             let val = compute(operand, ctx)?;
             Ok(PhpValue::Bool(!php_truthy(&val)))
         }
-        other => Err(ComputeError::Unsupported(format!("unary prefix operator {:?}", other))),
+        other => Err(ComputeError::Unsupported(format!(
+            "unary prefix operator {:?}",
+            other
+        ))),
     }
 }
 
@@ -221,7 +233,10 @@ fn compute_binary(
             let rs = coerce_to_string(r)?;
             Ok(PhpValue::String(ls + &rs))
         }
-        other => Err(ComputeError::Unsupported(format!("binary operator {:?}", other))),
+        other => Err(ComputeError::Unsupported(format!(
+            "binary operator {:?}",
+            other
+        ))),
     }
 }
 
@@ -373,20 +388,32 @@ mod tests {
     #[test]
     fn depth_limit_returns_error() {
         let expr = parse_expr("42");
-        let mut ctx = Context { depth: 100, max_depth: 100 };
-        assert!(matches!(compute(&expr, &mut ctx), Err(ComputeError::DepthExceeded)));
+        let mut ctx = Context {
+            depth: 100,
+            max_depth: 100,
+        };
+        assert!(matches!(
+            compute(&expr, &mut ctx),
+            Err(ComputeError::DepthExceeded)
+        ));
     }
 
     #[test]
     fn evaluates_integer_literal() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("42"), &mut ctx).unwrap(), PhpValue::Int(42));
+        assert_eq!(
+            compute(&parse_expr("42"), &mut ctx).unwrap(),
+            PhpValue::Int(42)
+        );
     }
 
     #[test]
     fn evaluates_negative_integer() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("-42"), &mut ctx).unwrap(), PhpValue::Int(-42));
+        assert_eq!(
+            compute(&parse_expr("-42"), &mut ctx).unwrap(),
+            PhpValue::Int(-42)
+        );
     }
 
     // `3.14` is intentionally a bare literal (we are verifying the string
@@ -422,33 +449,54 @@ mod tests {
     #[test]
     fn evaluates_true_false_null() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("true"), &mut ctx).unwrap(), PhpValue::Bool(true));
-        assert_eq!(compute(&parse_expr("false"), &mut ctx).unwrap(), PhpValue::Bool(false));
-        assert_eq!(compute(&parse_expr("null"), &mut ctx).unwrap(), PhpValue::Null);
+        assert_eq!(
+            compute(&parse_expr("true"), &mut ctx).unwrap(),
+            PhpValue::Bool(true)
+        );
+        assert_eq!(
+            compute(&parse_expr("false"), &mut ctx).unwrap(),
+            PhpValue::Bool(false)
+        );
+        assert_eq!(
+            compute(&parse_expr("null"), &mut ctx).unwrap(),
+            PhpValue::Null
+        );
     }
 
     #[test]
     fn evaluates_int_addition() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("1 + 2"), &mut ctx).unwrap(), PhpValue::Int(3));
+        assert_eq!(
+            compute(&parse_expr("1 + 2"), &mut ctx).unwrap(),
+            PhpValue::Int(3)
+        );
     }
 
     #[test]
     fn evaluates_int_subtraction() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("10 - 3"), &mut ctx).unwrap(), PhpValue::Int(7));
+        assert_eq!(
+            compute(&parse_expr("10 - 3"), &mut ctx).unwrap(),
+            PhpValue::Int(7)
+        );
     }
 
     #[test]
     fn evaluates_int_multiplication() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("6 * 7"), &mut ctx).unwrap(), PhpValue::Int(42));
+        assert_eq!(
+            compute(&parse_expr("6 * 7"), &mut ctx).unwrap(),
+            PhpValue::Int(42)
+        );
     }
 
     #[test]
     fn evaluates_int_division_exact() {
         let mut ctx = Context::new();
-        assert_eq!(compute(&parse_expr("10 / 2"), &mut ctx).unwrap(), PhpValue::Int(5));
+        assert_eq!(
+            compute(&parse_expr("10 / 2"), &mut ctx).unwrap(),
+            PhpValue::Int(5)
+        );
     }
 
     #[test]
@@ -487,8 +535,14 @@ mod tests {
         let mut ctx = Context::new();
         match compute(&parse_expr("['a' => 1, 'b' => 2]"), &mut ctx).unwrap() {
             PhpValue::Array(map) => {
-                assert_eq!(map.get(&ArrayKey::String("a".into())), Some(&PhpValue::Int(1)));
-                assert_eq!(map.get(&ArrayKey::String("b".into())), Some(&PhpValue::Int(2)));
+                assert_eq!(
+                    map.get(&ArrayKey::String("a".into())),
+                    Some(&PhpValue::Int(1))
+                );
+                assert_eq!(
+                    map.get(&ArrayKey::String("b".into())),
+                    Some(&PhpValue::Int(2))
+                );
             }
             v => panic!("expected Array, got {:?}", v),
         }

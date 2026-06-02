@@ -18,16 +18,17 @@ impl BoundaryResolver {
     pub fn from_config(cfg: &ProjectConfig) -> Self {
         let vendor_root_raw = cfg.root.join("vendor");
         Self {
-            includes: cfg.source_includes.iter()
+            includes: cfg
+                .source_includes
+                .iter()
                 .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
                 .collect(),
-            excludes: cfg.source_excludes.iter()
+            excludes: cfg
+                .source_excludes
+                .iter()
                 .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
                 .collect(),
-            vendor_root: vendor_root_raw
-                .canonicalize()
-                .ok()
-                .filter(|p| p.exists()),
+            vendor_root: vendor_root_raw.canonicalize().ok().filter(|p| p.exists()),
         }
     }
 
@@ -106,6 +107,9 @@ mod tests {
     fn classifies_unknown_path_as_builtin() {
         let dir = tempfile::tempdir().unwrap();
         let resolver = BoundaryResolver::from_config(&make_cfg(dir.path()));
-        assert_eq!(resolver.classify(Path::new("/usr/lib/php/builtin.so")), Boundary::Builtin);
+        assert_eq!(
+            resolver.classify(Path::new("/usr/lib/php/builtin.so")),
+            Boundary::Builtin
+        );
     }
 }

@@ -50,9 +50,9 @@ struct TraceCacheEntry {
 impl TraceCacheEntry {
     fn still_valid(&self, current: &HashMap<PathBuf, FileMeta>) -> bool {
         self.dep_snapshots.iter().all(|(p, s)| {
-            current
-                .get(p)
-                .map_or(false, |m| m.size == s.size && m.mtime_nanos == s.mtime_nanos)
+            current.get(p).map_or(false, |m| {
+                m.size == s.size && m.mtime_nanos == s.mtime_nanos
+            })
         })
     }
 }
@@ -87,7 +87,10 @@ struct ResultCacheEntry {
 /// workers inherit the large stack too.
 pub fn with_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     const DEEP_STACK: usize = 128 * 1024 * 1024;
-    match rayon::ThreadPoolBuilder::new().stack_size(DEEP_STACK).build() {
+    match rayon::ThreadPoolBuilder::new()
+        .stack_size(DEEP_STACK)
+        .build()
+    {
         Ok(pool) => pool.install(f),
         Err(_) => f(), // fall back to the current thread if pool creation fails
     }
@@ -115,7 +118,6 @@ fn analyze_filtered_inner(
     cfg: &crate::config::ProjectConfig,
     allowed: Option<&std::collections::HashSet<(String, String)>>,
 ) -> anyhow::Result<crate::analyzer::Coverage> {
-
     let boundary = BoundaryResolver::from_config(cfg);
     let cache = CacheStore::open(&cfg.root, MagoProject::version())?;
     let cfg_fp = config_fingerprint(cfg);
@@ -167,7 +169,15 @@ fn analyze_filtered_inner(
                     }
                 }
                 Some(cached_cov.unwrap_or_else(|| {
-                    trace_and_cache(&project, &boundary, cfg_fp.as_str(), test, &file_metas, &cache, false)
+                    trace_and_cache(
+                        &project,
+                        &boundary,
+                        cfg_fp.as_str(),
+                        test,
+                        &file_metas,
+                        &cache,
+                        false,
+                    )
                 }))
             })
             .collect()
@@ -185,7 +195,9 @@ fn analyze_filtered_inner(
         let _ = cache.put(
             "result",
             &fingerprint,
-            &ResultCacheEntry { coverage: coverage.clone() },
+            &ResultCacheEntry {
+                coverage: coverage.clone(),
+            },
         );
     }
 
@@ -261,7 +273,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 .zip(cached_traces.into_par_iter())
                 .map(|(test, cached_cov)| {
                     cached_cov.unwrap_or_else(|| {
-                        trace_and_cache(&project, &boundary, cfg_fp.as_str(), test, &file_metas, &cache, no_cache)
+                        trace_and_cache(
+                            &project,
+                            &boundary,
+                            cfg_fp.as_str(),
+                            test,
+                            &file_metas,
+                            &cache,
+                            no_cache,
+                        )
                     })
                 })
                 .collect()
@@ -275,7 +295,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
         // Store the baked result so the next run hits tier 1.
         if !args.no_cache {
-            let _ = cache.put("result", &fingerprint, &ResultCacheEntry { coverage: coverage.clone() });
+            let _ = cache.put(
+                "result",
+                &fingerprint,
+                &ResultCacheEntry {
+                    coverage: coverage.clone(),
+                },
+            );
         }
 
         emit(coverage, &args)
@@ -327,10 +353,19 @@ fn trace_and_cache(
             .filter_map(|p| file_metas.get(p).map(|m| (p.clone(), m.clone())))
             .collect();
         if let Some(m) = file_metas.get(&test.file) {
-            dep_snapshots.entry(test.file.clone()).or_insert_with(|| m.clone());
+            dep_snapshots
+                .entry(test.file.clone())
+                .or_insert_with(|| m.clone());
         }
-        let entry = TraceCacheEntry { coverage: test_cov.clone(), dep_snapshots };
-        let _ = cache.put("trace_v2", &trace_v2_key(cfg_fp, &test.class, &test.method), &entry);
+        let entry = TraceCacheEntry {
+            coverage: test_cov.clone(),
+            dep_snapshots,
+        };
+        let _ = cache.put(
+            "trace_v2",
+            &trace_v2_key(cfg_fp, &test.class, &test.method),
+            &entry,
+        );
     }
 
     test_cov
@@ -368,7 +403,10 @@ fn emit(coverage: Coverage, args: &Args) -> anyhow::Result<()> {
 }
 
 /// Build a flat map of all PHP files under the given dirs with their (size, mtime) snapshots.
-fn collect_file_metas(source_includes: &[PathBuf], test_suites: &[PathBuf]) -> HashMap<PathBuf, FileMeta> {
+fn collect_file_metas(
+    source_includes: &[PathBuf],
+    test_suites: &[PathBuf],
+) -> HashMap<PathBuf, FileMeta> {
     let mut metas = HashMap::new();
     for dir in source_includes.iter().chain(test_suites.iter()) {
         collect_php_file_metas_rec(dir, &mut metas);
@@ -390,7 +428,13 @@ fn collect_php_file_metas_rec(dir: &Path, out: &mut HashMap<PathBuf, FileMeta>) 
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_nanos() as u64)
                         .unwrap_or(0);
-                    out.insert(path, FileMeta { size: meta.len(), mtime_nanos });
+                    out.insert(
+                        path,
+                        FileMeta {
+                            size: meta.len(),
+                            mtime_nanos,
+                        },
+                    );
                 }
             }
         }

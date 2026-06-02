@@ -1,9 +1,9 @@
 //! CLI subcommand definitions and routing.
 
 pub mod analyze;
+pub mod cache_cmd;
 pub mod report;
 pub mod test_discovery;
-pub mod cache_cmd;
 
 use clap::Subcommand;
 use std::path::PathBuf;

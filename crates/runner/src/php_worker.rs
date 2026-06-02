@@ -51,7 +51,8 @@ pub fn check_php_version(min_version_id: u32) -> Result<u32> {
     if id < min_version_id {
         return Err(anyhow!(
             "PHP version is too old: PHP_VERSION_ID={} (need >= {})",
-            id, min_version_id
+            id,
+            min_version_id
         ));
     }
     Ok(id)

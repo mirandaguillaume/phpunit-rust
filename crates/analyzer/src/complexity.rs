@@ -6,12 +6,12 @@
 use std::path::PathBuf;
 
 use mago_interner::ThreadedInterner;
+use mago_syntax::ast::binary::{Binary, BinaryOperator};
 use mago_syntax::ast::control_flow::r#if::{If, IfBody};
 use mago_syntax::ast::{
-    Block, ClassLikeMember, Expression, Match, MatchArm, MethodBody, Statement,
-    Switch, SwitchCase, Try, While,
+    Block, ClassLikeMember, Expression, Match, MatchArm, MethodBody, Statement, Switch, SwitchCase,
+    Try, While,
 };
-use mago_syntax::ast::binary::{Binary, BinaryOperator};
 
 use crate::boundary::{Boundary, BoundaryResolver};
 use crate::mago_bridge::MagoProject;
@@ -35,7 +35,9 @@ pub fn compute_all(project: &MagoProject, boundary: &BoundaryResolver) -> Vec<Me
 
     for (name, refl) in project.class_likes() {
         let source_id = refl.span.start.source;
-        let Some(src) = project.source_by_id(source_id) else { continue };
+        let Some(src) = project.source_by_id(source_id) else {
+            continue;
+        };
         let file = PathBuf::from(interner.lookup(&src.identifier.0).to_string());
 
         if boundary.classify(&file) != Boundary::Project {
@@ -51,8 +53,13 @@ pub fn compute_all(project: &MagoProject, boundary: &BoundaryResolver) -> Vec<Me
             let start_line = src.line_number(method_refl.span.start.offset) as u32 + 1;
             let end_line = src.line_number(method_refl.span.end.offset) as u32 + 1;
 
-            let cc = navigate(program.statements.iter(), &class_name, &method_name, interner)
-                .unwrap_or(0);
+            let cc = navigate(
+                program.statements.iter(),
+                &class_name,
+                &method_name,
+                interner,
+            )
+            .unwrap_or(0);
 
             result.push(MethodComplexity {
                 class: class_name.clone(),
@@ -119,8 +126,12 @@ fn navigate<'s>(
             Statement::Namespace(ns) => {
                 use mago_syntax::ast::namespace::NamespaceBody;
                 let found = match &ns.body {
-                    NamespaceBody::Implicit(b) => navigate(b.statements.iter(), class, method, interner),
-                    NamespaceBody::BraceDelimited(b) => navigate(b.statements.iter(), class, method, interner),
+                    NamespaceBody::Implicit(b) => {
+                        navigate(b.statements.iter(), class, method, interner)
+                    }
+                    NamespaceBody::BraceDelimited(b) => {
+                        navigate(b.statements.iter(), class, method, interner)
+                    }
                 };
                 if found.is_some() {
                     return found;
@@ -135,7 +146,11 @@ fn navigate<'s>(
 // ── Decision-point counters ───────────────────────────────────────────────────
 
 fn count_block(block: &Block, interner: &ThreadedInterner) -> u32 {
-    block.statements.iter().map(|s| count_stmt(s, interner)).sum()
+    block
+        .statements
+        .iter()
+        .map(|s| count_stmt(s, interner))
+        .sum()
 }
 
 fn count_stmts<'s>(stmts: impl Iterator<Item = &'s Statement>, interner: &ThreadedInterner) -> u32 {
@@ -192,10 +207,14 @@ fn count_while_body(w: &While, interner: &ThreadedInterner) -> u32 {
 }
 
 fn count_switch(sw: &Switch, interner: &ThreadedInterner) -> u32 {
-    sw.body.cases().iter().map(|case| match case {
-        SwitchCase::Expression(ec) => 1 + count_stmts(ec.statements.iter(), interner),
-        SwitchCase::Default(dc) => count_stmts(dc.statements.iter(), interner),
-    }).sum()
+    sw.body
+        .cases()
+        .iter()
+        .map(|case| match case {
+            SwitchCase::Expression(ec) => 1 + count_stmts(ec.statements.iter(), interner),
+            SwitchCase::Default(dc) => count_stmts(dc.statements.iter(), interner),
+        })
+        .sum()
 }
 
 fn count_try(t: &Try, interner: &ThreadedInterner) -> u32 {
@@ -236,10 +255,13 @@ fn count_binary(b: &Binary) -> u32 {
 }
 
 fn count_match(m: &Match) -> u32 {
-    m.arms.iter().map(|arm| match arm {
-        MatchArm::Expression(_) => 1,
-        MatchArm::Default(_) => 0,
-    }).sum()
+    m.arms
+        .iter()
+        .map(|arm| match arm {
+            MatchArm::Expression(_) => 1,
+            MatchArm::Default(_) => 0,
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -247,7 +269,9 @@ mod tests {
     use super::*;
     use crate::config::ProjectConfig;
 
-    fn make_project_and_boundary(files: &[(&str, &str)]) -> (tempfile::TempDir, MagoProject, BoundaryResolver) {
+    fn make_project_and_boundary(
+        files: &[(&str, &str)],
+    ) -> (tempfile::TempDir, MagoProject, BoundaryResolver) {
         let dir = tempfile::tempdir().unwrap();
         for (path, content) in files {
             let target = dir.path().join(path);

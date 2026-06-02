@@ -23,12 +23,12 @@ use std::time::Instant;
 #[derive(Serialize, Clone)]
 pub struct TraceEvent {
     pub name: String,
-    pub cat:  String,
-    pub ph:   &'static str,
-    pub ts:   u64,
-    pub dur:  u64,
-    pub pid:  u32,
-    pub tid:  u32,
+    pub cat: String,
+    pub ph: &'static str,
+    pub ts: u64,
+    pub dur: u64,
+    pub pid: u32,
+    pub tid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
 }
@@ -77,12 +77,12 @@ impl Profiler {
         let end_us = self.elapsed_us();
         self.push(TraceEvent {
             name: name.to_string(),
-            cat:  category.to_string(),
-            ph:   "X",
-            ts:   start_us,
-            dur:  end_us.saturating_sub(start_us),
-            pid:  std::process::id(),
-            tid:  0,
+            cat: category.to_string(),
+            ph: "X",
+            ts: start_us,
+            dur: end_us.saturating_sub(start_us),
+            pid: std::process::id(),
+            tid: 0,
             args: None,
         });
         r
@@ -90,13 +90,7 @@ impl Profiler {
 
     /// Same as [`span`] but with structured metadata attached to the event
     /// (visible in chrome://tracing's "Args" pane).
-    pub fn span_with<F, R>(
-        &self,
-        name: &str,
-        category: &str,
-        args: serde_json::Value,
-        f: F,
-    ) -> R
+    pub fn span_with<F, R>(&self, name: &str, category: &str, args: serde_json::Value, f: F) -> R
     where
         F: FnOnce() -> R,
     {
@@ -108,12 +102,12 @@ impl Profiler {
         let end_us = self.elapsed_us();
         self.push(TraceEvent {
             name: name.to_string(),
-            cat:  category.to_string(),
-            ph:   "X",
-            ts:   start_us,
-            dur:  end_us.saturating_sub(start_us),
-            pid:  std::process::id(),
-            tid:  0,
+            cat: category.to_string(),
+            ph: "X",
+            ts: start_us,
+            dur: end_us.saturating_sub(start_us),
+            pid: std::process::id(),
+            tid: 0,
             args: Some(args),
         });
         r
@@ -128,12 +122,12 @@ impl Profiler {
         let ts = self.elapsed_us();
         self.push(TraceEvent {
             name: name.to_string(),
-            cat:  category.to_string(),
-            ph:   "X",
+            cat: category.to_string(),
+            ph: "X",
             ts,
-            dur:  0,
-            pid:  std::process::id(),
-            tid:  0,
+            dur: 0,
+            pid: std::process::id(),
+            tid: 0,
             args: None,
         });
     }
@@ -170,11 +164,11 @@ impl Profiler {
         let dur = end.saturating_duration_since(start).as_micros() as u64;
         self.push(TraceEvent {
             name: name.to_string(),
-            cat:  category.to_string(),
-            ph:   "X",
-            ts:   start_us,
+            cat: category.to_string(),
+            ph: "X",
+            ts: start_us,
             dur,
-            pid:  std::process::id(),
+            pid: std::process::id(),
             tid,
             args,
         });
@@ -249,7 +243,9 @@ mod tests {
         p.write_to(tmp.path()).unwrap();
         let raw = std::fs::read_to_string(tmp.path()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let evs = v["traceEvents"].as_array().expect("traceEvents is an array");
+        let evs = v["traceEvents"]
+            .as_array()
+            .expect("traceEvents is an array");
         assert_eq!(evs.len(), 3, "alpha + beta + milestone");
         // All events should be complete-phase X with non-negative ts.
         for e in evs {

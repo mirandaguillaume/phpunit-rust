@@ -29,39 +29,65 @@ fn mocks_do_not_cover_interface_methods() {
         .args(["analyze", "--format", "pcov-extended"])
         .output()
         .unwrap();
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let map = parsed.as_object().expect("expected JSON object at top level");
+    let map = parsed
+        .as_object()
+        .expect("expected JSON object at top level");
 
     // Test method body should be covered.
     let has_test_file = map.keys().any(|k| k.ends_with("UserServiceTest.php"));
-    assert!(has_test_file, "expected UserServiceTest.php in output; keys: {:?}", map.keys().collect::<Vec<_>>());
+    assert!(
+        has_test_file,
+        "expected UserServiceTest.php in output; keys: {:?}",
+        map.keys().collect::<Vec<_>>()
+    );
 
     // Interface methods of UserRepository must NOT be covered — mock dispatch
     // is opaque, which is the correct semantic (same as PCov/Xdebug at runtime).
-    let has_repo_coverage = map.keys().any(|k| k.ends_with("UserRepository.php") && !k.contains("Test"));
-    assert!(!has_repo_coverage,
+    let has_repo_coverage = map
+        .keys()
+        .any(|k| k.ends_with("UserRepository.php") && !k.contains("Test"));
+    assert!(
+        !has_repo_coverage,
         "interface methods must never be marked covered via mock dispatch; keys: {:?}",
-        map.keys().collect::<Vec<_>>());
+        map.keys().collect::<Vec<_>>()
+    );
 
     // Phase 2: UserService is instantiated directly with `new UserService($repo)`,
     // so the analyzer recurses into UserService::__construct and attributes its
     // constructor line to testRename.
-    let has_service_coverage = map.keys().any(|k| k.ends_with("UserService.php") && !k.contains("Test"));
+    let has_service_coverage = map
+        .keys()
+        .any(|k| k.ends_with("UserService.php") && !k.contains("Test"));
     assert!(has_service_coverage,
         "Phase 2: UserService.php should appear in coverage (direct instantiation recurses into __construct); keys: {:?}",
         map.keys().collect::<Vec<_>>());
 
     // Verify the UserService lines are attributed to testRename.
-    let service_key = map.keys()
+    let service_key = map
+        .keys()
         .find(|k| k.ends_with("UserService.php") && !k.contains("Test"))
         .expect("UserService.php must be present");
-    let service_lines = map[service_key].as_object().expect("UserService.php entry must be a line-map");
+    let service_lines = map[service_key]
+        .as_object()
+        .expect("UserService.php entry must be a line-map");
     assert!(
         service_lines.values().any(|tests| {
-            tests.as_array()
-                .map(|a| a.iter().any(|v| v.as_str().map(|s| s.contains("testRename")).unwrap_or(false)))
+            tests
+                .as_array()
+                .map(|a| {
+                    a.iter().any(|v| {
+                        v.as_str()
+                            .map(|s| s.contains("testRename"))
+                            .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false)
         }),
         "UserService.php lines should be attributed to testRename; got: {service_lines:?}"

@@ -41,7 +41,10 @@ pub fn parse(path: &Path) -> Result<ProjectConfig, ConfigError> {
     let phpunit_node = doc.root_element();
 
     let mut test_suites = Vec::new();
-    for suite in phpunit_node.descendants().filter(|n| n.has_tag_name("testsuite")) {
+    for suite in phpunit_node
+        .descendants()
+        .filter(|n| n.has_tag_name("testsuite"))
+    {
         for dir in suite.descendants().filter(|n| n.has_tag_name("directory")) {
             if let Some(text) = dir.text() {
                 test_suites.push(root.join(text.trim()));
@@ -51,16 +54,25 @@ pub fn parse(path: &Path) -> Result<ProjectConfig, ConfigError> {
 
     let mut source_includes = Vec::new();
     let mut source_excludes = Vec::new();
-    for source in phpunit_node.descendants().filter(|n| n.has_tag_name("source")) {
+    for source in phpunit_node
+        .descendants()
+        .filter(|n| n.has_tag_name("source"))
+    {
         for include in source.descendants().filter(|n| n.has_tag_name("include")) {
-            for dir in include.descendants().filter(|n| n.has_tag_name("directory")) {
+            for dir in include
+                .descendants()
+                .filter(|n| n.has_tag_name("directory"))
+            {
                 if let Some(text) = dir.text() {
                     source_includes.push(root.join(text.trim()));
                 }
             }
         }
         for exclude in source.descendants().filter(|n| n.has_tag_name("exclude")) {
-            for dir in exclude.descendants().filter(|n| n.has_tag_name("directory")) {
+            for dir in exclude
+                .descendants()
+                .filter(|n| n.has_tag_name("directory"))
+            {
                 if let Some(text) = dir.text() {
                     source_excludes.push(root.join(text.trim()));
                 }
@@ -68,7 +80,12 @@ pub fn parse(path: &Path) -> Result<ProjectConfig, ConfigError> {
         }
     }
 
-    Ok(ProjectConfig { root, test_suites, source_includes, source_excludes })
+    Ok(ProjectConfig {
+        root,
+        test_suites,
+        source_includes,
+        source_excludes,
+    })
 }
 
 #[cfg(test)]
@@ -79,7 +96,9 @@ mod tests {
     fn parses_minimal_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("phpunit.xml");
-        std::fs::write(&path, r#"<?xml version="1.0"?>
+        std::fs::write(
+            &path,
+            r#"<?xml version="1.0"?>
 <phpunit>
     <testsuites>
         <testsuite name="default">
@@ -91,7 +110,9 @@ mod tests {
             <directory>src</directory>
         </include>
     </source>
-</phpunit>"#).unwrap();
+</phpunit>"#,
+        )
+        .unwrap();
 
         let cfg = parse(&path).unwrap();
         assert_eq!(cfg.test_suites, vec![dir.path().join("tests")]);
@@ -103,7 +124,9 @@ mod tests {
     fn parses_with_excludes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("phpunit.xml");
-        std::fs::write(&path, r#"<?xml version="1.0"?>
+        std::fs::write(
+            &path,
+            r#"<?xml version="1.0"?>
 <phpunit>
     <testsuites>
         <testsuite name="unit"><directory>tests/Unit</directory></testsuite>
@@ -113,13 +136,18 @@ mod tests {
         <include><directory>src</directory></include>
         <exclude><directory>src/Migrations</directory></exclude>
     </source>
-</phpunit>"#).unwrap();
+</phpunit>"#,
+        )
+        .unwrap();
 
         let cfg = parse(&path).unwrap();
-        assert_eq!(cfg.test_suites, vec![
-            dir.path().join("tests/Unit"),
-            dir.path().join("tests/Integration"),
-        ]);
+        assert_eq!(
+            cfg.test_suites,
+            vec![
+                dir.path().join("tests/Unit"),
+                dir.path().join("tests/Integration"),
+            ]
+        );
         assert_eq!(cfg.source_includes, vec![dir.path().join("src")]);
         assert_eq!(cfg.source_excludes, vec![dir.path().join("src/Migrations")]);
     }

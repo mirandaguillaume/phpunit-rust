@@ -49,17 +49,21 @@ pub fn find_test_methods(project: &MagoProject, test_classes: &[String]) -> Vec<
     let interner = project.interner();
 
     // Build a lowercased FQCN → reflection lookup.
-    let class_index: std::collections::HashMap<String, &mago_reflection::class_like::ClassLikeReflection> =
-        project
-            .class_likes()
-            .map(|(name, refl)| (project.class_name_str(name).to_lowercase(), refl))
-            .collect();
+    let class_index: std::collections::HashMap<
+        String,
+        &mago_reflection::class_like::ClassLikeReflection,
+    > = project
+        .class_likes()
+        .map(|(name, refl)| (project.class_name_str(name).to_lowercase(), refl))
+        .collect();
 
     let mut out = Vec::new();
 
     for class_name in test_classes {
         let key = class_name.to_lowercase();
-        let Some(class_refl) = class_index.get(&key) else { continue };
+        let Some(class_refl) = class_index.get(&key) else {
+            continue;
+        };
 
         for (_method_id, method_refl) in class_refl.methods.members.iter() {
             // Extract the plain method name from FunctionLikeName.
@@ -135,7 +139,11 @@ fn extract_data_provider(
         // Found the DataProvider attribute — look for the first positional string arg.
         if let Some(arg_list) = &attr.arguments {
             for arg in &arg_list.arguments {
-                if let AttributeArgumentReflection::Positional { value_type_reflection, .. } = arg {
+                if let AttributeArgumentReflection::Positional {
+                    value_type_reflection,
+                    ..
+                } = arg
+                {
                     if let TypeKind::Value(ValueTypeKind::String { value, .. }) =
                         &value_type_reflection.kind
                     {
@@ -161,7 +169,9 @@ fn has_doc_test_annotation(source_text: &str, method_offset: usize) -> bool {
     if !window.ends_with("*/") {
         return false;
     }
-    let Some(open) = window.rfind("/**") else { return false };
+    let Some(open) = window.rfind("/**") else {
+        return false;
+    };
     let docblock = &window[open..];
     let mut pos = 0;
     while let Some(i) = docblock[pos..].find("@test") {
@@ -196,7 +206,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
         )
         .unwrap();
@@ -221,7 +232,11 @@ mod tests {
             "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass MyTest extends TestCase {\n  public function helper(): void {}\n  public function setUp(): void {}\n}",
         );
         let methods = find_test_methods(&project, &["MyTest".to_string()]);
-        assert_eq!(methods.len(), 0, "expected no test methods; got: {methods:?}");
+        assert_eq!(
+            methods.len(),
+            0,
+            "expected no test methods; got: {methods:?}"
+        );
     }
 
     #[test]
@@ -238,7 +253,9 @@ mod tests {
         ));
         let methods = find_test_methods(&project, &["MyTest".to_string()]);
         assert!(
-            methods.iter().any(|m| m.method.to_lowercase() == "itdoessomething"),
+            methods
+                .iter()
+                .any(|m| m.method.to_lowercase() == "itdoessomething"),
             "expected itDoesSomething via #[Test]; got: {methods:?}"
         );
         assert!(
@@ -260,8 +277,13 @@ mod tests {
             "}"
         ));
         let methods = find_test_methods(&project, &["MyTest".to_string()]);
-        let test_foo = methods.iter().find(|m| m.method.to_lowercase() == "testfoo");
-        assert!(test_foo.is_some(), "expected testFoo in results; got: {methods:?}");
+        let test_foo = methods
+            .iter()
+            .find(|m| m.method.to_lowercase() == "testfoo");
+        assert!(
+            test_foo.is_some(),
+            "expected testFoo in results; got: {methods:?}"
+        );
         assert_eq!(
             test_foo.unwrap().has_data_provider.as_deref(),
             Some("provideData"),
@@ -286,6 +308,10 @@ mod tests {
         );
         let methods = find_test_methods(&project, &["MyTest".to_string()]);
         assert_eq!(methods.len(), 1);
-        assert!(methods[0].line > 0, "expected a non-zero line number; got {}", methods[0].line);
+        assert!(
+            methods[0].line > 0,
+            "expected a non-zero line number; got {}",
+            methods[0].line
+        );
     }
 }

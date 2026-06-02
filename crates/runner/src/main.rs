@@ -11,12 +11,18 @@ use phpunit_rust::discovery::discover_with_index;
 /// in the main autoload like MockeryTestCase). Returns empty Vec if absent.
 fn parse_autoload_dev_dirs(project: &std::path::Path) -> Vec<PathBuf> {
     let path = project.join("composer.json");
-    let Ok(text) = std::fs::read_to_string(&path) else { return vec![]; };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else { return vec![]; };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return vec![];
+    };
 
     let mut dirs = Vec::new();
     for section in ["autoload-dev", "autoload"] {
-        let Some(block) = val.get(section) else { continue };
+        let Some(block) = val.get(section) else {
+            continue;
+        };
         collect_psr4_dirs(block, project, &mut dirs);
         collect_classmap_dirs(block, project, &mut dirs);
     }
@@ -24,18 +30,24 @@ fn parse_autoload_dev_dirs(project: &std::path::Path) -> Vec<PathBuf> {
 }
 
 fn collect_psr4_dirs(block: &serde_json::Value, project: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Some(psr4) = block.get("psr-4").and_then(|v| v.as_object()) else { return };
+    let Some(psr4) = block.get("psr-4").and_then(|v| v.as_object()) else {
+        return;
+    };
     for v in psr4.values() {
         match v {
             serde_json::Value::String(s) => {
                 let p = project.join(s);
-                if p.is_dir() { out.push(p); }
+                if p.is_dir() {
+                    out.push(p);
+                }
             }
             serde_json::Value::Array(arr) => {
                 for s in arr {
                     if let Some(s) = s.as_str() {
                         let p = project.join(s);
-                        if p.is_dir() { out.push(p); }
+                        if p.is_dir() {
+                            out.push(p);
+                        }
                     }
                 }
             }
@@ -44,12 +56,20 @@ fn collect_psr4_dirs(block: &serde_json::Value, project: &std::path::Path, out: 
     }
 }
 
-fn collect_classmap_dirs(block: &serde_json::Value, project: &std::path::Path, out: &mut Vec<PathBuf>) {
-    let Some(arr) = block.get("classmap").and_then(|v| v.as_array()) else { return };
+fn collect_classmap_dirs(
+    block: &serde_json::Value,
+    project: &std::path::Path,
+    out: &mut Vec<PathBuf>,
+) {
+    let Some(arr) = block.get("classmap").and_then(|v| v.as_array()) else {
+        return;
+    };
     for s in arr {
         if let Some(s) = s.as_str() {
             let p = project.join(s);
-            if p.is_dir() { out.push(p); }
+            if p.is_dir() {
+                out.push(p);
+            }
         }
     }
 }
@@ -75,16 +95,30 @@ fn is_impacted(
 /// root. Empty if not a git repo / git fails — the caller decides what that means.
 fn git_changed_files(project: &std::path::Path) -> std::collections::HashSet<PathBuf> {
     use std::process::Command;
-    let root = Command::new("git").arg("-C").arg(project)
-        .args(["rev-parse", "--show-toplevel"]).output().ok()
+    let root = Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
         .filter(|o| o.status.success())
         .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string()))
         .and_then(|p| p.canonicalize().ok())
         .unwrap_or_else(|| project.to_path_buf());
     let lines = |args: &[&str]| -> Vec<String> {
-        Command::new("git").arg("-C").arg(project).args(args).output().ok()
+        Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .output()
+            .ok()
             .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let mut rel = lines(&["diff", "--name-only", "HEAD"]);
@@ -98,7 +132,9 @@ mod dirty_tests {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    fn fps(xs: &[&str]) -> HashSet<String> { xs.iter().map(|s| s.to_string()).collect() }
+    fn fps(xs: &[&str]) -> HashSet<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn impacted_when_file_class_or_fingerprint_changed() {
@@ -107,26 +143,47 @@ mod dirty_tests {
         let changed_fqcns: HashSet<String> = fps(&["App\\Calc"]);
 
         // (c) fingerprint references a changed class → impacted
-        assert!(is_impacted("Tests\\CalcTest", Path::new("/p/tests/CalcTest.php"),
-            &fps(&["App\\Calc"]), &changed_files, &changed_fqcns));
+        assert!(is_impacted(
+            "Tests\\CalcTest",
+            Path::new("/p/tests/CalcTest.php"),
+            &fps(&["App\\Calc"]),
+            &changed_files,
+            &changed_fqcns
+        ));
         // (a) the test's own file changed → impacted
-        assert!(is_impacted("Tests\\InSrc", Path::new("/p/src/Calc.php"),
-            &fps(&[]), &changed_files, &changed_fqcns));
+        assert!(is_impacted(
+            "Tests\\InSrc",
+            Path::new("/p/src/Calc.php"),
+            &fps(&[]),
+            &changed_files,
+            &changed_fqcns
+        ));
         // unrelated test → NOT impacted
-        assert!(!is_impacted("Tests\\OtherTest", Path::new("/p/tests/OtherTest.php"),
-            &fps(&["App\\Other"]), &changed_files, &changed_fqcns));
+        assert!(!is_impacted(
+            "Tests\\OtherTest",
+            Path::new("/p/tests/OtherTest.php"),
+            &fps(&["App\\Other"]),
+            &changed_files,
+            &changed_fqcns
+        ));
     }
 }
 
 use phpunit_rust::fork_pool::PhpForkPool;
 use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
+use phpunit_rust::phpunit_xml::{
+    parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_block, parse_testsuites,
+};
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
-use phpunit_rust::phpunit_xml::{parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_block, parse_testsuites};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::RunConfig;
 
 #[derive(Parser, Debug)]
-#[command(name = "phpunit-rust", version, about = "PHPUnit-compatible test runner")]
+#[command(
+    name = "phpunit-rust",
+    version,
+    about = "PHPUnit-compatible test runner"
+)]
 struct Cli {
     #[arg(long, default_value = ".")]
     project: PathBuf,
@@ -242,7 +299,9 @@ fn real_main() -> Result<ExitCode> {
     // Profiler clock starts at the earliest opportunity so wall-clock
     // accounting includes config parsing, not just test execution.
     let profiler = phpunit_rust::profiler::Profiler::new(cli.profile.is_some());
-    let project = cli.project.canonicalize()
+    let project = cli
+        .project
+        .canonicalize()
         .with_context(|| format!("project path invalid: {}", cli.project.display()))?;
     let autoload = project.join("vendor/autoload.php");
     if !autoload.is_file() {
@@ -260,7 +319,11 @@ fn real_main() -> Result<ExitCode> {
                 Some(auto)
             } else {
                 let dist = project.join("phpunit.xml.dist");
-                if dist.is_file() { Some(dist) } else { None }
+                if dist.is_file() {
+                    Some(dist)
+                } else {
+                    None
+                }
             }
         }
     };
@@ -268,8 +331,7 @@ fn real_main() -> Result<ExitCode> {
     // Read the phpunit.xml once; reuse for bootstrap + testsuites + constants.
     let xml_str = match &xml_path {
         Some(xml) => Some(
-            std::fs::read_to_string(xml)
-                .with_context(|| format!("reading {}", xml.display()))?,
+            std::fs::read_to_string(xml).with_context(|| format!("reading {}", xml.display()))?,
         ),
         None => None,
     };
@@ -278,7 +340,11 @@ fn real_main() -> Result<ExitCode> {
         (Some(b), _) => Some(if b.is_absolute() { b } else { project.join(b) }),
         (None, Some(xml)) => parse_bootstrap(xml).map(|rel| {
             let p = PathBuf::from(&rel);
-            if p.is_absolute() { p } else { project.join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                project.join(p)
+            }
         }),
         (None, None) => None,
     };
@@ -289,30 +355,45 @@ fn real_main() -> Result<ExitCode> {
     // <php> block: const + env + server + ini, all in one walk over
     // the XML. Forwarded to the master so it can apply them once
     // before fork (so each child inherits the configured state via COW).
-    let php_block = xml_str.as_deref()
-        .map(parse_php_block)
-        .unwrap_or_default();
-    let defines: Vec<[String; 2]> = php_block.constants.iter()
+    let php_block = xml_str.as_deref().map(parse_php_block).unwrap_or_default();
+    let defines: Vec<[String; 2]> = php_block
+        .constants
+        .iter()
         .map(|c| [c.name.clone(), c.value.clone()])
         .collect();
-    let env_triples: Vec<(String, String, bool)> = php_block.env.iter()
+    let env_triples: Vec<(String, String, bool)> = php_block
+        .env
+        .iter()
         .map(|e| (e.name.clone(), e.value.clone(), e.force))
         .collect();
-    let server_pairs: Vec<[String; 2]> = php_block.server.iter()
+    let server_pairs: Vec<[String; 2]> = php_block
+        .server
+        .iter()
         .map(|s| [s.name.clone(), s.value.clone()])
         .collect();
-    let ini_pairs: Vec<[String; 2]> = php_block.ini.iter()
+    let ini_pairs: Vec<[String; 2]> = php_block
+        .ini
+        .iter()
         .map(|s| [s.name.clone(), s.value.clone()])
         .collect();
     // `<var>` populates $GLOBALS (PHPUnit PhpHandler semantics) — distinct from
     // `<env>`. Forwarded separately so the worker can set $GLOBALS, not putenv.
-    let var_pairs: Vec<[String; 2]> = php_block.vars.iter()
+    let var_pairs: Vec<[String; 2]> = php_block
+        .vars
+        .iter()
         .map(|s| [s.name.clone(), s.value.clone()])
         .collect();
-    let total = defines.len() + env_triples.len() + server_pairs.len() + ini_pairs.len() + var_pairs.len();
+    let total =
+        defines.len() + env_triples.len() + server_pairs.len() + ini_pairs.len() + var_pairs.len();
     if total > 0 {
-        eprintln!("Applying <php> block: {} const, {} env, {} server, {} ini, {} var",
-            defines.len(), env_triples.len(), server_pairs.len(), ini_pairs.len(), var_pairs.len());
+        eprintln!(
+            "Applying <php> block: {} const, {} env, {} server, {} ini, {} var",
+            defines.len(),
+            env_triples.len(),
+            server_pairs.len(),
+            ini_pairs.len(),
+            var_pairs.len()
+        );
     }
 
     // <testsuites>: collect include directories + excludes, resolved relative
@@ -332,8 +413,12 @@ fn real_main() -> Result<ExitCode> {
                         target, before
                     ));
                 }
-                eprintln!("Selecting testsuite '{}' ({} suite{} matched)",
-                    target, suites.len(), if suites.len() == 1 { "" } else { "s" });
+                eprintln!(
+                    "Selecting testsuite '{}' ({} suite{} matched)",
+                    target,
+                    suites.len(),
+                    if suites.len() == 1 { "" } else { "s" }
+                );
             }
             if suites.is_empty() {
                 let dir = project.join(&cli.tests_dir);
@@ -384,7 +469,10 @@ fn real_main() -> Result<ExitCode> {
             if p.is_dir() {
                 true
             } else {
-                eprintln!("warning: test directory not found, skipping: {}", p.display());
+                eprintln!(
+                    "warning: test directory not found, skipping: {}",
+                    p.display()
+                );
                 false
             }
         })
@@ -408,8 +496,11 @@ fn real_main() -> Result<ExitCode> {
     if test_roots.len() == 1 {
         eprintln!("Discovering tests in {}...", test_roots[0].display());
     } else {
-        eprintln!("Discovering tests across {} roots ({} excludes)...",
-            test_roots.len(), excludes.len());
+        eprintln!(
+            "Discovering tests across {} roots ({} excludes)...",
+            test_roots.len(),
+            excludes.len()
+        );
     }
     // Single-pass discovery + class-file index. Empirically faster than
     // splitting into cases-then-index on every benched project (the
@@ -441,13 +532,26 @@ fn real_main() -> Result<ExitCode> {
             let mut changed_fqcns: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for (fqcn, file) in &class_file_index_full {
-                if changed_files.contains(file) { changed_fqcns.insert(fqcn.clone()); }
+                if changed_files.contains(file) {
+                    changed_fqcns.insert(fqcn.clone());
+                }
             }
             let before = cases.len();
-            cases.retain(|c| is_impacted(&c.class, &c.file, &c.fingerprint,
-                &changed_files, &changed_fqcns));
-            eprintln!("--dirty: {} of {} test methods impacted by {} changed file(s).",
-                cases.len(), before, changed_files.len());
+            cases.retain(|c| {
+                is_impacted(
+                    &c.class,
+                    &c.file,
+                    &c.fingerprint,
+                    &changed_files,
+                    &changed_fqcns,
+                )
+            });
+            eprintln!(
+                "--dirty: {} of {} test methods impacted by {} changed file(s).",
+                cases.len(),
+                before,
+                changed_files.len()
+            );
         }
     }
 
@@ -470,9 +574,12 @@ fn real_main() -> Result<ExitCode> {
     // file-path fallback to the worker — composer.php's PSR-4 autoload
     // will find each class. We skip the file-tree walk entirely in that
     // case (the dominant runtime cost on large projects).
-    let mut wanted_fqcns: std::collections::HashSet<String> = cases.iter()
+    let mut wanted_fqcns: std::collections::HashSet<String> = cases
+        .iter()
         .flat_map(|c| {
-            c.external_providers.iter().map(|(fqcn, _)| fqcn.clone())
+            c.external_providers
+                .iter()
+                .map(|(fqcn, _)| fqcn.clone())
                 .chain(c.fingerprint.iter().cloned())
         })
         .collect();
@@ -497,11 +604,14 @@ fn real_main() -> Result<ExitCode> {
     //   * --exclude-group adds names to the XML's exclude list.
     //   * --group restricts to tests whose groups intersect the include set
     //     (PHPUnit semantics: only the named groups run).
-    let mut excluded_groups: Vec<String> = xml_str.as_deref()
+    let mut excluded_groups: Vec<String> = xml_str
+        .as_deref()
         .map(parse_excluded_groups)
         .unwrap_or_default();
     for g in &cli.exclude_groups {
-        if !excluded_groups.contains(g) { excluded_groups.push(g.clone()); }
+        if !excluded_groups.contains(g) {
+            excluded_groups.push(g.clone());
+        }
     }
     if !excluded_groups.is_empty() {
         use std::collections::HashSet;
@@ -509,19 +619,27 @@ fn real_main() -> Result<ExitCode> {
         let before = cases.len();
         cases.retain(|c| !c.groups.iter().any(|g| excl.contains(g.as_str())));
         let dropped = before - cases.len();
-        eprintln!("Excluding {} test{} in groups: {}",
-            dropped, if dropped == 1 { "" } else { "s" },
-            excluded_groups.join(", "));
+        eprintln!(
+            "Excluding {} test{} in groups: {}",
+            dropped,
+            if dropped == 1 { "" } else { "s" },
+            excluded_groups.join(", ")
+        );
     }
     if !cli.groups.is_empty() {
         use std::collections::HashSet;
         let incl: HashSet<&str> = cli.groups.iter().map(|s| s.as_str()).collect();
         let before = cases.len();
         cases.retain(|c| c.groups.iter().any(|g| incl.contains(g.as_str())));
-        eprintln!("Including only {} test{} in group{} {} (filtered {} → {})",
-            cases.len(), if cases.len() == 1 { "" } else { "s" },
+        eprintln!(
+            "Including only {} test{} in group{} {} (filtered {} → {})",
+            cases.len(),
+            if cases.len() == 1 { "" } else { "s" },
             if cli.groups.len() == 1 { "" } else { "s" },
-            cli.groups.join(", "), before, cases.len());
+            cli.groups.join(", "),
+            before,
+            cases.len()
+        );
     }
 
     // Symfony's PhpUnitTestsListener detection is intentionally NOT acted
@@ -532,14 +650,17 @@ fn real_main() -> Result<ExitCode> {
     // cases when vanilla wraps only 14). Leaving this stub so we know
     // the detection is wired up if we later add generic <listeners>
     // dispatch.
-    let _listeners: Vec<String> = xml_str.as_deref()
-        .map(parse_listeners)
-        .unwrap_or_default();
+    let _listeners: Vec<String> = xml_str.as_deref().map(parse_listeners).unwrap_or_default();
     let synthetic_legacy_skips: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
 
-    eprintln!("Found {} test methods across {} classes.",
+    eprintln!(
+        "Found {} test methods across {} classes.",
         cases.len(),
-        cases.iter().map(|c| &c.class).collect::<std::collections::BTreeSet<_>>().len()
+        cases
+            .iter()
+            .map(|c| &c.class)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     );
 
     // --bake-mocks: rewrite createMock patterns into anonymous classes before
@@ -547,10 +668,11 @@ fn real_main() -> Result<ExitCode> {
     // still on disk when the worker tries to require them.
     let _bake_temp_dir: Option<tempfile::TempDir>;
     if cli.bake_mocks {
-        let td = tempfile::TempDir::new()
-            .context("creating temp dir for baked test files")?;
+        let td = tempfile::TempDir::new().context("creating temp dir for baked test files")?;
         let rewritten = phpunit_rust::mock_bake::bake_test_cases(&cases, &project, &td);
-        let baked_count = rewritten.iter().zip(cases.iter())
+        let baked_count = rewritten
+            .iter()
+            .zip(cases.iter())
             .filter(|(a, b)| a.file != b.file)
             .count();
         if baked_count > 0 {
@@ -577,8 +699,8 @@ fn real_main() -> Result<ExitCode> {
     // Verify a usable PHP is on PATH. We require ≥ 8.1; some projects need
     // newer (brick/math: 8.2; doctrine/collections: 8.4). The user is on
     // the hook for installing a sufficiently-new PHP.
-    let php_id = check_php_version(80100)
-        .context("PHP version check failed (need ≥ 8.1 on PATH)")?;
+    let php_id =
+        check_php_version(80100).context("PHP version check failed (need ≥ 8.1 on PATH)")?;
     eprintln!("PHP version id: {php_id}");
 
     // Enumerate data-provider row counts BEFORE forking workers.
@@ -596,17 +718,31 @@ fn real_main() -> Result<ExitCode> {
                 return Ok(RowCounts::new());
             }
             let enum_script = find_enumerate_script()?;
-            Ok(match enumerate(&enum_script, &autoload, bootstrap.as_deref(), &defines, &provider_pairs) {
-                Ok(counts) => counts,
-                Err(e) => {
-                    eprintln!("Provider enumeration failed (continuing with no row data): {e:#}");
-                    RowCounts::new()
-                }
-            })
+            Ok(
+                match enumerate(
+                    &enum_script,
+                    &autoload,
+                    bootstrap.as_deref(),
+                    &defines,
+                    &provider_pairs,
+                ) {
+                    Ok(counts) => counts,
+                    Err(e) => {
+                        eprintln!(
+                            "Provider enumeration failed (continuing with no row data): {e:#}"
+                        );
+                        RowCounts::new()
+                    }
+                },
+            )
         },
     )?;
 
-    eprintln!("Spawning {} PHP worker{}...", worker_count, if worker_count == 1 { "" } else { "s" });
+    eprintln!(
+        "Spawning {} PHP worker{}...",
+        worker_count,
+        if worker_count == 1 { "" } else { "s" }
+    );
     let fork_script = find_fork_script()?;
     let mut pool = profiler.span_with(
         "fork_pool_spawn",
@@ -614,9 +750,17 @@ fn real_main() -> Result<ExitCode> {
         serde_json::json!({"workers": worker_count}),
         || -> Result<_> {
             Ok(PhpForkPool::spawn(
-                &fork_script, &autoload, bootstrap.as_deref(),
-                &defines, &env_triples, &server_pairs, &ini_pairs, &var_pairs,
-                worker_count, &class_file_index, &cli.worker_memory_limit,
+                &fork_script,
+                &autoload,
+                bootstrap.as_deref(),
+                &defines,
+                &env_triples,
+                &server_pairs,
+                &ini_pairs,
+                &var_pairs,
+                worker_count,
+                &class_file_index,
+                &cli.worker_memory_limit,
                 cli.worker_max_batches,
             )?)
         },
@@ -645,18 +789,25 @@ fn real_main() -> Result<ExitCode> {
         "run",
         "main",
         serde_json::json!({"cases": n_cases, "workers": worker_count}),
-        || phpunit_rust::runner::run_with_profiler(
-            &mut pool, cases, &cfg, &row_counts,
-            |o| print_progress(o),
-            &profiler,
-        ),
+        || {
+            phpunit_rust::runner::run_with_profiler(
+                &mut pool,
+                cases,
+                &cfg,
+                &row_counts,
+                |o| print_progress(o),
+                &profiler,
+            )
+        },
     )?;
 
     // Append the synthetic skip outcomes for @group legacy under Symfony's
     // listener. They were never dispatched, so emit them now and adjust
     // the report's totals accordingly.
     if !synthetic_legacy_skips.is_empty() {
-        for o in &synthetic_legacy_skips { print_progress(o); }
+        for o in &synthetic_legacy_skips {
+            print_progress(o);
+        }
         report.outcomes.extend(synthetic_legacy_skips);
     }
 
@@ -683,11 +834,18 @@ fn real_main() -> Result<ExitCode> {
         if let Err(e) = profiler.write_to(out) {
             eprintln!("warning: writing profile to {} failed: {e}", out.display());
         } else {
-            eprintln!("Profile written to {} ({} events). \
+            eprintln!(
+                "Profile written to {} ({} events). \
                 Open it in chrome://tracing, perfetto.dev, or speedscope.app.",
-                out.display(), profiler.event_count());
+                out.display(),
+                profiler.event_count()
+            );
         }
     }
 
-    if report.is_success() { Ok(ExitCode::SUCCESS) } else { Ok(ExitCode::from(1)) }
+    if report.is_success() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }

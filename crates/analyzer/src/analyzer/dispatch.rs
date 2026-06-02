@@ -6,8 +6,8 @@
 //! call sites to the new `resolve()`.
 
 use crate::opacity::{CallSite, ReceiverType};
-use crate::types::walker::CallSiteEvent;
 use crate::types::type_to_receiver_type;
+use crate::types::walker::CallSiteEvent;
 
 /// Build a `CallSite` from minimal information available without type inference.
 ///

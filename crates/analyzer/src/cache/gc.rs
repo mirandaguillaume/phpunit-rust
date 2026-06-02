@@ -17,7 +17,9 @@ pub fn prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<GcStats> {
 
     for entry in walkdir(cache_root)? {
         let meta = fs::metadata(&entry)?;
-        if !meta.is_file() { continue; }
+        if !meta.is_file() {
+            continue;
+        }
         let size = meta.len();
         // Falls back to UNIX_EPOCH if atime is unavailable (e.g. noatime mounts).
         // On such filesystems, LRU eviction effectively degrades to FIFO order.
@@ -28,7 +30,11 @@ pub fn prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<GcStats> {
 
     let bytes_before = total;
     if total <= max_bytes {
-        return Ok(GcStats { bytes_before, bytes_after: total, entries_removed: 0 });
+        return Ok(GcStats {
+            bytes_before,
+            bytes_after: total,
+            entries_removed: 0,
+        });
     }
 
     // Sort newest-first so pop() yields the oldest in O(1).
@@ -36,24 +42,36 @@ pub fn prune(cache_root: &Path, max_bytes: u64) -> std::io::Result<GcStats> {
 
     let mut removed = 0;
     while total > max_bytes {
-        let Some((_, size, path)) = entries.pop() else { break };
+        let Some((_, size, path)) = entries.pop() else {
+            break;
+        };
         fs::remove_file(&path)?;
         total -= size;
         removed += 1;
     }
 
-    Ok(GcStats { bytes_before, bytes_after: total, entries_removed: removed })
+    Ok(GcStats {
+        bytes_before,
+        bytes_after: total,
+        entries_removed: removed,
+    })
 }
 
 fn walkdir(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if !dir.exists() { continue; }
+        if !dir.exists() {
+            continue;
+        }
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() { stack.push(path); } else { out.push(path); }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
         }
     }
     Ok(out)

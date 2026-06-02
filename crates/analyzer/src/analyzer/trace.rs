@@ -163,8 +163,7 @@ fn collect_method_info(
     let span = method_refl.span;
     let source_id = span.start.source;
     let source = project.source_by_id(source_id)?;
-    let file_path =
-        PathBuf::from(interner.lookup(&source.identifier.0).to_string());
+    let file_path = PathBuf::from(interner.lookup(&source.identifier.0).to_string());
     let start_line = source.line_number(span.start.offset) as u32 + 1;
     let end_line = source.line_number(span.end.offset) as u32 + 1;
 
@@ -224,8 +223,7 @@ fn find_method_in_hierarchy<'a>(
                 .lookup(&trait_name.value)
                 .trim_start_matches('\\')
                 .to_lowercase();
-            if let Some((t_fqcn, t_refl)) = project.find_class(&trait_fqcn_lc)
-            {
+            if let Some((t_fqcn, t_refl)) = project.find_class(&trait_fqcn_lc) {
                 for (_id, m_refl) in t_refl.methods.members.iter() {
                     let mname = match &m_refl.name {
                         FunctionLikeName::Method(_, n) => interner.lookup(&n.value).to_string(),
@@ -290,22 +288,13 @@ fn walk_method_body(
     class: &str,
     method: &str,
 ) {
-    walk_method_body_impl(
-        ctx,
-        program.statements.iter(),
-        class,
-        method,
-    );
+    walk_method_body_impl(ctx, program.statements.iter(), class, method);
 }
 
 /// Recursively walk statements looking for the target class + method,
 /// descending into namespace wrappers as needed.
-fn walk_method_body_impl<'s, I>(
-    ctx: &mut WalkerCtx,
-    stmts: I,
-    class: &str,
-    method: &str,
-) where
+fn walk_method_body_impl<'s, I>(ctx: &mut WalkerCtx, stmts: I, class: &str, method: &str)
+where
     I: Iterator<Item = &'s Statement>,
 {
     // Strip any leading namespace from class name for matching purposes.
@@ -321,7 +310,8 @@ fn walk_method_body_impl<'s, I>(
                 if ast_name.eq_ignore_ascii_case(simple_class) {
                     for member in c.members.iter() {
                         if let ClassLikeMember::Method(m) = member {
-                            if ctx.interner.lookup(&m.name.value).to_lowercase() == target_method_lc {
+                            if ctx.interner.lookup(&m.name.value).to_lowercase() == target_method_lc
+                            {
                                 if let MethodBody::Concrete(block) = &m.body {
                                     walk_block(ctx, block);
                                     return;
@@ -337,7 +327,8 @@ fn walk_method_body_impl<'s, I>(
                 if ast_name.eq_ignore_ascii_case(simple_class) {
                     for member in t.members.iter() {
                         if let ClassLikeMember::Method(m) = member {
-                            if ctx.interner.lookup(&m.name.value).to_lowercase() == target_method_lc {
+                            if ctx.interner.lookup(&m.name.value).to_lowercase() == target_method_lc
+                            {
                                 if let MethodBody::Concrete(block) = &m.body {
                                     walk_block(ctx, block);
                                     return;
@@ -405,7 +396,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
         )
         .unwrap();
@@ -432,7 +424,10 @@ class MyTest extends TestCase {
 
         let coverage = trace_test(&project, &boundary, &tests[0], None);
         // At least some line in the method body should be marked.
-        assert!(!coverage.is_empty(), "coverage should not be empty; got: {coverage:?}");
+        assert!(
+            !coverage.is_empty(),
+            "coverage should not be empty; got: {coverage:?}"
+        );
 
         // Find the entry for our test file. Verify at least one line has the test ID.
         let lines = coverage.values().next().unwrap();
@@ -447,7 +442,8 @@ class MyTest extends TestCase {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
         )
         .unwrap();

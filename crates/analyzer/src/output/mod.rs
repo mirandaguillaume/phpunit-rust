@@ -1,9 +1,9 @@
 //! Output formats for coverage results.
 
-pub mod pcov;
-pub mod pcov_extended;
 pub mod clover;
 pub mod json;
+pub mod pcov;
+pub mod pcov_extended;
 
 use crate::analyzer::Coverage;
 

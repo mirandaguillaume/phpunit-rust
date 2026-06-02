@@ -57,13 +57,21 @@ mod tests {
         let report = Report {
             outcomes: vec![
                 TestOutcome {
-                    class: "A".into(), method: "testOk".into(), dataset: None,
-                    status: TestStatus::Pass, message: None, trace: None,
+                    class: "A".into(),
+                    method: "testOk".into(),
+                    dataset: None,
+                    status: TestStatus::Pass,
+                    message: None,
+                    trace: None,
                     duration_ms: 1.0,
                 },
                 TestOutcome {
-                    class: "A".into(), method: "testFail".into(), dataset: None,
-                    status: TestStatus::Fail, message: None, trace: None,
+                    class: "A".into(),
+                    method: "testFail".into(),
+                    dataset: None,
+                    status: TestStatus::Fail,
+                    message: None,
+                    trace: None,
                     duration_ms: 1.0,
                 },
             ],

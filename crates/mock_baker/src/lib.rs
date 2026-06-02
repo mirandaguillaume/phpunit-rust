@@ -22,52 +22,57 @@ use tree_sitter::{Node, Parser};
 
 #[derive(Debug, Clone)]
 pub struct MethodSig {
-    pub name:      String,
-    pub params:    String,
+    pub name: String,
+    pub params: String,
     pub return_ty: String,
     pub is_static: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Expectation {
-    pub method:        String,
-    pub with_args:     Option<String>,
-    pub will_return:   Option<String>,
+    pub method: String,
+    pub with_args: Option<String>,
+    pub will_return: Option<String>,
     pub expects_count: ExpectsCount,
     /// false when the chain contains unsupported methods (willReturnMap, willReturnCallback,
     /// etc.). Blocks with any unsupported expectation are skipped from baking so the
     /// original $this->createMock() call is left verbatim.
-    pub is_supported:  bool,
+    pub is_supported: bool,
 }
 
 #[derive(Debug, Clone)]
-pub enum ExpectsCount { Once, Any, Never, Times(String) }
+pub enum ExpectsCount {
+    Once,
+    Any,
+    Never,
+    Times(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct MockBlock {
-    pub var:           String,
-    pub iface_name:    String,
+    pub var: String,
+    pub iface_name: String,
     /// Byte range of the `$x = $this->createMock(...)` statement only.
-    pub byte_start:    usize,
-    pub create_end:    usize,
+    pub byte_start: usize,
+    pub create_end: usize,
     /// Byte ranges of each `$x->expects(...)->method(...)->...` statement
     /// that follows this createMock. Stored separately so they can be
     /// excised independently — crucial when multiple mocks' expectation
     /// chains are interleaved in the same method body.
-    pub exp_stmts:     Vec<(usize, usize)>,
-    pub expectations:  Vec<Expectation>,
+    pub exp_stmts: Vec<(usize, usize)>,
+    pub expectations: Vec<Expectation>,
 }
 
 pub struct Interface {
-    pub use_lines:     Vec<String>,
-    pub methods:       Vec<MethodSig>,
-    pub is_interface:  bool,
+    pub use_lines: Vec<String>,
+    pub methods: Vec<MethodSig>,
+    pub is_interface: bool,
     /// True when this is an `abstract class` (not an interface). The two flags
     /// are mutually exclusive; both false means a concrete class, which is skipped.
-    pub is_abstract:   bool,
+    pub is_abstract: bool,
     pub extends_names: Vec<String>,
     /// PHP namespace of this interface (e.g. `Akeneo\Pim\Structure\Component\Model`).
-    pub namespace:     String,
+    pub namespace: String,
 }
 
 fn new_parser() -> Result<Parser> {
@@ -109,17 +114,24 @@ fn warn_on_syntax_errors(tree: &tree_sitter::Tree, context: &str) {
 /// Also handles aliased imports: `use Foo\Bar as Baz;` → `("Baz", "Foo\\Bar")`.
 pub fn extract_use_map(src: &str) -> Result<HashMap<String, String>> {
     let mut p = new_parser()?;
-    let tree = p.parse(src, None).ok_or_else(|| anyhow!("php parse failed"))?;
+    let tree = p
+        .parse(src, None)
+        .ok_or_else(|| anyhow!("php parse failed"))?;
     warn_on_syntax_errors(&tree, "extracting use imports");
     let bytes = src.as_bytes();
     let mut map = HashMap::new();
 
     walk(tree.root_node(), &mut |n: Node| {
-        if n.kind() != "namespace_use_declaration" { return; }
+        if n.kind() != "namespace_use_declaration" {
+            return;
+        }
         let mut cursor = n.walk();
         for clause in n.named_children(&mut cursor) {
-            if clause.kind() != "namespace_use_clause" { continue; }
-            let name_node = clause.child_by_field_name("name")
+            if clause.kind() != "namespace_use_clause" {
+                continue;
+            }
+            let name_node = clause
+                .child_by_field_name("name")
                 .or_else(|| clause.named_child(0));
             let Some(name_node) = name_node else { continue };
             let fqn = text(name_node, bytes).trim_start_matches('\\').to_string();
@@ -127,13 +139,13 @@ pub fn extract_use_map(src: &str) -> Result<HashMap<String, String>> {
             // Alias: `use Foo\Bar as Baz` — tree-sitter-php may not expose this
             // as a named field, so we scan the raw clause text for " as ".
             let clause_text = text(clause, bytes);
-            let alias = clause_text.to_ascii_lowercase()
+            let alias = clause_text
+                .to_ascii_lowercase()
                 .find(" as ")
                 .map(|pos| clause_text[pos + 4..].trim().to_string());
 
-            let short = alias.unwrap_or_else(|| {
-                fqn.rsplit('\\').next().unwrap_or(&fqn).to_string()
-            });
+            let short =
+                alias.unwrap_or_else(|| fqn.rsplit('\\').next().unwrap_or(&fqn).to_string());
             map.insert(short, fqn);
         }
     });
@@ -143,7 +155,9 @@ pub fn extract_use_map(src: &str) -> Result<HashMap<String, String>> {
 
 pub fn parse_interface(src: &str) -> Result<Interface> {
     let mut p = new_parser()?;
-    let tree = p.parse(src, None).ok_or_else(|| anyhow!("php parse failed"))?;
+    let tree = p
+        .parse(src, None)
+        .ok_or_else(|| anyhow!("php parse failed"))?;
     warn_on_syntax_errors(&tree, "parsing interface");
     let root = tree.root_node();
     let bytes = src.as_bytes();
@@ -161,8 +175,7 @@ pub fn parse_interface(src: &str) -> Result<Interface> {
         }
         if n.kind() == "namespace_definition" {
             if let Some(name_node) = n.child_by_field_name("name") {
-                namespace = text(name_node, bytes)
-                    .trim_start_matches('\\').to_string();
+                namespace = text(name_node, bytes).trim_start_matches('\\').to_string();
             }
         }
         if n.kind() == "interface_declaration" {
@@ -192,7 +205,14 @@ pub fn parse_interface(src: &str) -> Result<Interface> {
         }
     });
 
-    Ok(Interface { use_lines, methods, is_interface, is_abstract, extends_names, namespace })
+    Ok(Interface {
+        use_lines,
+        methods,
+        is_interface,
+        is_abstract,
+        extends_names,
+        namespace,
+    })
 }
 
 fn sig_from(n: Node, src: &[u8]) -> Option<MethodSig> {
@@ -204,8 +224,9 @@ fn sig_from(n: Node, src: &[u8]) -> Option<MethodSig> {
     let ret_node = n.child_by_field_name("return_type");
     // Use "mixed" when no return type is declared — methods without annotations
     // can return any value, so we must not treat them as void.
-    let return_ty = ret_node.map(|r| text(r, src).trim().to_string())
-                            .unwrap_or_else(|| "mixed".to_string());
+    let return_ty = ret_node
+        .map(|r| text(r, src).trim().to_string())
+        .unwrap_or_else(|| "mixed".to_string());
     let decl_text = text(n, src);
     let before_fn = decl_text.split("function").next().unwrap_or("");
     let mods: Vec<&str> = before_fn.split_whitespace().collect();
@@ -215,7 +236,12 @@ fn sig_from(n: Node, src: &[u8]) -> Option<MethodSig> {
         return None;
     }
     let is_static = mods.contains(&"static");
-    Some(MethodSig { name, params, return_ty, is_static })
+    Some(MethodSig {
+        name,
+        params,
+        return_ty,
+        is_static,
+    })
 }
 
 /// Strip outer parens, collapse internal whitespace runs, drop any
@@ -223,12 +249,19 @@ fn sig_from(n: Node, src: &[u8]) -> Option<MethodSig> {
 /// captures it verbatim — emitting it back into our anon class is fine,
 /// but it looks ugly so we clean it).
 fn normalize_params(raw: &str) -> String {
-    let mut s = raw.trim().trim_start_matches('(').trim_end_matches(')').trim().to_string();
+    let mut s = raw
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim()
+        .to_string();
     // Collapse whitespace.
     let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     s = collapsed;
     // Drop a trailing comma if present.
-    if s.ends_with(',') { s.pop(); }
+    if s.ends_with(',') {
+        s.pop();
+    }
     s
 }
 
@@ -260,30 +293,43 @@ fn walk<F: FnMut(Node)>(root: Node, f: &mut F) {
 /// Intermediate builder calls (disableOriginalConstructor, etc.) are silently
 /// ignored. Bails on `onlyMethods` / `addMethods` / `setConstructorArgs` since
 /// those require per-method or constructor-argument awareness.
-fn detect_get_mock_builder<'a>(
-    asn: Node<'a>, stmt: Node<'a>, src: &'a [u8],
-) -> Option<MockBlock> {
+fn detect_get_mock_builder<'a>(asn: Node<'a>, stmt: Node<'a>, src: &'a [u8]) -> Option<MockBlock> {
     let lhs = asn.child_by_field_name("left")?;
-    if lhs.kind() != "variable_name" { return None; }
+    if lhs.kind() != "variable_name" {
+        return None;
+    }
     let var = format!("${}", text(lhs.named_child(0)?, src));
 
     let rhs = asn.child_by_field_name("right")?;
-    if rhs.kind() != "member_call_expression" { return None; }
+    if rhs.kind() != "member_call_expression" {
+        return None;
+    }
 
-    const BAIL: &[&str] = &["onlyMethods", "addMethods", "setMethods", "setConstructorArgs"];
+    const BAIL: &[&str] = &[
+        "onlyMethods",
+        "addMethods",
+        "setMethods",
+        "setConstructorArgs",
+    ];
     let mut cur = rhs;
     let iface_name: String = loop {
-        if cur.kind() != "member_call_expression" { return None; }
+        if cur.kind() != "member_call_expression" {
+            return None;
+        }
         let call_name = text(cur.child_by_field_name("name")?, src);
         match call_name {
             "getMock" | "getMockForAbstractClass" => {}
             "getMockBuilder" => {
                 let args = cur.child_by_field_name("arguments")?;
-                let arg  = args.named_child(0)?;
-                let cce  = arg.named_child(0)?;
-                if cce.kind() != "class_constant_access_expression" { return None; }
+                let arg = args.named_child(0)?;
+                let cce = arg.named_child(0)?;
+                if cce.kind() != "class_constant_access_expression" {
+                    return None;
+                }
                 let obj = cur.child_by_field_name("object")?;
-                if text(obj, src) != "$this" { return None; }
+                if text(obj, src) != "$this" {
+                    return None;
+                }
                 break text(cce.named_child(0)?, src).to_string();
             }
             n if BAIL.contains(&n) => return None,
@@ -294,9 +340,9 @@ fn detect_get_mock_builder<'a>(
     Some(MockBlock {
         var,
         iface_name,
-        byte_start:   stmt.start_byte(),
-        create_end:   stmt.end_byte(),
-        exp_stmts:    Vec::new(),
+        byte_start: stmt.start_byte(),
+        create_end: stmt.end_byte(),
+        exp_stmts: Vec::new(),
         expectations: Vec::new(),
     })
 }
@@ -305,15 +351,22 @@ fn detect_get_mock_builder<'a>(
 /// (mock variable, interface name, statement byte range, expectations).
 pub fn parse_test(src: &str) -> Result<Vec<MockBlock>> {
     let mut p = new_parser()?;
-    let tree = p.parse(src, None).ok_or_else(|| anyhow!("php parse failed"))?;
+    let tree = p
+        .parse(src, None)
+        .ok_or_else(|| anyhow!("php parse failed"))?;
     warn_on_syntax_errors(&tree, "parsing test for mock baking");
     let bytes = src.as_bytes();
 
     let mut blocks: Vec<MockBlock> = Vec::new();
 
     walk(tree.root_node(), &mut |n: Node| {
-        if n.kind() != "expression_statement" { return; }
-        let inner = match n.named_child(0) { Some(c) => c, None => return };
+        if n.kind() != "expression_statement" {
+            return;
+        }
+        let inner = match n.named_child(0) {
+            Some(c) => c,
+            None => return,
+        };
 
         // Case A: assignment "$m = $this->createMock(Iface::class)"
         if inner.kind() == "assignment_expression" {
@@ -330,7 +383,10 @@ pub fn parse_test(src: &str) -> Result<Vec<MockBlock>> {
     // A variable may be declared in multiple test methods under the same name.
     let mut by_var: std::collections::HashMap<String, Vec<(usize, Option<usize>)>> = HashMap::new();
     for (i, b) in blocks.iter().enumerate() {
-        by_var.entry(b.var.clone()).or_default().push((b.byte_start, Some(i)));
+        by_var
+            .entry(b.var.clone())
+            .or_default()
+            .push((b.byte_start, Some(i)));
     }
 
     // Collect non-createMock assignments that shadow earlier createMock blocks.
@@ -338,32 +394,59 @@ pub fn parse_test(src: &str) -> Result<Vec<MockBlock>> {
     // we don't bake it, so any ->method() chain after it must NOT be attached to the
     // earlier createMock of the same variable.
     walk(tree.root_node(), &mut |n: Node| {
-        if n.kind() != "expression_statement" { return; }
-        let inner = match n.named_child(0) { Some(c) => c, None => return };
-        if inner.kind() != "assignment_expression" { return; }
-        let Some(lhs) = inner.child_by_field_name("left") else { return };
-        if lhs.kind() != "variable_name" { return; }
-        let Some(name_node) = lhs.named_child(0) else { return };
+        if n.kind() != "expression_statement" {
+            return;
+        }
+        let inner = match n.named_child(0) {
+            Some(c) => c,
+            None => return,
+        };
+        if inner.kind() != "assignment_expression" {
+            return;
+        }
+        let Some(lhs) = inner.child_by_field_name("left") else {
+            return;
+        };
+        if lhs.kind() != "variable_name" {
+            return;
+        }
+        let Some(name_node) = lhs.named_child(0) else {
+            return;
+        };
         let var = format!("${}", text(name_node, bytes));
-        if !by_var.contains_key(&var) { return; }
+        if !by_var.contains_key(&var) {
+            return;
+        }
         let pos = n.start_byte();
         // Skip positions already registered as createMock blocks.
-        if blocks.iter().any(|b| b.var == var && b.byte_start == pos) { return; }
+        if blocks.iter().any(|b| b.var == var && b.byte_start == pos) {
+            return;
+        }
         by_var.entry(var).or_default().push((pos, None));
     });
-    for v in by_var.values_mut() { v.sort_by_key(|(p, _)| *p); }
+    for v in by_var.values_mut() {
+        v.sort_by_key(|(p, _)| *p);
+    }
 
     walk(tree.root_node(), &mut |n: Node| {
-        if n.kind() != "expression_statement" { return; }
-        let inner = match n.named_child(0) { Some(c) => c, None => return };
-        if inner.kind() != "member_call_expression" { return; }
+        if n.kind() != "expression_statement" {
+            return;
+        }
+        let inner = match n.named_child(0) {
+            Some(c) => c,
+            None => return,
+        };
+        if inner.kind() != "member_call_expression" {
+            return;
+        }
         if let Some((var, expectation)) = detect_expectation(inner, bytes) {
             if let Some(assigns) = by_var.get(&var) {
                 // The closest preceding assignment for this variable wins.
                 // If it's a createMock (Some(idx)) → attach; if it's another
                 // assignment (None, e.g. getMockBuilder) → skip.
                 let exp_pos = n.start_byte();
-                let best = assigns.iter()
+                let best = assigns
+                    .iter()
                     .filter(|(bs, _)| *bs < exp_pos)
                     .max_by_key(|(bs, _)| *bs);
                 if let Some((_, Some(idx))) = best {
@@ -376,7 +459,8 @@ pub fn parse_test(src: &str) -> Result<Vec<MockBlock>> {
 
     // Remove blocks that have any unsupported expectation — the original
     // $this->createMock() call and all its method chains are left verbatim.
-    let unsupported_vars: std::collections::HashSet<String> = blocks.iter()
+    let unsupported_vars: std::collections::HashSet<String> = blocks
+        .iter()
         .filter(|b| b.expectations.iter().any(|e| !e.is_supported))
         .map(|b| b.var.clone())
         .collect();
@@ -387,32 +471,40 @@ pub fn parse_test(src: &str) -> Result<Vec<MockBlock>> {
     Ok(blocks)
 }
 
-fn detect_create_mock<'a>(
-    asn: Node<'a>, stmt: Node<'a>, src: &'a [u8],
-) -> Option<MockBlock> {
+fn detect_create_mock<'a>(asn: Node<'a>, stmt: Node<'a>, src: &'a [u8]) -> Option<MockBlock> {
     let lhs = asn.child_by_field_name("left")?;
-    if lhs.kind() != "variable_name" { return None; }
+    if lhs.kind() != "variable_name" {
+        return None;
+    }
     let var = format!("${}", text(lhs.named_child(0)?, src));
 
     let rhs = asn.child_by_field_name("right")?;
-    if rhs.kind() != "member_call_expression" { return None; }
+    if rhs.kind() != "member_call_expression" {
+        return None;
+    }
     let obj = rhs.child_by_field_name("object")?;
-    if text(obj, src) != "$this" { return None; }
+    if text(obj, src) != "$this" {
+        return None;
+    }
     let name = rhs.child_by_field_name("name")?;
-    if !matches!(text(name, src), "createMock" | "createStub") { return None; }
+    if !matches!(text(name, src), "createMock" | "createStub") {
+        return None;
+    }
 
     let args = rhs.child_by_field_name("arguments")?;
-    let arg  = args.named_child(0)?;
-    let cce  = arg.named_child(0)?;
-    if cce.kind() != "class_constant_access_expression" { return None; }
+    let arg = args.named_child(0)?;
+    let cce = arg.named_child(0)?;
+    if cce.kind() != "class_constant_access_expression" {
+        return None;
+    }
     let iface_name = text(cce.named_child(0)?, src).to_string();
 
     Some(MockBlock {
         var,
         iface_name,
-        byte_start:   stmt.start_byte(),
-        create_end:   stmt.end_byte(),
-        exp_stmts:    Vec::new(),
+        byte_start: stmt.start_byte(),
+        create_end: stmt.end_byte(),
+        exp_stmts: Vec::new(),
         expectations: Vec::new(),
     })
 }
@@ -420,54 +512,64 @@ fn detect_create_mock<'a>(
 /// Walk an expectation chain `$m->expects(...)->method('x')->with(...)->willReturn(...)`.
 /// We descend from the outermost call (willReturn / willReturnCallback / willThrow)
 /// down to the base `$m`.
-fn detect_expectation<'a>(
-    outer: Node<'a>, src: &'a [u8],
-) -> Option<(String, Expectation)> {
+fn detect_expectation<'a>(outer: Node<'a>, src: &'a [u8]) -> Option<(String, Expectation)> {
     let mut method_name: Option<String> = None;
-    let mut with_args:   Option<String> = None;
+    let mut with_args: Option<String> = None;
     let mut will_return: Option<String> = None;
     let mut expects_count = ExpectsCount::Any;
     let mut is_supported = true;
 
     let mut cur = outer;
     loop {
-        if cur.kind() != "member_call_expression" { break; }
+        if cur.kind() != "member_call_expression" {
+            break;
+        }
         let call_name = text(cur.child_by_field_name("name")?, src);
         let args = cur.child_by_field_name("arguments")?;
         let args_inner = strip_outer_parens(text(args, src));
 
         match call_name {
-            "willReturn"                  => will_return = Some(format!("return {};", args_inner)),
-            "willReturnSelf"              => will_return = Some("return $this;".to_string()),
-            "willThrowException"          => will_return = Some(format!("throw:{}", args_inner)),
-            "willReturnCallback"          => will_return = Some(format!("callback:{}", args_inner)),
+            "willReturn" => will_return = Some(format!("return {};", args_inner)),
+            "willReturnSelf" => will_return = Some("return $this;".to_string()),
+            "willThrowException" => will_return = Some(format!("throw:{}", args_inner)),
+            "willReturnCallback" => will_return = Some(format!("callback:{}", args_inner)),
             "willReturnOnConsecutiveCalls" => will_return = Some(format!("queue:[{}]", args_inner)),
-            "method"              => {
+            "method" => {
                 let s = args_inner.trim();
                 let s = s.trim_matches('\'').trim_matches('"');
                 method_name = Some(s.to_string());
             }
-            "with"                => with_args = Some(args_inner.to_string()),
-            "expects"             => {
+            "with" => with_args = Some(args_inner.to_string()),
+            "expects" => {
                 let a = args_inner.trim();
-                expects_count = if a.contains("once")  { ExpectsCount::Once }
-                                else if a.contains("never") { ExpectsCount::Never }
-                                else if a.contains("any")   { ExpectsCount::Any }
-                                else { ExpectsCount::Times(a.to_string()) };
+                expects_count = if a.contains("once") {
+                    ExpectsCount::Once
+                } else if a.contains("never") {
+                    ExpectsCount::Never
+                } else if a.contains("any") {
+                    ExpectsCount::Any
+                } else {
+                    ExpectsCount::Times(a.to_string())
+                };
             }
-            _ => { is_supported = false; }
+            _ => {
+                is_supported = false;
+            }
         }
 
         let obj = cur.child_by_field_name("object")?;
         if obj.kind() == "variable_name" {
             let var = format!("${}", text(obj.named_child(0)?, src));
-            return Some((var, Expectation {
-                method:        method_name?,
-                with_args,
-                will_return,
-                expects_count,
-                is_supported,
-            }));
+            return Some((
+                var,
+                Expectation {
+                    method: method_name?,
+                    with_args,
+                    will_return,
+                    expects_count,
+                    is_supported,
+                },
+            ));
         }
         cur = obj;
     }
@@ -489,15 +591,19 @@ fn primitive_default_body(ret: &str) -> String {
     // Strip nullable prefix for the base type check (after the above checks).
     let base = t.trim_start_matches('?').trim();
     // For union types, use the first component's default.
-    let first = base.split(|c: char| c == '|' || c == '&').next().unwrap_or(base).trim();
+    let first = base
+        .split(|c: char| c == '|' || c == '&')
+        .next()
+        .unwrap_or(base)
+        .trim();
     match first {
         "bool" | "true" | "false" => " return false;".to_string(),
-        "int"                     => " return 0;".to_string(),
-        "float"                   => " return 0.0;".to_string(),
-        "string"                  => " return '';".to_string(),
-        "array" | "iterable"      => " return [];".to_string(),
-        "static" | "self"         => " return $this;".to_string(),
-        "never"                   => " throw new \\LogicException('stub');".to_string(),
+        "int" => " return 0;".to_string(),
+        "float" => " return 0.0;".to_string(),
+        "string" => " return '';".to_string(),
+        "array" | "iterable" => " return [];".to_string(),
+        "static" | "self" => " return $this;".to_string(),
+        "never" => " throw new \\LogicException('stub');".to_string(),
         // mixed, null, object, resource, callable, scalar, numeric, or unrecognised — null is fine
         _ => " return null;".to_string(),
     }
@@ -510,7 +616,11 @@ fn object_return_fqn(ret: &str) -> Option<String> {
     let t = ret.trim().trim_start_matches(':').trim();
     let t = t.strip_prefix('?').unwrap_or(t).trim();
     // Take the first part of a union/intersection (e.g. `\Foo|\Bar` → `\Foo`).
-    let t = t.split(|c: char| c == '|' || c == '&').next().unwrap_or(t).trim();
+    let t = t
+        .split(|c: char| c == '|' || c == '&')
+        .next()
+        .unwrap_or(t)
+        .trim();
     if t.starts_with('\\') {
         Some(t.to_string())
     } else {
@@ -519,7 +629,9 @@ fn object_return_fqn(ret: &str) -> Option<String> {
 }
 
 fn strip_outer_parens(s: &str) -> &str {
-    s.strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(s)
+    s.strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(s)
 }
 
 /// Extract the first argument from a comma-separated PHP expression list,
@@ -546,11 +658,12 @@ fn first_arg(args: &str) -> String {
 /// is needed. The instantiation is emitted at the position of the *last*
 /// expectation statement by `bake()`, ensuring all runtime values are in
 /// scope at the call site.
-pub fn emit_anon_class(
-    block: &MockBlock, iface: Option<&Interface>,
-) -> String {
+pub fn emit_anon_class(block: &MockBlock, iface: Option<&Interface>) -> String {
     let Some(iface) = iface else {
-        return format!("{} = $this->createMock({}::class);", block.var, block.iface_name);
+        return format!(
+            "{} = $this->createMock({}::class);",
+            block.var, block.iface_name
+        );
     };
 
     // Build ordered list of (field_name, php_call_value, php_type) for promoted properties.
@@ -560,7 +673,9 @@ pub fn emit_anon_class(
             ctor_fields.push((format!("__cap_{}", i), first_arg(wa), "mixed"));
         }
         if let Some(raw) = &e.will_return {
-            if raw == "return $this;" { continue; }
+            if raw == "return $this;" {
+                continue;
+            }
             let (val, ty) = if let Some(rest) = raw.strip_prefix("throw:") {
                 (rest.to_string(), "mixed")
             } else if let Some(rest) = raw.strip_prefix("callback:") {
@@ -568,13 +683,23 @@ pub fn emit_anon_class(
             } else if let Some(rest) = raw.strip_prefix("queue:") {
                 (rest.to_string(), "array")
             } else {
-                (raw.trim_start_matches("return ").trim_end_matches(';').trim().to_string(), "mixed")
+                (
+                    raw.trim_start_matches("return ")
+                        .trim_end_matches(';')
+                        .trim()
+                        .to_string(),
+                    "mixed",
+                )
             };
             ctor_fields.push((format!("__ret_{}", i), val, ty));
         }
     }
 
-    let keyword = if iface.is_interface { "implements" } else { "extends" };
+    let keyword = if iface.is_interface {
+        "implements"
+    } else {
+        "extends"
+    };
     let mut out = String::new();
 
     // Constructor call args: $this (TestCase) + promoted field values in declaration order.
@@ -582,8 +707,10 @@ pub fn emit_anon_class(
         .chain(ctor_fields.iter().map(|(_, v, _)| v.clone()))
         .collect::<Vec<_>>()
         .join(", ");
-    out.push_str(&format!("{} = new class({}) {} {} {{\n",
-        block.var, call_args, keyword, block.iface_name));
+    out.push_str(&format!(
+        "{} = new class({}) {} {} {{\n",
+        block.var, call_args, keyword, block.iface_name
+    ));
 
     // Per-method call counters (mutable state — cannot use constructor promotion).
     let mut seen_counters = std::collections::HashSet::new();
@@ -594,15 +721,18 @@ pub fn emit_anon_class(
     }
 
     // Constructor: $__tc + all ret/cap values as promoted private properties.
-    let promoted = ctor_fields.iter()
+    let promoted = ctor_fields
+        .iter()
         .map(|(name, _, ty)| format!("private {} ${}", ty, name))
         .collect::<Vec<_>>();
-    let ctor_params = std::iter::once(
-            "private \\PHPUnit\\Framework\\TestCase $__tc".to_string())
+    let ctor_params = std::iter::once("private \\PHPUnit\\Framework\\TestCase $__tc".to_string())
         .chain(promoted)
         .collect::<Vec<_>>()
         .join(", ");
-    out.push_str(&format!("    public function __construct({}) {{}}\n", ctor_params));
+    out.push_str(&format!(
+        "    public function __construct({}) {{}}\n",
+        ctor_params
+    ));
 
     // Expectation methods.
     for (i, e) in block.expectations.iter().enumerate() {
@@ -611,14 +741,17 @@ pub fn emit_anon_class(
             None => continue,
         };
         let stat = if sig.is_static { "static " } else { "" };
-        out.push_str(&format!("    public {}function {}({}): {} {{\n",
-                              stat, sig.name, sig.params, sig.return_ty));
+        out.push_str(&format!(
+            "    public {}function {}({}): {} {{\n",
+            stat, sig.name, sig.params, sig.return_ty
+        ));
         out.push_str(&format!("        $this->__calls_{}++;\n", e.method));
         if e.with_args.is_some() {
             let param0 = first_param_name(&sig.params);
             out.push_str(&format!(
                 "        \\PHPUnit\\Framework\\Assert::assertSame($this->__cap_{}, {});\n",
-                i, param0));
+                i, param0
+            ));
         }
         let is_void = sig.return_ty.trim() == ": void" || sig.return_ty.trim() == "void";
         match e.will_return.as_deref() {
@@ -630,16 +763,25 @@ pub fn emit_anon_class(
             }
             Some(wr) if wr.starts_with("callback:") => {
                 if is_void {
-                    out.push_str(&format!("        ($this->__ret_{})(...func_get_args());\n", i));
+                    out.push_str(&format!(
+                        "        ($this->__ret_{})(...func_get_args());\n",
+                        i
+                    ));
                 } else {
-                    out.push_str(&format!("        return ($this->__ret_{})(...func_get_args());\n", i));
+                    out.push_str(&format!(
+                        "        return ($this->__ret_{})(...func_get_args());\n",
+                        i
+                    ));
                 }
             }
             Some(wr) if wr.starts_with("queue:") => {
                 if is_void {
                     out.push_str(&format!("        array_shift($this->__ret_{});\n", i));
                 } else {
-                    out.push_str(&format!("        return array_shift($this->__ret_{});\n", i));
+                    out.push_str(&format!(
+                        "        return array_shift($this->__ret_{});\n",
+                        i
+                    ));
                 }
             }
             Some(_) if !is_void => {
@@ -652,7 +794,9 @@ pub fn emit_anon_class(
 
     // Lenient stubs for methods not covered by any expectation.
     for m in &iface.methods {
-        if block.expectations.iter().any(|e| e.method == m.name) { continue; }
+        if block.expectations.iter().any(|e| e.method == m.name) {
+            continue;
+        }
         let stat = if m.is_static { "static " } else { "" };
         let is_void = m.return_ty.trim() == ": void" || m.return_ty.trim() == "void";
         let body = if is_void {
@@ -664,7 +808,8 @@ pub fn emit_anon_class(
         };
         out.push_str(&format!(
             "    public {}function {}({}): {} {{{}}}\n",
-            stat, m.name, m.params, m.return_ty, body));
+            stat, m.name, m.params, m.return_ty, body
+        ));
     }
 
     out.push_str("    public function __destruct() {\n");
@@ -707,7 +852,8 @@ pub fn bake(test_src: &str, ifaces: &HashMap<String, Interface>) -> Result<Strin
         bail!("no createMock pattern found in test source");
     }
     // Merge all use_lines from every resolved interface.
-    let all_uses: Vec<String> = ifaces.values()
+    let all_uses: Vec<String> = ifaces
+        .values()
         .flat_map(|i| i.use_lines.iter().cloned())
         .collect();
     let with_uses = inject_uses(test_src, &all_uses);
@@ -726,7 +872,10 @@ pub fn bake(test_src: &str, ifaces: &HashMap<String, Interface>) -> Result<Strin
     // This eliminates the old "Assign" spans entirely: values flow directly into
     // the constructor call, so no post-creation mutation is needed.
     #[derive(Clone)]
-    enum SpanKind { Create(usize), Skip }
+    enum SpanKind {
+        Create(usize),
+        Skip,
+    }
     let mut spans: Vec<(usize, usize, SpanKind)> = Vec::new();
     for (i, b) in blocks.iter().enumerate() {
         if !ifaces.contains_key(&b.iface_name) {
@@ -752,14 +901,23 @@ pub fn bake(test_src: &str, ifaces: &HashMap<String, Interface>) -> Result<Strin
     let mut out = String::new();
     let mut cursor = 0usize;
     for (start, end, kind) in &spans {
-        if *start < cursor { continue; }
+        if *start < cursor {
+            continue;
+        }
         out.push_str(&with_uses[cursor..*start]);
         if let SpanKind::Create(i) = kind {
-            out.push_str(&emit_anon_class(&blocks[*i], ifaces.get(&blocks[*i].iface_name)));
+            out.push_str(&emit_anon_class(
+                &blocks[*i],
+                ifaces.get(&blocks[*i].iface_name),
+            ));
         }
         cursor = *end;
-        if with_uses[cursor..].starts_with(';') { cursor += 1; }
-        if with_uses.as_bytes().get(cursor) == Some(&b'\n') { cursor += 1; }
+        if with_uses[cursor..].starts_with(';') {
+            cursor += 1;
+        }
+        if with_uses.as_bytes().get(cursor) == Some(&b'\n') {
+            cursor += 1;
+        }
     }
     out.push_str(&with_uses[cursor..]);
     Ok(out)
@@ -771,7 +929,9 @@ pub fn bake(test_src: &str, ifaces: &HashMap<String, Interface>) -> Result<Strin
 /// `use function ...`      → None  (function imports have different rules)
 fn use_short_name(line: &str) -> Option<String> {
     let body = line.trim().strip_prefix("use ")?.strip_suffix(';')?.trim();
-    if body.starts_with("function ") || body.starts_with("const ") { return None; }
+    if body.starts_with("function ") || body.starts_with("const ") {
+        return None;
+    }
     if let Some(pos) = body.to_ascii_lowercase().find(" as ") {
         Some(body[pos + 4..].trim().to_string())
     } else {
@@ -785,7 +945,8 @@ fn use_short_name(line: &str) -> Option<String> {
 /// (injecting it would produce a PHP fatal "name already in use" error).
 fn inject_uses(src: &str, extra: &[String]) -> String {
     // Collect short names already in use inside the test file.
-    let existing_short: std::collections::HashSet<String> = src.lines()
+    let existing_short: std::collections::HashSet<String> = src
+        .lines()
         .filter_map(|l| use_short_name(l.trim()))
         .collect();
 
@@ -793,15 +954,25 @@ fn inject_uses(src: &str, extra: &[String]) -> String {
     let mut missing: Vec<&str> = Vec::new();
     for line in extra {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        if src.contains(trimmed) { continue; }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if src.contains(trimmed) {
+            continue;
+        }
         // Skip if the short name/alias would shadow an existing import.
         if let Some(short) = use_short_name(trimmed) {
-            if existing_short.contains(&short) { continue; }
+            if existing_short.contains(&short) {
+                continue;
+            }
         }
-        if seen.insert(trimmed) { missing.push(trimmed); }
+        if seen.insert(trimmed) {
+            missing.push(trimmed);
+        }
     }
-    if missing.is_empty() { return src.to_string(); }
+    if missing.is_empty() {
+        return src.to_string();
+    }
 
     // Anchor: the line after the last top-level `use ...;` or `namespace ...;`
     // in the file. We only consider lines with NO leading whitespace — trait
@@ -811,15 +982,20 @@ fn inject_uses(src: &str, extra: &[String]) -> String {
     for (idx, line) in src.lines().enumerate() {
         // Top-level PHP statements never have leading whitespace.
         if line.starts_with("use ") || line.starts_with("namespace ") {
-            anchor = src.lines().take(idx + 1)
-                .map(|l| l.len() + 1).sum::<usize>(); // end of this line
+            anchor = src
+                .lines()
+                .take(idx + 1)
+                .map(|l| l.len() + 1)
+                .sum::<usize>(); // end of this line
         }
     }
     let (head, tail) = src.split_at(anchor);
     let mut block = String::new();
     for u in missing {
         block.push_str(u);
-        if !u.ends_with(';') { block.push(';'); }
+        if !u.ends_with(';') {
+            block.push(';');
+        }
         block.push('\n');
     }
     format!("{head}{block}{tail}")
@@ -830,10 +1006,21 @@ mod tests {
     use super::*;
     #[test]
     fn test_extract_use_map_with_alias() {
-        let src = "<?php\nuse Doctrine\\DBAL\\Driver\\Connection as DriverConnection;\nuse Foo\\Bar;\n";
+        let src =
+            "<?php\nuse Doctrine\\DBAL\\Driver\\Connection as DriverConnection;\nuse Foo\\Bar;\n";
         let map = extract_use_map(src).unwrap();
-        assert_eq!(map.get("DriverConnection").map(|s| s.as_str()), Some("Doctrine\\DBAL\\Driver\\Connection"), "alias not resolved: {:?}", map);
-        assert_eq!(map.get("Bar").map(|s| s.as_str()), Some("Foo\\Bar"), "non-alias not resolved: {:?}", map);
+        assert_eq!(
+            map.get("DriverConnection").map(|s| s.as_str()),
+            Some("Doctrine\\DBAL\\Driver\\Connection"),
+            "alias not resolved: {:?}",
+            map
+        );
+        assert_eq!(
+            map.get("Bar").map(|s| s.as_str()),
+            Some("Foo\\Bar"),
+            "non-alias not resolved: {:?}",
+            map
+        );
     }
 
     /// `walk` is invoked over arbitrary project test files under --bake-mocks.
@@ -896,7 +1083,10 @@ mod tests {
         let mut got: Vec<&str> = Vec::new();
         walk(tree.root_node(), &mut |n: Node| got.push(n.kind()));
 
-        assert_eq!(got, expected, "iterative walk must match recursive pre-order");
+        assert_eq!(
+            got, expected,
+            "iterative walk must match recursive pre-order"
+        );
     }
 
     /// tree-sitter recovers from syntax errors and returns a partial tree, so
@@ -911,10 +1101,16 @@ mod tests {
             tree.root_node().has_error(),
             "tree-sitter should flag the broken snippet as containing an ERROR node",
         );
-        assert!(has_syntax_errors(&tree), "helper must report broken input as having errors");
+        assert!(
+            has_syntax_errors(&tree),
+            "helper must report broken input as having errors"
+        );
 
         let valid = "<?php class Foo { public function bar(): void {} }";
         let tree_ok = p.parse(valid, None).unwrap();
-        assert!(!has_syntax_errors(&tree_ok), "helper must report valid input as clean");
+        assert!(
+            !has_syntax_errors(&tree_ok),
+            "helper must report valid input as clean"
+        );
     }
 }

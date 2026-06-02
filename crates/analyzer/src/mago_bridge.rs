@@ -30,13 +30,12 @@ use std::sync::{Arc, RwLock};
 
 use mago_interner::ThreadedInterner;
 use mago_php_version::PHPVersion;
-use mago_project::Project;
 use mago_project::module::{Module, ModuleBuildOptions};
+use mago_project::Project;
 use mago_reflection::class_like::ClassLikeReflection;
 use mago_reflection::identifier::ClassLikeName;
 use mago_source::Source;
 use mago_syntax::ast::Program;
-
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -78,12 +77,18 @@ impl MagoProject {
         Self::load_filtered(root, move |path| !path.starts_with(&vendor))
     }
 
-    fn load_filtered(root: &Path, keep: impl Fn(&std::path::Path) -> bool + Sync) -> Result<Self, BridgeError> {
+    fn load_filtered(
+        root: &Path,
+        keep: impl Fn(&std::path::Path) -> bool + Sync,
+    ) -> Result<Self, BridgeError> {
         use rayon::prelude::*;
 
         let interner = ThreadedInterner::new();
         let version = PHPVersion::LATEST;
-        let options = ModuleBuildOptions { reflect: true, validate: false };
+        let options = ModuleBuildOptions {
+            reflect: true,
+            validate: false,
+        };
 
         // Collect all matching paths first (walkdir is sequential by design).
         let entries: Vec<_> = walkdir::WalkDir::new(root)
@@ -179,7 +184,11 @@ impl MagoProject {
     /// Iterates `inner.modules` and returns the first module whose `source.identifier` matches.
     /// Used by downstream analysis (e.g., line-number resolution from a `Span`).
     pub(crate) fn source_by_id(&self, id: mago_source::SourceIdentifier) -> Option<&Source> {
-        self.inner.modules.iter().find(|m| m.source.identifier == id).map(|m| &m.source)
+        self.inner
+            .modules
+            .iter()
+            .find(|m| m.source.identifier == id)
+            .map(|m| &m.source)
     }
 
     /// Return the parsed AST for `src`, re-using a cached `Program` when available.
@@ -196,7 +205,10 @@ impl MagoProject {
         }
         let (program, _) = mago_syntax::parser::parse_source(&self.interner, src);
         let arc = Arc::new(program);
-        self.parse_cache.write().unwrap().insert(id, Arc::clone(&arc));
+        self.parse_cache
+            .write()
+            .unwrap()
+            .insert(id, Arc::clone(&arc));
         arc
     }
 
@@ -207,7 +219,6 @@ impl MagoProject {
         let refl = self.inner.reflection.class_like_reflections.get(cn)?;
         Some((cn.get_key(&self.interner), refl))
     }
-
 }
 
 #[cfg(test)]
@@ -248,7 +259,10 @@ class Hello {
         assert!(
             hello.is_some(),
             "Hello class was not found in reflection; classes found: {:?}",
-            project.class_likes().map(|(n, _)| project.class_name_str(n)).collect::<Vec<_>>()
+            project
+                .class_likes()
+                .map(|(n, _)| project.class_name_str(n))
+                .collect::<Vec<_>>()
         );
 
         let (_, hello_reflection) = hello.unwrap();
@@ -274,13 +288,18 @@ class Dog extends Animal {}
 
         let project = MagoProject::load(dir.path()).expect("load should succeed");
 
-        let dog = project.class_likes().find(|(name, _)| project.class_name_str(name).to_lowercase() == "dog");
+        let dog = project
+            .class_likes()
+            .find(|(name, _)| project.class_name_str(name).to_lowercase() == "dog");
         assert!(dog.is_some(), "Dog class not found");
 
         let (_, dog_reflection) = dog.unwrap();
         let parent = &dog_reflection.inheritance.direct_extended_class;
         assert!(parent.is_some(), "Dog should have a parent class (Animal)");
-        let parent_name = project.interner().lookup(&parent.unwrap().value).to_string();
+        let parent_name = project
+            .interner()
+            .lookup(&parent.unwrap().value)
+            .to_string();
         assert!(
             parent_name.to_lowercase() == "animal",
             "Dog's parent should be Animal, got: {parent_name}"
@@ -296,7 +315,9 @@ class Dog extends Animal {}
 
         let project = MagoProject::load(dir.path()).expect("load should succeed");
         assert_eq!(project.module_count(), 3, "expected 3 modules");
-        assert!(project.class_like_count() >= 3, "expected at least 3 class-likes");
+        assert!(
+            project.class_like_count() >= 3,
+            "expected at least 3 class-likes"
+        );
     }
-
 }

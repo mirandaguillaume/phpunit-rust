@@ -1,7 +1,7 @@
 //! Type → ReceiverType bridge for the opacity layer.
 
-use crate::opacity::ReceiverType;
 use super::type_repr::Type;
+use crate::opacity::ReceiverType;
 
 /// Convert an inferred Type into the ReceiverType the opacity rules consume.
 ///
@@ -23,13 +23,15 @@ pub fn type_to_receiver_type(ty: &Type, enclosing_class: Option<&str>) -> Receiv
         Type::Union(a, b) => {
             let ra = type_to_receiver_type(a, enclosing_class);
             let rb = type_to_receiver_type(b, enclosing_class);
-            if ra == rb { ra } else { ReceiverType::Mixed }
+            if ra == rb {
+                ra
+            } else {
+                ReceiverType::Mixed
+            }
         }
-        Type::This => {
-            enclosing_class
-                .map(|c| ReceiverType::Concrete(c.to_string()))
-                .unwrap_or(ReceiverType::Mixed)
-        }
+        Type::This => enclosing_class
+            .map(|c| ReceiverType::Concrete(c.to_string()))
+            .unwrap_or(ReceiverType::Mixed),
         Type::SelfRef(c) | Type::StaticRef(c) => ReceiverType::Concrete(c.clone()),
         Type::Mixed => ReceiverType::Mixed,
     }
@@ -90,13 +92,19 @@ mod tests {
             Box::new(Type::Class("A".into())),
             Box::new(Type::Class("A".into())),
         );
-        assert_eq!(type_to_receiver_type(&u, None), ReceiverType::Concrete("A".into()));
+        assert_eq!(
+            type_to_receiver_type(&u, None),
+            ReceiverType::Concrete("A".into())
+        );
     }
 
     #[test]
     fn nullable_resolves_via_inner() {
         let n = Type::Nullable(Box::new(Type::Class("Foo".into())));
-        assert_eq!(type_to_receiver_type(&n, None), ReceiverType::Concrete("Foo".into()));
+        assert_eq!(
+            type_to_receiver_type(&n, None),
+            ReceiverType::Concrete("Foo".into())
+        );
     }
 
     #[test]

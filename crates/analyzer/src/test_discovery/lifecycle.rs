@@ -5,8 +5,8 @@
 
 use super::TestMethod;
 use crate::mago_bridge::MagoProject;
-use std::collections::HashMap;
 use mago_reflection::class_like::ClassLikeReflection;
+use std::collections::HashMap;
 
 /// Walk each test method's owning class and flag which lifecycle methods are defined.
 ///
@@ -21,7 +21,9 @@ pub fn bind_lifecycle_methods(project: &MagoProject, methods: &mut [TestMethod])
 
     for tm in methods.iter_mut() {
         let key = tm.class.to_lowercase();
-        let Some(class_refl) = class_index.get(&key) else { continue };
+        let Some(class_refl) = class_index.get(&key) else {
+            continue;
+        };
         for (method_id, _method_refl) in class_refl.methods.members.iter() {
             let method_name = project.interner().lookup(method_id);
             match method_name {
@@ -45,9 +47,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
         std::fs::write(
-            dir.path().join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
             "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(dir.path().join("MyTest.php"), content).unwrap();
         let project = MagoProject::load(dir.path()).unwrap();
         (dir, project)
@@ -78,9 +82,18 @@ class MyTest extends TestCase {
         let mut methods = vec![empty_test_method("MyTest", "testThing")];
         bind_lifecycle_methods(&project, &mut methods);
         assert!(methods[0].lifecycle.set_up, "setUp should be detected");
-        assert!(methods[0].lifecycle.tear_down, "tearDown should be detected");
-        assert!(!methods[0].lifecycle.set_up_before_class, "setUpBeforeClass not present");
-        assert!(!methods[0].lifecycle.tear_down_after_class, "tearDownAfterClass not present");
+        assert!(
+            methods[0].lifecycle.tear_down,
+            "tearDown should be detected"
+        );
+        assert!(
+            !methods[0].lifecycle.set_up_before_class,
+            "setUpBeforeClass not present"
+        );
+        assert!(
+            !methods[0].lifecycle.tear_down_after_class,
+            "tearDownAfterClass not present"
+        );
     }
 
     #[test]
@@ -129,6 +142,9 @@ class OtherTest extends TestCase {
         );
         let mut methods = vec![empty_test_method("MissingClass", "testThing")];
         bind_lifecycle_methods(&project, &mut methods);
-        assert!(!methods[0].lifecycle.set_up, "unknown class should leave defaults");
+        assert!(
+            !methods[0].lifecycle.set_up,
+            "unknown class should leave defaults"
+        );
     }
 }

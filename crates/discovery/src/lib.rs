@@ -28,30 +28,30 @@ use walkdir::WalkDir;
 /// `<groups><exclude>` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestCase {
-    pub file:                 PathBuf,
-    pub class:                String,
-    pub method:               String,
-    pub data_provider:        Option<String>,
-    pub groups:               Vec<String>,
-    pub external_providers:   Vec<(String, String)>,
+    pub file: PathBuf,
+    pub class: String,
+    pub method: String,
+    pub data_provider: Option<String>,
+    pub groups: Vec<String>,
+    pub external_providers: Vec<(String, String)>,
     /// True when the method body consists entirely of trivially-true assertions
     /// and has at least one such assertion. See [`GroupedMethod::is_tautological`].
-    pub is_tautological:      bool,
+    pub is_tautological: bool,
     /// True when the class has no `setUpBeforeClass`/`tearDownAfterClass` override.
     /// See [`TestClass::has_lifecycle_overrides`].
     pub has_lifecycle_overrides: bool,
     /// Mirrors [`GroupedMethod::depends_on`].
-    pub depends_on:      Vec<String>,
+    pub depends_on: Vec<String>,
     /// Mirrors [`GroupedMethod::is_dispatch_safe`].
     pub is_dispatch_safe: bool,
     /// Mirrors [`GroupedMethod::fingerprint`].
-    pub fingerprint:      std::collections::HashSet<String>,
+    pub fingerprint: std::collections::HashSet<String>,
     /// True when the test class calls a PHP API that mutates process-global
     /// state (stream wrapper registry, error handler, ini values, locale, …)
     /// without a reliable restore mechanism. The runner forces a fresh fork
     /// for each batch of such a class so cross-batch pollution can't carry
     /// over. See [`TestClass::is_stateful`].
-    pub is_stateful:      bool,
+    pub is_stateful: bool,
     /// True when the class (or any of its methods) carries a PHPUnit
     /// "run in separate process" marker — `@runInSeparateProcess`,
     /// `@runTestsInSeparateProcesses`, `@runClassInSeparateProcess`, or the
@@ -60,7 +60,7 @@ pub struct TestCase {
     /// through K=1 (force_exit_after) and clearing the in-PHP flag before
     /// invoking the test — preventing PHPUnit from `proc_open`-ing a nested
     /// sub-process inside the worker. See [`TestClass::is_isolated`].
-    pub is_isolated:      bool,
+    pub is_isolated: bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -102,17 +102,17 @@ struct ParsedClass {
 /// Per-method discovery info collected during the tree-sitter walk.
 #[derive(Debug, Clone)]
 struct MethodInfo {
-    name:               String,
-    data_provider:      Option<String>,
-    groups:             Vec<String>,
+    name: String,
+    data_provider: Option<String>,
+    groups: Vec<String>,
     external_providers: Vec<(String, String)>,
-    is_tautological:    bool,
-    depends_on:         Vec<String>,
+    is_tautological: bool,
+    depends_on: Vec<String>,
     /// FQCNs statically referenced in the method body — `new Foo(...)`,
     /// `Foo::class`, `Foo::method()`, `createMock(Foo::class)`, etc. Used
     /// by the runner's slot-affinity dispatcher to route batches to workers
     /// that have already loaded matching classes (warm-cache routing).
-    fingerprint:        std::collections::HashSet<String>,
+    fingerprint: std::collections::HashSet<String>,
 }
 
 /// Maps every discovered class FQCN to its resolved parent FQCN (or None).
@@ -124,27 +124,27 @@ type ClassGraph = HashMap<String, Option<String>>;
 /// schedule heavy methods first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupedMethod {
-    pub name:               String,
-    pub data_provider:      Option<String>,
-    pub groups:             Vec<String>,
+    pub name: String,
+    pub data_provider: Option<String>,
+    pub groups: Vec<String>,
     pub external_providers: Vec<(String, String)>,
     /// True when the method body consists entirely of trivially-true assertions
     /// (assertTrue(true), assertFalse(false), assertNull(null), assertEquals(X,X),
     /// assertSame(X,X)) and has at least one such assertion. The runner can skip
     /// dispatching these to a PHP worker and emit a synthetic Pass outcome instead.
-    pub is_tautological:    bool,
+    pub is_tautological: bool,
     /// Names of methods this one depends on via `#[Depends('name')]` or
     /// `@depends name`. Empty when there are no declared dependencies.
     /// The runner uses this to group dependency chains together so
     /// return-value injection works correctly.
-    pub depends_on:         Vec<String>,
+    pub depends_on: Vec<String>,
     /// True when `depends_on` is empty — the method has no ordering constraint
     /// and can be dispatched to any worker independently.
-    pub is_dispatch_safe:   bool,
+    pub is_dispatch_safe: bool,
     /// FQCNs statically referenced in the method body. See
     /// [`MethodInfo::fingerprint`]. Used by the runner's slot-affinity
     /// dispatcher for warm-cache routing across batches.
-    pub fingerprint:        std::collections::HashSet<String>,
+    pub fingerprint: std::collections::HashSet<String>,
 }
 
 /// A discovered test class with all of its methods, grouped for batched
@@ -158,9 +158,9 @@ pub struct GroupedMethod {
 /// [`GroupedMethod::is_dispatch_safe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestClass {
-    pub file:                    PathBuf,
-    pub class:                   String,
-    pub methods:                 Vec<GroupedMethod>,
+    pub file: PathBuf,
+    pub class: String,
+    pub methods: Vec<GroupedMethod>,
     pub has_lifecycle_overrides: bool,
     /// True when the class statically references at least one PHP API that
     /// mutates process-global state without a guaranteed restore (stream
@@ -168,13 +168,13 @@ pub struct TestClass {
     /// Such classes must run in an isolated fork (one batch per process)
     /// so cross-batch pollution can't bleed in. Detected at discovery by
     /// walking ALL method bodies in the class (including setUp/tearDown).
-    pub is_stateful:             bool,
+    pub is_stateful: bool,
     /// True when the class or any of its methods carries a PHPUnit
     /// "separate process" annotation/attribute. The runner forces K=1
     /// (force_exit_after) on these classes AND signals the PHP executor
     /// to clear `runTestInSeparateProcess` on the test instance so PHPUnit
     /// does not spawn a nested sub-process inside our already-forked worker.
-    pub is_isolated:             bool,
+    pub is_isolated: bool,
 }
 
 /// Group a flat list of TestCases by class. Preserves discovery order
@@ -193,16 +193,17 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
         let is_stateful = case.is_stateful;
         let is_isolated = case.is_isolated;
         let gm = GroupedMethod {
-            name:               case.method,
-            data_provider:      case.data_provider,
-            groups:             case.groups,
+            name: case.method,
+            data_provider: case.data_provider,
+            groups: case.groups,
             external_providers: case.external_providers,
-            is_tautological:    case.is_tautological,
-            is_dispatch_safe:   case.is_dispatch_safe,
-            depends_on:         case.depends_on,
-            fingerprint:        case.fingerprint,
+            is_tautological: case.is_tautological,
+            is_dispatch_safe: case.is_dispatch_safe,
+            depends_on: case.depends_on,
+            fingerprint: case.fingerprint,
         };
-        if let Some(existing) = groups.iter_mut()
+        if let Some(existing) = groups
+            .iter_mut()
             .find(|g| g.class == case.class && g.file == case.file)
         {
             existing.methods.push(gm);
@@ -214,9 +215,9 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             existing.is_isolated = existing.is_isolated || is_isolated;
         } else {
             groups.push(TestClass {
-                file:                    case.file,
-                class:                   case.class,
-                methods:                 vec![gm],
+                file: case.file,
+                class: case.class,
+                methods: vec![gm],
                 has_lifecycle_overrides,
                 is_stateful,
                 is_isolated,
@@ -243,8 +244,8 @@ fn has_syntax_errors(tree: &tree_sitter::Tree) -> bool {
 /// "Resolved parent FQCN" applies the file's namespace + use-alias context so
 /// the BFS in pass 3 can compare on FQCN strings alone.
 fn parse_file_classes(path: &Path) -> Result<Vec<ParsedClass>> {
-    let src = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let mut parser = Parser::new();
     parser
@@ -300,7 +301,10 @@ fn parse_use_aliases(root: Node, bytes: &[u8]) -> HashMap<String, String> {
             for cc in clause.children(&mut clause_cur) {
                 match cc.kind() {
                     "qualified_name" | "name" if imported.is_none() => {
-                        imported = cc.utf8_text(bytes).ok().map(|s| s.trim_start_matches('\\').to_string());
+                        imported = cc
+                            .utf8_text(bytes)
+                            .ok()
+                            .map(|s| s.trim_start_matches('\\').to_string());
                     }
                     "namespace_aliasing_clause" => {
                         // Child is the alias name.
@@ -316,9 +320,8 @@ fn parse_use_aliases(root: Node, bytes: &[u8]) -> HashMap<String, String> {
             }
             if let Some(fqcn) = imported {
                 // Default local name is the last segment of the FQCN.
-                let local = alias.unwrap_or_else(|| {
-                    fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string()
-                });
+                let local =
+                    alias.unwrap_or_else(|| fqcn.rsplit('\\').next().unwrap_or(&fqcn).to_string());
                 aliases.insert(local, fqcn);
             }
         }
@@ -429,18 +432,21 @@ fn collect_parsed_classes(
             }
         }
 
-        let (Some(name), Some(body), Some(decl)) = (class_name, body_node, class_node) else { continue };
+        let (Some(name), Some(body), Some(decl)) = (class_name, body_node, class_node) else {
+            continue;
+        };
 
         // For multi-namespace files (namespace Foo { ... } braced form), each
         // class lives in the namespace of its own enclosing block, not the
         // first namespace encountered in the file.
-        let class_ns: Option<String> = find_enclosing_namespace(decl, bytes)
-            .or_else(|| namespace.map(String::from));
+        let class_ns: Option<String> =
+            find_enclosing_namespace(decl, bytes).or_else(|| namespace.map(String::from));
         let fqcn = match class_ns.as_deref() {
             Some(ns) => format!("{ns}\\{name}"),
             None => name.to_string(),
         };
-        let parent_fqcn = base_name.map(|b| resolve_class_reference(b, class_ns.as_deref(), aliases));
+        let parent_fqcn =
+            base_name.map(|b| resolve_class_reference(b, class_ns.as_deref(), aliases));
         let test_methods = collect_test_methods(body, bytes, class_ns.as_deref(), &aliases);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
@@ -499,8 +505,11 @@ fn class_has_modifier(class_decl: Node, bytes: &[u8], wanted: &str) -> bool {
 fn has_no_lifecycle_overrides(class_body: Node, src: &[u8]) -> bool {
     let mut cursor = class_body.walk();
     for child in class_body.children(&mut cursor) {
-        if child.kind() != "method_declaration" { continue; }
-        let name = child.child_by_field_name("name")
+        if child.kind() != "method_declaration" {
+            continue;
+        }
+        let name = child
+            .child_by_field_name("name")
             .and_then(|n| n.utf8_text(src).ok())
             .unwrap_or("");
         if matches!(name, "setUpBeforeClass" | "tearDownAfterClass") {
@@ -509,7 +518,6 @@ fn has_no_lifecycle_overrides(class_body: Node, src: &[u8]) -> bool {
     }
     true
 }
-
 
 /// Returns `true` when the method body consists *entirely* of trivially-true
 /// PHPUnit assertions and contains at least one of them:
@@ -589,30 +597,40 @@ fn is_tautological_method(method_node: Node, src: &[u8]) -> bool {
                 }
 
                 let trivial = match method_name {
-                    "assertTrue" => {
-                        args.len() == 1
-                            && matches!(args[0].utf8_text(src), Ok("true"))
-                    }
+                    "assertTrue" => args.len() == 1 && matches!(args[0].utf8_text(src), Ok("true")),
                     "assertFalse" => {
-                        args.len() == 1
-                            && matches!(args[0].utf8_text(src), Ok("false"))
+                        args.len() == 1 && matches!(args[0].utf8_text(src), Ok("false"))
                     }
-                    "assertNull" => {
-                        args.len() == 1
-                            && matches!(args[0].utf8_text(src), Ok("null"))
-                    }
+                    "assertNull" => args.len() == 1 && matches!(args[0].utf8_text(src), Ok("null")),
                     "assertEquals" | "assertSame" => {
                         if args.len() == 2 {
                             let a = &args[0];
                             let b = &args[1];
                             // Both args must be PHP literal nodes (not just textually equal)
-                            let both_literals = matches!(a.kind(),
-                                "integer" | "float" | "string" | "encapsed_string"
-                                | "boolean" | "true" | "false" | "null")
-                                && matches!(b.kind(),
-                                "integer" | "float" | "string" | "encapsed_string"
-                                | "boolean" | "true" | "false" | "null");
-                            both_literals && a.utf8_text(src).unwrap_or("a") == b.utf8_text(src).unwrap_or("b")
+                            let both_literals = matches!(
+                                a.kind(),
+                                "integer"
+                                    | "float"
+                                    | "string"
+                                    | "encapsed_string"
+                                    | "boolean"
+                                    | "true"
+                                    | "false"
+                                    | "null"
+                            ) && matches!(
+                                b.kind(),
+                                "integer"
+                                    | "float"
+                                    | "string"
+                                    | "encapsed_string"
+                                    | "boolean"
+                                    | "true"
+                                    | "false"
+                                    | "null"
+                            );
+                            both_literals
+                                && a.utf8_text(src).unwrap_or("a")
+                                    == b.utf8_text(src).unwrap_or("b")
                         } else {
                             false
                         }
@@ -672,20 +690,20 @@ fn extract_method_fingerprint(
         // Identify class references by node kind.
         let class_name_text: Option<&str> = match n.kind() {
             // `new Foo(...)` — the type sits in `name_node`/`type` field
-            "object_creation_expression" => {
-                n.child_by_field_name("type")
-                    .or_else(|| n.named_child(0))
-                    .and_then(|c| c.utf8_text(bytes).ok())
-            }
+            "object_creation_expression" => n
+                .child_by_field_name("type")
+                .or_else(|| n.named_child(0))
+                .and_then(|c| c.utf8_text(bytes).ok()),
             // `Foo::class` / `Foo::CONST` — first named child is the class name
-            "class_constant_access_expression" |
-            "scoped_call_expression" |
-            "scoped_property_access_expression" => {
+            "class_constant_access_expression"
+            | "scoped_call_expression"
+            | "scoped_property_access_expression" => {
                 n.named_child(0).and_then(|c| c.utf8_text(bytes).ok())
             }
             // `expr instanceof Foo` — Right operand if the op is `instanceof`
             "binary_expression" => {
-                let op = n.child_by_field_name("operator")
+                let op = n
+                    .child_by_field_name("operator")
                     .and_then(|c| c.utf8_text(bytes).ok())
                     .unwrap_or("");
                 if op == "instanceof" {
@@ -698,7 +716,9 @@ fn extract_method_fingerprint(
             _ => None,
         };
         if let Some(raw) = class_name_text {
-            if !is_valid_class_name(raw) { continue; }
+            if !is_valid_class_name(raw) {
+                continue;
+            }
             let resolved = resolve_class_reference(raw, namespace, aliases);
             // Only retain names that look like a FQCN (contain a backslash) —
             // bare unresolved names match PHP builtins and add noise.
@@ -722,16 +742,23 @@ fn extract_method_fingerprint(
 /// A real class reference is a single line of ASCII identifier characters
 /// plus optional namespace separators (`\\`).
 fn is_valid_class_name(raw: &str) -> bool {
-    if matches!(raw, "self" | "static" | "parent") { return false; }
-    if raw.is_empty() { return false; }
-    if raw.contains('\n') || raw.contains('\r') { return false; }
+    if matches!(raw, "self" | "static" | "parent") {
+        return false;
+    }
+    if raw.is_empty() {
+        return false;
+    }
+    if raw.contains('\n') || raw.contains('\r') {
+        return false;
+    }
     // First char must be a letter, underscore, or backslash (absolute name).
     let first = raw.chars().next().unwrap();
     if !(first.is_ascii_alphabetic() || first == '_' || first == '\\') {
         return false;
     }
     // Body must be identifier chars and namespace separators only.
-    raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\\')
+    raw.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\\')
 }
 
 /// Bare PHP function names that mutate process-global state without a
@@ -745,7 +772,7 @@ const STATEFUL_GLOBAL_APIS: &[&str] = &[
     "stream_wrapper_register",
     "stream_wrapper_unregister",
     "stream_wrapper_restore",
-    "stream_register_wrapper",          // pre-5.1 alias still in some codebases
+    "stream_register_wrapper", // pre-5.1 alias still in some codebases
     // Error / exception handlers
     "set_error_handler",
     "restore_error_handler",
@@ -778,7 +805,9 @@ fn class_has_stateful_calls(class_body: Node, bytes: &[u8]) -> bool {
         if member.kind() != "method_declaration" {
             continue;
         }
-        let Some(body) = member.child_by_field_name("body") else { continue };
+        let Some(body) = member.child_by_field_name("body") else {
+            continue;
+        };
         let mut stack = vec![body];
         while let Some(n) = stack.pop() {
             let mut c2 = n.walk();
@@ -786,7 +815,8 @@ fn class_has_stateful_calls(class_body: Node, bytes: &[u8]) -> bool {
                 stack.push(child);
             }
             if n.kind() == "function_call_expression" {
-                let fn_node = n.child_by_field_name("function")
+                let fn_node = n
+                    .child_by_field_name("function")
                     .or_else(|| n.named_child(0));
                 if let Some(fnn) = fn_node {
                     if let Ok(name) = fnn.utf8_text(bytes) {
@@ -891,29 +921,33 @@ fn collect_test_methods(
         //   - its name starts with "test"
         //   - it has a /** @test */ PHPDoc annotation
         //   - it has a #[Test] or #[PHPUnit\Framework\Attributes\Test] attribute
-        let has_annotation = prev_comment.as_deref()
+        let has_annotation = prev_comment
+            .as_deref()
             .map(|c| c.contains("@test"))
             .unwrap_or(false);
         let has_attr = method_has_test_attribute(child, bytes);
 
         if is_public && (name.starts_with("test") || has_annotation || has_attr) {
-            let dp = prev_comment.as_deref()
+            let dp = prev_comment
+                .as_deref()
                 .and_then(phpdoc_data_provider)
                 .or_else(|| method_data_provider_attr(child, bytes));
             let mut groups = extract_groups_attr(child, bytes);
             if let Some(c) = prev_comment.as_deref() {
                 extract_groups_phpdoc(c, &mut groups);
             }
-            let external_providers = extract_external_provider_attrs(child, bytes, namespace, aliases);
+            let external_providers =
+                extract_external_provider_attrs(child, bytes, namespace, aliases);
             let is_tautological = is_tautological_method(child, bytes);
-            let mut depends_on = prev_comment.as_deref()
+            let mut depends_on = prev_comment
+                .as_deref()
                 .map(|c| phpdoc_depends(c))
                 .unwrap_or_default();
             depends_on.extend(method_depends_attr(child, bytes));
             let fingerprint = extract_method_fingerprint(child, bytes, namespace, aliases);
             methods.push(MethodInfo {
-                name:               name.to_string(),
-                data_provider:      dp,
+                name: name.to_string(),
+                data_provider: dp,
                 groups,
                 external_providers,
                 is_tautological,
@@ -933,7 +967,10 @@ fn phpdoc_depends(comment: &str) -> Vec<String> {
     let mut search = comment;
     while let Some(pos) = search.find(needle) {
         let after = &search[pos + needle.len()..];
-        let name = after.split(|c: char| c.is_whitespace() || c == '*').next().unwrap_or("");
+        let name = after
+            .split(|c: char| c.is_whitespace() || c == '*')
+            .next()
+            .unwrap_or("");
         if !name.is_empty() {
             result.push(name.to_string());
         }
@@ -947,8 +984,12 @@ fn method_depends_attr(method: Node, bytes: &[u8]) -> Vec<String> {
     let mut result = Vec::new();
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
-        let Ok(text) = child.utf8_text(bytes) else { continue };
-        if !text.starts_with("#[") || !text.contains("Depends") { continue };
+        let Ok(text) = child.utf8_text(bytes) else {
+            continue;
+        };
+        if !text.starts_with("#[") || !text.contains("Depends") {
+            continue;
+        };
         // Walk all occurrences of Depends( in this attribute block
         let mut search = text;
         while let Some(start) = search.find("Depends(") {
@@ -977,8 +1018,14 @@ fn phpdoc_data_provider(comment: &str) -> Option<String> {
     let needle = "@dataProvider ";
     let start = comment.find(needle)?;
     let after = &comment[start + needle.len()..];
-    let name = after.split(|c: char| c.is_whitespace() || c == '*').next()?;
-    if name.is_empty() { None } else { Some(name.to_string()) }
+    let name = after
+        .split(|c: char| c.is_whitespace() || c == '*')
+        .next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Extract the provider name from `#[DataProvider("name")]` (also matches
@@ -987,8 +1034,12 @@ fn phpdoc_data_provider(comment: &str) -> Option<String> {
 fn method_data_provider_attr(method: Node, bytes: &[u8]) -> Option<String> {
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
-        let Ok(text) = child.utf8_text(bytes) else { continue };
-        if !text.starts_with("#[") { continue; }
+        let Ok(text) = child.utf8_text(bytes) else {
+            continue;
+        };
+        if !text.starts_with("#[") {
+            continue;
+        }
         if let Some(name) = extract_data_provider_arg(text) {
             return Some(name);
         }
@@ -1030,10 +1081,11 @@ fn parse_external_provider_attr_text(
     while let Some(idx) = text[search..].find(needle) {
         let abs = search + idx;
         // Reject false matches — require a boundary character before `DataProviderExternal`.
-        let before_ok = abs == 0 || matches!(
-            text.as_bytes()[abs - 1],
-            b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
-        );
+        let before_ok = abs == 0
+            || matches!(
+                text.as_bytes()[abs - 1],
+                b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
+            );
         let inside_start = abs + needle.len();
         if before_ok {
             let inside = &text[inside_start..];
@@ -1045,9 +1097,8 @@ fn parse_external_provider_attr_text(
                 let raw_class = inside[..class_end].trim();
                 let fqcn = resolve_class_reference(raw_class, namespace, aliases);
                 let after_class = &inside[class_end + "::class".len()..];
-                let after_comma = after_class.trim_start_matches(|c: char| {
-                    c == ',' || c.is_whitespace()
-                });
+                let after_comma =
+                    after_class.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
                 let method_name = if let Some(r) = after_comma.strip_prefix('\'') {
                     r.find('\'').map(|e| r[..e].to_string())
                 } else if let Some(r) = after_comma.strip_prefix('"') {
@@ -1076,8 +1127,12 @@ fn extract_external_provider_attrs(
     let mut out = Vec::new();
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
-        let Ok(text) = child.utf8_text(bytes) else { continue };
-        if !text.starts_with("#[") { continue; }
+        let Ok(text) = child.utf8_text(bytes) else {
+            continue;
+        };
+        if !text.starts_with("#[") {
+            continue;
+        }
         out.extend(parse_external_provider_attr_text(text, namespace, aliases));
     }
     out
@@ -1086,8 +1141,12 @@ fn extract_external_provider_attrs(
 fn method_has_test_attribute(method: Node, bytes: &[u8]) -> bool {
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
-        let Ok(text) = child.utf8_text(bytes) else { continue };
-        if !text.starts_with("#[") { continue; }
+        let Ok(text) = child.utf8_text(bytes) else {
+            continue;
+        };
+        if !text.starts_with("#[") {
+            continue;
+        }
         if has_attribute_name(text, "Test") {
             return true;
         }
@@ -1106,8 +1165,12 @@ fn extract_groups_attr(node: Node, bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        let Ok(text) = child.utf8_text(bytes) else { continue };
-        if !text.starts_with("#[") { continue; }
+        let Ok(text) = child.utf8_text(bytes) else {
+            continue;
+        };
+        if !text.starts_with("#[") {
+            continue;
+        }
         for needle in ["Group(", "Ticket("] {
             scan_string_arg(text, needle, &mut out);
         }
@@ -1122,10 +1185,11 @@ fn scan_string_arg(text: &str, needle: &str, out: &mut Vec<String>) {
     let mut search_start = 0;
     while let Some(idx) = text[search_start..].find(needle) {
         let abs = search_start + idx;
-        let before_ok = abs == 0 || matches!(
-            text.as_bytes()[abs - 1],
-            b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
-        );
+        let before_ok = abs == 0
+            || matches!(
+                text.as_bytes()[abs - 1],
+                b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r'
+            );
         if before_ok {
             let inside = &text[abs + needle.len()..];
             let trimmed = inside.trim_start();
@@ -1133,8 +1197,12 @@ fn scan_string_arg(text: &str, needle: &str, out: &mut Vec<String>) {
                 r.find('\'').map(|end| &r[..end])
             } else if let Some(r) = trimmed.strip_prefix('"') {
                 r.find('"').map(|end| &r[..end])
-            } else { None };
-            if let Some(name) = parsed { out.push(name.to_string()); }
+            } else {
+                None
+            };
+            if let Some(name) = parsed {
+                out.push(name.to_string());
+            }
         }
         search_start = abs + needle.len();
     }
@@ -1148,13 +1216,19 @@ fn preceding_docblock(node: Node, bytes: &[u8]) -> Option<String> {
     let mut prev: Option<Node> = None;
     let mut cursor = parent.walk();
     for child in parent.children(&mut cursor) {
-        if child.id() == node.id() { break; }
+        if child.id() == node.id() {
+            break;
+        }
         prev = Some(child);
     }
     let prev = prev?;
-    if prev.kind() != "comment" { return None; }
+    if prev.kind() != "comment" {
+        return None;
+    }
     let text = prev.utf8_text(bytes).ok()?;
-    if !text.contains("/**") { return None; }
+    if !text.contains("/**") {
+        return None;
+    }
     Some(text.to_string())
 }
 
@@ -1162,13 +1236,13 @@ fn preceding_docblock(node: Node, bytes: &[u8]) -> Option<String> {
 /// `@group name` and `@ticket name` (which is just an alias).
 fn extract_groups_phpdoc(comment: &str, into: &mut Vec<String>) {
     for line in comment.lines() {
-        let trimmed = line.trim_start_matches(|c: char|
-            c == '*' || c == '/' || c.is_whitespace()
-        );
+        let trimmed = line.trim_start_matches(|c: char| c == '*' || c == '/' || c.is_whitespace());
         for prefix in ["@group ", "@ticket "] {
             if let Some(rest) = trimmed.strip_prefix(prefix) {
                 let name = rest.split_whitespace().next().unwrap_or("");
-                if !name.is_empty() { into.push(name.to_string()); }
+                if !name.is_empty() {
+                    into.push(name.to_string());
+                }
             }
         }
     }
@@ -1192,16 +1266,21 @@ fn extract_groups_phpdoc(comment: &str, into: &mut Vec<String>) {
 fn has_attribute_name(attr_text: &str, name: &str) -> bool {
     let haystack = attr_text.as_bytes();
     let needle = name.as_bytes();
-    if needle.is_empty() || haystack.len() < needle.len() { return false; }
-    let is_boundary_before = |b: u8| matches!(b, b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r');
-    let is_boundary_after  = |b: u8| matches!(b, b']' | b',' | b'(' | b' ' | b'\t' | b'\n' | b'\r');
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    let is_boundary_before =
+        |b: u8| matches!(b, b'[' | b',' | b'\\' | b' ' | b'\t' | b'\n' | b'\r');
+    let is_boundary_after = |b: u8| matches!(b, b']' | b',' | b'(' | b' ' | b'\t' | b'\n' | b'\r');
     let mut i = 0;
     while i + needle.len() <= haystack.len() {
         if &haystack[i..i + needle.len()] == needle {
             let before_ok = i == 0 || is_boundary_before(haystack[i - 1]);
             let after_idx = i + needle.len();
             let after_ok = after_idx == haystack.len() || is_boundary_after(haystack[after_idx]);
-            if before_ok && after_ok { return true; }
+            if before_ok && after_ok {
+                return true;
+            }
         }
         i += 1;
     }
@@ -1212,7 +1291,10 @@ fn method_is_public(method: Node, bytes: &[u8]) -> bool {
     let mut cursor = method.walk();
     for child in method.children(&mut cursor) {
         if child.kind() == "visibility_modifier" {
-            return child.utf8_text(bytes).map(|t| t == "public").unwrap_or(false);
+            return child
+                .utf8_text(bytes)
+                .map(|t| t == "public")
+                .unwrap_or(false);
         }
     }
     // PHP defaults to public when no visibility modifier is present.
@@ -1277,7 +1359,9 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                         Some(p) => visit = p,
                         None => break,
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
                 d += 1;
             }
             acc
@@ -1296,7 +1380,9 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                         Some(p) => visit = p,
                         None => break,
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
                 d += 1;
             }
             acc
@@ -1316,19 +1402,19 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                         groups.extend(c.class_groups.iter().cloned());
                         groups.extend(mi.groups.iter().cloned());
                         cases.push(TestCase {
-                            file:                    class.file.clone(),
-                            class:                   class.fqcn.clone(),
-                            method:                  mi.name.clone(),
-                            data_provider:           mi.data_provider.clone(),
-                            groups:                  groups.into_iter().collect(),
-                            external_providers:      mi.external_providers.clone(),
-                            is_tautological:         mi.is_tautological,
+                            file: class.file.clone(),
+                            class: class.fqcn.clone(),
+                            method: mi.name.clone(),
+                            data_provider: mi.data_provider.clone(),
+                            groups: groups.into_iter().collect(),
+                            external_providers: mi.external_providers.clone(),
+                            is_tautological: mi.is_tautological,
                             has_lifecycle_overrides: class.has_lifecycle_overrides,
-                            depends_on:              mi.depends_on.clone(),
-                            is_dispatch_safe:        mi.depends_on.is_empty(),
-                            fingerprint:             mi.fingerprint.clone(),
-                            is_stateful:             chain_is_stateful,
-                            is_isolated:             chain_is_isolated,
+                            depends_on: mi.depends_on.clone(),
+                            is_dispatch_safe: mi.depends_on.is_empty(),
+                            fingerprint: mi.fingerprint.clone(),
+                            is_stateful: chain_is_stateful,
+                            is_isolated: chain_is_isolated,
                         });
                     }
                 }
@@ -1389,10 +1475,21 @@ pub fn discover_in_dirs(
     for root in roots {
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
-            if !p.file_name().and_then(|n| n.to_str()).unwrap_or("").contains("Test") { continue; }
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
+            if !p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("Test")
+            {
+                continue;
+            }
             if let Ok(canon) = p.canonicalize() {
-                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) { continue; }
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) {
+                    continue;
+                }
             }
             root_files.push(p.to_path_buf());
         }
@@ -1414,8 +1511,17 @@ pub fn discover_in_dirs(
     for dir in graph_supplement_dirs {
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
-            if !p.file_name().and_then(|n| n.to_str()).unwrap_or("").contains("Test") { continue; }
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
+            if !p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("Test")
+            {
+                continue;
+            }
             if !parsed_paths.contains(p) {
                 supp_files.push(p.to_path_buf());
             }
@@ -1493,13 +1599,23 @@ pub fn discover_with_index(
     for root in roots {
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
             if let Ok(canon) = p.canonicalize() {
-                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) { continue; }
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) {
+                    continue;
+                }
             }
             let buf = p.to_path_buf();
-            if !seen.insert(buf.clone()) { continue; }
-            let bucket = if is_test_name(p) { Bucket::TestRoot } else { Bucket::IndexOnly };
+            if !seen.insert(buf.clone()) {
+                continue;
+            }
+            let bucket = if is_test_name(p) {
+                Bucket::TestRoot
+            } else {
+                Bucket::IndexOnly
+            };
             files.push((buf, bucket));
         }
     }
@@ -1507,10 +1623,18 @@ pub fn discover_with_index(
     for dir in supplement_dirs {
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("php") { continue; }
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
             let buf = p.to_path_buf();
-            if !seen.insert(buf.clone()) { continue; }
-            let bucket = if is_test_name(p) { Bucket::TestSupp } else { Bucket::IndexOnly };
+            if !seen.insert(buf.clone()) {
+                continue;
+            }
+            let bucket = if is_test_name(p) {
+                Bucket::TestSupp
+            } else {
+                Bucket::IndexOnly
+            };
             files.push((buf, bucket));
         }
     }
@@ -1532,7 +1656,9 @@ pub fn discover_with_index(
     // Index: every parsed class, first occurrence wins.
     let mut index: HashMap<String, PathBuf> = HashMap::with_capacity(parsed.len());
     for (c, _) in &parsed {
-        index.entry(c.fqcn.clone()).or_insert_with(|| c.file.clone());
+        index
+            .entry(c.fqcn.clone())
+            .or_insert_with(|| c.file.clone());
     }
 
     // Graph: only Test classes from roots + supplement (matches legacy).
@@ -1575,7 +1701,8 @@ pub fn discover_class_file_index_targeted(
     if candidate_stems.is_empty() || keep_fqcns.is_empty() {
         return HashMap::new();
     }
-    let files: Vec<PathBuf> = dirs.iter()
+    let files: Vec<PathBuf> = dirs
+        .iter()
         .flat_map(|dir| WalkDir::new(dir).into_iter().filter_map(|e| e.ok()))
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("php"))
         .filter_map(|e| {
@@ -1591,11 +1718,14 @@ pub fn discover_class_file_index_targeted(
 
     let pairs: Vec<(String, PathBuf)> = files
         .par_iter()
-        .flat_map(|p| parse_file_classes(p).unwrap_or_default()
-            .into_iter()
-            .filter(|c| keep_fqcns.contains(&c.fqcn))
-            .map(|c| (c.fqcn, c.file))
-            .collect::<Vec<_>>())
+        .flat_map(|p| {
+            parse_file_classes(p)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|c| keep_fqcns.contains(&c.fqcn))
+                .map(|c| (c.fqcn, c.file))
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     let mut index = HashMap::with_capacity(pairs.len());
@@ -1606,7 +1736,8 @@ pub fn discover_class_file_index_targeted(
 }
 
 pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
-    let files: Vec<PathBuf> = dirs.iter()
+    let files: Vec<PathBuf> = dirs
+        .iter()
         .flat_map(|dir| WalkDir::new(dir).into_iter().filter_map(|e| e.ok()))
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("php"))
         .map(|e| e.path().to_path_buf())
@@ -1614,10 +1745,13 @@ pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
 
     let pairs: Vec<(String, PathBuf)> = files
         .par_iter()
-        .flat_map(|p| parse_file_classes(p).unwrap_or_default()
-            .into_iter()
-            .map(|c| (c.fqcn, c.file))
-            .collect::<Vec<_>>())
+        .flat_map(|p| {
+            parse_file_classes(p)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.fqcn, c.file))
+                .collect::<Vec<_>>()
+        })
         .collect();
 
     let mut index = HashMap::with_capacity(pairs.len());
@@ -1763,13 +1897,23 @@ class WithMethodTicket extends TestCase {
         let cases = discover_in_file(&path).unwrap();
         let by_method: std::collections::HashMap<&str, &TestCase> =
             cases.iter().map(|c| (c.method.as_str(), c)).collect();
-        assert!(by_method["testStuff"].groups.contains(&"GH-1234".to_string()),
-            "class-level #[Ticket] becomes a group");
+        assert!(
+            by_method["testStuff"]
+                .groups
+                .contains(&"GH-1234".to_string()),
+            "class-level #[Ticket] becomes a group"
+        );
         let mt = &by_method["testMethodTicket"].groups;
-        assert!(mt.contains(&"GH-9999".to_string()) && mt.contains(&"regression".to_string()),
-            "#[Ticket] and #[Group] on the same method both land in groups");
-        assert!(by_method["testPhpdocTicket"].groups.contains(&"GH-1111".to_string()),
-            "@ticket PHPDoc becomes a group");
+        assert!(
+            mt.contains(&"GH-9999".to_string()) && mt.contains(&"regression".to_string()),
+            "#[Ticket] and #[Group] on the same method both land in groups"
+        );
+        assert!(
+            by_method["testPhpdocTicket"]
+                .groups
+                .contains(&"GH-1111".to_string()),
+            "@ticket PHPDoc becomes a group"
+        );
     }
 
     #[test]
@@ -1796,9 +1940,20 @@ class DpTest extends TestCase {
         let cases = discover_in_file(&path).unwrap();
         let by_method: HashMap<&str, &TestCase> =
             cases.iter().map(|c| (c.method.as_str(), c)).collect();
-        assert_eq!(by_method["testWithPhpdoc"].data_provider.as_deref(),            Some("provideOne"));
-        assert_eq!(by_method["testWithAttribute"].data_provider.as_deref(),         Some("provideTwo"));
-        assert_eq!(by_method["testWithAttributeDoubleQuotes"].data_provider.as_deref(), Some("provideThree"));
+        assert_eq!(
+            by_method["testWithPhpdoc"].data_provider.as_deref(),
+            Some("provideOne")
+        );
+        assert_eq!(
+            by_method["testWithAttribute"].data_provider.as_deref(),
+            Some("provideTwo")
+        );
+        assert_eq!(
+            by_method["testWithAttributeDoubleQuotes"]
+                .data_provider
+                .as_deref(),
+            Some("provideThree")
+        );
         assert_eq!(by_method["testPlain"].data_provider, None);
     }
 
@@ -1808,7 +1963,9 @@ class DpTest extends TestCase {
         // (a single annotated method promotes the class) — same trade as
         // is_stateful — because the runner only needs a class-level bit.
         let variants = [
-            ("phpdoc_class_level", r#"<?php
+            (
+                "phpdoc_class_level",
+                r#"<?php
 namespace App;
 use PHPUnit\Framework\TestCase;
 
@@ -1818,8 +1975,11 @@ use PHPUnit\Framework\TestCase;
 class IsolatedClassPhpdoc extends TestCase {
     public function testOne(): void {}
 }
-"#),
-            ("phpdoc_method_level", r#"<?php
+"#,
+            ),
+            (
+                "phpdoc_method_level",
+                r#"<?php
 namespace App;
 use PHPUnit\Framework\TestCase;
 
@@ -1827,8 +1987,11 @@ class IsolatedMethodPhpdoc extends TestCase {
     /** @runInSeparateProcess */
     public function testOne(): void {}
 }
-"#),
-            ("attribute_class_level", r#"<?php
+"#,
+            ),
+            (
+                "attribute_class_level",
+                r#"<?php
 namespace App;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\RunClassInSeparateProcess;
@@ -1837,8 +2000,11 @@ use PHPUnit\Framework\Attributes\RunClassInSeparateProcess;
 class IsolatedClassAttr extends TestCase {
     public function testOne(): void {}
 }
-"#),
-            ("attribute_method_level", r#"<?php
+"#,
+            ),
+            (
+                "attribute_method_level",
+                r#"<?php
 namespace App;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\RunInSeparateProcess;
@@ -1847,7 +2013,8 @@ class IsolatedMethodAttr extends TestCase {
     #[RunInSeparateProcess]
     public function testOne(): void {}
 }
-"#),
+"#,
+            ),
         ];
         for (label, src) in variants {
             let (_dir, path) = write_tmp(src);
@@ -1874,8 +2041,10 @@ class PlainTest extends TestCase {
         let (_dir, path) = write_tmp(src);
         let cases = discover_in_file(&path).unwrap();
         assert_eq!(cases.len(), 1);
-        assert!(!cases[0].is_isolated,
-            "merely importing the attribute without applying it must not promote the class");
+        assert!(
+            !cases[0].is_isolated,
+            "merely importing the attribute without applying it must not promote the class"
+        );
     }
 
     #[test]
@@ -1884,11 +2053,21 @@ class PlainTest extends TestCase {
         assert!(looks_like_test_case("PHPUnit\\Framework\\TestCase"));
         assert!(looks_like_test_case("My\\Custom\\TestCase"));
         assert!(looks_like_test_case("PHPStan\\Testing\\PHPStanTestCase"));
-        assert!(looks_like_test_case("Symfony\\Bundle\\FrameworkBundle\\Test\\KernelTestCase"));
-        assert!(looks_like_test_case("Symfony\\Bundle\\FrameworkBundle\\Test\\WebTestCase"));
+        assert!(looks_like_test_case(
+            "Symfony\\Bundle\\FrameworkBundle\\Test\\KernelTestCase"
+        ));
+        assert!(looks_like_test_case(
+            "Symfony\\Bundle\\FrameworkBundle\\Test\\WebTestCase"
+        ));
 
-        assert!(!looks_like_test_case("Foo\\TestCases"), "plural form rejected");
-        assert!(!looks_like_test_case("Foo\\TestCaseDescription"), "suffix-only rejected");
+        assert!(
+            !looks_like_test_case("Foo\\TestCases"),
+            "plural form rejected"
+        );
+        assert!(
+            !looks_like_test_case("Foo\\TestCaseDescription"),
+            "suffix-only rejected"
+        );
         assert!(!looks_like_test_case("Foo\\NotTested"));
         assert!(!looks_like_test_case("App\\Service\\OrderService"));
     }
@@ -1926,14 +2105,20 @@ class StackedTest extends TestCase {
 "#;
         let (_dir, path) = write_tmp(src);
         let cases = discover_in_file(&path).unwrap();
-        let methods: std::collections::BTreeSet<&str> = cases.iter()
-            .map(|c| c.method.as_str()).collect();
-        assert!(methods.contains("thisIsActuallyATestDespiteTheName"),
-            "missed #[Test] before #[Group]");
-        assert!(methods.contains("reversedOrderAlsoCounts"),
-            "missed #[Test] after #[Group]");
-        assert!(!methods.contains("plainGroupNoTest"),
-            "false positive on plain non-test method");
+        let methods: std::collections::BTreeSet<&str> =
+            cases.iter().map(|c| c.method.as_str()).collect();
+        assert!(
+            methods.contains("thisIsActuallyATestDespiteTheName"),
+            "missed #[Test] before #[Group]"
+        );
+        assert!(
+            methods.contains("reversedOrderAlsoCounts"),
+            "missed #[Test] after #[Group]"
+        );
+        assert!(
+            !methods.contains("plainGroupNoTest"),
+            "false positive on plain non-test method"
+        );
         // testDoxIsNotTheTestAttribute / testWithIsAlsoNotTest start with
         // "test" so they're picked up by the name rule, not the attribute.
         // That's expected — we just want #[Test]-only methods to be found.
@@ -1960,8 +2145,14 @@ class BareTest extends TestCase {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../runner/fixtures/sample_project/tests");
         let cases = discover_in_dir(&fixture).unwrap();
-        let methods: Vec<_> = cases.iter().map(|c| (c.class.as_str(), c.method.as_str())).collect();
-        assert!(methods.contains(&("Sample\\Tests\\CalculatorTest", "testAddsTwoPositiveIntegers")));
+        let methods: Vec<_> = cases
+            .iter()
+            .map(|c| (c.class.as_str(), c.method.as_str()))
+            .collect();
+        assert!(methods.contains(&(
+            "Sample\\Tests\\CalculatorTest",
+            "testAddsTwoPositiveIntegers"
+        )));
         assert!(methods.contains(&("Sample\\Tests\\FailingTest", "testThisDeliberatelyFails")));
         assert_eq!(cases.len(), 12);
     }
@@ -1982,7 +2173,8 @@ abstract class AbstractBaseTest extends TestCase {
     protected function helper(): void {}
 }
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             dir.path().join("ConcreteTest.php"),
             r#"<?php
@@ -1992,7 +2184,8 @@ final class ConcreteTest extends AbstractBaseTest {
     public function testAnother(): void {}
 }
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let cases = discover_in_dir(dir.path()).unwrap();
         let methods: Vec<_> = cases
@@ -2000,8 +2193,12 @@ final class ConcreteTest extends AbstractBaseTest {
             .map(|c| (c.class.as_str(), c.method.as_str()))
             .collect();
         // The abstract base class itself must NOT contribute tests.
-        assert!(!methods.iter().any(|(c, _)| *c == "App\\Tests\\AbstractBaseTest"),
-            "abstract base class leaked into discovery: {methods:?}");
+        assert!(
+            !methods
+                .iter()
+                .any(|(c, _)| *c == "App\\Tests\\AbstractBaseTest"),
+            "abstract base class leaked into discovery: {methods:?}"
+        );
         // The concrete subclass's two tests must appear.
         assert!(methods.contains(&("App\\Tests\\ConcreteTest", "testActual")));
         assert!(methods.contains(&("App\\Tests\\ConcreteTest", "testAnother")));
@@ -2024,9 +2221,51 @@ final class ConcreteTest extends AbstractBaseTest {
     #[test]
     fn group_by_class_collapses_per_method_cases() {
         let cases = vec![
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testOne".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
-            TestCase { file: PathBuf::from("/p/A.php"), class: "A".into(), method: "testTwo".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
-            TestCase { file: PathBuf::from("/p/B.php"), class: "B".into(), method: "testThree".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
+            TestCase {
+                file: PathBuf::from("/p/A.php"),
+                class: "A".into(),
+                method: "testOne".into(),
+                data_provider: None,
+                groups: vec![],
+                external_providers: vec![],
+                is_tautological: false,
+                has_lifecycle_overrides: false,
+                depends_on: vec![],
+                is_dispatch_safe: true,
+                fingerprint: std::collections::HashSet::new(),
+                is_stateful: false,
+                is_isolated: false,
+            },
+            TestCase {
+                file: PathBuf::from("/p/A.php"),
+                class: "A".into(),
+                method: "testTwo".into(),
+                data_provider: None,
+                groups: vec![],
+                external_providers: vec![],
+                is_tautological: false,
+                has_lifecycle_overrides: false,
+                depends_on: vec![],
+                is_dispatch_safe: true,
+                fingerprint: std::collections::HashSet::new(),
+                is_stateful: false,
+                is_isolated: false,
+            },
+            TestCase {
+                file: PathBuf::from("/p/B.php"),
+                class: "B".into(),
+                method: "testThree".into(),
+                data_provider: None,
+                groups: vec![],
+                external_providers: vec![],
+                is_tautological: false,
+                has_lifecycle_overrides: false,
+                depends_on: vec![],
+                is_dispatch_safe: true,
+                fingerprint: std::collections::HashSet::new(),
+                is_stateful: false,
+                is_isolated: false,
+            },
         ];
         let grouped = group_by_class(cases);
         assert_eq!(grouped.len(), 2);
@@ -2046,12 +2285,58 @@ final class ConcreteTest extends AbstractBaseTest {
         // for another file, which previously caused ReflectionException crashes
         // when --workers 1 serialised all batches through one PHP process.
         let cases = vec![
-            TestCase { file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),              class: "Ns\\Foo".into(), method: "testDeprecation".into(), data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
-            TestCase { file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),    class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
-            TestCase { file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),class: "Ns\\Foo".into(), method: "testSomething".into(),   data_provider: None, groups: vec![], external_providers: vec![], is_tautological: false, has_lifecycle_overrides: false, depends_on: vec![], is_dispatch_safe: true, fingerprint: std::collections::HashSet::new(), is_stateful: false, is_isolated: false },
+            TestCase {
+                file: PathBuf::from("/fix/IssueTriggerResolverTest.php"),
+                class: "Ns\\Foo".into(),
+                method: "testDeprecation".into(),
+                data_provider: None,
+                groups: vec![],
+                external_providers: vec![],
+                is_tautological: false,
+                has_lifecycle_overrides: false,
+                depends_on: vec![],
+                is_dispatch_safe: true,
+                fingerprint: std::collections::HashSet::new(),
+                is_stateful: false,
+                is_isolated: false,
+            },
+            TestCase {
+                file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),
+                class: "Ns\\Foo".into(),
+                method: "testSomething".into(),
+                data_provider: None,
+                groups: vec![],
+                external_providers: vec![],
+                is_tautological: false,
+                has_lifecycle_overrides: false,
+                depends_on: vec![],
+                is_dispatch_safe: true,
+                fingerprint: std::collections::HashSet::new(),
+                is_stateful: false,
+                is_isolated: false,
+            },
+            TestCase {
+                file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),
+                class: "Ns\\Foo".into(),
+                method: "testSomething".into(),
+                data_provider: None,
+                groups: vec![],
+                external_providers: vec![],
+                is_tautological: false,
+                has_lifecycle_overrides: false,
+                depends_on: vec![],
+                is_dispatch_safe: true,
+                fingerprint: std::collections::HashSet::new(),
+                is_stateful: false,
+                is_isolated: false,
+            },
         ];
         let grouped = group_by_class(cases);
-        assert_eq!(grouped.len(), 3, "each (file, class) pair must be its own TestClass");
+        assert_eq!(
+            grouped.len(),
+            3,
+            "each (file, class) pair must be its own TestClass"
+        );
         assert_eq!(grouped[0].methods[0].name, "testDeprecation");
         assert_eq!(grouped[1].methods[0].name, "testSomething");
         assert_eq!(grouped[2].methods[0].name, "testSomething");
@@ -2059,20 +2344,36 @@ final class ConcreteTest extends AbstractBaseTest {
 
     #[test]
     fn parse_external_provider_attr_text_short_class() {
-        let aliases: HashMap<String, String> = [
-            ("AssertSize".to_string(), "PHPUnit\\Tests\\AssertSize".to_string()),
-        ].into_iter().collect();
+        let aliases: HashMap<String, String> = [(
+            "AssertSize".to_string(),
+            "PHPUnit\\Tests\\AssertSize".to_string(),
+        )]
+        .into_iter()
+        .collect();
         let text = "#[DataProviderExternal(AssertSize::class, 'providerMethod')]";
         let got = parse_external_provider_attr_text(text, Some("PHPUnit\\Tests"), &aliases);
-        assert_eq!(got, vec![("PHPUnit\\Tests\\AssertSize".to_string(), "providerMethod".to_string())]);
+        assert_eq!(
+            got,
+            vec![(
+                "PHPUnit\\Tests\\AssertSize".to_string(),
+                "providerMethod".to_string()
+            )]
+        );
     }
 
     #[test]
     fn parse_external_provider_attr_text_fqcn() {
         let aliases = HashMap::new();
-        let text = "#[DataProviderExternal(PHPUnit\\Framework\\ProviderClass::class, \"myProvider\")]";
+        let text =
+            "#[DataProviderExternal(PHPUnit\\Framework\\ProviderClass::class, \"myProvider\")]";
         let got = parse_external_provider_attr_text(text, None, &aliases);
-        assert_eq!(got, vec![("PHPUnit\\Framework\\ProviderClass".to_string(), "myProvider".to_string())]);
+        assert_eq!(
+            got,
+            vec![(
+                "PHPUnit\\Framework\\ProviderClass".to_string(),
+                "myProvider".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -2118,10 +2419,13 @@ class FooTest extends TestCase {
         let text = "#[DataProviderExternal(ClassA::class, 'p1'), DataProviderExternal(ClassB::class, 'p2')]";
         let mut got = parse_external_provider_attr_text(text, None, &aliases);
         got.sort();
-        assert_eq!(got, vec![
-            ("ClassA".to_string(), "p1".to_string()),
-            ("ClassB".to_string(), "p2".to_string()),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                ("ClassA".to_string(), "p1".to_string()),
+                ("ClassB".to_string(), "p2".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -2241,14 +2545,16 @@ class DependsTest extends TestCase {
         let (_dir, path) = write_tmp(src);
         let cases = discover_in_file(&path).unwrap();
         let grouped = group_by_class(cases);
-        let methods: std::collections::HashMap<&str, bool> = grouped[0].methods.iter()
+        let methods: std::collections::HashMap<&str, bool> = grouped[0]
+            .methods
+            .iter()
             .map(|m| (m.name.as_str(), m.is_dispatch_safe))
             .collect();
 
-        assert!(methods["testFirst"],        "no depends → dispatch safe");
-        assert!(!methods["testSecond"],      "#[Depends] → not dispatch safe");
+        assert!(methods["testFirst"], "no depends → dispatch safe");
+        assert!(!methods["testSecond"], "#[Depends] → not dispatch safe");
         assert!(!methods["testThirdPhpdoc"], "@depends → not dispatch safe");
-        assert!(methods["testIndependent"],  "no depends → dispatch safe");
+        assert!(methods["testIndependent"], "no depends → dispatch safe");
     }
 
     #[test]
@@ -2293,16 +2599,43 @@ class TautologyTest extends TestCase {
         let by_method: std::collections::HashMap<&str, &TestCase> =
             cases.iter().map(|c| (c.method.as_str(), c)).collect();
 
-        assert!(by_method["testTrivialTrue"].is_tautological,  "assertTrue(true) must be tautological");
-        assert!(by_method["testTrivialFalse"].is_tautological, "assertFalse(false) must be tautological");
-        assert!(by_method["testTrivialNull"].is_tautological,  "assertNull(null) must be tautological");
-        assert!(by_method["testTrivialEquals"].is_tautological,"assertEquals(42,42) must be tautological");
-        assert!(by_method["testTrivialSame"].is_tautological,  "assertSame('hello','hello') must be tautological");
+        assert!(
+            by_method["testTrivialTrue"].is_tautological,
+            "assertTrue(true) must be tautological"
+        );
+        assert!(
+            by_method["testTrivialFalse"].is_tautological,
+            "assertFalse(false) must be tautological"
+        );
+        assert!(
+            by_method["testTrivialNull"].is_tautological,
+            "assertNull(null) must be tautological"
+        );
+        assert!(
+            by_method["testTrivialEquals"].is_tautological,
+            "assertEquals(42,42) must be tautological"
+        );
+        assert!(
+            by_method["testTrivialSame"].is_tautological,
+            "assertSame('hello','hello') must be tautological"
+        );
 
-        assert!(!by_method["testRealAssert"].is_tautological,  "body with assignment must NOT be tautological");
-        assert!(!by_method["testAssertsTrue"].is_tautological, "assertTrue(false) must NOT be tautological");
-        assert!(!by_method["testNoAssertions"].is_tautological,"zero assertions must NOT be tautological");
-        assert!(!by_method["testVarEquals"].is_tautological,   "assertEquals with variables must NOT be tautological");
+        assert!(
+            !by_method["testRealAssert"].is_tautological,
+            "body with assignment must NOT be tautological"
+        );
+        assert!(
+            !by_method["testAssertsTrue"].is_tautological,
+            "assertTrue(false) must NOT be tautological"
+        );
+        assert!(
+            !by_method["testNoAssertions"].is_tautological,
+            "zero assertions must NOT be tautological"
+        );
+        assert!(
+            !by_method["testVarEquals"].is_tautological,
+            "assertEquals with variables must NOT be tautological"
+        );
     }
 
     /// tree-sitter is error-recovering: a broken file still yields a partial
@@ -2315,16 +2648,24 @@ class TautologyTest extends TestCase {
         // flags the tree as containing an ERROR node.
         let broken = "<?php class Foo { public function bar() { ";
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_php::language_php()).unwrap();
+        parser
+            .set_language(&tree_sitter_php::language_php())
+            .unwrap();
         let tree = parser.parse(broken, None).unwrap();
         assert!(
             tree.root_node().has_error(),
             "tree-sitter should flag the broken snippet as containing an ERROR node",
         );
-        assert!(has_syntax_errors(&tree), "helper must report broken input as having errors");
+        assert!(
+            has_syntax_errors(&tree),
+            "helper must report broken input as having errors"
+        );
 
         let valid = "<?php class Foo { public function bar(): void {} }";
         let tree_ok = parser.parse(valid, None).unwrap();
-        assert!(!has_syntax_errors(&tree_ok), "helper must report valid input as clean");
+        assert!(
+            !has_syntax_errors(&tree_ok),
+            "helper must report valid input as clean"
+        );
     }
 }
