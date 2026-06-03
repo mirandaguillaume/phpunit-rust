@@ -1,8 +1,12 @@
 name: CI
 
 on:
+  # Only master pushes + PRs. A PR commit previously triggered TWO runs (push on
+  # the feature branch AND pull_request on the same SHA); if either flaked, branch
+  # protection blocked the merge. Now: feature branches run once (via the PR),
+  # master runs on its own pushes, plus the daily cron.
   push:
-    branches: ["**"]
+    branches: [master]
   pull_request:
   # Daily run on the default branch (master) to catch external breakage
   # (dependency, registry, toolchain or runner-image changes) even without a push.
