@@ -14,6 +14,11 @@ pub fn find_enumerate_script() -> Result<PathBuf> {
     find_script_named("enumerate_providers.php")
 }
 
+/// Find `provision_db.php` — same search path as the fork script.
+pub fn find_provision_script() -> Result<PathBuf> {
+    find_script_named("provision_db.php")
+}
+
 fn find_script_named(name: &str) -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from(format!("php/{name}"))];
     if let Ok(exe) = std::env::current_exe() {
@@ -56,6 +61,18 @@ pub fn check_php_version(min_version_id: u32) -> Result<u32> {
         ));
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod provision_locator_tests {
+    use super::*;
+
+    #[test]
+    fn finds_provision_db_script() {
+        let p = find_provision_script().expect("provision_db.php must be locatable");
+        assert!(p.ends_with("provision_db.php"));
+        assert!(p.is_file());
+    }
 }
 
 #[cfg(test)]

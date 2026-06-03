@@ -61,6 +61,13 @@ pub struct TestCase {
     /// invoking the test — preventing PHPUnit from `proc_open`-ing a nested
     /// sub-process inside the worker. See [`TestClass::is_isolated`].
     pub is_isolated: bool,
+    /// True when the test class (or any ancestor) requires a provisioned
+    /// database. Detected via OPT-IN MARKERS ONLY: an in-class marker trait
+    /// (`RefreshDatabase` / `DatabaseTransactions` by default) or a configured
+    /// marker base-class (default list empty). No type-reference inference.
+    /// Disjoint from `is_stateful` / `is_isolated` — never contributes to
+    /// `must_force_exit`.
+    pub needs_db: bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -97,6 +104,9 @@ struct ParsedClass {
     /// marker (class-level docblock, attribute, or any method-level
     /// equivalent). See [`TestCase::is_isolated`].
     is_isolated: bool,
+    /// True when the class (or its trait/inheritance chain) requires a
+    /// database clone. OR-folded down the chain in [`emit_test_cases`].
+    needs_db: bool,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -175,6 +185,10 @@ pub struct TestClass {
     /// to clear `runTestInSeparateProcess` on the test instance so PHPUnit
     /// does not spawn a nested sub-process inside our already-forked worker.
     pub is_isolated: bool,
+    /// True when the class (or any ancestor) requires a provisioned database.
+    /// OR-folded from all per-method `TestCase::needs_db` values during
+    /// grouping. Disjoint from `is_stateful`/`is_isolated`.
+    pub needs_db: bool,
 }
 
 /// Group a flat list of TestCases by class. Preserves discovery order
@@ -192,6 +206,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
         let has_lifecycle_overrides = case.has_lifecycle_overrides;
         let is_stateful = case.is_stateful;
         let is_isolated = case.is_isolated;
+        let needs_db = case.needs_db;
         let gm = GroupedMethod {
             name: case.method,
             data_provider: case.data_provider,
@@ -213,6 +228,8 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             // Likewise for isolation: a single method-level
             // @runInSeparateProcess promotes the whole class.
             existing.is_isolated = existing.is_isolated || is_isolated;
+            // OR-fold: any DB-needing method makes the whole class DB-needing.
+            existing.needs_db = existing.needs_db || needs_db;
         } else {
             groups.push(TestClass {
                 file: case.file,
@@ -221,6 +238,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
                 has_lifecycle_overrides,
                 is_stateful,
                 is_isolated,
+                needs_db,
             });
         }
     }
@@ -476,6 +494,13 @@ fn collect_parsed_classes(
         let has_lifecycle_overrides = !has_no_lifecycle_overrides(body, bytes);
         let is_stateful = class_has_stateful_calls(body, bytes);
         let is_isolated = class_has_run_in_separate_process(decl, bytes);
+        let needs_db = class_needs_db(
+            decl,
+            body,
+            bytes,
+            DEFAULT_DB_MARKER_TRAITS,
+            DEFAULT_DB_MARKER_BASE_CLASSES,
+        );
 
         out.push(ParsedClass {
             file: path.to_path_buf(),
@@ -487,6 +512,7 @@ fn collect_parsed_classes(
             has_lifecycle_overrides,
             is_stateful,
             is_isolated,
+            needs_db,
         });
     }
     Ok(())
@@ -906,6 +932,104 @@ fn class_has_run_in_separate_process(class_decl: Node, bytes: &[u8]) -> bool {
     if let Ok(text) = class_decl.utf8_text(bytes) {
         if scan(text) {
             return true;
+        }
+    }
+    false
+}
+
+/// Default marker traits that signal a test needs a transactional database.
+/// Configurable; threaded as `&[&str]` so the signature is stable. An in-class
+/// `use RefreshDatabase;` trait-use member is the tight signal.
+const DEFAULT_DB_MARKER_TRAITS: &[&str] = &["RefreshDatabase", "DatabaseTransactions"];
+
+/// Default marker base-classes that signal a test needs a database — matched
+/// against the `extends` target. EMPTY ON PURPOSE: a default base-class would
+/// re-flag whole suites (e.g. doctrine-orm, where 850 files extend a common
+/// ORM test base) and, under the later fail-fast policy, abort a run that does
+/// not actually need a DB. Users opt in by adding their own functional-test
+/// base class to this list.
+const DEFAULT_DB_MARKER_BASE_CLASSES: &[&str] = &[];
+
+/// Whole-token / last-segment match of one identifier reference (a trait name
+/// or a base-class name pulled from a tree-sitter node — never comment or
+/// string text) against a configured marker list.
+///
+/// After stripping a leading `\`, a reference matches an entry when the entry
+/// equals the whole reference OR its last `\`-segment. So `RefreshDatabase`
+/// matches both `use RefreshDatabase;` and `use Illuminate\Foundation\Testing\RefreshDatabase;`,
+/// while a partial identifier (e.g. `RefreshDatabaseState`) does NOT match.
+/// The reference is validated as identifier-shaped by the caller, so it
+/// carries no comment/string noise.
+fn reference_matches_marker(reference: &str, markers: &[&str]) -> bool {
+    let reference = reference.trim_start_matches('\\');
+    if reference.is_empty() {
+        return false;
+    }
+    let last_seg = reference.rsplit('\\').next().unwrap_or(reference);
+    markers.iter().any(|m| reference == *m || last_seg == *m)
+}
+
+/// Returns true when a class needs a provisioned database. Detection is
+/// OPT-IN MARKERS ONLY — there is deliberately no type-reference inference:
+///   1. an in-class `use <MarkerTrait>;` trait-use member whose name matches
+///      `marker_traits` (NOT a file-level `namespace_use_declaration` import),
+///   2. an `extends <MarkerBaseClass>` whose base-class name matches
+///      `marker_base_classes`.
+///
+/// Both are matched as whole tokens / last namespace segment (see
+/// [`reference_matches_marker`]), so a partial identifier never trips
+/// detection. An imported-but-unused `use Foo\RefreshDatabase;` at file scope
+/// must NOT trip detection — only the in-class trait-use member counts.
+///
+/// Mirrors the structure of `class_has_stateful_calls` (walks `class_body`)
+/// and `class_has_run_in_separate_process` (scans `class_decl`). The flag
+/// ONLY ever sets `needs_db` (provision + isolate) — it must NEVER set
+/// `must_force_exit`.
+fn class_needs_db(
+    class_decl: Node,
+    class_body: Node,
+    bytes: &[u8],
+    marker_traits: &[&str],
+    marker_base_classes: &[&str],
+) -> bool {
+    // 1. `extends <MarkerBaseClass>` — match the base type name as a whole
+    // token from the `base_clause`, not from raw text. (Default list empty.)
+    if !marker_base_classes.is_empty() {
+        let mut decl_cursor = class_decl.walk();
+        for child in class_decl.children(&mut decl_cursor) {
+            if child.kind() == "base_clause" {
+                let mut base_cursor = child.walk();
+                for base in child.named_children(&mut base_cursor) {
+                    if matches!(base.kind(), "name" | "qualified_name") {
+                        if let Ok(raw) = base.utf8_text(bytes) {
+                            if is_valid_class_name(raw)
+                                && reference_matches_marker(raw, marker_base_classes)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. `use <MarkerTrait>;` as a trait-use member inside the class body.
+    // A `use_declaration` here is the in-class trait-use list; a file-scope
+    // import is a `namespace_use_declaration` and never reaches this loop.
+    let mut cursor = class_body.walk();
+    for member in class_body.children(&mut cursor) {
+        if member.kind() != "use_declaration" {
+            continue;
+        }
+        let mut tu_cursor = member.walk();
+        for used in member.named_children(&mut tu_cursor) {
+            if matches!(used.kind(), "name" | "qualified_name") {
+                if let Ok(raw) = used.utf8_text(bytes) {
+                    if is_valid_class_name(raw) && reference_matches_marker(raw, marker_traits) {
+                        return true;
+                    }
+                }
+            }
         }
     }
     false
@@ -1410,6 +1534,27 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
             }
             acc
         };
+        // Same walk for needs_db: a parent base that `use`s RefreshDatabase or
+        // references a DB type propagates to every concrete subclass, mirroring
+        // PHPUnit's runtime trait/inheritance behaviour.
+        let chain_needs_db = {
+            let mut visit = class.fqcn.as_str();
+            let mut d = 0;
+            let mut acc = false;
+            while d < 32 {
+                if let Some(c) = by_fqcn.get(visit) {
+                    acc = acc || c.needs_db;
+                    match c.parent_fqcn.as_deref() {
+                        Some(p) => visit = p,
+                        None => break,
+                    }
+                } else {
+                    break;
+                }
+                d += 1;
+            }
+            acc
+        };
         let mut visit = class.fqcn.as_str();
         let mut depth = 0;
         while depth < 32 {
@@ -1438,6 +1583,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             fingerprint: mi.fingerprint.clone(),
                             is_stateful: chain_is_stateful,
                             is_isolated: chain_is_isolated,
+                            needs_db: chain_needs_db,
                         });
                     }
                 }
@@ -1862,6 +2008,205 @@ mod tests {
     }
 
     #[test]
+    fn group_by_class_or_folds_needs_db_across_methods() {
+        let mk = |class: &str, method: &str, needs_db: bool| TestCase {
+            file: PathBuf::from("/p/A.php"),
+            class: class.into(),
+            method: method.into(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
+            has_lifecycle_overrides: false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
+            needs_db,
+        };
+        let cases = vec![
+            mk("A", "testOne", false),
+            mk("A", "testTwo", true),
+            mk("B", "testThree", false),
+        ];
+        let grouped = group_by_class(cases);
+        let a = grouped.iter().find(|g| g.class == "A").unwrap();
+        let b = grouped.iter().find(|g| g.class == "B").unwrap();
+        assert!(
+            a.needs_db,
+            "any DB-needing method makes the class DB-needing"
+        );
+        assert!(
+            !b.needs_db,
+            "a class with no DB method stays needs_db=false"
+        );
+    }
+
+    #[test]
+    fn needs_db_propagates_down_inheritance_chain() {
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+abstract class DbBaseTest extends TestCase {
+    use RefreshDatabase;
+}
+
+class ConcreteDbTest extends DbBaseTest {
+    public function testOne(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(
+            cases.len(),
+            1,
+            "abstract base emits nothing; concrete subclass emits one"
+        );
+        assert_eq!(cases[0].class, "App\\ConcreteDbTest");
+        assert!(
+            cases[0].needs_db,
+            "needs_db must OR-fold up the inheritance chain like is_stateful"
+        );
+    }
+
+    #[test]
+    fn db_type_reference_alone_does_not_flag_needs_db() {
+        // Regression guard (doctrine-orm lesson): detection is opt-in markers
+        // ONLY. A class that constructs `new \PDO(...)` and references
+        // `Doctrine\ORM\EntityManager` but uses NO marker trait/base-class
+        // must NOT be flagged — otherwise the later fail-fast policy would
+        // abort large no-DB suites (850 doctrine-orm files reference the ORM).
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Doctrine\ORM\EntityManager;
+
+class RawDbReferenceTest extends TestCase {
+    public function testOne(): void {
+        $db = new \PDO('pgsql:host=localhost');
+        $em = new EntityManager($conn, $config);
+    }
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1, "one test method");
+        assert!(
+            !cases[0].needs_db,
+            "raw PDO / Doctrine references without a marker must NOT flag needs_db"
+        );
+    }
+
+    #[test]
+    fn needs_db_detects_configured_base_class() {
+        // A class extending a configured marker base-class is needs_db.
+        // The DEFAULT base-class list is empty on purpose, so we exercise
+        // class_needs_db directly with an explicit configured list.
+        let src = r#"<?php
+namespace App;
+
+class WidgetTest extends MyFunctionalTestCase {
+    public function testOne(): void {}
+}
+"#;
+        let (dir, path) = write_tmp(src);
+        let _ = &dir;
+        let bytes = std::fs::read(&path).unwrap();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::language_php())
+            .unwrap();
+        let tree = parser.parse(&bytes, None).unwrap();
+        let root = tree.root_node();
+        // Find the single class_declaration and its body.
+        let mut stack = vec![root];
+        let mut flagged = false;
+        let mut seen_class = false;
+        while let Some(n) = stack.pop() {
+            let mut c = n.walk();
+            for ch in n.named_children(&mut c) {
+                stack.push(ch);
+            }
+            if n.kind() == "class_declaration" {
+                seen_class = true;
+                let body = n.child_by_field_name("body").unwrap();
+                flagged = class_needs_db(
+                    n,
+                    body,
+                    &bytes,
+                    DEFAULT_DB_MARKER_TRAITS,
+                    &["MyFunctionalTestCase"],
+                );
+            }
+        }
+        assert!(seen_class, "fixture must contain a class declaration");
+        assert!(
+            flagged,
+            "extends a configured marker base-class must flag needs_db"
+        );
+    }
+
+    #[test]
+    fn detects_needs_db_from_marker_trait() {
+        let variants = [
+            (
+                "marker_trait",
+                r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+class TraitDbTest extends TestCase {
+    use RefreshDatabase;
+    public function testOne(): void {}
+}
+"#,
+                true,
+            ),
+            (
+                "file_scope_use_does_not_trip",
+                r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+class NoTraitUseTest extends TestCase {
+    public function testOne(): void {}
+}
+"#,
+                false,
+            ),
+        ];
+        for (label, src, expected) in &variants {
+            let (_dir, path) = write_tmp(src);
+            let cases = discover_in_file(&path).unwrap();
+            assert_eq!(cases.len(), 1, "{label}: expected 1 test case");
+            assert_eq!(cases[0].needs_db, *expected, "{label}: needs_db mismatch");
+        }
+    }
+
+    #[test]
+    fn discovered_plain_test_does_not_need_db() {
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+class PlainTest extends TestCase {
+    public function testOk(): void { $this->assertTrue(true); }
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1, "one test method");
+        assert!(
+            cases.iter().all(|c| !c.needs_db),
+            "plain tests must not need a DB by default"
+        );
+    }
+
+    #[test]
     fn discovers_a_namespaced_test_class() {
         let src = r#"<?php
 namespace App\Tests;
@@ -2259,6 +2604,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/p/A.php"),
@@ -2274,6 +2620,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/p/B.php"),
@@ -2289,6 +2636,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
         ];
         let grouped = group_by_class(cases);
@@ -2323,6 +2671,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),
@@ -2338,6 +2687,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),
@@ -2353,6 +2703,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
         ];
         let grouped = group_by_class(cases);

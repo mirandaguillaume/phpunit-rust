@@ -174,6 +174,10 @@ final class TestExecutor
             $startedAt = microtime(true);
             $error = null;
             $returnValue = null;
+            // Per-test DB isolation handle (P2). Resolved inside the try below
+            // so a connection failure is reported as this test's error rather
+            // than aborting runClass. Null on non-DB runs (zero overhead).
+            $txPdo = null;
 
             try {
                 $test = new $class($method);
@@ -190,6 +194,16 @@ final class TestExecutor
                             $this->runClassInSeparateProcess = false;
                         }
                     }, $test, TestCase::class)();
+                }
+                // P2: resolve the per-slot handle and begin a transaction
+                // before setUp, so every write made by setUp / the test /
+                // tearDown is rolled back afterwards. We bypass PHPUnit's
+                // runBare, so framework traits (RefreshDatabase,
+                // DatabaseTransactions) NEVER fire — this plain-PDO
+                // transaction is the only correct per-test isolation boundary.
+                $txPdo = self::dbHandle();
+                if ($txPdo !== null && !$txPdo->inTransaction()) {
+                    $txPdo->beginTransaction();
                 }
                 self::invokeOptional($test, 'setUp');
                 foreach ($hooks['before'] as $name)         self::invokeInstanceByName($test, $name);
@@ -235,6 +249,17 @@ final class TestExecutor
                     } catch (\Throwable) { /* best-effort */ }
                 } else {
                     $error = $e;
+                }
+            } finally {
+                // P2: roll back unconditionally. Microsecond cost. Reset, not
+                // recreate. Guarded so non-DB runs pay zero (txPdo is null).
+                if ($txPdo !== null && $txPdo->inTransaction()) {
+                    try {
+                        $txPdo->rollBack();
+                    } catch (\Throwable) {
+                        // best-effort: a connection death already surfaces as
+                        // the test error; don't mask it with a rollback throw.
+                    }
                 }
             }
 
@@ -550,6 +575,70 @@ final class TestExecutor
             }
         }
         return null;
+    }
+
+    /**
+     * The runner-managed PDO connection used for per-test transaction isolation.
+     * Tests and application code MUST obtain their DB connection from here (or be
+     * configured to route through it) for the begin/rollback reset to isolate their
+     * writes. Code that opens its OWN connection is NOT isolated by the runner and
+     * must be marked stateful (#[UsesDatabase] does not make ad-hoc connections
+     * isolated). Returns null when PHPUNIT_RUST_DB_DSN is unset (inert).
+     */
+    public static function connection(): ?\PDO
+    {
+        return self::dbHandle();
+    }
+
+    /**
+     * Resolve a single, per-process PDO handle for per-test transaction
+     * isolation (P2), or null when no per-slot DSN was injected.
+     *
+     * The DSN comes from PHPUNIT_RUST_DB_DSN (the per-slot env var set by the
+     * fork-worker master). We memoize the handle per worker process: opening a
+     * new PDO per test would cost latency AND, for sqlite::memory:, create a
+     * fresh empty DB each time — breaking cross-test visibility. Memoization
+     * keys on $dsnAtConnect: the fast path returns the cached handle when
+     * $pdo !== null && $dsnAtConnect === $dsn, otherwise we (re)connect. In
+     * production a worker's DSN never changes, so the first call connects and
+     * every later call hits the fast path; a non-DB run pays one getenv only.
+     *
+     * A DSN that is set but unusable is NOT swallowed: the PDO constructor's
+     * exception propagates so the per-test try/catch records that test as an
+     * Error with the real connection message, rather than silently running it
+     * unisolated and reporting green.
+     */
+    private static function dbHandle(): ?\PDO
+    {
+        static $pdo = null;
+        static $dsnAtConnect = null; // DSN we connected with, for memoization
+
+        // Inert path: no DSN injected. Drop any stale handle so that if the
+        // DSN is later set again — even to the same string, as the test
+        // harness does in setUp/tearDown — we open a FRESH connection instead
+        // of returning a handle to an unlinked-and-recreated sqlite inode.
+        // Production never re-injects a DSN, so this only removes a test flake.
+        $dsn = getenv('PHPUNIT_RUST_DB_DSN');
+        if ($dsn === false || $dsn === '') {
+            $pdo = null;
+            $dsnAtConnect = null;
+            return null;
+        }
+
+        // Fast path: reuse the existing connection if the DSN hasn't changed.
+        // In production a worker's DSN never changes, so this always hits
+        // after the first call. One getenv per test is negligible.
+        if ($pdo !== null && $dsnAtConnect === $dsn) {
+            return $pdo;
+        }
+
+        // A DSN IS set: connect. Do NOT swallow a connection failure — let it
+        // propagate so the per-test try/catch records a loud, diagnosable
+        // Error rather than silently running the test without isolation.
+        $pdo = new \PDO($dsn, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $dsnAtConnect = $dsn;
+
+        return $pdo;
     }
 
     /**

@@ -88,17 +88,19 @@ $childStdoutFdsStr = $args['child-stdout-fds']   ?? '';
 $classMapFile      = $args['class-map-file']     ?? null;
 $workerMemoryLimit = $args['worker-memory-limit'] ?? '512M';
 $maxBatches        = (int) ($args['max-batches-per-child'] ?? '0'); // 0 = unlimited
+$perSlotDsnJson    = $args['per-slot-dsn']        ?? '[]';
 
 if ($autoload === null || $childStdinFdsStr === '' || $childStdoutFdsStr === '') {
     fwrite(STDERR, "worker_fork.php: missing --autoload, --child-stdin-fds, --child-stdout-fds\n");
     exit(1);
 }
 
-$defines       = json_decode($definesJson, true) ?? [];
-$envVars       = json_decode($envJson,     true) ?? [];
-$serverVars    = json_decode($serverJson,  true) ?? [];
-$iniVars       = json_decode($iniJson,     true) ?? [];
-$varVars       = json_decode($varsJson,    true) ?? [];
+$defines       = json_decode($definesJson,    true) ?? [];
+$envVars       = json_decode($envJson,        true) ?? [];
+$serverVars    = json_decode($serverJson,     true) ?? [];
+$iniVars       = json_decode($iniJson,        true) ?? [];
+$varVars       = json_decode($varsJson,       true) ?? [];
+$perSlotDsn    = json_decode($perSlotDsnJson, true) ?? [];
 $classMapExtra = ($classMapFile !== null && is_file($classMapFile))
     ? (json_decode(file_get_contents($classMapFile), true) ?? [])
     : [];
@@ -340,7 +342,7 @@ pcntl_signal(SIGHUP,  $signalHandler);
 //    When $maxBatches = 0 we keep the original long-lived behaviour.
 // ---------------------------------------------------------------------------
 $forkChildForSlot = static function (int $slot) use (
-    $childStdinStreams, $childStdoutStreams, $n, $workerMemoryLimit, $maxBatches
+    $childStdinStreams, $childStdoutStreams, $n, $workerMemoryLimit, $maxBatches, $perSlotDsn
 ): int {
     $pid = pcntl_fork();
     if ($pid === -1) {
@@ -352,6 +354,24 @@ $forkChildForSlot = static function (int $slot) use (
         pcntl_signal(SIGTERM, SIG_DFL);
         pcntl_signal(SIGINT,  SIG_DFL);
         pcntl_signal(SIGHUP,  SIG_DFL);
+        // Worker token: stable per-slot identity for resource leases
+        // (per-slot DB clone, Paratest-style TEST_TOKEN parity). Set on
+        // the child only; re-applied automatically on SIGCHLD respawn and
+        // K-batch/force_exit recycle because both re-enter this closure
+        // with the same $slot. Mirror the existing <env> convention
+        // (putenv + $_ENV + $_SERVER) so getenv()/$_ENV/$_SERVER all see it.
+        putenv("PHPUNIT_RUST_WORKER_ID={$slot}");
+        $_ENV['PHPUNIT_RUST_WORKER_ID']    = (string) $slot;
+        $_SERVER['PHPUNIT_RUST_WORKER_ID'] = (string) $slot;
+        // Per-slot DB clone DSN (P3). Injected on the child only, keyed by
+        // $slot, so a respawned/recycled child re-attaches to the SAME clone.
+        // Mirror the existing <env> convention (putenv + $_ENV + $_SERVER).
+        // Only injected when a DSN exists for this slot (empty list = no-op).
+        if (isset($perSlotDsn[$slot]) && is_string($perSlotDsn[$slot]) && $perSlotDsn[$slot] !== '') {
+            putenv("PHPUNIT_RUST_DB_DSN={$perSlotDsn[$slot]}");
+            $_ENV['PHPUNIT_RUST_DB_DSN']    = $perSlotDsn[$slot];
+            $_SERVER['PHPUNIT_RUST_DB_DSN'] = $perSlotDsn[$slot];
+        }
         for ($j = 0; $j < $n; $j++) {
             if ($j !== $slot) {
                 @fclose($childStdinStreams[$j]);

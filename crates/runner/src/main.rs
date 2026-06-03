@@ -127,6 +127,39 @@ fn git_changed_files(project: &std::path::Path) -> std::collections::HashSet<Pat
     rel.into_iter().map(|r| root.join(r)).collect()
 }
 
+/// Outcome of the DB pre-flight decision.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DbPreflight {
+    /// Proceed normally (no DB tests, or DB is configured).
+    Proceed,
+    /// Skip DB tests and continue (--skip-db).
+    SkipDbTests,
+    /// Abort before forking: DB tests selected but nothing configured.
+    Abort,
+}
+
+/// Pure decision helper: no I/O, no side effects.
+/// `db_configured` = `--provision-db` set OR PHPUNIT_RUST_DB_DSN present.
+pub(crate) fn db_preflight(
+    selected_needs_db: bool,
+    db_configured: bool,
+    skip_db: bool,
+) -> DbPreflight {
+    match (selected_needs_db, db_configured, skip_db) {
+        (false, _, _) => DbPreflight::Proceed,
+        (true, true, _) => DbPreflight::Proceed,
+        (true, false, true) => DbPreflight::SkipDbTests,
+        (true, false, false) => DbPreflight::Abort,
+    }
+}
+
+/// Returns `true` iff at least one of the FINAL selected test cases (after all
+/// filters including `--filter`, `--group`, and `--dirty`) has `needs_db = true`.
+/// When `false` the gate is a zero-cost no-op; no provisioning logic runs.
+fn selected_needs_db(cases: &[phpunit_rust::types::TestCase]) -> bool {
+    cases.iter().any(|c| c.needs_db)
+}
+
 #[cfg(test)]
 mod dirty_tests {
     use super::*;
@@ -178,6 +211,7 @@ use phpunit_rust::phpunit_xml::{
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::RunConfig;
+use phpunit_rust::types::{TestOutcome, TestStatus};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -248,6 +282,16 @@ struct Cli {
     /// repo / no changes → nothing to run.
     #[arg(long)]
     dirty: bool,
+    /// Base DSN for per-worker database provisioning (Phase 3). Passing this flag
+    /// marks a database as "configured" for the preflight gate — actual
+    /// provisioning is wired in Phase 3. Example: postgres://user:pw@localhost/mydb
+    #[arg(long)]
+    provision_db: Option<String>,
+    /// When `needs_db` tests are selected but no database is configured,
+    /// skip those tests instead of aborting (exit code 2). The skip reason
+    /// "database not configured (--skip-db)" is recorded in the report.
+    #[arg(long)]
+    skip_db: bool,
     /// Rewrite `createMock()` patterns in test files into anonymous-class stubs
     /// before execution. Requires that mocked interfaces are resolvable via
     /// the project's PSR-4 autoload map in composer.json.
@@ -643,6 +687,22 @@ fn real_main() -> Result<ExitCode> {
         );
     }
 
+    // --filter is applied HERE — the single place the substring predicate
+    // runs against the FINAL selected set (after --dirty, --exclude-group and
+    // --group). The post-spawn application in run_with_profiler then sees an
+    // already-narrowed set (RunConfig.filter is None below), so there is
+    // exactly one filter application and which tests run is unchanged.
+    if let Some(f) = cli.filter.as_deref() {
+        let before = cases.len();
+        cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(f)));
+        eprintln!(
+            "--filter {:?}: {} of {} test method(s) match.",
+            f,
+            cases.len(),
+            before
+        );
+    }
+
     // Symfony's PhpUnitTestsListener detection is intentionally NOT acted
     // upon: the listener's "SkippedTestCase wrapper" behaviour isn't
     // "every @group legacy test" — it inspects deprecation emissions at
@@ -697,6 +757,46 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Demand gate: only perform DB-related work when the FINAL selected set
+    // actually contains needs_db cases. When false this is a zero-cost no-op
+    // and the hot path is byte-identical to a pre-P1 run.
+    let needs_db = selected_needs_db(&cases);
+
+    // DB preflight: fail-fast (or skip) when needs_db tests are selected but
+    // no database is configured. "configured" = --provision-db set OR
+    // PHPUNIT_RUST_DB_DSN present. The gate is zero-cost when needs_db = false.
+    let db_configured =
+        cli.provision_db.is_some() || std::env::var_os("PHPUNIT_RUST_DB_DSN").is_some();
+    let db_case_count = cases.iter().filter(|c| c.needs_db).count();
+    let mut synthetic_db_skips: Vec<TestOutcome> = Vec::new();
+    match db_preflight(needs_db, db_configured, cli.skip_db) {
+        DbPreflight::Proceed => {}
+        DbPreflight::SkipDbTests => {
+            eprintln!("note: skipping {db_case_count} test(s) that require a database (--skip-db)");
+            for c in cases.iter().filter(|c| c.needs_db) {
+                let o = TestOutcome {
+                    class: c.class.clone(),
+                    method: c.method.clone(),
+                    dataset: None,
+                    status: TestStatus::Skipped,
+                    message: Some("database not configured (--skip-db)".into()),
+                    trace: None,
+                    duration_ms: 0.0,
+                };
+                print_progress(&o);
+                synthetic_db_skips.push(o);
+            }
+            cases.retain(|c| !c.needs_db);
+        }
+        DbPreflight::Abort => {
+            eprintln!(
+                "error: {db_case_count} selected test(s) require a database but none is configured.\n  \
+                 pass --provision-db <DSN_BASE> to provision per-worker databases, or --skip-db to skip them."
+            );
+            std::process::exit(2);
+        }
+    }
+
     // Verify a usable PHP is on PATH. We require ≥ 8.1; some projects need
     // newer (brick/math: 8.2; doctrine/collections: 8.4). The user is on
     // the hook for installing a sufficiently-new PHP.
@@ -739,6 +839,61 @@ fn real_main() -> Result<ExitCode> {
         },
     )?;
 
+    // Task 8: demand-gated lease build. Declared here so `_lease_guard` is in
+    // scope BEFORE `pool` — Rust drops in reverse declaration order, so the
+    // guard (and its destroy_all) runs AFTER the pool is dropped.
+    let mut per_slot_dsn_opt: Option<Vec<String>> = None;
+    let _lease_guard = if let Some(base) = &cli.provision_db {
+        if needs_db {
+            let provision_script = phpunit_rust::php_worker::find_provision_script()?;
+            let run_uuid = format!("pr{}", std::process::id());
+            let template = phpunit_rust::resource_lease::build_template(
+                &provision_script,
+                &autoload,
+                bootstrap.as_deref(),
+                &defines,
+                base,
+            )?;
+            let mut lease = phpunit_rust::resource_lease::ResourceLease::new(
+                provision_script.clone(),
+                autoload.clone(),
+                bootstrap.clone(),
+                defines.clone(),
+                base.clone(),
+            );
+            let mut per_slot_dsn: Vec<String> = Vec::with_capacity(worker_count);
+            for slot in 0..worker_count {
+                let dsn = phpunit_rust::resource_lease::clone_for_slot(
+                    &provision_script,
+                    &autoload,
+                    bootstrap.as_deref(),
+                    &defines,
+                    slot,
+                    &run_uuid,
+                    &template,
+                    base,
+                )?;
+                lease.register(phpunit_rust::resource_lease::clone_name(
+                    base, &run_uuid, slot,
+                ));
+                per_slot_dsn.push(dsn);
+            }
+            eprintln!(
+                "Resource provisioning: built template '{template}' and {} per-slot clone(s).",
+                per_slot_dsn.len()
+            );
+            per_slot_dsn_opt = Some(per_slot_dsn);
+            Some(phpunit_rust::resource_lease::LeaseGuard::new(lease))
+        } else {
+            eprintln!(
+                "--provision-db: no selected test needs a DB; skipping provisioning (zero cost)."
+            );
+            None
+        }
+    } else {
+        None
+    };
+
     eprintln!(
         "Spawning {} PHP worker{}...",
         worker_count,
@@ -763,6 +918,7 @@ fn real_main() -> Result<ExitCode> {
                 &class_file_index,
                 &cli.worker_memory_limit,
                 cli.worker_max_batches,
+                per_slot_dsn_opt.as_deref(),
             )
         },
     )?;
@@ -777,7 +933,8 @@ fn real_main() -> Result<ExitCode> {
     let cfg = RunConfig {
         autoload,
         bootstrap: None,
-        filter: cli.filter,
+        // filter already applied in main.rs via matches_filter; runner sees None.
+        filter: None,
         defines,
         stop_on,
         class_file_index,
@@ -801,6 +958,11 @@ fn real_main() -> Result<ExitCode> {
             )
         },
     )?;
+
+    // Append synthetic skips for DB tests suppressed by --skip-db.
+    if !synthetic_db_skips.is_empty() {
+        report.outcomes.extend(synthetic_db_skips);
+    }
 
     // Append the synthetic skip outcomes for @group legacy under Symfony's
     // listener. They were never dispatched, so emit them now and adjust
@@ -848,5 +1010,74 @@ fn real_main() -> Result<ExitCode> {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(1))
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use phpunit_rust::types::TestCase;
+    use std::path::PathBuf;
+
+    fn case(class: &str, method: &str, needs_db: bool) -> TestCase {
+        TestCase {
+            file: PathBuf::from("/p/T.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
+            has_lifecycle_overrides: false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
+            needs_db,
+        }
+    }
+
+    #[test]
+    fn gate_is_noop_when_nothing_needs_db() {
+        let cases = vec![case("A", "t1", false), case("B", "t2", false)];
+        assert!(
+            !selected_needs_db(&cases),
+            "no-DB suite must NOT trip the gate"
+        );
+    }
+
+    #[test]
+    fn gate_trips_when_any_selected_case_needs_db() {
+        let cases = vec![case("A", "t1", false), case("B", "t2", true)];
+        assert!(selected_needs_db(&cases));
+    }
+
+    #[test]
+    fn db_preflight_decisions() {
+        use super::{db_preflight, DbPreflight};
+        // No DB tests selected -> always proceed (zero-cost path).
+        assert_eq!(db_preflight(false, false, false), DbPreflight::Proceed);
+        assert_eq!(db_preflight(false, false, true), DbPreflight::Proceed);
+        // DB tests + a configured database -> proceed.
+        assert_eq!(db_preflight(true, true, false), DbPreflight::Proceed);
+        // DB tests, no database, --skip-db -> skip them.
+        assert_eq!(db_preflight(true, false, true), DbPreflight::SkipDbTests);
+        // DB tests, no database, no --skip-db -> abort.
+        assert_eq!(db_preflight(true, false, false), DbPreflight::Abort);
+    }
+
+    #[test]
+    fn filter_lift_does_not_change_selected_set_or_gate() {
+        // Simulate: two cases, one matches the filter, one doesn't.
+        // After retain, only the matching case remains. Gate checks THAT set.
+        let filter = "DbTest";
+        let mut cases = vec![
+            case("DbTest", "testSave", true),
+            case("OtherTest", "testFoo", false),
+        ];
+        cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(filter)));
+        assert_eq!(cases.len(), 1);
+        assert!(selected_needs_db(&cases), "filtered set still needs DB");
     }
 }
