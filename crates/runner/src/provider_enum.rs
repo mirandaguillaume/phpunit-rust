@@ -120,6 +120,7 @@ mod tests {
             fingerprint: std::collections::HashSet::new(),
             is_stateful: false,
             is_isolated: false,
+            needs_db: false,
         }
     }
 
