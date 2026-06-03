@@ -4,7 +4,10 @@ A Rust orchestrator that runs PHPUnit tests in parallel using forked PHP
 workers — no FrankenPHP, no HTTP, no daemon. One PHP master loads the
 project's autoloader and bootstrap once; N children are forked via
 `pcntl_fork()` so they inherit the warmed-up interpreter via copy-on-write.
-Tests delegate to the project's own PHPUnit installation.
+Tests run against the project's own PHPUnit — its `TestCase` API, assertions
+and mocks — but driven by a thin in-house lifecycle shim (`TestExecutor`),
+**not** PHPUnit's own `TestRunner`/`Facade`. That re-implementation is why a
+handful of behavioural edges differ from vanilla (see the scoreboard notes).
 
 ## Status: v0.8.0 — exact test-count parity on PHPUnit's own suite + 5 OSS projects
 

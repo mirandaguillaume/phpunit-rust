@@ -20,6 +20,9 @@ pub struct PhpForkPool {
     read_ends: Vec<Option<std::fs::File>>,
     // Keep class-map temp file alive until the pool is dropped.
     _class_map_tmp: Option<tempfile::NamedTempFile>,
+    // Set once the master has been reaped (via `wait`/`terminate`). After a
+    // reap the PID may be recycled by the OS, so `Drop` must NOT signal it.
+    reaped: bool,
 }
 
 impl PhpForkPool {
@@ -210,6 +213,7 @@ impl PhpForkPool {
             write_ends,
             read_ends,
             _class_map_tmp,
+            reaped: false,
         })
     }
 
@@ -272,6 +276,7 @@ impl PhpForkPool {
     /// Wait for the PHP master process to exit cleanly.
     pub fn wait(&mut self) {
         let _ = self.master.wait();
+        self.reaped = true;
     }
 
     /// Forcibly tear the pool down *now*: close all write ends and SIGTERM the
@@ -309,11 +314,19 @@ impl PhpForkPool {
         kill_process_tree(pid);
         let _ = self.master.kill();
         let _ = self.master.wait();
+        self.reaped = true;
     }
 }
 
 impl Drop for PhpForkPool {
     fn drop(&mut self) {
+        // If the master was already reaped (the runner called `wait()` or
+        // `terminate()`), its PID may have been recycled by the OS — signalling
+        // it now could hit an innocent process. Do nothing; the pipe `File`s are
+        // closed by their own `Drop` regardless.
+        if self.reaped {
+            return;
+        }
         self.close_write_ends();
         // SIGTERM first so the master can run its handler (which posix_kills
         // every forked child). SIGKILL would bypass the handler and leave

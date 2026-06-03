@@ -4,6 +4,10 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  # Daily run on the default branch (master) to catch external breakage
+  # (dependency, registry, toolchain or runner-image changes) even without a push.
+  schedule:
+    - cron: "0 6 * * *"
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -38,6 +42,20 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.1"
+
+      # The fork-pool integration tests drive the bundled sample fixture, whose
+      # vendor/ is gitignored — install it so PHPUnit's TestCase autoloads.
+      - name: Install fixture dependencies (composer)
+        run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
+
+      # The fork-pool worker (php/worker_fork.php) require_once's php/vendor/autoload.php
+      # to load the PhpunitRust\ shim classes (TestExecutor/OutcomeBuilder). That vendor/
+      # is gitignored too — without it every worker fatals at startup, which silently
+      # drops outcomes and breaks data-provider row enumeration (the parity count drift).
+      # --no-dev: the worker needs only the shim autoloader; PHPUnit itself comes from the
+      # project's own autoload at runtime.
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
 
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
@@ -74,6 +92,18 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.1"
+
+      - name: Install fixture dependencies (composer)
+        run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
+
+      # The fork-pool worker (php/worker_fork.php) require_once's php/vendor/autoload.php
+      # to load the PhpunitRust\ shim classes (TestExecutor/OutcomeBuilder). That vendor/
+      # is gitignored too — without it every worker fatals at startup, which silently
+      # drops outcomes and breaks data-provider row enumeration (the parity count drift).
+      # --no-dev: the worker needs only the shim autoloader; PHPUnit itself comes from the
+      # project's own autoload at runtime.
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
 
       - name: Build phpunit-rust binary
         run: cargo build -p phpunit-rust

@@ -25,6 +25,7 @@ pub struct StopOn {
 impl StopOn {
     /// `--stop-on-failure` PHPUnit semantics: stop on Fail OR Error
     /// (both are "real" defects).
+    #[must_use]
     pub fn on_failure() -> Self {
         Self {
             failure: true,
@@ -33,6 +34,7 @@ impl StopOn {
         }
     }
     /// `--stop-on-defect` PHPUnit semantics: stop on anything not-pass.
+    #[must_use]
     pub fn on_defect() -> Self {
         Self {
             failure: true,
@@ -116,9 +118,11 @@ pub struct Report {
 }
 
 impl Report {
+    #[must_use]
     pub fn count(&self, status: TestStatus) -> usize {
         self.outcomes.iter().filter(|o| o.status == status).count()
     }
+    #[must_use]
     pub fn passed(&self) -> usize {
         self.count(TestStatus::Pass)
     }
@@ -138,6 +142,7 @@ impl Report {
         self.count(TestStatus::Risky)
     }
 
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.failed() == 0 && self.errored() == 0
     }
@@ -488,29 +493,24 @@ pub fn run_with_profiler(
             }
             WorkerEvent::Eof(_slot) => {
                 live_readers -= 1;
-                // If this was the last live reader and there are still
-                // batches in the queue, the worker(s) crashed before
-                // draining them.  Emit error outcomes so every test
-                // appears in the report rather than being silently lost.
-                if live_readers == 0 && !queue.is_empty() {
-                    while let Some(plan) = queue.pop_front() {
-                        for bc in &plan.classes {
-                            for method in &bc.methods {
-                                let o = TestOutcome {
-                                    class: bc.class.clone(),
-                                    method: method.clone(),
-                                    dataset: None,
-                                    status: TestStatus::Error,
-                                    message: Some(
-                                        "worker process crashed before reaching this test".into(),
-                                    ),
-                                    trace: None,
-                                    duration_ms: 0.0,
-                                };
-                                on_progress(&o);
-                                outcomes.push(o);
-                            }
+                // When the LAST reader closes, anything that never produced a
+                // result means a worker died WITHOUT a `slot_died` notice — e.g.
+                // a crash in long-lived mode, where the master reaps the child
+                // via a blocking `pcntl_waitpid` and emits no SIGCHLD-driven
+                // notice. Synthesise errors for the in-flight batches (the tests
+                // that were actually running when the worker died) AND the
+                // still-queued batches, so no test silently vanishes from the
+                // report. Slots already drained by a `slot_died` are `None`, so
+                // nothing is double-counted.
+                if live_readers == 0 {
+                    let cause = "worker process crashed before reporting this test";
+                    for in_flight in slot_in_flight.iter_mut() {
+                        if let Some(lost) = in_flight.take() {
+                            synth_error_outcomes(&lost, cause, &on_progress, &mut outcomes);
                         }
+                    }
+                    while let Some(plan) = queue.pop_front() {
+                        synth_error_outcomes(&plan, cause, &on_progress, &mut outcomes);
                     }
                 }
             }
