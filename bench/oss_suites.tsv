@@ -1,0 +1,8 @@
+name	git_url	ref	extra_env
+brick-math	https://github.com/brick/math	0.17.2	CALCULATOR=GMP
+carbon	https://github.com/briannesbitt/Carbon	3.11.4
+doctrine-orm	https://github.com/doctrine/orm	3.6.7
+faker	https://github.com/FakerPHP/Faker	v1.24.1
+guzzle-psr7	https://github.com/guzzle/psr7	2.11.0
+php-parser	https://github.com/nikic/PHP-Parser	v5.7.0
+phpunit-itself	https://github.com/sebastianbergmann/phpunit	11.5.55
