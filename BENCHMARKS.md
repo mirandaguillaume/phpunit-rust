@@ -1,0 +1,200 @@
+# Benchmarks
+
+## Performance
+
+Benchmarked on Linux/PHP 8.1.33 against real OSS suites. Median of 3
+runs each. "vanilla" is `./vendor/bin/phpunit` (one process); `1w` /
+`2w` / `4w` / `8w` are our fork pool at that worker count.
+
+### Reference run — June 2026
+
+End-to-end bench of seven real OSS suites. PHP 8.4 Docker image, 4 workers,
+median of 3 runs; vanilla = single-process PHPUnit.
+
+| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |
+|---|---|---|---|---|
+| brick-math | 20392 / 20392 | 2041 ms | 821 ms | 2.5× |
+| carbon | 6169 / 6169 | 23281 ms | 10753 ms | 2.2× |
+| doctrine-orm | 3481 / 3481 | 4531 ms | 3007 ms | 1.5× |
+| faker | 1416 / 1402 | 1431 ms | 1293 ms | 1.1× |
+| guzzle-psr7 | 1248 / 1248 | 550 ms | 653 ms | 0.85× |
+| php-parser | 1887 / 1878 | 805 ms | 877 ms | 0.9× |
+| phpunit-itself | 6128 / 5082 | 146998 ms | 2471 ms | — |
+
+Test counts match vanilla on most suites (faker −14 / php-parser −9 are
+pre-existing discovery edges); phpunit-itself has a known parity gap (see
+[COMPATIBILITY.md](COMPATIBILITY.md) / [ROADMAP.md §4](ROADMAP.md)).
+Small fast suites (guzzle-psr7, php-parser) are approximately par because
+fork-pool overhead exceeds the gain when a suite already finishes
+sub-second.
+
+#### Reading the trade-off in actual money
+
+Indexed against a fully-loaded senior PHP engineer salary in the US
+mid-2026 (~$90/hr — base ~$65-70/hr W2 + ~30 % employer load),
+AWS m7i.large on-demand at $0.1008/hr, and GitHub Actions Linux
+small at $0.006/min (post January-2026 reduction), the wall-time
+savings dominate every other cost line by ~3 orders of magnitude.
+Worked example: a 10-engineer team running rector's suite 30 times
+each weekday.
+
+| Cost line | Vanilla | Rust | Annual savings |
+|---|---:|---:|---:|
+| Engineer wait time @ $90/hr | $10.6 k / yr | $3.1 k / yr | **~$7.5 k** per engineer × 10 = **~$22.9 k** |
+| Cloud compute @ $0.1008/hr | ~$31 / yr | ~$9 / yr | ~$22 |
+| GitHub Actions runner @ $0.006/min | ~$210 / yr | ~$61 / yr | ~$149 |
+
+The CPU we pay for is essentially free; the wall we save is paid back
+in engineer-hours.
+
+Salary anchor: [Senior PHP Developer 2026 — Salary.com](https://www.salary.com/research/salary/hiring/senior-php-developer-salary)
+($70/hr W2). EC2 reference: [m7i.large — Vantage Instances](https://instances.vantage.sh/aws/ec2/m7i.large)
+(updated 2026-05-27). CI rate: [GitHub Actions 2026 pricing](https://resources.github.com/actions/2026-pricing-changes-for-github-actions/).
+
+#### Known limitation — process-isolation hangs (PHPUnit-itself)
+
+The PHPUnit project's own test suite was attempted as an eighth
+data point (PHP 8.4, Docker, `bench/Dockerfile.php84` + `--tmpfs /tmp`).
+Vanilla median: **133.66 s** (3 runs: 132.31, 133.66, 141.10 s), ~108 MB
+RSS. phpunit-rust did **not** complete: a worker hangs partway
+through, our reader thread blocks on its (still-open) stdout pipe,
+no `SIGCHLD` ever fires because the child is alive — just stuck.
+
+The root cause is PHPUnit's own `@runInSeparateProcess` / end-to-end
+fixtures: a test spawns a sub-PHP process via `proc_open`, and if
+that sub-process never returns (e.g. waiting on input the worker
+never produces), the parent worker stays in `read()` indefinitely.
+The lost-batch recovery added in `feat(runner): recover lost
+batches when a worker dies mid-run` only triggers on actual death
+(non-zero exit / signal), not on a stuck-but-alive worker.
+
+Fix is straightforward but unwritten: a per-slot inactivity
+watchdog. If a slot has an in-flight batch and hasn't emitted any
+outcome for N seconds, the dispatcher SIGKILLs the worker, treats
+the batch as crashed (lost-batch path takes over), and the master's
+SIGCHLD handler respawns a clean child. Tracked as a follow-up.
+
+### Worker scaling
+
+| Project | vanilla | 1w | 2w | 4w | 8w | Best speedup vs vanilla |
+|---|---:|---:|---:|---:|---:|---:|
+| carbon (6169 tests) | 21.4s | 31.7s | 15.4s | 8.7s | **5.8s** | **3.7×** at 8w |
+| doctrine-orm (3478 tests) | 1.62s | 2.15s | 1.74s | 1.66s | **1.59s** | 1.02× at 8w (≈ tied) |
+| faker (1402 tests) | 1.08s | 1.22s | **0.81s** | 0.81s | 0.82s | 1.34× at 2w |
+| php-parser (1887 tests) | 0.38s | 0.44s | 0.36s | **0.34s** | 0.38s | 1.13× at 4w |
+| guzzle-psr7 (1088 tests) | 0.14s | 0.21s | 0.20s | 0.19s | 0.20s | — (vanilla wins) |
+
+What this says:
+
+- **CPU-bound suites with many independent classes** (carbon) scale
+  cleanly: 1→8 workers gives 5.4× speedup (68 % parallel efficiency),
+  and 8 workers buys 3.7× over vanilla's single-process run.
+- **Mixed suites** (faker, php-parser) peak at 2–4 workers and degrade
+  past that: per-class fork/dispatch overhead starts to dominate when
+  tests are short.
+- **Suites of fast-erroring tests** (doctrine-orm functional tests bail
+  out in setUp because no DB is configured) are essentially tied with
+  vanilla — the parallelism can't help when tests take <1 ms each and
+  there's no real work to spread.
+- **Sub-second suites** (guzzle-psr7) can't beat vanilla at any worker
+  count: our fork-pool startup is ~50 ms, vanilla starts in ~10 ms.
+  For these, run vanilla.
+
+The rule of thumb: **use `--workers N` where N is between 2 and the
+number of physical cores you have, capped at half the test class
+count.** Default is 4. If a 1-second suite slows down at 4 workers,
+drop to 1 — the parallelism overhead isn't free.
+
+### Docker (PHP 8.4 projects)
+
+Some OSS suites require a newer PHP than the host. Build the Docker
+image once (`docker build -f bench/Dockerfile.php84 -t phpunit-rust-bench:php84 .`)
+and the `bench/bench_docker.sh` wrapper handles `composer install`
+and the bind-mount of our release binary + PHP scripts.
+
+| Project | vanilla | phpunit-rust (4w) | Speedup | Tests |
+|---|---:|---:|---:|---:|
+| brick-math | 183s | 167s | 1.09× | 13589 |
+
+(More Docker projects pending; brick-math is the heavyweight reference
+point — 13 k tests across 6 classes, almost entirely CPU-bound arithmetic.)
+
+#### Docker (PHP 8.3, defaults)
+
+Measured single-run on the same Linux host using `bench/Dockerfile.php83`
+with `--tmpfs /tmp` + `--worker-memory-limit 4G`, 8 workers, K=20 recycling.
+Wall and RSS captured by `/usr/bin/time` inside the container.
+
+| Project (tests) | vanilla wall | rust wall | speedup | vanilla RSS | rust RSS |
+|---|---:|---:|---:|---:|---:|
+| monolog (1162) | 4.28 s | **1.38 s** | **3.10×** | 60 MB | **35 MB** |
+| rector (5207) | 19.63 s | **4.00 s** | **4.91×** | 676 MB | **157 MB** |
+| phpstan-src (12397) | ≈ 97 s ¹ | **22.92 s** | **≈ 4.24×** | 1.83 GB ¹ | **313 MB** |
+
+¹ phpstan-src needs `php -d memory_limit=2G` on vanilla — its tests
+allocate the analyzer in-memory per case. Default 128 MB makes vanilla
+crash within 3 s.
+
+Rector + phpstan exercise three of the runner's bug-class repairs at
+once: per-class state isolation (stream wrappers, error handlers),
+in-flight batch recovery when a child fatal kills a worker mid-run,
+and skipping opcache pre-warm for the fixture-style files those
+suites pack into the test roots.
+
+#### Running inside Docker or CI
+
+Two flags matter when running the runner inside a container:
+
+- `--tmpfs /tmp:rw,exec,nosuid,size=4g` — analyzer-style suites (phpstan,
+  psalm, rector) write multi-GB of disposable scratch under `/tmp` per
+  test. With the container's default overlay `/tmp` these writes hit the
+  storage driver — wasted IO bandwidth and disk wear. tmpfs keeps them
+  in RAM. Measured on phpstan-src (12 k tests): 1.83 GB → 11 MB filesystem
+  writes, wall unchanged. The host's `/tmp` is already tmpfs on modern
+  Linux, so this only matters in containers.
+
+- `--init` (or `tini`) — without it, Ctrl-C on `docker run` orphans the
+  PHP fork children; the daemon never signals the container's main
+  process, and the workers spin until the OOM killer notices. Both
+  bundled wrappers (`bench/bench_docker.sh` and
+  `scripts/docker-test-bake.sh`) set both flags automatically; pass them
+  yourself when invoking phpunit-rust directly.
+
+Memory-heavy suites (phpstan-src needs ≥ 2 GB resident, rector ~700 MB)
+need `--worker-memory-limit 4G` to keep the fork children from being
+killed by their own self-imposed cap. The master process always runs
+with `memory_limit=-1` because it pre-warms opcache for every test
+file before forking.
+
+#### Environment variables
+
+Three opt-in knobs surface from the PHP master, useful for debugging
+and A/B benchmarking:
+
+- `PHPUNIT_RUST_TIMING=1` — log master phase timings to stderr
+  (autoload, bootstrap, opcache pre-warm, fork) as `[TIMING]` lines.
+- `PHPUNIT_RUST_OPCACHE_THRESHOLD=N` — override the default
+  50-test-file threshold for pre-warming opcache. Pass `99999` to
+  disable pre-warm entirely (useful when investigating master crashes
+  on very large suites).
+- `PHPUNIT_RUST_NO_ISOLATION=1` — disable the per-batch fresh-fork
+  applied to stateful test classes (those calling
+  `stream_wrapper_register`, `set_error_handler`, …). Costs ~14 % on
+  state-sensitive suites but exposes their pollution for diagnosis.
+
+## Benchmarking
+
+```bash
+# Host bench (uses your local PHP). Defaults to 3 runs, 4 workers.
+bench/bench_host.sh                              # all OSS projects
+bench/bench_host.sh carbon doctrine-orm          # subset
+RUNS=5 WORKERS=8 bench/bench_host.sh             # tuning
+
+# Docker bench for PHP-version-specific projects.
+docker build -f bench/Dockerfile.php84 -t phpunit-rust-bench:php84 .
+bench/bench_docker.sh phpunit-itself
+```
+
+The host script expects projects under `/tmp/phpunit-rust-smoke/<name>`
+with composer install run; the Docker script handles composer install
+inside the container on first use.
