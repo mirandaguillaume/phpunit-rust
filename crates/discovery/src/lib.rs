@@ -493,6 +493,7 @@ fn collect_parsed_classes(
         let has_lifecycle_overrides = !has_no_lifecycle_overrides(body, bytes);
         let is_stateful = class_has_stateful_calls(body, bytes);
         let is_isolated = class_has_run_in_separate_process(decl, bytes);
+        let needs_db = class_needs_db(decl, body, bytes, DEFAULT_DB_MARKER_TRAITS);
 
         out.push(ParsedClass {
             file: path.to_path_buf(),
@@ -504,7 +505,7 @@ fn collect_parsed_classes(
             has_lifecycle_overrides,
             is_stateful,
             is_isolated,
-            needs_db: false,
+            needs_db,
         });
     }
     Ok(())
@@ -924,6 +925,83 @@ fn class_has_run_in_separate_process(class_decl: Node, bytes: &[u8]) -> bool {
     if let Ok(text) = class_decl.utf8_text(bytes) {
         if scan(text) {
             return true;
+        }
+    }
+    false
+}
+
+/// Default marker traits that signal a test needs a transactional database.
+/// Configurable in a later phase; threaded as `&[&str]` so the signature is
+/// stable. `use RefreshDatabase;` *inside* a class body is the tight signal.
+const DEFAULT_DB_MARKER_TRAITS: &[&str] = &["RefreshDatabase", "DatabaseTransactions"];
+
+/// Conservative static references that imply a real database connection.
+/// False NEGATIVES here mean an un-isolated DB test (order-dependent flake),
+/// so the list is real but deliberately tight. The heuristic ONLY ever sets
+/// `needs_db` (provision + isolate) — it must NEVER set `must_force_exit`.
+const DB_HEURISTIC_REFERENCES: &[&str] = &[
+    "PDO",
+    "Doctrine\\DBAL",
+    "Doctrine\\ORM",
+    "EntityManager",
+    "KernelTestCase",
+    "WebTestCase",
+];
+
+/// Returns true when a class needs a provisioned database, detected via three
+/// independent sources:
+///   1. the delimited `#[UsesDatabase]` attribute on the class declaration,
+///   2. a `use <MarkerTrait>;` statement *inside* the class body,
+///   3. a conservative reference to a known DB type in any method body.
+///
+/// Mirrors the structure of `class_has_stateful_calls` (walks `class_body`)
+/// and `class_has_run_in_separate_process` (scans `class_decl` for the
+/// attribute). An imported-but-unused `use Foo\RefreshDatabase;` at file scope
+/// must NOT trip detection — we only match `use <Trait>;` as a trait-use
+/// member inside the class declaration list.
+fn class_needs_db(
+    class_decl: Node,
+    class_body: Node,
+    bytes: &[u8],
+    marker_traits: &[&str],
+) -> bool {
+    // 1. #[UsesDatabase] attribute — delimited, so an import alone won't match.
+    if let Ok(decl_text) = class_decl.utf8_text(bytes) {
+        if has_attribute_name(decl_text, "UsesDatabase") {
+            return true;
+        }
+    }
+    // 2. `use <MarkerTrait>;` as a trait-use member inside the class body, and
+    // 3. a DB-type reference in any method body. One walk over class_body.
+    let mut cursor = class_body.walk();
+    for member in class_body.children(&mut cursor) {
+        if member.kind() == "use_declaration" {
+            if let Ok(text) = member.utf8_text(bytes) {
+                let used = text.trim_start_matches('\\');
+                if marker_traits.iter().any(|t| {
+                    used.contains(t)
+                        && used
+                            .rsplit(['\\', ' ', ';', ','])
+                            .any(|seg| seg.trim() == *t)
+                }) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        if member.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(body) = member.child_by_field_name("body") else {
+            continue;
+        };
+        if let Ok(body_text) = body.utf8_text(bytes) {
+            if DB_HEURISTIC_REFERENCES
+                .iter()
+                .any(|r| body_text.contains(r))
+            {
+                return true;
+            }
         }
     }
     false
@@ -1456,7 +1534,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             fingerprint: mi.fingerprint.clone(),
                             is_stateful: chain_is_stateful,
                             is_isolated: chain_is_isolated,
-                            needs_db: false,
+                            needs_db: class.needs_db,
                         });
                     }
                 }
@@ -1908,6 +1986,77 @@ mod tests {
         let b = grouped.iter().find(|g| g.class == "B").unwrap();
         assert!(a.needs_db, "any DB-needing method makes the class DB-needing");
         assert!(!b.needs_db, "a class with no DB method stays needs_db=false");
+    }
+
+    #[test]
+    fn detects_needs_db_from_attribute_trait_and_pdo_heuristic() {
+        let variants = [
+            (
+                "attribute",
+                r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use PhpunitRust\Attributes\UsesDatabase;
+
+#[UsesDatabase]
+class AttrDbTest extends TestCase {
+    public function testOne(): void {}
+}
+"#,
+                true,
+            ),
+            (
+                "marker_trait",
+                r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+class TraitDbTest extends TestCase {
+    use RefreshDatabase;
+    public function testOne(): void {}
+}
+"#,
+                true,
+            ),
+            (
+                "pdo_heuristic",
+                r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+
+class RawPdoTest extends TestCase {
+    public function testOne(): void {
+        $db = new PDO('pgsql:host=localhost');
+    }
+}
+"#,
+                true,
+            ),
+            (
+                "file_scope_use_does_not_trip",
+                r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+class NoTraitUseTest extends TestCase {
+    public function testOne(): void {}
+}
+"#,
+                false,
+            ),
+        ];
+        for (label, src, expected) in &variants {
+            let (_dir, path) = write_tmp(src);
+            let cases = discover_in_file(&path).unwrap();
+            assert_eq!(cases.len(), 1, "{label}: expected 1 test case");
+            assert_eq!(
+                cases[0].needs_db,
+                *expected,
+                "{label}: needs_db mismatch"
+            );
+        }
     }
 
     #[test]
