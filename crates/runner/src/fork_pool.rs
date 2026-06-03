@@ -47,6 +47,7 @@ impl PhpForkPool {
         class_map: &std::collections::HashMap<String, std::path::PathBuf>,
         worker_memory_limit: &str,
         max_batches_per_child: u32,
+        per_slot_dsn: Option<&[String]>,
     ) -> Result<Self> {
         if n == 0 {
             return Err(anyhow!("fork pool requires at least 1 slot"));
@@ -176,6 +177,16 @@ impl PhpForkPool {
         if !vars.is_empty() {
             cmd.arg("--vars")
                 .arg(serde_json::to_string(vars).context("serializing vars")?);
+        }
+        if let Some(dsns) = per_slot_dsn {
+            if dsns.len() != n {
+                return Err(anyhow!(
+                    "per_slot_dsn length {} must equal worker count {n}",
+                    dsns.len()
+                ));
+            }
+            cmd.arg("--per-slot-dsn")
+                .arg(serde_json::to_string(dsns).context("serializing per-slot DSNs")?);
         }
         // Write class map to a temp file to avoid ARG_MAX limits.
         // The file is deleted when the pool is dropped (or when the process exits).

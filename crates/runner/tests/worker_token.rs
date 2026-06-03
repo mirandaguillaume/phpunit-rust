@@ -72,7 +72,7 @@ fn worker_token_is_set_and_distinct_per_slot() {
 
     let mut pool = PhpForkPool::spawn(
         &script, &autoload, None, &[], &[], &[], &[], &[],
-        2, &HashMap::new(), "512M", 0,
+        2, &HashMap::new(), "512M", 0, None,
     )
     .expect("spawn");
     pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
@@ -121,7 +121,7 @@ fn worker_token_stable_across_recycle() {
     // each batch via the SIGCHLD path that re-invokes $forkChildForSlot($slot).
     let mut pool = PhpForkPool::spawn(
         &script, &autoload, None, &[], &[], &[], &[], &[],
-        1, &HashMap::new(), "512M", 1,
+        1, &HashMap::new(), "512M", 1, None,
     )
     .expect("spawn");
 

@@ -79,6 +79,7 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
         &std::collections::HashMap::new(),
         "512M",
         0,
+        None,
     )
     .expect("PhpForkPool::spawn failed");
 
@@ -206,6 +207,7 @@ fn worker_timeout_aborts_stuck_run() {
             &std::collections::HashMap::new(),
             "512M",
             0,
+            None,
         )
         .expect("PhpForkPool::spawn failed");
         let cfg = RunConfig {
@@ -311,6 +313,7 @@ fn worker_crash_is_recovered_as_error() {
             &std::collections::HashMap::new(),
             "512M",
             0,
+            None,
         )
         .expect("PhpForkPool::spawn failed");
         // No watchdog: this must be recovered via the `slot_died` path, not the
