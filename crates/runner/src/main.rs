@@ -643,6 +643,22 @@ fn real_main() -> Result<ExitCode> {
         );
     }
 
+    // --filter is applied HERE — the single place the substring predicate
+    // runs against the FINAL selected set (after --dirty, --exclude-group and
+    // --group). The post-spawn application in run_with_profiler then sees an
+    // already-narrowed set (RunConfig.filter is None below), so there is
+    // exactly one filter application and which tests run is unchanged.
+    if let Some(f) = cli.filter.as_deref() {
+        let before = cases.len();
+        cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(f)));
+        eprintln!(
+            "--filter {:?}: {} of {} test method(s) match.",
+            f,
+            cases.len(),
+            before
+        );
+    }
+
     // Symfony's PhpUnitTestsListener detection is intentionally NOT acted
     // upon: the listener's "SkippedTestCase wrapper" behaviour isn't
     // "every @group legacy test" — it inspects deprecation emissions at
@@ -777,7 +793,8 @@ fn real_main() -> Result<ExitCode> {
     let cfg = RunConfig {
         autoload,
         bootstrap: None,
-        filter: cli.filter,
+        // filter already applied in main.rs via matches_filter; runner sees None.
+        filter: None,
         defines,
         stop_on,
         class_file_index,
