@@ -140,7 +140,11 @@ pub(crate) enum DbPreflight {
 
 /// Pure decision helper: no I/O, no side effects.
 /// `db_configured` = `--provision-db` set OR PHPUNIT_RUST_DB_DSN present.
-pub(crate) fn db_preflight(selected_needs_db: bool, db_configured: bool, skip_db: bool) -> DbPreflight {
+pub(crate) fn db_preflight(
+    selected_needs_db: bool,
+    db_configured: bool,
+    skip_db: bool,
+) -> DbPreflight {
     match (selected_needs_db, db_configured, skip_db) {
         (false, _, _) => DbPreflight::Proceed,
         (true, true, _) => DbPreflight::Proceed,
@@ -761,8 +765,8 @@ fn real_main() -> Result<ExitCode> {
     // DB preflight: fail-fast (or skip) when needs_db tests are selected but
     // no database is configured. "configured" = --provision-db set OR
     // PHPUNIT_RUST_DB_DSN present. The gate is zero-cost when needs_db = false.
-    let db_configured = cli.provision_db.is_some()
-        || std::env::var_os("PHPUNIT_RUST_DB_DSN").is_some();
+    let db_configured =
+        cli.provision_db.is_some() || std::env::var_os("PHPUNIT_RUST_DB_DSN").is_some();
     let db_case_count = cases.iter().filter(|c| c.needs_db).count();
     let mut synthetic_db_skips: Vec<TestOutcome> = Vec::new();
     match db_preflight(needs_db, db_configured, cli.skip_db) {
@@ -869,7 +873,9 @@ fn real_main() -> Result<ExitCode> {
                     &template,
                     base,
                 )?;
-                lease.register(phpunit_rust::resource_lease::clone_name(base, &run_uuid, slot));
+                lease.register(phpunit_rust::resource_lease::clone_name(
+                    base, &run_uuid, slot,
+                ));
                 per_slot_dsn.push(dsn);
             }
             eprintln!(
@@ -879,7 +885,9 @@ fn real_main() -> Result<ExitCode> {
             per_slot_dsn_opt = Some(per_slot_dsn);
             Some(phpunit_rust::resource_lease::LeaseGuard::new(lease))
         } else {
-            eprintln!("--provision-db: no selected test needs a DB; skipping provisioning (zero cost).");
+            eprintln!(
+                "--provision-db: no selected test needs a DB; skipping provisioning (zero cost)."
+            );
             None
         }
     } else {
@@ -1033,7 +1041,10 @@ mod gate_tests {
     #[test]
     fn gate_is_noop_when_nothing_needs_db() {
         let cases = vec![case("A", "t1", false), case("B", "t2", false)];
-        assert!(!selected_needs_db(&cases), "no-DB suite must NOT trip the gate");
+        assert!(
+            !selected_needs_db(&cases),
+            "no-DB suite must NOT trip the gate"
+        );
     }
 
     #[test]

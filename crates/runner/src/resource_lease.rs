@@ -34,7 +34,13 @@ const PG_MAX_IDENT: usize = 63;
 /// interpolate into DDL and free of surprising characters.
 fn sanitize_ident(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -284,16 +290,30 @@ mod tests {
         assert_eq!(n0, "app_pr123_w0");
         assert_eq!(n1, "app_pr123_w1");
         assert_ne!(n0, n1, "each slot must get a distinct clone");
-        assert_eq!(n0, clone_name("postgres://u@h/app", "pr123", 0), "stable across calls");
+        assert_eq!(
+            n0,
+            clone_name("postgres://u@h/app", "pr123", 0),
+            "stable across calls"
+        );
     }
 
     #[test]
     fn clone_name_sanitizes_special_chars() {
         let is_ident = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        for base in ["postgres://u@h/my\"db", "postgres://u@h/my-db", "postgres://u@h/a.b c"] {
+        for base in [
+            "postgres://u@h/my\"db",
+            "postgres://u@h/my-db",
+            "postgres://u@h/a.b c",
+        ] {
             let n = clone_name(base, "pr-1.x", 0);
-            assert!(is_ident(&n), "clone name must be ^[A-Za-z0-9_]+$, got: {n:?}");
-            assert!(n.ends_with("_w0"), "the _w{{slot}} suffix must survive: {n:?}");
+            assert!(
+                is_ident(&n),
+                "clone name must be ^[A-Za-z0-9_]+$, got: {n:?}"
+            );
+            assert!(
+                n.ends_with("_w0"),
+                "the _w{{slot}} suffix must survive: {n:?}"
+            );
         }
     }
 
@@ -306,11 +326,25 @@ mod tests {
         let n1 = clone_name(&base, &uuid, 1);
         // Postgres NAMEDATALEN bound: never exceed 63 bytes (else silent
         // truncation could collapse two slots onto the same database).
-        assert!(n0.len() <= 63, "slot 0 over 63 bytes: {} ({n0:?})", n0.len());
-        assert!(n1.len() <= 63, "slot 1 over 63 bytes: {} ({n1:?})", n1.len());
+        assert!(
+            n0.len() <= 63,
+            "slot 0 over 63 bytes: {} ({n0:?})",
+            n0.len()
+        );
+        assert!(
+            n1.len() <= 63,
+            "slot 1 over 63 bytes: {} ({n1:?})",
+            n1.len()
+        );
         // Distinct per slot even when truncated.
-        assert_ne!(n0, n1, "long inputs must NOT collapse two slots onto one name");
-        assert!(n0.ends_with("_w0") && n1.ends_with("_w1"), "suffix survives: {n0:?} {n1:?}");
+        assert_ne!(
+            n0, n1,
+            "long inputs must NOT collapse two slots onto one name"
+        );
+        assert!(
+            n0.ends_with("_w0") && n1.ends_with("_w1"),
+            "suffix survives: {n0:?} {n1:?}"
+        );
         // Sanitized.
         assert!(
             n0.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
@@ -321,7 +355,8 @@ mod tests {
     #[test]
     fn run_helper_errors_when_php_script_missing() {
         use std::path::Path;
-        let req = serde_json::json!({"action": "drop", "base": "postgres://u@h/app", "clone_name": "x"});
+        let req =
+            serde_json::json!({"action": "drop", "base": "postgres://u@h/app", "clone_name": "x"});
         let res = run_helper(
             Path::new("/does/not/exist/provision_db.php"),
             Path::new("/does/not/exist/autoload.php"),
@@ -329,7 +364,10 @@ mod tests {
             &[],
             &req,
         );
-        assert!(res.is_err(), "missing/failing helper must hard-fail, not degrade");
+        assert!(
+            res.is_err(),
+            "missing/failing helper must hard-fail, not degrade"
+        );
     }
 
     #[test]
@@ -338,9 +376,24 @@ mod tests {
         let script = Path::new("/does/not/exist/provision_db.php");
         let autoload = Path::new("/does/not/exist/autoload.php");
         let bt = build_template(script, autoload, None, &[], "postgres://u@h/app");
-        assert!(bt.is_err(), "build_template must hard-fail without a usable helper");
-        let cl = clone_for_slot(script, autoload, None, &[], 0, "pr1", "app", "postgres://u@h/app");
-        assert!(cl.is_err(), "clone_for_slot must hard-fail without a usable helper");
+        assert!(
+            bt.is_err(),
+            "build_template must hard-fail without a usable helper"
+        );
+        let cl = clone_for_slot(
+            script,
+            autoload,
+            None,
+            &[],
+            0,
+            "pr1",
+            "app",
+            "postgres://u@h/app",
+        );
+        assert!(
+            cl.is_err(),
+            "clone_for_slot must hard-fail without a usable helper"
+        );
     }
 
     #[test]

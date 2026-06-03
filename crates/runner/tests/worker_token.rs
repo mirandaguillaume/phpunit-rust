@@ -62,8 +62,7 @@ fn token_in(outcomes: &[TestOutcome]) -> String {
 /// Token must be present and DISTINCT across slots.
 #[test]
 fn worker_token_is_set_and_distinct_per_slot() {
-    let project =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
     let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
     let dir = std::env::temp_dir().join(format!("phpunit_rust_token_{}", std::process::id()));
@@ -71,8 +70,19 @@ fn worker_token_is_set_and_distinct_per_slot() {
     let file = write_echo_test(&dir);
 
     let mut pool = PhpForkPool::spawn(
-        &script, &autoload, None, &[], &[], &[], &[], &[],
-        2, &HashMap::new(), "512M", 0, None,
+        &script,
+        &autoload,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        2,
+        &HashMap::new(),
+        "512M",
+        0,
+        None,
     )
     .expect("spawn");
     pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
@@ -92,10 +102,17 @@ fn worker_token_is_set_and_distinct_per_slot() {
 
     assert_eq!(per_slot.len(), 2, "both slots produced an outcome");
     for t in &per_slot {
-        assert_ne!(t, "false", "PHPUNIT_RUST_WORKER_ID must be set (getenv != false)");
+        assert_ne!(
+            t, "false",
+            "PHPUNIT_RUST_WORKER_ID must be set (getenv != false)"
+        );
     }
     let distinct: HashSet<&String> = per_slot.iter().collect();
-    assert_eq!(distinct.len(), 2, "tokens must be distinct per slot: {per_slot:?}");
+    assert_eq!(
+        distinct.len(),
+        2,
+        "tokens must be distinct per slot: {per_slot:?}"
+    );
 }
 
 /// Token must SURVIVE a K-batch recycle: with max_batches_per_child=1 the
@@ -109,8 +126,7 @@ fn worker_token_is_set_and_distinct_per_slot() {
 /// stream-read buffer and silently discard plan 2 when child 0 exits.
 #[test]
 fn worker_token_stable_across_recycle() {
-    let project =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
     let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
     let dir = std::env::temp_dir().join(format!("phpunit_rust_token_rcy_{}", std::process::id()));
@@ -120,8 +136,19 @@ fn worker_token_stable_across_recycle() {
     // max_batches_per_child = 1 -> fork-server mode, child recycles after
     // each batch via the SIGCHLD path that re-invokes $forkChildForSlot($slot).
     let mut pool = PhpForkPool::spawn(
-        &script, &autoload, None, &[], &[], &[], &[], &[],
-        1, &HashMap::new(), "512M", 1, None,
+        &script,
+        &autoload,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        1,
+        &HashMap::new(),
+        "512M",
+        1,
+        None,
     )
     .expect("spawn");
 
@@ -172,8 +199,17 @@ fn worker_token_stable_across_recycle() {
         .iter()
         .filter(|o| o.class == "WorkerTokenEchoTest")
         .filter_map(|o| o.message.clone())
-        .filter_map(|m| m.find("TOKEN=").map(|i| m[i + "TOKEN=".len()..].trim().to_string()))
+        .filter_map(|m| {
+            m.find("TOKEN=")
+                .map(|i| m[i + "TOKEN=".len()..].trim().to_string())
+        })
         .collect();
-    assert!(tokens.len() >= 2, "both batches ran (recycle happened): {tokens:?}");
-    assert!(tokens.iter().all(|t| t == "'0'"), "slot-0 token stable across recycle: {tokens:?}");
+    assert!(
+        tokens.len() >= 2,
+        "both batches ran (recycle happened): {tokens:?}"
+    );
+    assert!(
+        tokens.iter().all(|t| t == "'0'"),
+        "slot-0 token stable across recycle: {tokens:?}"
+    );
 }

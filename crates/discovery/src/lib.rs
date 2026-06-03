@@ -966,9 +966,7 @@ fn reference_matches_marker(reference: &str, markers: &[&str]) -> bool {
         return false;
     }
     let last_seg = reference.rsplit('\\').next().unwrap_or(reference);
-    markers
-        .iter()
-        .any(|m| reference == *m || last_seg == *m)
+    markers.iter().any(|m| reference == *m || last_seg == *m)
 }
 
 /// Returns true when a class needs a provisioned database. Detection is
@@ -1027,9 +1025,7 @@ fn class_needs_db(
         for used in member.named_children(&mut tu_cursor) {
             if matches!(used.kind(), "name" | "qualified_name") {
                 if let Ok(raw) = used.utf8_text(bytes) {
-                    if is_valid_class_name(raw)
-                        && reference_matches_marker(raw, marker_traits)
-                    {
+                    if is_valid_class_name(raw) && reference_matches_marker(raw, marker_traits) {
                         return true;
                     }
                 }
@@ -2037,8 +2033,14 @@ mod tests {
         let grouped = group_by_class(cases);
         let a = grouped.iter().find(|g| g.class == "A").unwrap();
         let b = grouped.iter().find(|g| g.class == "B").unwrap();
-        assert!(a.needs_db, "any DB-needing method makes the class DB-needing");
-        assert!(!b.needs_db, "a class with no DB method stays needs_db=false");
+        assert!(
+            a.needs_db,
+            "any DB-needing method makes the class DB-needing"
+        );
+        assert!(
+            !b.needs_db,
+            "a class with no DB method stays needs_db=false"
+        );
     }
 
     #[test]
@@ -2058,7 +2060,11 @@ class ConcreteDbTest extends DbBaseTest {
 "#;
         let (_dir, path) = write_tmp(src);
         let cases = discover_in_file(&path).unwrap();
-        assert_eq!(cases.len(), 1, "abstract base emits nothing; concrete subclass emits one");
+        assert_eq!(
+            cases.len(),
+            1,
+            "abstract base emits nothing; concrete subclass emits one"
+        );
         assert_eq!(cases[0].class, "App\\ConcreteDbTest");
         assert!(
             cases[0].needs_db,
@@ -2178,11 +2184,7 @@ class NoTraitUseTest extends TestCase {
             let (_dir, path) = write_tmp(src);
             let cases = discover_in_file(&path).unwrap();
             assert_eq!(cases.len(), 1, "{label}: expected 1 test case");
-            assert_eq!(
-                cases[0].needs_db,
-                *expected,
-                "{label}: needs_db mismatch"
-            );
+            assert_eq!(cases[0].needs_db, *expected, "{label}: needs_db mismatch");
         }
     }
 

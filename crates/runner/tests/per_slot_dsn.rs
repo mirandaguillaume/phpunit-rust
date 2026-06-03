@@ -123,7 +123,11 @@ fn per_slot_dsn_is_injected_and_distinct() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(per_slot.len(), 2, "both slots produced an outcome");
     let distinct: HashSet<&String> = per_slot.iter().collect();
-    assert_eq!(distinct.len(), 2, "DSNs must be distinct per slot: {per_slot:?}");
+    assert_eq!(
+        distinct.len(),
+        2,
+        "DSNs must be distinct per slot: {per_slot:?}"
+    );
     // Each slot must see its own injected DSN value
     assert!(
         per_slot.iter().any(|d| d.contains("app_w0")),
@@ -142,10 +146,7 @@ fn per_slot_dsn_absent_when_none() {
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
     let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
-    let dir = std::env::temp_dir().join(format!(
-        "phpunit_rust_dsn_none_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_dsn_none_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = write_echo_test(&dir);
 

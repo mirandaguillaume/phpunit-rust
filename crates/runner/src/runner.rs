@@ -1462,7 +1462,10 @@ mod tests {
         // A pure DB-needing class (not stateful, not isolated) must remain a
         // warm-child dispatch-safe batch. This pins the runner.rs disjointness
         // guarantee: needs_db is NOT folded into must_force_exit.
-        let cases = vec![make_db_case("DbTest", "testOne"), make_db_case("DbTest", "testTwo")];
+        let cases = vec![
+            make_db_case("DbTest", "testOne"),
+            make_db_case("DbTest", "testTwo"),
+        ];
         let grouped = group_by_class(cases);
         let g = grouped.iter().find(|g| g.class == "DbTest").unwrap();
         assert!(g.needs_db, "grouping carries the DB flag");
@@ -1552,7 +1555,11 @@ mod filter_lift_tests {
         assert!(matches_filter("App\\CalcTest", "testAdd", None));
         assert!(matches_filter("App\\CalcTest", "testAdd", Some("Calc")));
         assert!(matches_filter("App\\CalcTest", "testAdd", Some("testAdd")));
-        assert!(matches_filter("App\\CalcTest", "testAdd", Some("CalcTest::testAdd")));
+        assert!(matches_filter(
+            "App\\CalcTest",
+            "testAdd",
+            Some("CalcTest::testAdd")
+        ));
         assert!(!matches_filter("App\\CalcTest", "testAdd", Some("Nope")));
     }
 }
