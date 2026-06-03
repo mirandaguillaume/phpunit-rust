@@ -114,14 +114,20 @@ function dbNameFromBase(string $base): string {
 }
 
 function dsnForClone(string $base, string $clone): string {
-    $parts  = parse_url($base);
-    $auth   = isset($parts['user'])
-        ? $parts['user'] . (isset($parts['pass']) ? ':' . $parts['pass'] : '') . '@'
-        : '';
-    $host   = $parts['host'] ?? '127.0.0.1';
-    $port   = isset($parts['port']) ? ':' . $parts['port'] : '';
-    $scheme = $parts['scheme'] ?? 'postgres';
-    return sprintf('%s://%s%s%s/%s', $scheme, $auth, $host, $port, $clone);
+    // The returned DSN is injected as PHPUNIT_RUST_DB_DSN and consumed by
+    // TestExecutor via `new \PDO($dsn)` with NO separate user/pass args, so it
+    // MUST be a PDO connection string (pgsql:...) with credentials embedded —
+    // not the URL-style form (`postgres://...`), which PDO rejects with
+    // "could not find driver".
+    $parts = parse_url($base);
+    $host  = $parts['host'] ?? '127.0.0.1';
+    $port  = $parts['port'] ?? 5432;
+    $user  = $parts['user'] ?? (getenv('PGUSER') ?: 'postgres');
+    $pass  = $parts['pass'] ?? (getenv('PGPASSWORD') ?: '');
+    return sprintf(
+        'pgsql:host=%s;port=%d;dbname=%s;user=%s;password=%s',
+        $host, $port, $clone, $user, $pass
+    );
 }
 
 /** Quote an identifier for Postgres DDL (double-quote, escape embedded quotes). */
