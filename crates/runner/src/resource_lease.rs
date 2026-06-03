@@ -84,12 +84,15 @@ pub fn clone_name(base: &str, run_uuid: &str, slot: usize) -> String {
     format!("{prefix}{tail}")
 }
 
-/// Wire shape returned by provision_db.php for build/clone/drop actions.
-/// `dsn` is the connection string the worker should use (null for `drop`);
+/// Wire shape returned by provision_db.php for build/clone/drop/gc actions.
+/// `dsn` is the connection string the worker should use (null for `drop`/`gc`);
+/// `dropped` is the list of clone names reclaimed by the `gc` action;
 /// `error` is set (and the process exits non-zero) on hard failure.
 #[derive(Debug, Deserialize)]
 struct ProvisionResult {
     dsn: Option<String>,
+    #[serde(default)]
+    dropped: Vec<String>,
     #[allow(dead_code)]
     error: Option<String>,
 }
@@ -182,6 +185,26 @@ pub fn clone_for_slot(
     let res = run_helper(script, autoload, bootstrap, defines, &req)?;
     res.dsn
         .ok_or_else(|| anyhow!("provision_db.php clone returned no DSN for slot {slot}"))
+}
+
+/// Best-effort startup GC sweep: ask `provision_db.php` to drop any clone
+/// databases that match `<base_db>_pr<N>_w<N>` and have zero active Postgres
+/// backends (meaning the run that created them is gone). Called BEFORE
+/// `build_template` so the current run starts with a clean slate.
+///
+/// Returns `Ok(n)` where `n` is the number of stale clones reclaimed.
+/// Returns `Err` if the helper process cannot be spawned or exits non-zero;
+/// the caller is expected to swallow the error and continue (best-effort).
+pub fn gc_stale_clones(
+    script: &Path,
+    autoload: &Path,
+    bootstrap: Option<&Path>,
+    defines: &[[String; 2]],
+    base: &str,
+) -> Result<usize> {
+    let req = serde_json::json!({"action": "gc", "base": base});
+    let res = run_helper(script, autoload, bootstrap, defines, &req)?;
+    Ok(res.dropped.len())
 }
 
 /// Pre-fork registry of every clone name created for this run. Built BEFORE
@@ -393,6 +416,25 @@ mod tests {
         assert!(
             cl.is_err(),
             "clone_for_slot must hard-fail without a usable helper"
+        );
+    }
+
+    #[test]
+    fn gc_stale_clones_errs_when_helper_missing() {
+        // Without a real Postgres connection gc_stale_clones must Err (the
+        // helper binary is absent) — the caller swallows this and continues,
+        // so the error path must be reachable and not panic.
+        use std::path::Path;
+        let res = gc_stale_clones(
+            Path::new("/does/not/exist/provision_db.php"),
+            Path::new("/does/not/exist/autoload.php"),
+            None,
+            &[],
+            "postgres://u@h/app",
+        );
+        assert!(
+            res.is_err(),
+            "gc_stale_clones must Err when the helper binary is missing"
         );
     }
 

@@ -846,6 +846,20 @@ fn real_main() -> Result<ExitCode> {
     let _lease_guard = if let Some(base) = &cli.provision_db {
         if needs_db {
             let provision_script = phpunit_rust::php_worker::find_provision_script()?;
+            // P4 startup GC sweep: best-effort, never aborts the run.
+            match phpunit_rust::resource_lease::gc_stale_clones(
+                &provision_script,
+                &autoload,
+                bootstrap.as_deref(),
+                &defines,
+                base,
+            ) {
+                Ok(n) if n > 0 => eprintln!(
+                    "Resource provisioning: GC reclaimed {n} stale clone(s) from a prior crashed run."
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("Resource provisioning: GC sweep skipped ({e})"),
+            }
             let run_uuid = format!("pr{}", std::process::id());
             let template = phpunit_rust::resource_lease::build_template(
                 &provision_script,

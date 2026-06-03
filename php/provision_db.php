@@ -14,9 +14,10 @@ declare(strict_types=1);
  *   {"action":"build_template","base":"<TEMPLATE_DSN_BASE>"}
  *   {"action":"clone","base":...,"template":"app","clone_name":"app_pr1_w0"}
  *   {"action":"drop","base":...,"clone_name":"app_pr1_w0"}
+ *   {"action":"gc","base":"<TEMPLATE_DSN_BASE>"}
  *
  * Writes ONE JSON object to stdout: {"dsn":"<conn-string>"} on success (dsn is
- * null for drop), or {"error":"..."} with a non-zero exit on hard failure. The
+ * null for drop/gc), or {"error":"..."} with a non-zero exit on hard failure. The
  * Rust lease gates on the exit code exactly like provider_enum.
  *
  * v1 = PostgreSQL only: `CREATE DATABASE ... TEMPLATE` is the cheap storage-
@@ -179,6 +180,50 @@ try {
             $stmt->execute([$clone]);
             $pdo->exec('DROP DATABASE IF EXISTS ' . qid($clone));
             echo json_encode(['dsn' => null]), "\n";
+            exit(0);
+
+        /**
+         * Best-effort crash cleanup: drop clone databases left by a prior run
+         * that was killed before its LeaseGuard could run destroy_all().
+         *
+         * Safety rule: only drop clones with ZERO active backends. A non-zero
+         * count means a live concurrent run owns that clone — we must not touch
+         * it. This relies on the assumption that no two runs provision against
+         * the SAME base DSN concurrently (use isolated base DBs for that; CI
+         * service containers give each job its own Postgres instance).
+         *
+         * Pattern: <base>_pr<digits>_w<digits> — the literal underscores in the
+         * LIKE pattern are escaped with \ so they match only '_', not any char.
+         */
+        case 'gc':
+            $baseName = dbNameFromBase($base);
+            // Escape literal underscores in the base name so they act as exact
+            // matches in the LIKE expression (not "any single char" wildcards).
+            $escapedBase = str_replace('_', '\\_', $baseName);
+            $pat = $escapedBase . '\\_pr%\\_w%';
+
+            $stmt = $pdo->prepare(
+                'SELECT datname FROM pg_database WHERE datname LIKE :pat ESCAPE \'\\\\\' AND datname <> :base'
+            );
+            $stmt->execute([':pat' => $pat, ':base' => $baseName]);
+            $candidates = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+            $dropped = [];
+            foreach ($candidates as $name) {
+                // Count active backends — skip any clone still in use.
+                $bStmt = $pdo->prepare(
+                    'SELECT count(*) FROM pg_stat_activity WHERE datname = ?'
+                );
+                $bStmt->execute([$name]);
+                $backends = (int) $bStmt->fetchColumn();
+                if ($backends > 0) {
+                    continue; // live run owns this clone — do not touch
+                }
+                assertSafeIdent($name, 'gc clone');
+                $pdo->exec('DROP DATABASE IF EXISTS ' . qid($name));
+                $dropped[] = $name;
+            }
+            echo json_encode(['dsn' => null, 'dropped' => $dropped]), "\n";
             exit(0);
 
         default:
