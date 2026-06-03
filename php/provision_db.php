@@ -192,18 +192,20 @@ try {
          * the SAME base DSN concurrently (use isolated base DBs for that; CI
          * service containers give each job its own Postgres instance).
          *
-         * Pattern: <base>_pr<digits>_w<digits> — the literal underscores in the
-         * LIKE pattern are escaped with \ so they match only '_', not any char.
+         * Match exactly `<base>_pr<digits>_w<digits>` with a POSIX regex (the `~`
+         * operator) — precise, and free of the LIKE ESCAPE-string pitfalls (a
+         * malformed multi-char escape errors the whole sweep out). Clones the
+         * Rust side hash-splices for >63-byte base names (rare) won't match and
+         * are left for a later run; the common short-name case is covered.
          */
         case 'gc':
             $baseName = dbNameFromBase($base);
-            // Escape literal underscores in the base name so they act as exact
-            // matches in the LIKE expression (not "any single char" wildcards).
-            $escapedBase = str_replace('_', '\\_', $baseName);
-            $pat = $escapedBase . '\\_pr%\\_w%';
-
+            // Escape POSIX-ERE metacharacters in the base name; the clone suffix
+            // is the fixed shape `_pr<digits>_w<digits>`.
+            $reBase = preg_replace('/[.^$*+?()\\[\\]{}|\\\\]/', '\\\\$0', $baseName);
+            $pat = '^' . $reBase . '_pr[0-9]+_w[0-9]+$';
             $stmt = $pdo->prepare(
-                'SELECT datname FROM pg_database WHERE datname LIKE :pat ESCAPE \'\\\\\' AND datname <> :base'
+                'SELECT datname FROM pg_database WHERE datname ~ :pat AND datname <> :base'
             );
             $stmt->execute([':pat' => $pat, ':base' => $baseName]);
             $candidates = $stmt->fetchAll(\PDO::FETCH_COLUMN);
