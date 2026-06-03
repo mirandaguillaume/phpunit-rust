@@ -127,6 +127,28 @@ fn git_changed_files(project: &std::path::Path) -> std::collections::HashSet<Pat
     rel.into_iter().map(|r| root.join(r)).collect()
 }
 
+/// Outcome of the DB pre-flight decision.
+#[derive(Debug, PartialEq)]
+pub(crate) enum DbPreflight {
+    /// Proceed normally (no DB tests, or DB is configured).
+    Proceed,
+    /// Skip DB tests and continue (--skip-db).
+    SkipDbTests,
+    /// Abort before forking: DB tests selected but nothing configured.
+    Abort,
+}
+
+/// Pure decision helper: no I/O, no side effects.
+/// `db_configured` = `--provision-db` set OR PHPUNIT_RUST_DB_DSN present.
+pub(crate) fn db_preflight(selected_needs_db: bool, db_configured: bool, skip_db: bool) -> DbPreflight {
+    match (selected_needs_db, db_configured, skip_db) {
+        (false, _, _) => DbPreflight::Proceed,
+        (true, true, _) => DbPreflight::Proceed,
+        (true, false, true) => DbPreflight::SkipDbTests,
+        (true, false, false) => DbPreflight::Abort,
+    }
+}
+
 /// Returns `true` iff at least one of the FINAL selected test cases (after all
 /// filters including `--filter`, `--group`, and `--dirty`) has `needs_db = true`.
 /// When `false` the gate is a zero-cost no-op; no provisioning logic runs.
@@ -185,6 +207,7 @@ use phpunit_rust::phpunit_xml::{
 use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::RunConfig;
+use phpunit_rust::types::{TestOutcome, TestStatus};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -255,6 +278,16 @@ struct Cli {
     /// repo / no changes → nothing to run.
     #[arg(long)]
     dirty: bool,
+    /// Base DSN for per-worker database provisioning (Phase 3). Passing this flag
+    /// marks a database as "configured" for the preflight gate — actual
+    /// provisioning is wired in Phase 3. Example: postgres://user:pw@localhost/mydb
+    #[arg(long)]
+    provision_db: Option<String>,
+    /// When `needs_db` tests are selected but no database is configured,
+    /// skip those tests instead of aborting (exit code 2). The skip reason
+    /// "database not configured (--skip-db)" is recorded in the report.
+    #[arg(long)]
+    skip_db: bool,
     /// Rewrite `createMock()` patterns in test files into anonymous-class stubs
     /// before execution. Requires that mocked interfaces are resolvable via
     /// the project's PSR-4 autoload map in composer.json.
@@ -728,6 +761,42 @@ fn real_main() -> Result<ExitCode> {
         eprintln!("DB gate: {} selected test(s) need a database.", cases.iter().filter(|c| c.needs_db).count());
     }
 
+    // DB preflight: fail-fast (or skip) when needs_db tests are selected but
+    // no database is configured. "configured" = --provision-db set OR
+    // PHPUNIT_RUST_DB_DSN present. The gate is zero-cost when needs_db = false.
+    let db_configured = cli.provision_db.is_some()
+        || std::env::var_os("PHPUNIT_RUST_DB_DSN").is_some();
+    let mut synthetic_db_skips: Vec<TestOutcome> = Vec::new();
+    match db_preflight(needs_db, db_configured, cli.skip_db) {
+        DbPreflight::Proceed => {}
+        DbPreflight::SkipDbTests => {
+            let n = cases.iter().filter(|c| c.needs_db).count();
+            eprintln!("note: skipping {n} test(s) that require a database (--skip-db)");
+            for c in cases.iter().filter(|c| c.needs_db) {
+                let o = TestOutcome {
+                    class: c.class.clone(),
+                    method: c.method.clone(),
+                    dataset: None,
+                    status: TestStatus::Skipped,
+                    message: Some("database not configured (--skip-db)".into()),
+                    trace: None,
+                    duration_ms: 0.0,
+                };
+                print_progress(&o);
+                synthetic_db_skips.push(o);
+            }
+            cases.retain(|c| !c.needs_db);
+        }
+        DbPreflight::Abort => {
+            let n = cases.iter().filter(|c| c.needs_db).count();
+            eprintln!(
+                "error: {n} selected test(s) require a database (needs_db) but no database is configured.\n  \
+                 pass --provision-db <DSN_BASE> to provision per-worker databases, or --skip-db to skip them."
+            );
+            std::process::exit(2);
+        }
+    }
+
     // Verify a usable PHP is on PATH. We require ≥ 8.1; some projects need
     // newer (brick/math: 8.2; doctrine/collections: 8.4). The user is on
     // the hook for installing a sufficiently-new PHP.
@@ -834,6 +903,11 @@ fn real_main() -> Result<ExitCode> {
         },
     )?;
 
+    // Append synthetic skips for DB tests suppressed by --skip-db.
+    if !synthetic_db_skips.is_empty() {
+        report.outcomes.extend(synthetic_db_skips);
+    }
+
     // Append the synthetic skip outcomes for @group legacy under Symfony's
     // listener. They were never dispatched, so emit them now and adjust
     // the report's totals accordingly.
@@ -918,6 +992,20 @@ mod gate_tests {
     fn gate_trips_when_any_selected_case_needs_db() {
         let cases = vec![case("A", "t1", false), case("B", "t2", true)];
         assert!(selected_needs_db(&cases));
+    }
+
+    #[test]
+    fn db_preflight_decisions() {
+        use super::{db_preflight, DbPreflight};
+        // No DB tests selected -> always proceed (zero-cost path).
+        assert_eq!(db_preflight(false, false, false), DbPreflight::Proceed);
+        assert_eq!(db_preflight(false, false, true), DbPreflight::Proceed);
+        // DB tests + a configured database -> proceed.
+        assert_eq!(db_preflight(true, true, false), DbPreflight::Proceed);
+        // DB tests, no database, --skip-db -> skip them.
+        assert_eq!(db_preflight(true, false, true), DbPreflight::SkipDbTests);
+        // DB tests, no database, no --skip-db -> abort.
+        assert_eq!(db_preflight(true, false, false), DbPreflight::Abort);
     }
 
     #[test]
