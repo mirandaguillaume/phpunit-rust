@@ -127,6 +127,18 @@ function dsnForClone(string $base, string $clone): string {
 /** Quote an identifier for Postgres DDL (double-quote, escape embedded quotes). */
 function qid(string $id): string { return '"' . str_replace('"', '""', $id) . '"'; }
 
+/**
+ * Defense-in-depth: every identifier interpolated into DDL must already be
+ * sanitized by the Rust lease (clone_name maps to [A-Za-z0-9_] and bounds to
+ * 63 bytes). Reject anything else hard, BEFORE running DDL, so a malformed
+ * request can never reach the database. We keep qid() too (belt + braces).
+ */
+function assertSafeIdent(string $id, string $what): void {
+    if ($id === '' || strlen($id) > 63 || !preg_match('/^[A-Za-z0-9_]+$/', $id)) {
+        throw new \RuntimeException("unsafe $what identifier (expected ^[A-Za-z0-9_]+\$, <=63 bytes): $id");
+    }
+}
+
 try {
     $pdo = connectAdmin($base);
     switch ($action) {
@@ -141,6 +153,8 @@ try {
             $template = (string) ($req['template'] ?? dbNameFromBase($base));
             $clone    = (string) ($req['clone_name'] ?? '');
             if ($clone === '') { throw new \RuntimeException('clone requires clone_name'); }
+            assertSafeIdent($clone, 'clone_name');
+            assertSafeIdent($template, 'template');
             // Idempotent: drop any stale clone from a previous crashed run first.
             $pdo->exec('DROP DATABASE IF EXISTS ' . qid($clone));
             $pdo->exec('CREATE DATABASE ' . qid($clone) . ' TEMPLATE ' . qid($template));
@@ -150,6 +164,7 @@ try {
         case 'drop':
             $clone = (string) ($req['clone_name'] ?? '');
             if ($clone === '') { throw new \RuntimeException('drop requires clone_name'); }
+            assertSafeIdent($clone, 'clone_name');
             // Terminate any lingering backends so DROP succeeds even if a
             // SIGKILLed worker left a connection open, then DROP IF EXISTS.
             $stmt = $pdo->prepare(

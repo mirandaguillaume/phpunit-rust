@@ -5,6 +5,13 @@
 //! DSN. Every clone name is recorded in a `ResourceLease` registry built
 //! BEFORE the master forks, so teardown never depends on a live child.
 //!
+//! Cleanup model: graceful exit, `?` early-return, and panic-unwind are all
+//! covered by [`LeaseGuard`]'s `Drop`, which runs [`ResourceLease::destroy_all`].
+//! Ctrl-C / SIGKILL cleanup is handled by the P4 startup GC sweep (drops stale
+//! clones by `run_uuid` prefix). We deliberately do NOT install a SIGINT
+//! handler — doing real cleanup (spawning `php`, allocating, I/O) from a signal
+//! handler is async-signal-unsafe and can deadlock or invoke UB.
+//!
 //! NOTE: this module is not yet wired into `main.rs` or the run path (Task 8).
 
 #[allow(dead_code)]
@@ -17,19 +24,58 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 use std::process::{Command, Stdio};
-#[allow(dead_code)]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[allow(dead_code)]
-use std::sync::Mutex;
 
-/// Deterministic clone name for a slot: `{base_db}_{run_uuid}_w{slot}`.
-/// `base` is the TEMPLATE_DSN_BASE; we extract its database name (the path
-/// component after the last `/`) to derive the clone identifier. The registry
-/// only needs the name, not the DSN.
+/// Max length of a Postgres identifier (NAMEDATALEN - 1). Clone names MUST fit
+/// or Postgres silently truncates them — which could collapse two distinct
+/// slots onto the same database (cross-slot data bleed).
+const PG_MAX_IDENT: usize = 63;
+
+/// Map every char not in `[A-Za-z0-9_]` to `_`. Keeps clone names safe to
+/// interpolate into DDL and free of surprising characters.
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+/// Deterministic clone name for a slot: `{base_db}_{run_uuid}_w{slot}`, with
+/// every component sanitized to `[A-Za-z0-9_]` and the whole bounded to 63
+/// bytes (Postgres NAMEDATALEN). `base` is the TEMPLATE_DSN_BASE; we extract
+/// its database name (the path component after the last `/`) to derive the
+/// clone identifier. The registry only needs the name, not the DSN.
+///
+/// The `_w{slot}` suffix ALWAYS survives. When the natural name exceeds 63
+/// bytes we truncate the variable `{db}_{run_uuid}` prefix and splice in the
+/// first 8 hex of a hash of the FULL unsanitized name, so distinct inputs that
+/// would otherwise truncate to the same string still get distinct names.
 #[must_use]
 pub fn clone_name(base: &str, run_uuid: &str, slot: usize) -> String {
-    let db = base.rsplit('/').next().unwrap_or(base);
-    format!("{db}_{run_uuid}_w{slot}")
+    let raw_db = base.rsplit('/').next().unwrap_or(base);
+    let db = sanitize_ident(raw_db);
+    let uuid = sanitize_ident(run_uuid);
+
+    let suffix = format!("_w{slot}");
+    let natural = format!("{db}_{uuid}{suffix}");
+    if natural.len() <= PG_MAX_IDENT {
+        return natural;
+    }
+
+    // Too long: keep `_w{slot}` and a deterministic 8-hex hash of the full
+    // unsanitized input (so collisions across distinct inputs are impossible),
+    // then fill the remaining budget with as much sanitized prefix as fits.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(raw_db.as_bytes());
+    hasher.update(b"/");
+    hasher.update(run_uuid.as_bytes());
+    hasher.update(b"/");
+    hasher.update(slot.to_string().as_bytes());
+    let hash = hasher.finalize().to_hex();
+    let hash8: String = hash.chars().take(8).collect();
+    let tail = format!("_{hash8}{suffix}");
+
+    let prefix_budget = PG_MAX_IDENT.saturating_sub(tail.len());
+    let prefix: String = db.chars().take(prefix_budget).collect();
+    format!("{prefix}{tail}")
 }
 
 /// Wire shape returned by provision_db.php for build/clone/drop actions.
@@ -170,9 +216,8 @@ impl ResourceLease {
     }
 
     /// `DROP DATABASE IF EXISTS` every registered clone (idempotent). Wired to
-    /// `wait()`/`terminate()` (via the `LeaseGuard` held until after them) and
-    /// to the SIGINT handler. Best-effort: logs but NEVER panics, so it is safe
-    /// from a `Drop` and from a signal-handler context.
+    /// `wait()`/`terminate()` (via the `LeaseGuard` held until after them).
+    /// Best-effort: logs but NEVER panics, so it is safe to call from a `Drop`.
     pub fn destroy_all(&self) {
         for name in &self.names {
             let req = serde_json::json!({
@@ -191,76 +236,37 @@ impl ResourceLease {
             }
         }
     }
-}
 
-/// Deep-copy the registry so the SIGINT handler's global copy and the
-/// RAII guard's copy are independent (both call `destroy_all`; the drop is
-/// idempotent via `DROP DATABASE IF EXISTS`).
-fn clone_registry(l: &ResourceLease) -> ResourceLease {
-    ResourceLease {
-        script: l.script.clone(),
-        autoload: l.autoload.clone(),
-        bootstrap: l.bootstrap.clone(),
-        defines: l.defines.clone(),
-        base: l.base.clone(),
-        names: l.names.clone(),
+    /// Consume the lease into a [`LeaseGuard`] for RAII teardown. Convenience
+    /// for the Task 8 main wiring; equivalent to `LeaseGuard::new(self)`.
+    #[must_use]
+    pub fn into_guard(self) -> LeaseGuard {
+        LeaseGuard::new(self)
     }
-}
-
-/// Process-global handle so a SIGINT handler (which takes no arguments) can
-/// reach the registry. Set once, pre-fork, when provisioning is active.
-static SIGINT_TRIPPED: AtomicBool = AtomicBool::new(false);
-static GLOBAL_LEASE: Mutex<Option<ResourceLease>> = Mutex::new(None);
-
-extern "C" fn handle_sigint(_sig: libc::c_int) {
-    // Flip the flag, then opportunistically drop clones under a try_lock so a
-    // plain Ctrl-C (where RAII Drop never runs) still cleans up. Re-raise the
-    // default SIGINT so the process actually terminates.
-    SIGINT_TRIPPED.store(true, Ordering::SeqCst);
-    if let Ok(guard) = GLOBAL_LEASE.try_lock() {
-        if let Some(lease) = guard.as_ref() {
-            lease.destroy_all();
-        }
-    }
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::raise(libc::SIGINT);
-    }
-}
-
-/// Install the SIGINT handler and stash a copy of the lease registry globally
-/// so the handler can drop the clones on Ctrl-C (where RAII `Drop` never runs).
-/// Returns a `LeaseGuard` whose `Drop` is the normal-path teardown.
-pub fn install_sigint_handler(lease: ResourceLease) -> LeaseGuard {
-    {
-        let mut g = GLOBAL_LEASE.lock().expect("GLOBAL_LEASE poisoned");
-        *g = Some(clone_registry(&lease));
-    }
-    unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
-    }
-    LeaseGuard { lease: Some(lease) }
 }
 
 /// RAII teardown. Holding this until AFTER `pool.wait()`/`pool.terminate()`
 /// guarantees `destroy_all()` runs on the Ok path AND on any `?` early-return
-/// or panic-unwind. Idempotent with the SIGINT handler (`DROP IF EXISTS`).
+/// or panic-unwind. Idempotent (`DROP DATABASE IF EXISTS`), so a P4 startup GC
+/// sweep that already reclaimed a clone causes no harm.
+///
+/// There is deliberately NO SIGINT handler: doing real cleanup (spawning `php`,
+/// allocating, I/O) from a signal handler is async-signal-unsafe. Ctrl-C /
+/// SIGKILL leftovers are reclaimed by the P4 startup GC sweep instead.
 pub struct LeaseGuard {
     lease: Option<ResourceLease>,
 }
 
 impl LeaseGuard {
+    /// Wrap a lease for RAII teardown. Task 8 (main wiring) calls this after
+    /// the registry is populated and holds the guard until after the pool exits.
     pub fn new(lease: ResourceLease) -> Self {
-        install_sigint_handler(lease)
+        LeaseGuard { lease: Some(lease) }
     }
 }
 
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
-        if SIGINT_TRIPPED.load(Ordering::SeqCst) {
-            // The signal handler already dropped the clones.
-            return;
-        }
         if let Some(lease) = self.lease.take() {
             lease.destroy_all();
         }
@@ -279,6 +285,37 @@ mod tests {
         assert_eq!(n1, "app_pr123_w1");
         assert_ne!(n0, n1, "each slot must get a distinct clone");
         assert_eq!(n0, clone_name("postgres://u@h/app", "pr123", 0), "stable across calls");
+    }
+
+    #[test]
+    fn clone_name_sanitizes_special_chars() {
+        let is_ident = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        for base in ["postgres://u@h/my\"db", "postgres://u@h/my-db", "postgres://u@h/a.b c"] {
+            let n = clone_name(base, "pr-1.x", 0);
+            assert!(is_ident(&n), "clone name must be ^[A-Za-z0-9_]+$, got: {n:?}");
+            assert!(n.ends_with("_w0"), "the _w{{slot}} suffix must survive: {n:?}");
+        }
+    }
+
+    #[test]
+    fn clone_name_is_bounded_and_distinct_for_long_inputs() {
+        let long_db = "x".repeat(200);
+        let base = format!("postgres://u@h/{long_db}");
+        let uuid = "run".to_string() + &"y".repeat(200);
+        let n0 = clone_name(&base, &uuid, 0);
+        let n1 = clone_name(&base, &uuid, 1);
+        // Postgres NAMEDATALEN bound: never exceed 63 bytes (else silent
+        // truncation could collapse two slots onto the same database).
+        assert!(n0.len() <= 63, "slot 0 over 63 bytes: {} ({n0:?})", n0.len());
+        assert!(n1.len() <= 63, "slot 1 over 63 bytes: {} ({n1:?})", n1.len());
+        // Distinct per slot even when truncated.
+        assert_ne!(n0, n1, "long inputs must NOT collapse two slots onto one name");
+        assert!(n0.ends_with("_w0") && n1.ends_with("_w1"), "suffix survives: {n0:?} {n1:?}");
+        // Sanitized.
+        assert!(
+            n0.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "bounded name must still be ^[A-Za-z0-9_]+$: {n0:?}"
+        );
     }
 
     #[test]
