@@ -1506,6 +1506,27 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
             }
             acc
         };
+        // Same walk for needs_db: a parent base that `use`s RefreshDatabase or
+        // references a DB type propagates to every concrete subclass, mirroring
+        // PHPUnit's runtime trait/inheritance behaviour.
+        let chain_needs_db = {
+            let mut visit = class.fqcn.as_str();
+            let mut d = 0;
+            let mut acc = false;
+            while d < 32 {
+                if let Some(c) = by_fqcn.get(visit) {
+                    acc = acc || c.needs_db;
+                    match c.parent_fqcn.as_deref() {
+                        Some(p) => visit = p,
+                        None => break,
+                    }
+                } else {
+                    break;
+                }
+                d += 1;
+            }
+            acc
+        };
         let mut visit = class.fqcn.as_str();
         let mut depth = 0;
         while depth < 32 {
@@ -1534,7 +1555,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             fingerprint: mi.fingerprint.clone(),
                             is_stateful: chain_is_stateful,
                             is_isolated: chain_is_isolated,
-                            needs_db: class.needs_db,
+                            needs_db: chain_needs_db,
                         });
                     }
                 }
@@ -1986,6 +2007,31 @@ mod tests {
         let b = grouped.iter().find(|g| g.class == "B").unwrap();
         assert!(a.needs_db, "any DB-needing method makes the class DB-needing");
         assert!(!b.needs_db, "a class with no DB method stays needs_db=false");
+    }
+
+    #[test]
+    fn needs_db_propagates_down_inheritance_chain() {
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+
+abstract class DbBaseTest extends TestCase {
+    use RefreshDatabase;
+}
+
+class ConcreteDbTest extends DbBaseTest {
+    public function testOne(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1, "abstract base emits nothing; concrete subclass emits one");
+        assert_eq!(cases[0].class, "App\\ConcreteDbTest");
+        assert!(
+            cases[0].needs_db,
+            "needs_db must OR-fold up the inheritance chain like is_stateful"
+        );
     }
 
     #[test]
