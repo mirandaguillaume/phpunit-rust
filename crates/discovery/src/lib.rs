@@ -244,8 +244,21 @@ fn has_syntax_errors(tree: &tree_sitter::Tree) -> bool {
 /// "Resolved parent FQCN" applies the file's namespace + use-alias context so
 /// the BFS in pass 3 can compare on FQCN strings alone.
 fn parse_file_classes(path: &Path) -> Result<Vec<ParsedClass>> {
-    let src =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    // PHP source is byte-oriented: a file with a stray non-UTF-8 byte (latin-1
+    // text, a binary blob in a heredoc) must still have its tests discovered,
+    // not be silently dropped by callers' `unwrap_or_default()`. Read bytes and
+    // decode lossily — only paying the copy (and warning) on the rare bad file.
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let src = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "phpunit-rust: warning: {} contains non-UTF-8 bytes \u{2014} decoding lossily; some characters may be replaced",
+                path.display()
+            );
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        }
+    };
 
     let mut parser = Parser::new();
     parser
@@ -2667,6 +2680,26 @@ class TautologyTest extends TestCase {
         assert!(
             !has_syntax_errors(&tree_ok),
             "helper must report valid input as clean"
+        );
+    }
+
+    /// M10: a PHP file with a non-UTF-8 byte (latin-1 text, a binary heredoc)
+    /// must still be parsed lossily and its tests discovered — `read_to_string`
+    /// would error on it and the caller's `unwrap_or_default()` would silently
+    /// drop every test in the file (a test-count parity violation).
+    #[test]
+    fn discovers_tests_in_non_utf8_php() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LatinTest.php");
+        // 0xE9 is latin-1 'é' — invalid UTF-8, which `read_to_string` rejects.
+        let content: &[u8] = b"<?php\nclass LatinTest extends TestCase {\n    // caf\xe9 latin-1\n    public function testBar(): void {}\n}\n";
+        std::fs::write(&path, content).unwrap();
+        let classes =
+            parse_file_classes(&path).expect("non-UTF-8 PHP must parse lossily, not error out");
+        assert!(
+            classes.iter().any(|c| c.fqcn == "LatinTest"),
+            "LatinTest must be discovered despite the non-UTF-8 byte; got {:?}",
+            classes.iter().map(|c| &c.fqcn).collect::<Vec<_>>()
         );
     }
 }
