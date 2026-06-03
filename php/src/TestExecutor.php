@@ -553,6 +553,46 @@ final class TestExecutor
     }
 
     /**
+     * Resolve a single, per-process PDO handle for per-test transaction
+     * isolation (P2), or null when no per-slot DSN was injected.
+     *
+     * The DSN comes from PHPUNIT_RUST_DB_DSN (the per-slot env var set by the
+     * fork-worker master). We memoize the handle per worker process: opening a
+     * new PDO per test would cost latency AND, for sqlite::memory:, create a
+     * fresh empty DB each time — breaking cross-test visibility. The $present
+     * sentinel makes the absent-DSN case a single static read after the first
+     * call, so a non-DB run pays one getenv + one bool read and no PDO work.
+     */
+    private static function dbHandle(): ?\PDO
+    {
+        static $present = null; // null=unknown, false=no DSN, true=have PDO
+        static $pdo = null;
+
+        if ($present === false) {
+            return null;
+        }
+        if ($pdo !== null) {
+            return $pdo;
+        }
+
+        $dsn = getenv('PHPUNIT_RUST_DB_DSN');
+        if ($dsn === false || $dsn === '') {
+            $present = false;
+            return null;
+        }
+
+        try {
+            $pdo = new \PDO($dsn, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            $present = true;
+        } catch (\Throwable) {
+            $present = false;
+            $pdo = null;
+        }
+
+        return $pdo;
+    }
+
+    /**
      * Read one of TestCase's private "expected*" properties via reflection.
      * Returns null if the property doesn't exist (PHPUnit version drift) or
      * is unset on this instance.
