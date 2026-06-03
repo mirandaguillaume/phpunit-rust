@@ -812,6 +812,16 @@ const STATEFUL_GLOBAL_APIS: &[&str] = &[
 /// `if (false)`. The runner pays for any positive match by forking a
 /// fresh worker per batch; the cost is much smaller than running a
 /// polluting suite with K=20 recycling and silently losing tests.
+///
+/// # Known blind spots
+///
+/// It scans the class's OWN method bodies (and, via the chain walk, its
+/// ancestors'). It does **not** see state mutated through a `use`d trait
+/// method, a called free function/helper, a static-property accumulator, or a
+/// DI-container / global registry. A class that pollutes global state only
+/// through one of those is not flagged `is_stateful`, so it can still leak
+/// across a recycled worker — force isolation explicitly when that bites
+/// (`PHPUNIT_RUST_NO_ISOLATION`, or run such a suite with `--workers 1`).
 fn class_has_stateful_calls(class_body: Node, bytes: &[u8]) -> bool {
     let mut cursor = class_body.walk();
     for member in class_body.children(&mut cursor) {

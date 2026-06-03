@@ -25,6 +25,7 @@ pub struct StopOn {
 impl StopOn {
     /// `--stop-on-failure` PHPUnit semantics: stop on Fail OR Error
     /// (both are "real" defects).
+    #[must_use]
     pub fn on_failure() -> Self {
         Self {
             failure: true,
@@ -33,6 +34,7 @@ impl StopOn {
         }
     }
     /// `--stop-on-defect` PHPUnit semantics: stop on anything not-pass.
+    #[must_use]
     pub fn on_defect() -> Self {
         Self {
             failure: true,
@@ -116,9 +118,11 @@ pub struct Report {
 }
 
 impl Report {
+    #[must_use]
     pub fn count(&self, status: TestStatus) -> usize {
         self.outcomes.iter().filter(|o| o.status == status).count()
     }
+    #[must_use]
     pub fn passed(&self) -> usize {
         self.count(TestStatus::Pass)
     }
@@ -138,6 +142,7 @@ impl Report {
         self.count(TestStatus::Risky)
     }
 
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.failed() == 0 && self.errored() == 0
     }
