@@ -193,6 +193,18 @@ pub fn run(
     run_with_profiler(pool, cases, cfg, row_counts, on_progress, &profiler)
 }
 
+/// The PHPUnit-compatible `--filter` substring predicate, factored out so the
+/// pre-spawn selection in `main.rs` and the in-loop application in
+/// `run_with_profiler` use ONE definition. Returns `true` when `filter` is
+/// `None`, or when the `Class::method` identifier contains the substring.
+/// This must stay the only place the predicate is defined.
+pub fn matches_filter(class: &str, method: &str, filter: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some(f) => format!("{}::{}", class, method).contains(f),
+    }
+}
+
 /// Same as [`run`] but accepts a [`Profiler`] so the caller can record
 /// per-batch wall time and the build-queue / dispatch / drain breakdown.
 /// When `profiler.enabled() == false`, every span call is a noop branch.
@@ -206,10 +218,7 @@ pub fn run_with_profiler(
 ) -> Result<Report> {
     let filtered: Vec<TestCase> = cases
         .into_iter()
-        .filter(|c| match &cfg.filter {
-            Some(f) => format!("{}::{}", c.class, c.method).contains(f.as_str()),
-            None => true,
-        })
+        .filter(|c| matches_filter(&c.class, &c.method, cfg.filter.as_deref()))
         .collect();
 
     let n = pool.len();
@@ -1526,5 +1535,19 @@ mod tests {
             .collect();
         sm.sort_unstable();
         assert_eq!(sm, vec!["testD", "testE"]);
+    }
+}
+
+#[cfg(test)]
+mod filter_lift_tests {
+    use super::*;
+
+    #[test]
+    fn matches_filter_is_substring_on_class_colon_method() {
+        assert!(matches_filter("App\\CalcTest", "testAdd", None));
+        assert!(matches_filter("App\\CalcTest", "testAdd", Some("Calc")));
+        assert!(matches_filter("App\\CalcTest", "testAdd", Some("testAdd")));
+        assert!(matches_filter("App\\CalcTest", "testAdd", Some("CalcTest::testAdd")));
+        assert!(!matches_filter("App\\CalcTest", "testAdd", Some("Nope")));
     }
 }
