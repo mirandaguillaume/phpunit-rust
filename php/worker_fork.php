@@ -352,6 +352,15 @@ $forkChildForSlot = static function (int $slot) use (
         pcntl_signal(SIGTERM, SIG_DFL);
         pcntl_signal(SIGINT,  SIG_DFL);
         pcntl_signal(SIGHUP,  SIG_DFL);
+        // Worker token: stable per-slot identity for resource leases
+        // (per-slot DB clone, Paratest-style TEST_TOKEN parity). Set on
+        // the child only; re-applied automatically on SIGCHLD respawn and
+        // K-batch/force_exit recycle because both re-enter this closure
+        // with the same $slot. Mirror the existing <env> convention
+        // (putenv + $_ENV + $_SERVER) so getenv()/$_ENV/$_SERVER all see it.
+        putenv("PHPUNIT_RUST_WORKER_ID={$slot}");
+        $_ENV['PHPUNIT_RUST_WORKER_ID']    = (string) $slot;
+        $_SERVER['PHPUNIT_RUST_WORKER_ID'] = (string) $slot;
         for ($j = 0; $j < $n; $j++) {
             if ($j !== $slot) {
                 @fclose($childStdinStreams[$j]);
