@@ -49,8 +49,26 @@ else
 fi
 
 # Per-project extras: some projects need explicit phpunit args.
+#
+# phpunit-itself: restrict vanilla to the `unit` testsuite. PHPUnit's own suite
+# splits into `unit` (regular *Test.php classes) and `end-to-end` (1000+ `.phpt`
+# files). phpunit-rust discovers tests by reflecting *Test.php CLASSES, so it
+# cannot run the file-based `.phpt` format at all — comparing against vanilla's
+# full run (unit + .phpt) would be apples-to-oranges. `--testsuite unit` makes
+# the comparison like-for-like. The `.phpt` gap is documented in COMPATIBILITY.md
+# ("Not yet supported") and tracked as a close-the-gaps follow-up.
 declare -A EXTRA_VANILLA=(
     [mockery]="--no-configuration --bootstrap tests/Bootstrap.php tests/"
+    [phpunit-itself]="--testsuite unit"
+)
+
+# Per-project vanilla phpunit executable, relative to the suite dir. Defaults to
+# vendor/bin/phpunit. PHPUnit's OWN repo ships its binary as ./phpunit
+# (composer.json "bin": ["phpunit"]) and does not depend on phpunit/phpunit, so
+# vendor/bin/phpunit never exists there — using it errors out in ~40 ms and
+# silently yields a "?" test count.
+declare -A VANILLA_BIN=(
+    [phpunit-itself]="phpunit"
 )
 
 ms_now() { date +%s%3N; }
@@ -104,13 +122,10 @@ for name in "${PROJECTS[@]}"; do
     # vanilla PHPUnit
     if [ "$SKIP_VANILLA" != "1" ]; then
         extra="${EXTRA_VANILLA[$name]:-}"
+        phpunit_bin="${VANILLA_BIN[$name]:-vendor/bin/phpunit}"
         read median_ms tests < <(
             cd "$path" && \
-            if [ -n "$extra" ]; then
-                bench_runs php vendor/bin/phpunit $extra
-            else
-                bench_runs php vendor/bin/phpunit
-            fi
+            bench_runs php "$phpunit_bin" $extra
         )
         printf "| %-22s | %-15s | %7s | %6s | %7s ms |\n" \
             "$name" "vanilla-phpunit" "1" "$tests" "$median_ms"
