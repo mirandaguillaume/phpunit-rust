@@ -198,6 +198,11 @@ pub fn run(
 /// `run_with_profiler` use ONE definition. Returns `true` when `filter` is
 /// `None`, or when the `Class::method` identifier contains the substring.
 /// This must stay the only place the predicate is defined.
+///
+/// Note: for all main-driven runs the filter is applied once in `main.rs` and
+/// `RunConfig.filter` is always `None`, so the post-spawn application in
+/// `run_with_profiler` is a no-op there; it is retained only as a safety net
+/// for library callers that build `RunConfig` directly with a `Some(filter)`.
 pub fn matches_filter(class: &str, method: &str, filter: Option<&str>) -> bool {
     match filter {
         None => true,

@@ -757,21 +757,18 @@ fn real_main() -> Result<ExitCode> {
     // actually contains needs_db cases. When false this is a zero-cost no-op
     // and the hot path is byte-identical to a pre-P1 run.
     let needs_db = selected_needs_db(&cases);
-    if needs_db {
-        eprintln!("DB gate: {} selected test(s) need a database.", cases.iter().filter(|c| c.needs_db).count());
-    }
 
     // DB preflight: fail-fast (or skip) when needs_db tests are selected but
     // no database is configured. "configured" = --provision-db set OR
     // PHPUNIT_RUST_DB_DSN present. The gate is zero-cost when needs_db = false.
     let db_configured = cli.provision_db.is_some()
         || std::env::var_os("PHPUNIT_RUST_DB_DSN").is_some();
+    let db_case_count = cases.iter().filter(|c| c.needs_db).count();
     let mut synthetic_db_skips: Vec<TestOutcome> = Vec::new();
     match db_preflight(needs_db, db_configured, cli.skip_db) {
         DbPreflight::Proceed => {}
         DbPreflight::SkipDbTests => {
-            let n = cases.iter().filter(|c| c.needs_db).count();
-            eprintln!("note: skipping {n} test(s) that require a database (--skip-db)");
+            eprintln!("note: skipping {db_case_count} test(s) that require a database (--skip-db)");
             for c in cases.iter().filter(|c| c.needs_db) {
                 let o = TestOutcome {
                     class: c.class.clone(),
@@ -788,9 +785,8 @@ fn real_main() -> Result<ExitCode> {
             cases.retain(|c| !c.needs_db);
         }
         DbPreflight::Abort => {
-            let n = cases.iter().filter(|c| c.needs_db).count();
             eprintln!(
-                "error: {n} selected test(s) require a database (needs_db) but no database is configured.\n  \
+                "error: {db_case_count} selected test(s) require a database but none is configured.\n  \
                  pass --provision-db <DSN_BASE> to provision per-worker databases, or --skip-db to skip them."
             );
             std::process::exit(2);
