@@ -103,6 +103,9 @@ struct ParsedClass {
     /// marker (class-level docblock, attribute, or any method-level
     /// equivalent). See [`TestCase::is_isolated`].
     is_isolated: bool,
+    /// True when the class (or its trait/inheritance chain) requires a
+    /// database clone. OR-folded down the chain in [`emit_test_cases`].
+    needs_db: bool,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -181,6 +184,10 @@ pub struct TestClass {
     /// to clear `runTestInSeparateProcess` on the test instance so PHPUnit
     /// does not spawn a nested sub-process inside our already-forked worker.
     pub is_isolated: bool,
+    /// True when the class (or any ancestor) requires a provisioned database.
+    /// OR-folded from all per-method `TestCase::needs_db` values during
+    /// grouping. Disjoint from `is_stateful`/`is_isolated`.
+    pub needs_db: bool,
 }
 
 /// Group a flat list of TestCases by class. Preserves discovery order
@@ -198,6 +205,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
         let has_lifecycle_overrides = case.has_lifecycle_overrides;
         let is_stateful = case.is_stateful;
         let is_isolated = case.is_isolated;
+        let needs_db = case.needs_db;
         let gm = GroupedMethod {
             name: case.method,
             data_provider: case.data_provider,
@@ -219,6 +227,8 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
             // Likewise for isolation: a single method-level
             // @runInSeparateProcess promotes the whole class.
             existing.is_isolated = existing.is_isolated || is_isolated;
+            // OR-fold: any DB-needing method makes the whole class DB-needing.
+            existing.needs_db = existing.needs_db || needs_db;
         } else {
             groups.push(TestClass {
                 file: case.file,
@@ -227,6 +237,7 @@ pub fn group_by_class(cases: Vec<TestCase>) -> Vec<TestClass> {
                 has_lifecycle_overrides,
                 is_stateful,
                 is_isolated,
+                needs_db,
             });
         }
     }
@@ -493,6 +504,7 @@ fn collect_parsed_classes(
             has_lifecycle_overrides,
             is_stateful,
             is_isolated,
+            needs_db: false,
         });
     }
     Ok(())
@@ -1866,6 +1878,36 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn group_by_class_or_folds_needs_db_across_methods() {
+        let mk = |class: &str, method: &str, needs_db: bool| TestCase {
+            file: PathBuf::from("/p/A.php"),
+            class: class.into(),
+            method: method.into(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
+            has_lifecycle_overrides: false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
+            needs_db,
+        };
+        let cases = vec![
+            mk("A", "testOne", false),
+            mk("A", "testTwo", true),
+            mk("B", "testThree", false),
+        ];
+        let grouped = group_by_class(cases);
+        let a = grouped.iter().find(|g| g.class == "A").unwrap();
+        let b = grouped.iter().find(|g| g.class == "B").unwrap();
+        assert!(a.needs_db, "any DB-needing method makes the class DB-needing");
+        assert!(!b.needs_db, "a class with no DB method stays needs_db=false");
     }
 
     #[test]
