@@ -39,6 +39,11 @@ jobs:
         with:
           php-version: "8.1"
 
+      # The fork-pool integration tests drive the bundled sample fixture, whose
+      # vendor/ is gitignored — install it so PHPUnit's TestCase autoloads.
+      - name: Install fixture dependencies (composer)
+        run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
+
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
@@ -74,6 +79,9 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.1"
+
+      - name: Install fixture dependencies (composer)
+        run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
 
       - name: Build phpunit-rust binary
         run: cargo build -p phpunit-rust
