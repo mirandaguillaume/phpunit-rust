@@ -597,35 +597,46 @@ final class TestExecutor
      * The DSN comes from PHPUNIT_RUST_DB_DSN (the per-slot env var set by the
      * fork-worker master). We memoize the handle per worker process: opening a
      * new PDO per test would cost latency AND, for sqlite::memory:, create a
-     * fresh empty DB each time — breaking cross-test visibility. The $present
-     * sentinel makes the absent-DSN case a single static read after the first
-     * call, so a non-DB run pays one getenv + one bool read and no PDO work.
+     * fresh empty DB each time — breaking cross-test visibility. Memoization
+     * keys on $dsnAtConnect: the fast path returns the cached handle when
+     * $pdo !== null && $dsnAtConnect === $dsn, otherwise we (re)connect. In
+     * production a worker's DSN never changes, so the first call connects and
+     * every later call hits the fast path; a non-DB run pays one getenv only.
+     *
+     * A DSN that is set but unusable is NOT swallowed: the PDO constructor's
+     * exception propagates so the per-test try/catch records that test as an
+     * Error with the real connection message, rather than silently running it
+     * unisolated and reporting green.
      */
     private static function dbHandle(): ?\PDO
     {
         static $pdo = null;
         static $dsnAtConnect = null; // DSN we connected with, for memoization
 
-        // Fast path: we already have a handle for the current DSN.
-        // In production a worker's DSN never changes, so this always hits
-        // after the first call. One getenv per test is negligible.
+        // Inert path: no DSN injected. Drop any stale handle so that if the
+        // DSN is later set again — even to the same string, as the test
+        // harness does in setUp/tearDown — we open a FRESH connection instead
+        // of returning a handle to an unlinked-and-recreated sqlite inode.
+        // Production never re-injects a DSN, so this only removes a test flake.
         $dsn = getenv('PHPUNIT_RUST_DB_DSN');
         if ($dsn === false || $dsn === '') {
+            $pdo = null;
+            $dsnAtConnect = null;
             return null;
         }
 
-        // Re-use the existing connection if the DSN hasn't changed.
+        // Fast path: reuse the existing connection if the DSN hasn't changed.
+        // In production a worker's DSN never changes, so this always hits
+        // after the first call. One getenv per test is negligible.
         if ($pdo !== null && $dsnAtConnect === $dsn) {
             return $pdo;
         }
 
-        try {
-            $pdo = new \PDO($dsn, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
-            $dsnAtConnect = $dsn;
-        } catch (\Throwable) {
-            $pdo = null;
-            $dsnAtConnect = null;
-        }
+        // A DSN IS set: connect. Do NOT swallow a connection failure — let it
+        // propagate so the per-test try/catch records a loud, diagnosable
+        // Error rather than silently running the test without isolation.
+        $pdo = new \PDO($dsn, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $dsnAtConnect = $dsn;
 
         return $pdo;
     }
