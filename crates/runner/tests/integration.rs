@@ -188,6 +188,7 @@ fn worker_timeout_aborts_stuck_run() {
         fingerprint: std::collections::HashSet::new(),
         is_stateful: false,
         is_isolated: false,
+        needs_db: false,
     };
 
     let autoload_t = autoload.clone();
@@ -292,6 +293,7 @@ fn worker_crash_is_recovered_as_error() {
         fingerprint: std::collections::HashSet::new(),
         is_stateful: false,
         is_isolated: false,
+        needs_db: false,
     };
 
     let autoload_t = autoload.clone();

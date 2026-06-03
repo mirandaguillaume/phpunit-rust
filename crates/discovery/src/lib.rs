@@ -61,6 +61,12 @@ pub struct TestCase {
     /// invoking the test — preventing PHPUnit from `proc_open`-ing a nested
     /// sub-process inside the worker. See [`TestClass::is_isolated`].
     pub is_isolated: bool,
+    /// True when the test class (or any ancestor) requires a provisioned
+    /// database. Detected via `#[UsesDatabase]`, the `RefreshDatabase` /
+    /// `DatabaseTransactions` marker traits, or a conservative static
+    /// reference to PDO / Doctrine types. Disjoint from `is_stateful` /
+    /// `is_isolated` — never contributes to `must_force_exit`.
+    pub needs_db: bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -1438,6 +1444,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             fingerprint: mi.fingerprint.clone(),
                             is_stateful: chain_is_stateful,
                             is_isolated: chain_is_isolated,
+                            needs_db: false,
                         });
                     }
                 }
@@ -1862,6 +1869,24 @@ mod tests {
     }
 
     #[test]
+    fn discovered_plain_test_does_not_need_db() {
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+class PlainTest extends TestCase {
+    public function testOk(): void { $this->assertTrue(true); }
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        assert_eq!(cases.len(), 1, "one test method");
+        assert!(
+            cases.iter().all(|c| !c.needs_db),
+            "plain tests must not need a DB by default"
+        );
+    }
+
+    #[test]
     fn discovers_a_namespaced_test_class() {
         let src = r#"<?php
 namespace App\Tests;
@@ -2259,6 +2284,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/p/A.php"),
@@ -2274,6 +2300,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/p/B.php"),
@@ -2289,6 +2316,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
         ];
         let grouped = group_by_class(cases);
@@ -2323,6 +2351,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),
@@ -2338,6 +2367,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
             TestCase {
                 file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),
@@ -2353,6 +2383,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 fingerprint: std::collections::HashSet::new(),
                 is_stateful: false,
                 is_isolated: false,
+                needs_db: false,
             },
         ];
         let grouped = group_by_class(cases);
