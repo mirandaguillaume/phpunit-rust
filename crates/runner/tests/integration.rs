@@ -252,3 +252,110 @@ fn worker_timeout_aborts_stuck_run() {
         stuck.message
     );
 }
+
+/// M7: when a worker process dies mid-batch (crash, fatal error, OOM) the
+/// master reports `slot_died`, and `run` must synthesise an Error outcome for
+/// every test in the lost batch rather than silently dropping it. Exercises the
+/// parity-preserving SlotDied recovery path in the dispatcher.
+#[test]
+fn worker_crash_is_recovered_as_error() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
+    let autoload = project.join("vendor/autoload.php");
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+
+    // A test that hard-kills its own worker process mid-run.
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_crash_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let test_file = dir.join("CrashTest.php");
+    std::fs::write(
+        &test_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass CrashTest extends TestCase {\n    public function testCrash(): void { posix_kill(posix_getpid(), SIGKILL); }\n}\n",
+    ).unwrap();
+
+    let case = TestCase {
+        file: test_file.clone(),
+        class: "CrashTest".to_string(),
+        method: "testCrash".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+    };
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        let mut pool = PhpForkPool::spawn(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            0,
+        )
+        .expect("PhpForkPool::spawn failed");
+        // No watchdog: this must be recovered via the `slot_died` path, not the
+        // inactivity timeout.
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, vec![case], &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    // Deadline guard: if SlotDied recovery fails, the dispatcher would hang
+    // waiting for outcomes that never arrive — fail the test instead.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "run did not return within 25s — SlotDied recovery failed to surface the crash"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let report = handle
+        .join()
+        .expect("run thread panicked")
+        .expect("run returned Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let crashed = report
+        .outcomes
+        .iter()
+        .find(|o| o.class == "CrashTest" && o.status == TestStatus::Error)
+        .unwrap_or_else(|| {
+            panic!(
+                "crashed CrashTest must be reported as an Error; got: {:?}",
+                report.outcomes
+            )
+        });
+    assert!(
+        crashed.message.as_deref().unwrap_or("").contains("worker"),
+        "the synthesised error should mention the worker failure; got: {:?}",
+        crashed.message
+    );
+}
