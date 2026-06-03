@@ -1437,6 +1437,28 @@ mod tests {
         );
     }
 
+    fn make_db_case(class: &str, method: &str) -> TestCase {
+        let mut c = make_case(class, method);
+        c.needs_db = true;
+        c
+    }
+
+    #[test]
+    fn needs_db_class_stays_dispatch_safe_not_force_exit() {
+        // A pure DB-needing class (not stateful, not isolated) must remain a
+        // warm-child dispatch-safe batch. This pins the runner.rs disjointness
+        // guarantee: needs_db is NOT folded into must_force_exit.
+        let cases = vec![make_db_case("DbTest", "testOne"), make_db_case("DbTest", "testTwo")];
+        let grouped = group_by_class(cases);
+        let g = grouped.iter().find(|g| g.class == "DbTest").unwrap();
+        assert!(g.needs_db, "grouping carries the DB flag");
+        let must_force_exit = g.is_stateful || g.is_isolated;
+        assert!(
+            !must_force_exit,
+            "needs_db must NOT force a fresh fork (disjointness invariant)"
+        );
+    }
+
     fn make_depends_case(class: &str, method: &str, deps: Vec<&str>) -> TestCase {
         let depends_on: Vec<String> = deps.iter().map(|s| s.to_string()).collect();
         let safe = depends_on.is_empty();
