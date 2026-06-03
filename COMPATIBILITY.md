@@ -105,6 +105,15 @@ attribution; no Xdebug / PCOV needed).
 
 ### Not yet supported (deferred)
 
+- **`.phpt` tests.** PHPUnit's file-based test format (a mini-INI with
+  `--TEST--` / `--FILE--` / `--EXPECT--` sections) is not a PHP class, and
+  phpunit-rust discovers tests by reflecting `*Test.php` **classes** — so
+  `.phpt` files are invisible to it by construction. This is a structural gap,
+  not a bug: supporting it means teaching the runner a second execution model.
+  It mainly affects PHPUnit's own suite (`sebastianbergmann/phpunit`), whose
+  `end-to-end` testsuite is ~1000 `.phpt` files. For that reason the benchmark
+  harness runs vanilla phpunit-itself with `--testsuite unit` (the `.phpt`-free
+  suite) so the comparison is like-for-like; see `bench/bench_host.sh`.
 - Generic `<listeners>` dispatch (we parse the entries but don't execute
   user listener code — affects projects using Symfony's PhpUnitTestsListener
   for `@group legacy` handling)

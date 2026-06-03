@@ -44,8 +44,19 @@ jobs:
           extensions: gmp, pdo_sqlite, pcntl
           tools: composer
 
+      # CRITICAL: php/worker_fork.php require_once's php/vendor/autoload.php at
+      # every worker startup; php/vendor is gitignored, so without this install
+      # every fork-pool worker fatals at boot and the bench silently records
+      # FRACTIONAL rust test counts (a crash that masquerades as a fast run).
+      # Mirrors the same step in ci.yml. --no-dev: the shim autoloader only.
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+
+      - name: Verify worker shim autoloader is present
+        run: test -f php/vendor/autoload.php || { echo 'php/vendor/autoload.php missing — workers would fatal and drop outcomes'; exit 1; }
+
       - name: Make bench scripts executable
-        run: chmod +x bench/bench_host.sh bench/run_oss_bench.sh bench/update_benchmarks_table.sh
+        run: chmod +x bench/bench_host.sh bench/run_oss_bench.sh bench/update_benchmarks_table.sh bench/check_parity.sh
 
       - name: Run OSS benchmark
         env:
@@ -61,6 +72,15 @@ jobs:
           echo "## OSS Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           cat /tmp/bench-table.md >> "$GITHUB_STEP_SUMMARY" || echo "(no table generated)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Strict parity gate: refuse to publish unless EVERY suite ran the same
+      # number of tests under vanilla PHPUnit and phpunit-rust. A divergence
+      # means the run is not a like-for-like comparison (e.g. crashed workers,
+      # or an unclosed parity gap), so the splice + auto-PR below are skipped and
+      # the job goes RED. The table is already in the job summary above (which is
+      # `if: always()`) so the bad numbers remain visible for diagnosis.
+      - name: Parity gate (counts must match vanilla)
+        run: bench/check_parity.sh /tmp/bench-table.md
 
       - name: Splice table into BENCHMARKS.md
         run: bench/update_benchmarks_table.sh /tmp/bench-table.md
