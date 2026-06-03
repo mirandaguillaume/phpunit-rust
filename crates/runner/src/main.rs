@@ -127,6 +127,13 @@ fn git_changed_files(project: &std::path::Path) -> std::collections::HashSet<Pat
     rel.into_iter().map(|r| root.join(r)).collect()
 }
 
+/// Returns `true` iff at least one of the FINAL selected test cases (after all
+/// filters including `--filter`, `--group`, and `--dirty`) has `needs_db = true`.
+/// When `false` the gate is a zero-cost no-op; no provisioning logic runs.
+fn selected_needs_db(cases: &[phpunit_rust::types::TestCase]) -> bool {
+    cases.iter().any(|c| c.needs_db)
+}
+
 #[cfg(test)]
 mod dirty_tests {
     use super::*;
@@ -713,6 +720,14 @@ fn real_main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Demand gate: only perform DB-related work when the FINAL selected set
+    // actually contains needs_db cases. When false this is a zero-cost no-op
+    // and the hot path is byte-identical to a pre-P1 run.
+    let needs_db = selected_needs_db(&cases);
+    if needs_db {
+        eprintln!("DB gate: {} selected test(s) need a database.", cases.iter().filter(|c| c.needs_db).count());
+    }
+
     // Verify a usable PHP is on PATH. We require ≥ 8.1; some projects need
     // newer (brick/math: 8.2; doctrine/collections: 8.4). The user is on
     // the hook for installing a sufficiently-new PHP.
@@ -865,5 +880,57 @@ fn real_main() -> Result<ExitCode> {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(1))
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use phpunit_rust::types::TestCase;
+    use std::path::PathBuf;
+
+    fn case(class: &str, method: &str, needs_db: bool) -> TestCase {
+        TestCase {
+            file: PathBuf::from("/p/T.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: None,
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
+            has_lifecycle_overrides: false,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: false,
+            needs_db,
+        }
+    }
+
+    #[test]
+    fn gate_is_noop_when_nothing_needs_db() {
+        let cases = vec![case("A", "t1", false), case("B", "t2", false)];
+        assert!(!selected_needs_db(&cases), "no-DB suite must NOT trip the gate");
+    }
+
+    #[test]
+    fn gate_trips_when_any_selected_case_needs_db() {
+        let cases = vec![case("A", "t1", false), case("B", "t2", true)];
+        assert!(selected_needs_db(&cases));
+    }
+
+    #[test]
+    fn filter_lift_does_not_change_selected_set_or_gate() {
+        // Simulate: two cases, one matches the filter, one doesn't.
+        // After retain, only the matching case remains. Gate checks THAT set.
+        let filter = "DbTest";
+        let mut cases = vec![
+            case("DbTest", "testSave", true),
+            case("OtherTest", "testFoo", false),
+        ];
+        cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(filter)));
+        assert_eq!(cases.len(), 1);
+        assert!(selected_needs_db(&cases), "filtered set still needs DB");
     }
 }
