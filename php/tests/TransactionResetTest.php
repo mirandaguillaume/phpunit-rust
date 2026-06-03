@@ -13,15 +13,23 @@ use PHPUnit\Framework\TestCase;
  * asserts the table is empty. With the P2 begin/rollback wrapper, testB sees a
  * clean table — proving per-test isolation despite the runBare bypass.
  *
- * Uses a file-backed sqlite DSN (not :memory:) so the fixture's own PDO handle
- * and the handle TestExecutor opens via dbHandle() see the SAME database.
+ * The fixture obtains its connection from TestExecutor::connection() — the
+ * exact handle the runner wraps in begin/rollback — so testA's INSERT lives
+ * inside the runner's transaction and is rolled back before testB runs.
  */
 final class _TxFixture extends TestCase
 {
     private static function pdo(): \PDO
     {
-        $dsn = (string) getenv('PHPUNIT_RUST_DB_DSN');
-        return new \PDO($dsn, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        // Use the SAME connection the runner wraps in begin/rollback. A local
+        // `new \PDO(...)` would be a separate connection that autocommits
+        // independently, so the runner's rollback would isolate nothing.
+        $pdo = \PhpunitRust\TestExecutor::connection();
+        \PHPUnit\Framework\Assert::assertNotNull(
+            $pdo,
+            'TestExecutor::connection() returned null; PHPUNIT_RUST_DB_DSN must be set for this fixture'
+        );
+        return $pdo;
     }
 
     public static function setUpBeforeClass(): void

@@ -578,6 +578,19 @@ final class TestExecutor
     }
 
     /**
+     * The runner-managed PDO connection used for per-test transaction isolation.
+     * Tests and application code MUST obtain their DB connection from here (or be
+     * configured to route through it) for the begin/rollback reset to isolate their
+     * writes. Code that opens its OWN connection is NOT isolated by the runner and
+     * must be marked stateful (#[UsesDatabase] does not make ad-hoc connections
+     * isolated). Returns null when PHPUNIT_RUST_DB_DSN is unset (inert).
+     */
+    public static function connection(): ?\PDO
+    {
+        return self::dbHandle();
+    }
+
+    /**
      * Resolve a single, per-process PDO handle for per-test transaction
      * isolation (P2), or null when no per-slot DSN was injected.
      *
