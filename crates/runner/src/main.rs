@@ -835,6 +835,57 @@ fn real_main() -> Result<ExitCode> {
         },
     )?;
 
+    // Task 8: demand-gated lease build. Declared here so `_lease_guard` is in
+    // scope BEFORE `pool` — Rust drops in reverse declaration order, so the
+    // guard (and its destroy_all) runs AFTER the pool is dropped.
+    let mut per_slot_dsn_opt: Option<Vec<String>> = None;
+    let _lease_guard = if let Some(base) = &cli.provision_db {
+        if needs_db {
+            let provision_script = phpunit_rust::php_worker::find_provision_script()?;
+            let run_uuid = format!("pr{}", std::process::id());
+            let template = phpunit_rust::resource_lease::build_template(
+                &provision_script,
+                &autoload,
+                bootstrap.as_deref(),
+                &defines,
+                base,
+            )?;
+            let mut lease = phpunit_rust::resource_lease::ResourceLease::new(
+                provision_script.clone(),
+                autoload.clone(),
+                bootstrap.clone(),
+                defines.clone(),
+                base.clone(),
+            );
+            let mut per_slot_dsn: Vec<String> = Vec::with_capacity(worker_count);
+            for slot in 0..worker_count {
+                let dsn = phpunit_rust::resource_lease::clone_for_slot(
+                    &provision_script,
+                    &autoload,
+                    bootstrap.as_deref(),
+                    &defines,
+                    slot,
+                    &run_uuid,
+                    &template,
+                    base,
+                )?;
+                lease.register(phpunit_rust::resource_lease::clone_name(base, &run_uuid, slot));
+                per_slot_dsn.push(dsn);
+            }
+            eprintln!(
+                "Resource provisioning: built template '{template}' and {} per-slot clone(s).",
+                per_slot_dsn.len()
+            );
+            per_slot_dsn_opt = Some(per_slot_dsn);
+            Some(phpunit_rust::resource_lease::LeaseGuard::new(lease))
+        } else {
+            eprintln!("--provision-db: no selected test needs a DB; skipping provisioning (zero cost).");
+            None
+        }
+    } else {
+        None
+    };
+
     eprintln!(
         "Spawning {} PHP worker{}...",
         worker_count,
@@ -859,6 +910,7 @@ fn real_main() -> Result<ExitCode> {
                 &class_file_index,
                 &cli.worker_memory_limit,
                 cli.worker_max_batches,
+                per_slot_dsn_opt.as_deref(),
             )
         },
     )?;
