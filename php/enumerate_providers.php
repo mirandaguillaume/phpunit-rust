@@ -136,14 +136,24 @@ function enumerateRows(string $class, string $method): ?int
 
         $rows = $reflMethod->invoke(null);
         if (is_array($rows)) {
-            return count($rows);
-        }
-        if ($rows instanceof \Traversable) {
+            $count = count($rows);
+        } elseif ($rows instanceof \Traversable) {
             // Generators / iterators: materialize without preserving keys,
             // we only need the count.
-            return iterator_count($rows);
+            $count = iterator_count($rows);
+        } else {
+            $count = null;
         }
-        return null;
+        // Tear the provider's returned objects down HERE, inside the try, so an
+        // object with a throwing __destruct (e.g. php-parser's
+        // NodeVisitorForTesting, which asserts in __destruct that its scripted
+        // events were consumed — they never are during enumeration) is CAUGHT
+        // below and degrades only THIS provider to null. Left to the frame/script
+        // teardown the throw would be an uncatchable fatal (exit 255), and the
+        // Rust side would then discard the row counts of EVERY provider in the
+        // batch — disabling row-splitting for the whole suite.
+        unset($rows);
+        return $count;
     } catch (\Throwable) {
         return null;
     }

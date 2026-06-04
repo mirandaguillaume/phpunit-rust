@@ -75,6 +75,31 @@ final class _MpThrowingProvider extends TestCase
     public function testWithThrowingArg(object $o): void {}
 }
 
+class _MpPrivateStateObject
+{
+    // Public state is identical across instances; the distinguishing value is
+    // PRIVATE, so json_encode() (which only sees public properties) renders
+    // every instance the same. Mirrors php-parser's NodeVisitorForTesting,
+    // whose scripted returns live in a private property.
+    public array $trace = [];
+    public function __construct(private string $secret) {}
+}
+
+final class _MpObjectDedupProvider extends TestCase
+{
+    public static function rows(): array
+    {
+        // Two DISTINCT objects + an identical scalar tail. Under json_encode
+        // both rows render identically, so a naive content hash collides.
+        return [
+            [new _MpPrivateStateObject('first'), 'same'],
+            [new _MpPrivateStateObject('second'), 'same'],
+        ];
+    }
+    #[DataProvider('rows')]
+    public function testObj(object $o, string $tag): void {}
+}
+
 final class MethodPlannerTest extends TestCase
 {
     public function testNonProviderMethodEmitsSingleStep(): void
@@ -131,5 +156,23 @@ final class MethodPlannerTest extends TestCase
         $steps = MethodPlanner::plan(_MpThrowingProvider::class, ['testWithThrowingArg']);
         $this->assertCount(1, $steps);
         $this->assertSame('testWithThrowingArg', $steps[0]['method']);
+    }
+
+    public function testObjectProviderRowsAreNeverDeduplicated(): void
+    {
+        // Regression for php-parser NodeTraverserTest::testInvalidReturn: two
+        // rows carrying DISTINCT objects whose distinguishing state is PRIVATE
+        // hash identically under json_encode, so the 2nd row was flagged
+        // is_duplicate and memoized — never executed — leaving its object
+        // unconsumed. A throwing __destruct on that object then collapsed the
+        // whole class. PHPUnit runs every data row, so an object-bearing row
+        // must never be deduplicated.
+        $steps = MethodPlanner::plan(_MpObjectDedupProvider::class, ['testObj']);
+        $this->assertCount(2, $steps);
+        $this->assertFalse($steps[0]['is_duplicate'], 'row 0 must not be a duplicate');
+        $this->assertFalse(
+            $steps[1]['is_duplicate'],
+            'object rows must never be deduplicated (private state is invisible to json_encode)'
+        );
     }
 }
