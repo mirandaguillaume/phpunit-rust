@@ -35,4 +35,5 @@ exec docker run --rm --init \
     -e SMOKE=/tmp/smoke \
     -e RUNS="${RUNS:-1}" \
     -e WORKERS="${WORKERS:-4}" \
+    -e PARITY_FORCE_FORENSICS="${PARITY_FORCE_FORENSICS:-0}" \
     "${IMAGE}" "$@"

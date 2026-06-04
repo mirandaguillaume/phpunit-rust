@@ -988,6 +988,27 @@ fn real_main() -> Result<ExitCode> {
         report.outcomes.extend(synthetic_legacy_skips);
     }
 
+    // Diagnostic: when PHPUNIT_RUST_DUMP_TESTS is set, write one line per
+    // executed test — one line PER DATA ROW — as `Class::method|Status`. This
+    // is the runner's exact expanded test list, which `--list-tests` cannot
+    // provide (it is method-level). The bench's parity forensics collapse it to
+    // per-method row counts and diff against vanilla's `--list-tests` to
+    // pinpoint exactly which tests diverge on a machine where the counts
+    // disagree (the CI-only parity drift). An env var rather than a CLI flag so
+    // wrappers (bench_host.sh) pass it through without interface changes.
+    if let Ok(dump_path) = std::env::var("PHPUNIT_RUST_DUMP_TESTS") {
+        if !dump_path.is_empty() {
+            use std::fmt::Write as _;
+            let mut buf = String::with_capacity(report.outcomes.len() * 64);
+            for o in &report.outcomes {
+                let _ = writeln!(buf, "{}::{}|{:?}", o.class, o.method, o.status);
+            }
+            if let Err(e) = std::fs::write(&dump_path, buf) {
+                eprintln!("warning: PHPUNIT_RUST_DUMP_TESTS write to {dump_path} failed: {e}");
+            }
+        }
+    }
+
     print_summary(&report);
 
     #[cfg(feature = "coverage")]
