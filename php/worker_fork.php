@@ -218,103 +218,31 @@ if ($bootstrap !== null && is_file($bootstrap)) {
 $__log_phase('bootstrap');
 
 // ---------------------------------------------------------------------------
-// 4. OPcache pre-warm: compile every test file before forking so children
-//    inherit compiled opcodes via COW — no worker ever recompiles a file
-//    the master already saw. Only runs when ext-opcache is loaded and
-//    opcache.enable_cli is on (we pass -d opcache.enable_cli=1 from Rust).
+// 4. NO opcache pre-warm — deliberately. The master used to
+//    opcache_compile_file() every classmap file here so children would
+//    inherit compiled opcodes. Root-caused and removed after it was proven
+//    to be the source of the CI-only parity-gate worker deaths:
+//
+//    * opcache_compile_file early-binds any class whose parent is already
+//      resolvable at compile time, DECLARING it in the master with no
+//      include-registry entry. Every fork inherits the ghost class; the
+//      first child that include_once's its file re-executes the file and
+//      dies on "Cannot redeclare class" (exit 255), which the orchestrator
+//      books as a worker death — the exact carbon/doctrine/php-parser
+//      parity drift. The leaked SET varies with master state and file
+//      order (doctrine leaked 292 classes on CI), which is why it never
+//      reproduced locally. Static guards (multi-class files, top-level
+//      functions) were holed three times; the mechanism is inherently
+//      state-dependent and cannot be guarded statically.
+//    * The benefit was measured to be zero on PHP 8.4 CLI: compiled
+//      opcodes do NOT reach forked children (100 prewarmed vs 100 cold
+//      files: 18.2ms vs 17.2ms child include time, speedup 0.94x).
+//
+//    All cost, no benefit: do not re-add. The death-row diagnostics in
+//    runChild() keep reporting prewarm/leak breadcrumbs (now 'off') so a
+//    regression would be visible in the parity gate's forensics.
 // ---------------------------------------------------------------------------
-// Pre-compile every test file into opcache so children inherit compiled
-// opcodes via COW. We skip files that declare more than one top-level
-// symbol or any top-level function because opcache_compile_file on
-// PHP 8.1 (and likely later) leaks the secondary symbols into the master
-// process — those symbols are then inherited by forks and trigger
-// "Cannot declare ..." fatals when the child re-includes the file.
-// Observed cases:
-//   - fakerphp/faker BaseTest.php — class BaseTest + class Collection
-//   - guzzlehttp/psr7 StreamTest.php — class StreamTest + namespaced
-//     function GuzzleHttp\Psr7\fread() that shadows the builtin
-if (!empty($classMapExtra)
-    && function_exists('opcache_compile_file')
-    && filter_var(ini_get('opcache.enable_cli'), FILTER_VALIDATE_BOOLEAN)) {
-    $fileClassCount = [];
-    foreach ($classMapExtra as $file) {
-        if (is_string($file) && is_file($file)) {
-            $rp = realpath($file);
-            if ($rp !== false) {
-                $fileClassCount[$rp] = ($fileClassCount[$rp] ?? 0) + 1;
-            }
-        }
-    }
-    // Skip the pre-warm loop entirely on small suites: opcache_compile_file
-    // costs ~0.5ms per file (measured: 50 files ≈ 25ms), but the COW saving
-    // it buys per worker is roughly the same as a plain require_once on the
-    // first batch — i.e. negligible when there are few files. Below the
-    // threshold, lazy require_once in the child wins on cold runs by ~20ms.
-    // Above the threshold, sharing compiled opcodes via COW dominates.
-    // Threshold overridable via PHPUNIT_RUST_OPCACHE_THRESHOLD for A/B
-    // benchmarking; 0 forces always-prewarm, a huge value forces never.
-    $opcacheThreshold = (int) (getenv('PHPUNIT_RUST_OPCACHE_THRESHOLD') ?: '50');
-    if (count($fileClassCount) >= $opcacheThreshold) {
-        // Diagnostic breadcrumbs, inherited by every fork: how many files the
-        // master pre-warmed, and — decisive for the CI-only redeclare fatals —
-        // whether the pre-warm LEAKED class declarations into the master
-        // (opcache_compile_file early-binds eligible classes on some
-        // PHP/opcache states; a leaked class exists process-wide with NO
-        // include-registry entry, so a child's later include_once of its
-        // file re-executes it and dies). The death-row suffix reports both.
-        $GLOBALS['__phpunit_rust_prewarm_count'] = 0;
-        $preDeclared = get_declared_classes();
-        foreach ($fileClassCount as $rp => $count) {
-            if ($count !== 1) continue;          // multi-class file → skip
-            if (file_has_top_level_function($rp)) continue;  // file with fn → skip
-            if (@opcache_compile_file($rp)) {
-                $GLOBALS['__phpunit_rust_prewarm_count']++;
-            }
-        }
-        $leakedNames = array_values(array_diff(get_declared_classes(), $preDeclared));
-        $GLOBALS['__phpunit_rust_prewarm_leaked'] = count($leakedNames)
-            . ($leakedNames ? ':' . implode(',', array_slice($leakedNames, 0, 3)) : '');
-        // Full list kept for the death-row suffix: at fatal time the child
-        // checks whether the class it died redeclaring is one of these.
-        $GLOBALS['__phpunit_rust_prewarm_leaked_list'] = $leakedNames;
-        if ($leakedNames) {
-            fwrite(STDERR, 'worker_fork.php: opcache pre-warm leaked '
-                . count($leakedNames) . " class declarations into the master\n");
-        }
-    }
-}
 $__log_phase('opcache_prewarm');
-
-/**
- * Return true if the PHP file declares at least one top-level (depth-0)
- * function. Used to skip opcache pre-warm for files that mix a test class
- * with namespaced helper functions, because opcache_compile_file leaks the
- * function into the master and causes redeclaration fatals in forks.
- *
- * Brace-depth tracking is approximate but correct for well-formed PHP:
- * anonymous classes and closures have their `function` / `class` token at
- * depth 0 only when they're the file's top-level declaration; nested ones
- * sit inside another body so depth > 0 and aren't counted.
- */
-function file_has_top_level_function(string $file): bool
-{
-    $src = @file_get_contents($file);
-    if ($src === false) return true; // err on the safe side — skip pre-warm
-    $tokens = @token_get_all($src);
-    if (!is_array($tokens) || empty($tokens)) return false;
-    $depth = 0;
-    foreach ($tokens as $tok) {
-        if (is_array($tok)) {
-            if ($depth === 0 && $tok[0] === T_FUNCTION) {
-                return true;
-            }
-        } else {
-            if ($tok === '{') $depth++;
-            elseif ($tok === '}') $depth--;
-        }
-    }
-    return false;
-}
 
 // ---------------------------------------------------------------------------
 // 6. Open PHP stream handles for all child FDs BEFORE fork so children inherit
