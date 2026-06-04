@@ -91,7 +91,7 @@ forensics() {
       | sed -E 's/^[[:space:]]*-[[:space:]]*//; s/^PHPUnit\\Framework\\SkippedTestCase:://' \
       | grep -oE '^[A-Za-z0-9_\\]+::[A-Za-z_][A-Za-z0-9_]*' \
       | sort | uniq -c | awk '{print $2 "\t" $1}' | sort > "${vcounts}"
-    sed 's/|[^|]*$//' "${DUMP}" | sort | uniq -c | awk '{print $2 "\t" $1}' | sort > "${rcounts}"
+    cut -d'|' -f1 "${DUMP}" | sort | uniq -c | awk '{print $2 "\t" $1}' | sort > "${rcounts}"
 
     echo "[forensics] divergent methods (method | vanilla-rows | rust-rows):"
     join -t$'\t' -a1 -a2 -e 0 -o 0,1.2,2.2 "${vcounts}" "${rcounts}" \
@@ -105,6 +105,15 @@ forensics() {
             printf '  %s:' "${m}"
             grep -F "${m}|" "${DUMP}" | cut -d'|' -f2 | sort | uniq -c | awk '{printf "  %s=%s", $2, $1}'
             echo
+        done
+
+    # The WHY: sample error messages for the divergent methods. One distinct
+    # message usually names the root cause outright.
+    echo "[forensics] sample error messages for divergent methods (top 8):"
+    join -t$'\t' -a1 -a2 -e 0 -o 0,1.2,2.2 "${vcounts}" "${rcounts}" \
+      | awk -F'\t' '$2 != $3 {print $1}' | head -8 \
+      | while IFS= read -r m; do
+            grep -F "${m}|" "${DUMP}" | awk -F'|' -v m="${m}" '$3 != "" {print "  " m ": " $3}' | sort -u | head -2
         done
 }
 
