@@ -989,19 +989,29 @@ fn real_main() -> Result<ExitCode> {
     }
 
     // Diagnostic: when PHPUNIT_RUST_DUMP_TESTS is set, write one line per
-    // executed test — one line PER DATA ROW — as `Class::method|Status`. This
-    // is the runner's exact expanded test list, which `--list-tests` cannot
-    // provide (it is method-level). The bench's parity forensics collapse it to
-    // per-method row counts and diff against vanilla's `--list-tests` to
-    // pinpoint exactly which tests diverge on a machine where the counts
-    // disagree (the CI-only parity drift). An env var rather than a CLI flag so
-    // wrappers (bench_host.sh) pass it through without interface changes.
+    // executed test — one line PER DATA ROW — as `Class::method|Status|message`
+    // (message: first 200 chars, newlines/pipes flattened; empty for passes).
+    // This is the runner's exact expanded test list, which `--list-tests`
+    // cannot provide (it is method-level). The bench's parity forensics
+    // collapse it to per-method row counts, diff against vanilla's
+    // `--list-tests`, and surface the messages of error outcomes — pinpointing
+    // both WHICH tests diverge and WHY, on the machine where they diverge (the
+    // CI-only parity drift). An env var rather than a CLI flag so wrappers
+    // (bench_host.sh) pass it through without interface changes.
     if let Ok(dump_path) = std::env::var("PHPUNIT_RUST_DUMP_TESTS") {
         if !dump_path.is_empty() {
             use std::fmt::Write as _;
             let mut buf = String::with_capacity(report.outcomes.len() * 64);
             for o in &report.outcomes {
-                let _ = writeln!(buf, "{}::{}|{:?}", o.class, o.method, o.status);
+                let msg: String = o
+                    .message
+                    .as_deref()
+                    .unwrap_or("")
+                    .chars()
+                    .map(|c| if c == '\n' || c == '\r' || c == '|' { ' ' } else { c })
+                    .take(200)
+                    .collect();
+                let _ = writeln!(buf, "{}::{}|{:?}|{}", o.class, o.method, o.status, msg);
             }
             if let Err(e) = std::fs::write(&dump_path, buf) {
                 eprintln!("warning: PHPUNIT_RUST_DUMP_TESTS write to {dump_path} failed: {e}");
