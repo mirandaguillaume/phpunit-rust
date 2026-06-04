@@ -27,5 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Opcache CLI on so the fork-pool master's COW pre-warm isn't a no-op.
 RUN echo "opcache.enable_cli=1" >> /usr/local/etc/php/conf.d/opcache-cli.ini
 
+# No memory cap: this is a bench image. The default 128M makes vanilla PHPUnit
+# OOM near the end of large suites (carbon's 6169 tests, faker's 2462) and die
+# before printing its summary, so the parsed count becomes "?" and the parity
+# gate fails spuriously. phpunit-rust's workers already self-limit; vanilla
+# needs the cap lifted so the comparison is apples-to-apples.
+RUN echo "memory_limit=-1" >> /usr/local/etc/php/conf.d/zz-memory-limit.ini
+
 COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
 WORKDIR /work
