@@ -1663,6 +1663,16 @@ pub fn discover_in_dirs(
             root_files.push(p.to_path_buf());
         }
     }
+    // Sort for deterministic, filesystem-order-independent discovery. WalkDir
+    // yields entries in the OS readdir order, which differs across machines
+    // (e.g. a CI runner vs a dev box, even inside the same container image —
+    // tmpfs readdir order is host/kernel-dependent). Downstream FQCN handling
+    // (the inheritance `graph` HashMap below is last-insert-wins on duplicate
+    // FQCNs, and emission keys off parse order) is order-sensitive, so an
+    // unsorted walk made the emitted test count MACHINE-DEPENDENT — the daily
+    // bench's CI-vs-local parity drift (carbon/doctrine/php-parser). A stable
+    // sort makes discovery reproducible everywhere.
+    root_files.sort();
     let mut parsed: Vec<ParsedClass> = root_files
         .par_iter()
         .map(|p| parse_file_classes(p))
@@ -1696,6 +1706,7 @@ pub fn discover_in_dirs(
             }
         }
     }
+    supp_files.sort(); // same determinism rationale as root_files above
     let supp: Vec<ParsedClass> = supp_files
         .par_iter()
         .map(|p| parse_file_classes(p))
