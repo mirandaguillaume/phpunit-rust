@@ -1819,6 +1819,16 @@ pub fn discover_with_index(
         }
     }
 
+    // Deterministic, filesystem-order-independent discovery. WalkDir yields OS
+    // readdir order, which differs across machines (CI runner vs dev box, even
+    // inside the same container image — tmpfs readdir order is host-dependent).
+    // Downstream FQCN handling is order-sensitive (last-insert-wins graph,
+    // parse-order emission), so an unsorted walk made the emitted test COUNT
+    // machine-dependent — the daily-bench CI-vs-local parity drift. Sort by
+    // path so the count is reproducible everywhere. (NOTE: this is the path the
+    // runner actually uses; the sibling discover_in_dirs is sorted too.)
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
     // Parse every file ONCE in parallel. Failures (`parse_file_classes`
     // returning Err) are silently skipped — the file likely isn't valid
     // PHP and would have been ignored by the split path too.
