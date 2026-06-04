@@ -131,8 +131,15 @@ for name in "${PROJECTS[@]}"; do
             "$name" "vanilla-phpunit" "1" "$tests" "$median_ms"
     fi
 
-    # phpunit-rust
-    read median_ms tests < <(bench_runs "$BINARY" --project "$path" --workers "$WORKERS")
+    # phpunit-rust. `--worker-memory-limit=-1` so the comparison is
+    # apples-to-apples: vanilla above runs with `-d memory_limit=-1` (and the
+    # bench image lifts the cap globally). At the default 512M, memory-heavy
+    # suites (doctrine's SecondLevelCache*, php-parser's 47-row
+    # testExtraAttributes, carbon's MacroTest) can fatal a worker mid-run on
+    # slower machines — the orchestrator then reports the queued batches as
+    # `<class>: worker process terminated`, which is exactly the parity-gate
+    # drift the forensics pinned (exit code 255 worker deaths, CI-only).
+    read median_ms tests < <(bench_runs "$BINARY" --project "$path" --workers "$WORKERS" --worker-memory-limit=-1)
     printf "| %-22s | %-15s | %7s | %6s | %7s ms |\n" \
         "$name" "phpunit-rust" "$WORKERS" "$tests" "$median_ms"
 

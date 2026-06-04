@@ -115,6 +115,21 @@ forensics() {
       | while IFS= read -r m; do
             grep -F "${m}|" "${DUMP}" | awk -F'|' -v m="${m}" '$3 != "" {print "  " m ": " $3}' | sort -u | head -2
         done
+
+    # Worker deaths: the synthetic outcomes only say "worker process died /
+    # terminated"; the PHP fatal's own text goes to the worker's stderr, which
+    # the count parsing discards. Re-run once with full output captured so the
+    # fatal lands in this log (mirrors bench_host's rust invocation).
+    if grep -q 'worker process' "${DUMP}"; then
+        echo "[forensics] worker death detected — re-running once to capture the fatal text:"
+        rerun="${TMPDIR:-/tmp}/rust-rerun-${name}.log"
+        (
+            [[ -n "${extra_env}" ]] && export "${extra_env?}"
+            "${BINARY}" --project "${suite_dir}" --workers "${WORKERS}" --worker-memory-limit=-1 \
+                > "${rerun}" 2>&1
+        ) || true
+        grep -nEi 'fatal|exhausted|allowed memory|segmentation|killed|signal|worker process' "${rerun}" | head -15
+    fi
 }
 
 echo "[parity] ${name} (workers=${WORKERS}): vanilla=${van:-?} rust=${rust:-?}" >&2
