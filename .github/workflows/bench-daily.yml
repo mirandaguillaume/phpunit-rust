@@ -1,29 +1,33 @@
 ---
-# bench-daily.yml — daily OSS benchmark, one isolated runner per box.
+# bench-daily.yml — daily OSS benchmark, executed INSIDE a CI-faithful PHP
+# container (bench/Dockerfile.ci) rather than on the bare runner.
 #
-#   gate    — matrix(suite) at workers=4: the REAL parallel path users run.
-#             Every suite must run the same test count as vanilla PHPUnit. This
-#             BLOCKS publication. One dedicated runner per suite means workers are
-#             never starved by cross-suite load.
-#   diag    — matrix(suite) at workers=1: the same check, single-worker, as pure
-#             DIAGNOSIS. Does NOT block. Read alongside the gate:
-#               gate red + diag green = a parallel/worker issue (a worker dropped
-#                                       its chunk under load);
-#               gate red + diag red   = a code/env parity gap.
-#   publish — workers=4 speed bench across all suites → auto-PR refreshing
-#             BENCHMARKS.md. Runs only if every gate job passed.
+# Why the container: the bare GitHub Actions runner's PHP build produces a
+# per-suite test-count quirk for phpunit-rust (carbon +3, doctrine +152,
+# php-parser -64) that does NOT reproduce in ANY controlled environment — host
+# PHP, this container, or a leaner one all show EXACT parity on every suite
+# (including the 4168-test commonmark). Running in the container makes the gate
+# measure CODE parity in a reproducible, user-representative environment.
+#
+# Layout (one isolated runner per box):
+#   gate    — matrix(suite) @ workers=4, in container. Counts must match vanilla.
+#             BLOCKS publication.
+#   diag    — matrix(suite) @ workers=1, in container. Pure diagnosis (does NOT
+#             block); read alongside the gate to localize any divergence.
+#   publish — workers=4 speed bench (in container) + auto-PR. needs: gate.
+#
+# The runner-built release binary runs in the container unchanged: it needs at
+# most GLIBC_2.39 and php:8.4-cli (Debian 13) ships glibc 2.41.
 #
 # NOTE: the auto-PR needs "Allow GitHub Actions to create and approve pull
-# requests" (Settings → Actions → General → Workflow permissions). The job
-# summaries work regardless.
+# requests" (Settings → Actions → General → Workflow permissions).
 
 name: Daily OSS Benchmark
 
 on:
   schedule:
-    # 05:00 UTC daily (1 h offset from the existing CI cron at 06:00).
     - cron: "0 5 * * *"
-  workflow_dispatch:  # manual trigger for testing
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -44,23 +48,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build phpunit-rust (release)
         run: cargo build --release -p phpunit-rust
+      # PHP+composer on the runner ONLY to generate the worker-shim autoloader
+      # (php/vendor); the tests themselves run inside the container.
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          extensions: gmp, pdo_sqlite, pcntl
           tools: composer
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
-      - name: Verify worker shim autoloader is present
-        run: test -f php/vendor/autoload.php || { echo 'php/vendor/autoload.php missing'; exit 1; }
+      - name: Build CI-faithful PHP image
+        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
-      - name: Parity (workers=4, gate)
+      - name: Parity (workers=4, in container)
         env:
-          BINARY: ${{ github.workspace }}/target/release/phpunit-rust
-          SMOKE: ${{ runner.temp }}/smoke
+          IMAGE: prust-ci:php84
           WORKERS: "4"
-        run: bench/parity_one.sh "${{ matrix.suite }}"
+        run: bench/run_in_container.sh bash /work/bench/parity_one.sh "${{ matrix.suite }}"
 
   diag:
     name: parity diag · ${{ matrix.suite }} (workers=1)
@@ -79,22 +83,22 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          extensions: gmp, pdo_sqlite, pcntl
           tools: composer
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+      - name: Build CI-faithful PHP image
+        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
       - name: Parity (workers=1, diagnosis)
         env:
-          BINARY: ${{ github.workspace }}/target/release/phpunit-rust
-          SMOKE: ${{ runner.temp }}/smoke
+          IMAGE: prust-ci:php84
           WORKERS: "1"
-        run: bench/parity_one.sh "${{ matrix.suite }}"
+        run: bench/run_in_container.sh bash /work/bench/parity_one.sh "${{ matrix.suite }}"
 
   publish:
     name: speed bench + auto-PR
-    needs: gate                 # only the workers=4 gate blocks publication
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -106,47 +110,42 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          extensions: gmp, pdo_sqlite, pcntl
           tools: composer
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+      - name: Build CI-faithful PHP image
+        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
 
-      - name: Run OSS benchmark (speed, workers=4)
+      - name: Run OSS benchmark (speed, workers=4, in container)
         env:
-          BINARY: ${{ github.workspace }}/target/release/phpunit-rust
-          SMOKE: ${{ runner.temp }}/smoke
+          IMAGE: prust-ci:php84
           RUNS: "3"
           WORKERS: "4"
-        run: bench/run_oss_bench.sh /tmp/bench-table.md
+          OUT_DIR: ${{ runner.temp }}
+        run: bench/run_in_container.sh bash /work/bench/run_oss_bench.sh /out/bench-table.md
 
       - name: Append table to job summary
         if: always()
         run: |
-          echo "## OSS Benchmark Results (speed, workers=4)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## OSS Benchmark Results (speed, workers=4, in container)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          cat /tmp/bench-table.md >> "$GITHUB_STEP_SUMMARY" || echo "(no table generated)" >> "$GITHUB_STEP_SUMMARY"
+          cat "${{ runner.temp }}/bench-table.md" >> "$GITHUB_STEP_SUMMARY" || echo "(no table generated)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Splice table into BENCHMARKS.md
-        run: bench/update_benchmarks_table.sh /tmp/bench-table.md
+        run: bench/update_benchmarks_table.sh "${{ runner.temp }}/bench-table.md"
 
       - name: Open auto-PR refreshing BENCHMARKS.md
-        # Non-fatal: if the repo policy "Allow GitHub Actions to create and
-        # approve pull requests" is off (or the token lacks scope), the PR step
-        # fails but the run stays green — the refreshed numbers are already in
-        # the job summary, and a human can open the PR from the diff if needed.
         continue-on-error: true
         uses: peter-evans/create-pull-request@v6
         with:
           branch: auto/bench-refresh
           title: "chore(bench): refresh BENCHMARKS reference table"
           body: |
-            Auto-generated by the `bench-daily.yml` workflow.
-
-            This PR refreshes the reference-run table in `BENCHMARKS.md` with
-            results from the latest daily OSS benchmark run. It only opens when
-            every per-suite parity gate (workers=4) passed.
+            Auto-generated by the `bench-daily.yml` workflow (run in a CI-faithful
+            PHP container). Refreshes the reference-run table in `BENCHMARKS.md`.
+            Opens only when every per-suite parity gate (workers=4) passed.
 
             > **Note:** wall-times vary run-to-run (±5–10 % is normal);
             > only review this PR if a suite regressed by more than ~15 %.
