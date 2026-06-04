@@ -1015,7 +1015,11 @@ fn real_main() -> Result<ExitCode> {
                             c
                         }
                     })
-                    .take(200)
+                    // 400 keeps the worker-death fatal suffix intact: a
+                    // "Cannot redeclare" message carries two long absolute
+                    // paths plus the registry/prewarm discriminator, which
+                    // overflows 200 chars on deep suite trees (doctrine).
+                    .take(400)
                     .collect();
                 let _ = writeln!(buf, "{}::{}|{:?}|{}", o.class, o.method, o.status, msg);
             }
