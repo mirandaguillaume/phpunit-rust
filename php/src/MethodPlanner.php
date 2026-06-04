@@ -99,16 +99,28 @@ final class MethodPlanner
             $seenHashes = [];
             foreach ($kept as $key => $row) {
                 $rowData     = is_array($row) ? $row : iterator_to_array($row);
-                // Hash the row for duplicate detection. Some provider values have
-                // side-effecting magic methods (e.g. Carbon\CarbonPeriod endless
-                // periods throw in jsonSerialize()); if hashing throws we must NOT
-                // take down the whole class — treat the row as unique (no dedup),
-                // exactly as vanilla PHPUnit runs every row.
-                try {
-                    $encoded = json_encode(array_values($rowData));
-                    $rowHash = md5($encoded !== false ? $encoded : serialize(array_values($rowData)));
-                } catch (\Throwable $e) {
+                // Hash the row for duplicate detection, guarded by two rules:
+                //  1. Object-bearing rows are NEVER deduplicated. json_encode only
+                //     sees PUBLIC properties, so two distinct provider objects that
+                //     differ only in PRIVATE state (e.g. php-parser's
+                //     NodeVisitorForTesting, whose scripted returns are private)
+                //     hash identically — the 2nd row would be wrongly memoized,
+                //     never executed, leaving its object unconsumed, and a throwing
+                //     __destruct on it then collapses the entire class.
+                //  2. Some provider values have side-effecting magic methods (e.g.
+                //     Carbon\CarbonPeriod endless throws in jsonSerialize()); if
+                //     hashing throws we must NOT take down the class.
+                // In both cases the row is treated as unique — exactly as vanilla
+                // PHPUnit, which runs every data row.
+                if (self::rowContainsObject($rowData)) {
                     $rowHash = null;
+                } else {
+                    try {
+                        $encoded = json_encode(array_values($rowData));
+                        $rowHash = md5($encoded !== false ? $encoded : serialize(array_values($rowData)));
+                    } catch (\Throwable $e) {
+                        $rowHash = null;
+                    }
                 }
                 $isDuplicate = $rowHash !== null && isset($seenHashes[$rowHash]);
                 if ($rowHash !== null) {
@@ -125,6 +137,27 @@ final class MethodPlanner
             }
         }
         return $steps;
+    }
+
+    /**
+     * True if a data-provider row holds an object anywhere — top level or nested
+     * inside arrays. Such rows must never be deduplicated: json_encode sees only
+     * public state, so distinct objects differing only in private state hash
+     * alike, and the collision wrongly memoizes (skips) a row that PHPUnit runs.
+     *
+     * @param array<mixed> $row
+     */
+    private static function rowContainsObject(array $row): bool
+    {
+        foreach ($row as $v) {
+            if (is_object($v)) {
+                return true;
+            }
+            if (is_array($v) && self::rowContainsObject($v)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** @return list<string> */
