@@ -1,0 +1,31 @@
+# CI-faithful PHP 8.4 image for the daily parity gate.
+#
+# Why: the bare GitHub Actions runner's PHP build produces a per-suite test-count
+# quirk for phpunit-rust (carbon +3, doctrine +152, php-parser -64) that does NOT
+# reproduce in any controlled environment — host PHP, this container, or a leaner
+# one all show EXACT parity on every suite (including the 4168-test commonmark).
+# So the gate runs INSIDE this image: it measures code parity in a reproducible,
+# user-representative environment instead of a bare-runner artifact.
+#
+# The runner-built binary runs here without rebuilding: it needs at most
+# GLIBC_2.39 and php:8.4-cli (Debian 13) ships glibc 2.41.
+#
+# Build:  docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+FROM php:8.4-cli
+
+# CI installs gmp, pdo_sqlite, pcntl; the OSS suites additionally need
+# intl/mbstring/bcmath to actually run (so a missing extension can't masquerade
+# as a parity gap). pcntl is required by the fork-pool worker.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git unzip ca-certificates \
+        libgmp-dev libicu-dev libonig-dev libsqlite3-dev libxml2-dev libzip-dev \
+    && docker-php-ext-install -j"$(nproc)" \
+        pcntl gmp pdo_sqlite intl mbstring bcmath opcache \
+    && docker-php-ext-enable opcache \
+    && rm -rf /var/lib/apt/lists/*
+
+# Opcache CLI on so the fork-pool master's COW pre-warm isn't a no-op.
+RUN echo "opcache.enable_cli=1" >> /usr/local/etc/php/conf.d/opcache-cli.ini
+
+COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
+WORKDIR /work
