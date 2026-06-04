@@ -255,16 +255,31 @@ if (!empty($classMapExtra)
     // benchmarking; 0 forces always-prewarm, a huge value forces never.
     $opcacheThreshold = (int) (getenv('PHPUNIT_RUST_OPCACHE_THRESHOLD') ?: '50');
     if (count($fileClassCount) >= $opcacheThreshold) {
-        // Diagnostic breadcrumb, inherited by every fork: how many files the
-        // master pre-warmed (the death-row suffix below reports it, so a CI
-        // "Cannot redeclare" fatal can be correlated with the pre-warm).
+        // Diagnostic breadcrumbs, inherited by every fork: how many files the
+        // master pre-warmed, and — decisive for the CI-only redeclare fatals —
+        // whether the pre-warm LEAKED class declarations into the master
+        // (opcache_compile_file early-binds eligible classes on some
+        // PHP/opcache states; a leaked class exists process-wide with NO
+        // include-registry entry, so a child's later include_once of its
+        // file re-executes it and dies). The death-row suffix reports both.
         $GLOBALS['__phpunit_rust_prewarm_count'] = 0;
+        $preDeclared = get_declared_classes();
         foreach ($fileClassCount as $rp => $count) {
             if ($count !== 1) continue;          // multi-class file → skip
             if (file_has_top_level_function($rp)) continue;  // file with fn → skip
             if (@opcache_compile_file($rp)) {
                 $GLOBALS['__phpunit_rust_prewarm_count']++;
             }
+        }
+        $leakedNames = array_values(array_diff(get_declared_classes(), $preDeclared));
+        $GLOBALS['__phpunit_rust_prewarm_leaked'] = count($leakedNames)
+            . ($leakedNames ? ':' . implode(',', array_slice($leakedNames, 0, 3)) : '');
+        // Full list kept for the death-row suffix: at fatal time the child
+        // checks whether the class it died redeclaring is one of these.
+        $GLOBALS['__phpunit_rust_prewarm_leaked_list'] = $leakedNames;
+        if ($leakedNames) {
+            fwrite(STDERR, 'worker_fork.php: opcache pre-warm leaked '
+                . count($leakedNames) . " class declarations into the master\n");
         }
     }
 }
@@ -557,18 +572,25 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                 [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
             $suffix = sprintf(' (php fatal: %s in %s:%d)',
                 $fatal['message'], $fatal['file'], $fatal['line']);
-            // Redeclare-fatal discriminator. "Cannot redeclare class" with the
-            // fatal file ABSENT from the include registry means the class was
-            // declared without ever include-ing its file in this process —
-            // i.e. a symbol leaked into the master (opcache pre-warm) and
-            // inherited via fork; PRESENT means a genuine double include of
-            // two paths/files. prewarm reports how many files the master
-            // compiled (unset = pre-warm never ran).
+            // Redeclare-fatal breadcrumbs. NOTE: the include-registry check is
+            // NOT discriminating (the dying include registers the file before
+            // executing it, so it reads "yes" under both mechanisms) — the
+            // decisive bit is `leaked`, measured in the master right after the
+            // pre-warm loop: N>0 names classes that opcache_compile_file
+            // declared into the master without any include-registry entry,
+            // which every fork then inherits.
             if (str_contains($fatal['message'], 'Cannot redeclare')) {
-                $inRegistry = in_array($fatal['file'], get_included_files(), true)
-                    ? 'yes' : 'no';
                 $prewarm = $GLOBALS['__phpunit_rust_prewarm_count'] ?? 'off';
-                $suffix .= " [fatal-file-in-include-registry={$inRegistry} prewarm={$prewarm}]";
+                $leaked  = $GLOBALS['__phpunit_rust_prewarm_leaked'] ?? 'off';
+                // The surgical bit: is the class we died redeclaring one the
+                // master's pre-warm leaked? yes = mechanism confirmed.
+                $thisLeaked = 'n/a';
+                if (preg_match('/Cannot redeclare class (\S+)/', $fatal['message'], $m)) {
+                    $thisLeaked = in_array(ltrim($m[1], '\\'),
+                        $GLOBALS['__phpunit_rust_prewarm_leaked_list'] ?? [], true)
+                        ? 'yes' : 'no';
+                }
+                $suffix .= " [prewarm={$prewarm} leaked={$leaked} this-class-leaked={$thisLeaked}]";
             }
         }
         for ($i = $nextIdx; $i < count($currentClasses); $i++) {
