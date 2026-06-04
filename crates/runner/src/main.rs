@@ -1008,7 +1008,13 @@ fn real_main() -> Result<ExitCode> {
                     .as_deref()
                     .unwrap_or("")
                     .chars()
-                    .map(|c| if c == '\n' || c == '\r' || c == '|' { ' ' } else { c })
+                    .map(|c| {
+                        if c == '\n' || c == '\r' || c == '|' {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
                     .take(200)
                     .collect();
                 let _ = writeln!(buf, "{}::{}|{:?}|{}", o.class, o.method, o.status, msg);
