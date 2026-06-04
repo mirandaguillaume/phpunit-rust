@@ -1,17 +1,27 @@
 ---
-# bench-daily.yml — daily OSS benchmark job that refreshes BENCHMARKS.md via auto-PR.
+# bench-daily.yml — daily OSS benchmark, one isolated runner per box.
 #
-# NOTE: For the "create-pull-request" step to succeed, the repository must have
-# "Allow GitHub Actions to create and approve pull requests" enabled under
-# Settings → Actions → General → Workflow permissions.
-# The job-summary step (which appends the table to $GITHUB_STEP_SUMMARY) works
-# regardless of that setting.
+#   gate    — matrix(suite) at workers=4: the REAL parallel path users run.
+#             Every suite must run the same test count as vanilla PHPUnit. This
+#             BLOCKS publication. One dedicated runner per suite means workers are
+#             never starved by cross-suite load.
+#   diag    — matrix(suite) at workers=1: the same check, single-worker, as pure
+#             DIAGNOSIS. Does NOT block. Read alongside the gate:
+#               gate red + diag green = a parallel/worker issue (a worker dropped
+#                                       its chunk under load);
+#               gate red + diag red   = a code/env parity gap.
+#   publish — workers=4 speed bench across all suites → auto-PR refreshing
+#             BENCHMARKS.md. Runs only if every gate job passed.
+#
+# NOTE: the auto-PR needs "Allow GitHub Actions to create and approve pull
+# requests" (Settings → Actions → General → Workflow permissions). The job
+# summaries work regardless.
 
 name: Daily OSS Benchmark
 
 on:
   schedule:
-    # 05:00 UTC daily (1 h offset from the existing CI cron at 06:00)
+    # 05:00 UTC daily (1 h offset from the existing CI cron at 06:00).
     - cron: "0 5 * * *"
   workflow_dispatch:  # manual trigger for testing
 
@@ -20,45 +30,90 @@ permissions:
   pull-requests: write
 
 jobs:
-  bench:
+  gate:
+    name: parity gate · ${{ matrix.suite }} (workers=4)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [brick-math, carbon, doctrine-orm, faker, guzzle-psr7, php-parser, phpunit-itself]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust build cache
-        uses: Swatinem/rust-cache@v2
-
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build phpunit-rust (release)
         run: cargo build --release -p phpunit-rust
-
-      - name: Set up PHP 8.4
-        uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
           extensions: gmp, pdo_sqlite, pcntl
           tools: composer
-
-      # CRITICAL: php/worker_fork.php require_once's php/vendor/autoload.php at
-      # every worker startup; php/vendor is gitignored, so without this install
-      # every fork-pool worker fatals at boot and the bench silently records
-      # FRACTIONAL rust test counts (a crash that masquerades as a fast run).
-      # Mirrors the same step in ci.yml. --no-dev: the shim autoloader only.
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
-
       - name: Verify worker shim autoloader is present
-        run: test -f php/vendor/autoload.php || { echo 'php/vendor/autoload.php missing — workers would fatal and drop outcomes'; exit 1; }
-
+        run: test -f php/vendor/autoload.php || { echo 'php/vendor/autoload.php missing'; exit 1; }
       - name: Make bench scripts executable
-        run: chmod +x bench/bench_host.sh bench/run_oss_bench.sh bench/update_benchmarks_table.sh bench/check_parity.sh
+        run: chmod +x bench/*.sh
+      - name: Parity (workers=4, gate)
+        env:
+          BINARY: ${{ github.workspace }}/target/release/phpunit-rust
+          SMOKE: ${{ runner.temp }}/smoke
+          WORKERS: "4"
+        run: bench/parity_one.sh "${{ matrix.suite }}"
 
-      - name: Run OSS benchmark
+  diag:
+    name: parity diag · ${{ matrix.suite }} (workers=1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [brick-math, carbon, doctrine-orm, faker, guzzle-psr7, php-parser, phpunit-itself]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build phpunit-rust (release)
+        run: cargo build --release -p phpunit-rust
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: gmp, pdo_sqlite, pcntl
+          tools: composer
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+      - name: Make bench scripts executable
+        run: chmod +x bench/*.sh
+      - name: Parity (workers=1, diagnosis)
+        env:
+          BINARY: ${{ github.workspace }}/target/release/phpunit-rust
+          SMOKE: ${{ runner.temp }}/smoke
+          WORKERS: "1"
+        run: bench/parity_one.sh "${{ matrix.suite }}"
+
+  publish:
+    name: speed bench + auto-PR
+    needs: gate                 # only the workers=4 gate blocks publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build phpunit-rust (release)
+        run: cargo build --release -p phpunit-rust
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: gmp, pdo_sqlite, pcntl
+          tools: composer
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+      - name: Make bench scripts executable
+        run: chmod +x bench/*.sh
+
+      - name: Run OSS benchmark (speed, workers=4)
         env:
           BINARY: ${{ github.workspace }}/target/release/phpunit-rust
           SMOKE: ${{ runner.temp }}/smoke
@@ -69,18 +124,9 @@ jobs:
       - name: Append table to job summary
         if: always()
         run: |
-          echo "## OSS Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "## OSS Benchmark Results (speed, workers=4)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           cat /tmp/bench-table.md >> "$GITHUB_STEP_SUMMARY" || echo "(no table generated)" >> "$GITHUB_STEP_SUMMARY"
-
-      # Strict parity gate: refuse to publish unless EVERY suite ran the same
-      # number of tests under vanilla PHPUnit and phpunit-rust. A divergence
-      # means the run is not a like-for-like comparison (e.g. crashed workers,
-      # or an unclosed parity gap), so the splice + auto-PR below are skipped and
-      # the job goes RED. The table is already in the job summary above (which is
-      # `if: always()`) so the bad numbers remain visible for diagnosis.
-      - name: Parity gate (counts must match vanilla)
-        run: bench/check_parity.sh /tmp/bench-table.md
 
       - name: Splice table into BENCHMARKS.md
         run: bench/update_benchmarks_table.sh /tmp/bench-table.md
@@ -99,7 +145,8 @@ jobs:
             Auto-generated by the `bench-daily.yml` workflow.
 
             This PR refreshes the reference-run table in `BENCHMARKS.md` with
-            results from the latest daily OSS benchmark run.
+            results from the latest daily OSS benchmark run. It only opens when
+            every per-suite parity gate (workers=4) passed.
 
             > **Note:** wall-times vary run-to-run (±5–10 % is normal);
             > only review this PR if a suite regressed by more than ~15 %.
