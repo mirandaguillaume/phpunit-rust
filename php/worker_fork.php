@@ -255,10 +255,16 @@ if (!empty($classMapExtra)
     // benchmarking; 0 forces always-prewarm, a huge value forces never.
     $opcacheThreshold = (int) (getenv('PHPUNIT_RUST_OPCACHE_THRESHOLD') ?: '50');
     if (count($fileClassCount) >= $opcacheThreshold) {
+        // Diagnostic breadcrumb, inherited by every fork: how many files the
+        // master pre-warmed (the death-row suffix below reports it, so a CI
+        // "Cannot redeclare" fatal can be correlated with the pre-warm).
+        $GLOBALS['__phpunit_rust_prewarm_count'] = 0;
         foreach ($fileClassCount as $rp => $count) {
             if ($count !== 1) continue;          // multi-class file → skip
             if (file_has_top_level_function($rp)) continue;  // file with fn → skip
-            @opcache_compile_file($rp);
+            if (@opcache_compile_file($rp)) {
+                $GLOBALS['__phpunit_rust_prewarm_count']++;
+            }
         }
     }
 }
@@ -551,6 +557,19 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                 [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
             $suffix = sprintf(' (php fatal: %s in %s:%d)',
                 $fatal['message'], $fatal['file'], $fatal['line']);
+            // Redeclare-fatal discriminator. "Cannot redeclare class" with the
+            // fatal file ABSENT from the include registry means the class was
+            // declared without ever include-ing its file in this process —
+            // i.e. a symbol leaked into the master (opcache pre-warm) and
+            // inherited via fork; PRESENT means a genuine double include of
+            // two paths/files. prewarm reports how many files the master
+            // compiled (unset = pre-warm never ran).
+            if (str_contains($fatal['message'], 'Cannot redeclare')) {
+                $inRegistry = in_array($fatal['file'], get_included_files(), true)
+                    ? 'yes' : 'no';
+                $prewarm = $GLOBALS['__phpunit_rust_prewarm_count'] ?? 'off';
+                $suffix .= " [fatal-file-in-include-registry={$inRegistry} prewarm={$prewarm}]";
+            }
         }
         for ($i = $nextIdx; $i < count($currentClasses); $i++) {
             $class = (string)($currentClasses[$i]['class'] ?? '');
