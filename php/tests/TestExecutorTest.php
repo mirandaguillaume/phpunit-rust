@@ -66,6 +66,14 @@ final class _ExecChainVoid extends TestCase
     }
 }
 
+final class _ExecEmptyProvider extends TestCase
+{
+    // Mirrors faker's localeDataProvider when the locale dirs are absent.
+    public static function none(): array { return []; }
+    #[DataProvider('none')]
+    public function testNoData(int $x): void { $this->fail('must never run'); }
+}
+
 final class TestExecutorTest extends TestCase
 {
     public function testPassingTestProducesPassOutcome(): void
@@ -116,6 +124,17 @@ final class TestExecutorTest extends TestCase
         $this->assertCount(2, $outcomes);
         $this->assertSame('pass', $outcomes[0]['status']);
         $this->assertSame('pass', $outcomes[1]['status'], var_export($outcomes[1], true));
+    }
+
+    public function testEmptyDataProviderYieldsOneSkippedOutcome(): void
+    {
+        // Regression for faker: a data-provider method that provides NO data is
+        // reported by PHPUnit as ONE skipped test, never zero. Without this the
+        // method vanished from the count (faker undercounted by the number of
+        // empty-provider methods, e.g. ProviderOverrideTest with no locale dirs).
+        $outcomes = TestExecutor::runClass(_ExecEmptyProvider::class, ['testNoData']);
+        $this->assertCount(1, $outcomes);
+        $this->assertSame('skipped', $outcomes[0]['status'], var_export($outcomes[0], true));
     }
 
     public function testDependsOnVoidReturningDependencyStillRuns(): void

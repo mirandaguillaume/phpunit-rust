@@ -108,6 +108,22 @@ final class TestExecutor
                 continue;
             }
 
+            // Empty data provider: PHPUnit reports the method as ONE skipped
+            // test ("skipped by data provider"), never zero — emit it so the
+            // count matches vanilla instead of the method silently vanishing.
+            if (!empty($step['empty_provider'])) {
+                $outcomes[] = [
+                    'class'       => $class,
+                    'method'      => $method,
+                    'dataset'     => null,
+                    'status'      => 'skipped',
+                    'message'     => 'Skipped: data provider provided no data',
+                    'trace'       => null,
+                    'duration_ms' => 0.0,
+                ];
+                continue;
+            }
+
             // setUpBeforeClass threw: every test in this batch errors with
             // the same message. Don't even reflect on the method — we may
             // not have loaded its dependencies. Emit and continue.

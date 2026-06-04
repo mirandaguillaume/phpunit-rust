@@ -100,6 +100,18 @@ final class _MpObjectDedupProvider extends TestCase
     public function testObj(object $o, string $tag): void {}
 }
 
+final class _MpEmptyProvider extends TestCase
+{
+    // Mirrors faker's localeDataProvider when the locale dirs are absent: the
+    // provider returns an empty array.
+    public static function none(): array
+    {
+        return [];
+    }
+    #[DataProvider('none')]
+    public function testNoData(int $x): void {}
+}
+
 final class MethodPlannerTest extends TestCase
 {
     public function testNonProviderMethodEmitsSingleStep(): void
@@ -174,5 +186,17 @@ final class MethodPlannerTest extends TestCase
             $steps[1]['is_duplicate'],
             'object rows must never be deduplicated (private state is invisible to json_encode)'
         );
+    }
+
+    public function testEmptyDataProviderStillYieldsOneSkipStep(): void
+    {
+        // Regression for faker (localeDataProvider empty when no locale dirs):
+        // PHPUnit reports a data-provider method that provides NO data as one
+        // skipped test, never zero. The planner must emit a single step flagged
+        // empty_provider so the method still appears in the count.
+        $steps = MethodPlanner::plan(_MpEmptyProvider::class, ['testNoData']);
+        $this->assertCount(1, $steps, 'an empty data provider must still yield one step');
+        $this->assertSame('testNoData', $steps[0]['method']);
+        $this->assertTrue($steps[0]['empty_provider'] ?? false, 'the step must be flagged empty_provider');
     }
 }

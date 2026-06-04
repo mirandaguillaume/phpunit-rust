@@ -74,6 +74,24 @@ final class MethodPlanner
             }
             // Materialize datasets once so we can index/slice them.
             $datasets = is_array($datasets) ? $datasets : iterator_to_array($datasets);
+            // An empty data provider is NOT zero tests: PHPUnit reports the
+            // method as a single SKIPPED test ("skipped by data provider"). Emit
+            // one skip-step so the method still appears in the count — otherwise
+            // the method vanishes. (faker's localeDataProvider returns [] when no
+            // locale dirs are present, which made rust undercount faker by the
+            // number of such methods.)
+            if (count($datasets) === 0) {
+                $steps[] = [
+                    'method'         => $methodName,
+                    'dataset'        => null,
+                    'args'           => [],
+                    'args_hash'      => null,
+                    'is_duplicate'   => false,
+                    'depends'        => $depends,
+                    'empty_provider' => true,
+                ];
+                continue;
+            }
             // Apply row_filter if present (only on this method's rows).
             // The filter is `{chunk_index, total_chunks}`. We keep rows
             // whose 0-based position satisfies `pos % total_chunks == chunk_index`
