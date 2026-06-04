@@ -537,6 +537,21 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
 
     register_shutdown_function(function() use (&$currentClasses, &$nextIdx, $stdoutStream): void {
         while (ob_get_level() > 0) @ob_end_clean();
+        // Name the fatal that killed us. A fataling child's stderr never
+        // reaches the orchestrator (verified empirically: even a memory_limit
+        // OOM leaves no trace in the captured output), but this handler DOES
+        // run during fatal shutdown and error_get_last() still holds the
+        // message — so ship it through the protocol pipe instead. Without
+        // this, CI-only worker deaths are undiagnosable ("exit code 255" is
+        // all the master sees). Segfaults/SIGKILL skip shutdown handlers
+        // entirely, so a death WITHOUT a fatal suffix points at a signal.
+        $fatal  = error_get_last();
+        $suffix = '';
+        if ($fatal !== null && in_array($fatal['type'],
+                [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+            $suffix = sprintf(' (php fatal: %s in %s:%d)',
+                $fatal['message'], $fatal['file'], $fatal['line']);
+        }
         for ($i = $nextIdx; $i < count($currentClasses); $i++) {
             $class = (string)($currentClasses[$i]['class'] ?? '');
             if ($class === '') continue;
@@ -545,7 +560,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                 'method'      => '<class>',
                 'dataset'     => null,
                 'status'      => 'error',
-                'message'     => 'worker process terminated before this class could run',
+                'message'     => 'worker process terminated before this class could run' . $suffix,
                 'trace'       => null,
                 'duration_ms' => 0.0,
             ]);
