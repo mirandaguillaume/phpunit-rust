@@ -116,19 +116,36 @@ forensics() {
             grep -F "${m}|" "${DUMP}" | awk -F'|' -v m="${m}" '$3 != "" {print "  " m ": " $3}' | sort -u | head -2
         done
 
-    # Worker deaths: the synthetic outcomes only say "worker process died /
-    # terminated"; the PHP fatal's own text goes to the worker's stderr, which
-    # the count parsing discards. Re-run once with full output captured so the
-    # fatal lands in this log (mirrors bench_host's rust invocation).
+    # Worker deaths. Verified empirically (poison-OOM repro): the PHP fatal's
+    # text NEVER reaches the orchestrator's streams — the child's stderr is
+    # swallowed — so grepping the run output is useless. Two instruments DO
+    # name the killer: (1) the dump already attributes the IN-FLIGHT victim
+    # ("worker process died" on a concrete test), and (2) the per-slot batch
+    # traces (PHPUNIT_RUST_TRACE_BATCHES): a trace whose last line is START
+    # with no matching END is the batch that took its worker down.
     if grep -q 'worker process' "${DUMP}"; then
-        echo "[forensics] worker death detected — re-running once to capture the fatal text:"
+        echo "[forensics] in-flight victims (test running when its worker died):"
+        grep -a 'worker process died' "${DUMP}" | cut -d'|' -f1 | sort | uniq -c | head -10
+
+        echo "[forensics] re-running with batch traces to name the killer batches:"
         rerun="${TMPDIR:-/tmp}/rust-rerun-${name}.log"
+        tracedir="${TMPDIR:-/tmp}/rust-traces-${name}"
+        mkdir -p "${tracedir}"
         (
             [[ -n "${extra_env}" ]] && export "${extra_env?}"
+            export PHPUNIT_RUST_TRACE_BATCHES="${tracedir}"
             "${BINARY}" --project "${suite_dir}" --workers "${WORKERS}" --worker-memory-limit=-1 \
                 > "${rerun}" 2>&1
         ) || true
-        grep -nEi 'fatal|exhausted|allowed memory|segmentation|killed|signal|worker process' "${rerun}" | head -15
+        echo "[forensics] dangling batch traces (START without END = killer batch):"
+        for f in "${tracedir}"/*; do
+            [[ -f "$f" ]] || continue
+            last="$(tail -1 "$f")"
+            [[ "$last" == *START* ]] && echo "  ${last}"
+        done
+        echo "[forensics] re-run summary + tail (binary-safe):"
+        tr -d '\0' < "${rerun}" | grep -aE 'Tests: [0-9]+' | tail -1
+        tr -d '\0' < "${rerun}" | tail -20
     fi
 }
 
