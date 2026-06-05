@@ -112,6 +112,62 @@ final class _MpEmptyProvider extends TestCase
     public function testNoData(int $x): void {}
 }
 
+// A provider living in a DIFFERENT class, referenced from a test method via the
+// legacy PHPDoc cross-class form `@dataProvider \FQCN::method`. Vanilla PHPUnit
+// splits the annotation on '::' and reflects the external class. The provider
+// is intentionally non-test-prefixed so it is not itself collected as a test.
+final class _MpExternalProviderSource extends TestCase
+{
+    public static function rows(): array
+    {
+        return ['ext_a' => [1, 2], 'ext_b' => [3, 4]];
+    }
+}
+
+final class _MpLegacyExternalProvider extends TestCase
+{
+    /**
+     * @dataProvider \PhpunitRust\Tests\_MpExternalProviderSource::rows
+     */
+    public function testParam(int $a, int $b): void {}
+}
+
+// Two providers on one method that both define the SAME string dataset key.
+// Vanilla PHPUnit throws InvalidDataProviderException with the message
+// 'The key "%s" has already been defined by a previous data provider'.
+final class _MpDuplicateStringKeyProvider extends TestCase
+{
+    public static function first(): array
+    {
+        return ['dup' => [1]];
+    }
+    public static function second(): array
+    {
+        return ['dup' => [2]];
+    }
+    #[DataProvider('first')]
+    #[DataProvider('second')]
+    public function testParam(int $a): void {}
+}
+
+// Two providers on one method that both use INTEGER keys. PHP renumbers
+// integer keys on append (each provider restarts at 0), so vanilla does NOT
+// treat colliding int keys as an error — it appends every row sequentially.
+final class _MpDuplicateIntKeyProvider extends TestCase
+{
+    public static function first(): array
+    {
+        return [[1], [2]]; // keys 0, 1
+    }
+    public static function second(): array
+    {
+        return [[3], [4]]; // keys 0, 1 again — must append, not collide
+    }
+    #[DataProvider('first')]
+    #[DataProvider('second')]
+    public function testParam(int $a): void {}
+}
+
 final class MethodPlannerTest extends TestCase
 {
     public function testNonProviderMethodEmitsSingleStep(): void
@@ -198,5 +254,50 @@ final class MethodPlannerTest extends TestCase
         $this->assertCount(1, $steps, 'an empty data provider must still yield one step');
         $this->assertSame('testNoData', $steps[0]['method']);
         $this->assertTrue($steps[0]['empty_provider'] ?? false, 'the step must be flagged empty_provider');
+    }
+
+    public function testLegacyCrossClassPhpDocProviderExpandsToRows(): void
+    {
+        // Regression: `@dataProvider \FQCN::method` (the legacy PHPUnit 9 form,
+        // still common in PHPUnit 10 codebases) was collapsing the whole method
+        // to a single provider_error because the planner reflected the literal
+        // token 'Source::rows' on the TEST class. Vanilla splits on '::' and
+        // reflects the EXTERNAL class. We must expand to that provider's rows,
+        // preserving its dataset keys.
+        $steps = MethodPlanner::plan(_MpLegacyExternalProvider::class, ['testParam']);
+        $this->assertCount(2, $steps, 'cross-class PHPDoc provider must expand to its rows');
+        $this->assertArrayNotHasKey('provider_error', $steps[0]);
+        $this->assertSame('ext_a', $steps[0]['dataset']);
+        $this->assertSame([1, 2], $steps[0]['args']);
+        $this->assertSame('ext_b', $steps[1]['dataset']);
+        $this->assertSame([3, 4], $steps[1]['args']);
+    }
+
+    public function testDuplicateStringKeyAcrossProvidersEmitsProviderError(): void
+    {
+        // Vanilla PHPUnit (DataProvider::dataProvidedByMethods) throws
+        // InvalidDataProviderException when two providers for the same method
+        // define the same string dataset key. The planner must surface this as
+        // a single per-method provider_error with the vanilla-matching message,
+        // not silently last-wins.
+        $steps = MethodPlanner::plan(_MpDuplicateStringKeyProvider::class, ['testParam']);
+        $this->assertCount(1, $steps, 'a duplicate key must collapse the method to one error step');
+        $this->assertSame('testParam', $steps[0]['method']);
+        $this->assertSame(
+            'The key "dup" has already been defined by a previous data provider',
+            $steps[0]['provider_error'] ?? null,
+        );
+    }
+
+    public function testDuplicateIntKeysAcrossProvidersAppendRatherThanError(): void
+    {
+        // PHP arrays renumber integer keys on append, so two providers that both
+        // use integer keys 0,1 do NOT collide in vanilla — every row is appended
+        // sequentially. The planner must keep all four rows and emit no error.
+        $steps = MethodPlanner::plan(_MpDuplicateIntKeyProvider::class, ['testParam']);
+        $this->assertCount(4, $steps, 'colliding int keys must append, not error');
+        $this->assertArrayNotHasKey('provider_error', $steps[0]);
+        $args = array_column($steps, 'args');
+        $this->assertSame([[1], [2], [3], [4]], $args);
     }
 }
