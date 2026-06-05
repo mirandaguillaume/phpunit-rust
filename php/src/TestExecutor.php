@@ -70,7 +70,6 @@ final class TestExecutor
 
         $outcomes = [];
         $passedReturns = [];  // method -> return value, for @depends injection
-        $givenCache = [];  // "$method\0$args_hash" → array (outcome shape)
 
         foreach ($steps as $step) {
             $method  = $step['method'];
@@ -78,21 +77,13 @@ final class TestExecutor
             $userArgs = $step['args'];
             $depends = $step['depends'];
 
-            // Check cache for duplicate Given (identical method + args_hash).
-            $cacheKey = (isset($step['args_hash']) && $step['args_hash'] !== null)
-                ? $step['method'] . "\0" . $step['args_hash']
-                : null;
-
-            if (($step['is_duplicate'] ?? false) && $cacheKey !== null && isset($givenCache[$cacheKey])) {
-                $cached = $givenCache[$cacheKey];
-                $outcomes[] = array_merge($cached, [
-                    'dataset' => $step['dataset'],
-                    'message' => ($cached['message'] ?? null) !== null
-                        ? $cached['message']
-                        : '[memoized: identical Given]',
-                ]);
-                continue;
-            }
+            // Parity (P4): we DELIBERATELY do not memoize/replay byte-identical
+            // data-provider rows. Vanilla PHPUnit executes every row, even two
+            // identical ones — replaying row 1's cached outcome for row 2 masks
+            // state-dependent divergence (static counters, filesystem artifacts,
+            // a row whose body mutates process-global state). MethodPlanner still
+            // computes `is_duplicate` (that flag is owned elsewhere), but we no
+            // longer CONSUME it here: every row runs the body exactly once.
 
             // Provider threw during planning — emit error and move on.
             if (isset($step['provider_error'])) {
@@ -194,23 +185,62 @@ final class TestExecutor
             // so a connection failure is reported as this test's error rather
             // than aborting runClass. Null on non-DB runs (zero overhead).
             $txPdo = null;
+            // P6: per-test $GLOBALS snapshot when the test opts into
+            // backupGlobals. Null when not requested (zero overhead otherwise).
+            $globalsBackup = null;
+            // P3: each test gets its own output buffer so expectOutputString()/
+            // expectOutputRegex() can be asserted against exactly this test's
+            // echo, and so stray output never bleeds into the batch stream.
+            $obStarted = false;
 
+            // Construct the TestCase before the body try. A constructor throw
+            // is exceptional (TestCase's own constructor only records the name),
+            // but if it happens we must record THIS test as an error and move
+            // on — one test failing must never abort the rest of the batch.
             try {
                 $test = new $class($method);
-                if ($isolated) {
-                    // Bind a closure into the TestCase scope so we can write
-                    // the protected `runTestInSeparateProcess` flag directly.
-                    // PHPUnit 10+ exposes `setRunTestInSeparateProcess()`, but
-                    // the property exists on 9.x too and the closure path
-                    // works uniformly across versions without relying on
-                    // setter availability.
-                    \Closure::bind(function () {
-                        $this->runTestInSeparateProcess = false;
-                        if (property_exists($this, 'runClassInSeparateProcess')) {
-                            $this->runClassInSeparateProcess = false;
-                        }
-                    }, $test, TestCase::class)();
-                }
+            } catch (\Throwable $ctorEx) {
+                $outcomes[] = OutcomeBuilder::build(
+                    $class, $method, $dataset,
+                    (microtime(true) - $startedAt) * 1000.0,
+                    $ctorEx
+                );
+                continue;
+            }
+            if ($isolated) {
+                // Bind a closure into the TestCase scope so we can write
+                // the protected `runTestInSeparateProcess` flag directly.
+                // PHPUnit 10+ exposes `setRunTestInSeparateProcess()`, but
+                // the property exists on 9.x too and the closure path
+                // works uniformly across versions without relying on
+                // setter availability.
+                \Closure::bind(function () {
+                    $this->runTestInSeparateProcess = false;
+                    if (property_exists($this, 'runClassInSeparateProcess')) {
+                        $this->runClassInSeparateProcess = false;
+                    }
+                }, $test, TestCase::class)();
+            }
+
+            // P6: snapshot $GLOBALS BEFORE setUp when the class/method opts in.
+            // Vanilla snapshots in runBare before the before-hooks fire so any
+            // global mutation by setUp/the body/after-hooks is rolled back.
+            $backupGlobals = self::backupGlobalsRequested($ref, $method);
+            if ($backupGlobals) {
+                $globalsBackup = self::snapshotGlobals(
+                    self::backupGlobalsExcludeList($ref, $method)
+                );
+            }
+
+            // BODY try: setUp + before/precondition hooks + the test body only.
+            // Crucially this try does NOT contain the after-hooks/tearDown —
+            // vanilla runs those in a SEPARATE try so they fire even when the
+            // body throws, while preserving the ORIGINAL exception (P1).
+            try {
+                // P3: open this test's own output buffer just before the body.
+                ob_start();
+                $obStarted = true;
+
                 // P2: resolve the per-slot handle and begin a transaction
                 // before setUp, so every write made by setUp / the test /
                 // tearDown is rolled back afterwards. We bypass PHPUnit's
@@ -226,24 +256,27 @@ final class TestExecutor
                 foreach ($hooks['pre_condition'] as $name)  self::invokeInstanceByName($test, $name);
                 $returnValue = $test->{$method}(...$args);
                 foreach ($hooks['post_condition'] as $name) self::invokeInstanceByName($test, $name);
-                foreach ($hooks['after'] as $name)          self::invokeInstanceByName($test, $name);
-                self::invokeOptional($test, 'tearDown');
 
                 // expectException* check: if the test declared any expectation
-                // (class, message, or code) and no exception was thrown,
-                // that's a failure. PHPUnit's runner verifies this via the
-                // runBare flow we're bypassing.
-                $expectedClass = self::readExpectedException($test);
-                $expectedMessage = self::readPrivateProp($test, 'expectedExceptionMessage');
-                $expectedCode = self::readPrivateProp($test, 'expectedExceptionCode');
+                // (class, message, code, OR message-regex) and no exception was
+                // thrown, that's a failure. PHPUnit's runner verifies this via
+                // the runBare flow we're bypassing (expectedExceptionWasNotRaised).
+                $expectedClass     = self::readExpectedException($test);
+                $expectedMessage   = self::readPrivateProp($test, 'expectedExceptionMessage');
+                $expectedCode      = self::readPrivateProp($test, 'expectedExceptionCode');
+                $expectedMsgRegExp = self::readPrivateProp($test, 'expectedExceptionMessageRegExp');
                 if (
                     $expectedClass !== null
                     || (is_string($expectedMessage) && $expectedMessage !== '')
                     || ($expectedCode !== null && $expectedCode !== '')
+                    || (is_string($expectedMsgRegExp) && $expectedMsgRegExp !== '')
                 ) {
                     $desc = $expectedClass ?? 'exception';
                     if (is_string($expectedMessage) && $expectedMessage !== '') {
                         $desc .= " with message containing \"{$expectedMessage}\"";
+                    }
+                    if (is_string($expectedMsgRegExp) && $expectedMsgRegExp !== '') {
+                        $desc .= " with message matching \"{$expectedMsgRegExp}\"";
                     }
                     $error = new \PHPUnit\Framework\ExpectationFailedException(
                         "Expected {$desc} was not thrown"
@@ -254,38 +287,87 @@ final class TestExecutor
             } catch (\PHPUnit\Framework\IncompleteTestError $e) {
                 $error = $e;
             } catch (\Throwable $e) {
-                // Was this exception expected via expectException()?
-                if (isset($test) && self::wasExceptionExpected($test, $e)) {
-                    // Pass. Run post-test hooks + tearDown best-effort —
-                    // any of these failing here would override the pass,
-                    // which is consistent with vanilla PHPUnit.
-                    try {
-                        foreach ($hooks['after'] as $name) self::invokeInstanceByName($test, $name);
-                        self::invokeOptional($test, 'tearDown');
-                    } catch (\Throwable) { /* best-effort */ }
+                // Was this exception expected via expectException* setup?
+                if (self::wasExceptionExpected($test, $e)) {
+                    // Pass: the throw matched every set expectation. $error stays
+                    // null; after-hooks + tearDown still run below (separate try).
                 } else {
                     $error = $e;
                 }
-            } finally {
-                // P2: roll back unconditionally. Microsecond cost. Reset, not
-                // recreate. Guarded so non-DB runs pay zero (txPdo is null).
-                if ($txPdo !== null && $txPdo->inTransaction()) {
+            }
+
+            // P3: assert output expectations exactly like vanilla's
+            // performAssertionsOnOutput — but ONLY when the body did not already
+            // error, mirroring runBare's `if (!isset($e) && hasExpectationOnOutput)`.
+            // Capture+close this test's buffer regardless so it never leaks.
+            if ($obStarted) {
+                $output = ob_get_clean();
+                $obStarted = false;
+                if ($error === null) {
+                    $error = self::assertOutputExpectations($test, (string) $output);
+                }
+                // No output expectation, or already errored: vanilla discards
+                // the buffered output (it is not re-echoed into the parent).
+            }
+
+            // TEARDOWN try (P1): #[After] hooks + tearDown ALWAYS run, even when
+            // the body threw. Vanilla TestCase::runBare runs these in a separate
+            // try: "An exception raised in tearDown() will be caught and passed
+            // on when no exception was raised before." So a teardown throw only
+            // becomes the outcome's error when the test itself succeeded; it
+            // must never mask the test's own failure.
+            try {
+                foreach ($hooks['after'] as $name) self::invokeInstanceByName($test, $name);
+                self::invokeOptional($test, 'tearDown');
+            } catch (\Throwable $teardownEx) {
+                if ($error === null) {
+                    $error = $teardownEx;
+                }
+            }
+
+            // P2: roll back unconditionally. Microsecond cost. Reset, not
+            // recreate. Guarded so non-DB runs pay zero (txPdo is null).
+            if ($txPdo !== null) {
+                if ($txPdo->inTransaction()) {
                     try {
                         $txPdo->rollBack();
                     } catch (\Throwable) {
                         // best-effort: a connection death already surfaces as
                         // the test error; don't mask it with a rollback throw.
                     }
+                } else {
+                    // P5: the transaction is gone but we opened one — the test
+                    // committed (explicit commit() or a DDL implicit commit).
+                    // We CANNOT roll those writes back; they leak into the slot
+                    // clone for every later test in this worker. Full re-clone is
+                    // out of scope (resource-provisioning design), so the
+                    // documented mitigation is a loud forensic breadcrumb, in the
+                    // STDERR style worker_fork.php uses for its own warnings.
+                    $slot = getenv('PHPUNIT_RUST_SLOT');
+                    $slot = ($slot === false || $slot === '') ? '?' : $slot;
+                    fwrite(STDERR, sprintf(
+                        "TestExecutor: DB isolation LEAK — %s::%s committed inside its "
+                        . "transaction (slot=%s); writes are NOT rolled back and will "
+                        . "leak into later tests in this worker\n",
+                        $class,
+                        $method,
+                        $slot
+                    ));
                 }
+            }
+
+            // P6: restore $GLOBALS from the pre-test snapshot, undoing any
+            // mutation the test made. Done after teardown so teardown can still
+            // read the (mutated) globals, matching vanilla's restore-after-tear.
+            if ($globalsBackup !== null) {
+                self::restoreGlobals(
+                    $globalsBackup,
+                    self::backupGlobalsExcludeList($ref, $method)
+                );
             }
 
             $duration = (microtime(true) - $startedAt) * 1000.0;
             $outcomes[] = OutcomeBuilder::build($class, $method, $dataset, $duration, $error);
-
-            // Store in cache (first occurrence only) for memoization.
-            if ($cacheKey !== null && !isset($givenCache[$cacheKey])) {
-                $givenCache[$cacheKey] = end($outcomes);
-            }
 
             // A passing test satisfies @depends regardless of its return value:
             // PHPUnit injects the return (null for a void dependency) into the
@@ -689,20 +771,25 @@ final class TestExecutor
      *   - expectExceptionMessage(substring)   → throw->getMessage must contain substring
      *   - expectExceptionCode(code)           → throw->getCode must equal code
      *
-     * If ANY of the three is set, an exception is expected. The throw matches
-     * iff every set expectation is satisfied. A test that only sets
+     * PHPUnit honors a fourth expectation too:
+     *   - expectExceptionMessageMatches(regex) → throw->getMessage must match regex
+     *
+     * If ANY of these is set, an exception is expected. The throw matches iff
+     * every set expectation is satisfied. A test that only sets
      * `expectExceptionMessage('foo')` (no class) implicitly expects any
      * Throwable whose message contains 'foo' — that's PHPUnit's semantics.
      */
     private static function wasExceptionExpected(TestCase $test, \Throwable $thrown): bool
     {
-        $expectedClass   = self::readExpectedException($test);
-        $expectedMessage = self::readPrivateProp($test, 'expectedExceptionMessage');
-        $expectedCode    = self::readPrivateProp($test, 'expectedExceptionCode');
+        $expectedClass     = self::readExpectedException($test);
+        $expectedMessage   = self::readPrivateProp($test, 'expectedExceptionMessage');
+        $expectedCode      = self::readPrivateProp($test, 'expectedExceptionCode');
+        $expectedMsgRegExp = self::readPrivateProp($test, 'expectedExceptionMessageRegExp');
 
         $anySet = $expectedClass !== null
             || (is_string($expectedMessage) && $expectedMessage !== '')
-            || ($expectedCode !== null && $expectedCode !== '');
+            || ($expectedCode !== null && $expectedCode !== '')
+            || (is_string($expectedMsgRegExp) && $expectedMsgRegExp !== '');
         if (!$anySet) {
             return false;
         }
@@ -714,10 +801,200 @@ final class TestExecutor
             && strpos((string) $thrown->getMessage(), $expectedMessage) === false) {
             return false;
         }
+        // expectExceptionMessageMatches(): preg_match the thrown message against
+        // the user-supplied regex (delimiters are part of the pattern, exactly
+        // like vanilla's ExceptionMessageMatchesRegularExpression constraint).
+        // An invalid pattern (@preg_match === false) is NOT a match → reported
+        // as a non-expected throw, which surfaces the real error to the user.
+        if (is_string($expectedMsgRegExp) && $expectedMsgRegExp !== ''
+            && @preg_match($expectedMsgRegExp, (string) $thrown->getMessage()) !== 1) {
+            return false;
+        }
         if ($expectedCode !== null && $expectedCode !== ''
             && (string) $thrown->getCode() !== (string) $expectedCode) {
             return false;
         }
         return true;
+    }
+
+    /**
+     * P3: assert the test's output expectations against its captured buffer,
+     * mirroring vanilla TestCase::performAssertionsOnOutput. Regex takes
+     * precedence over the literal-string form (same order as vanilla). Returns
+     * a Throwable to record as the test's error on mismatch, or null on
+     * pass / when no output expectation was declared.
+     */
+    private static function assertOutputExpectations(TestCase $test, string $output): ?\Throwable
+    {
+        $expectedRegex  = self::readPrivateProp($test, 'outputExpectedRegex');
+        $expectedString = self::readPrivateProp($test, 'outputExpectedString');
+
+        if (is_string($expectedRegex)) {
+            if (@preg_match($expectedRegex, $output) !== 1) {
+                return new \PHPUnit\Framework\ExpectationFailedException(sprintf(
+                    "Failed asserting that '%s' matches PCRE pattern \"%s\".",
+                    $output,
+                    $expectedRegex
+                ));
+            }
+            return null;
+        }
+
+        if (is_string($expectedString)) {
+            if ($output !== $expectedString) {
+                return new \PHPUnit\Framework\ExpectationFailedException(sprintf(
+                    "Failed asserting that two strings are identical.\n"
+                    . "--- Expected\n+++ Actual\n@@ @@\n-'%s'\n+'%s'",
+                    $expectedString,
+                    $output
+                ));
+            }
+            return null;
+        }
+
+        // No output expectation declared: nothing to assert.
+        return null;
+    }
+
+    /**
+     * P6: does the class or method opt into backupGlobals? Method-level wins
+     * over class-level. We honor both the PHPUnit 10/11 attribute
+     * (#[BackupGlobals(true)]) and the legacy `@backupGlobals enabled` docblock.
+     */
+    private static function backupGlobalsRequested(\ReflectionClass $ref, string $method): bool
+    {
+        $methodRef = $ref->hasMethod($method) ? $ref->getMethod($method) : null;
+
+        // Method-level attribute / docblock takes precedence (either direction).
+        if ($methodRef !== null) {
+            $m = self::readBackupGlobalsFrom($methodRef->getAttributes(), (string) $methodRef->getDocComment());
+            if ($m !== null) {
+                return $m;
+            }
+        }
+        $c = self::readBackupGlobalsFrom($ref->getAttributes(), (string) $ref->getDocComment());
+        return $c ?? false;
+    }
+
+    /**
+     * Resolve a backupGlobals opt-in from a set of reflection attributes and a
+     * docblock. Returns true/false when an explicit opt-in is found at this
+     * scope, or null when this scope says nothing (so the caller can fall back).
+     *
+     * @param \ReflectionAttribute[] $attrs
+     */
+    private static function readBackupGlobalsFrom(array $attrs, string $doc): ?bool
+    {
+        foreach ($attrs as $attr) {
+            if ($attr->getName() === 'PHPUnit\\Framework\\Attributes\\BackupGlobals') {
+                return (bool) $attr->newInstance()->enabled();
+            }
+        }
+        // Legacy docblock: `@backupGlobals enabled` / `@backupGlobals disabled`.
+        if ($doc !== '' && preg_match('/@backupGlobals\s+(enabled|disabled|true|false)/i', $doc, $m)) {
+            $v = strtolower($m[1]);
+            return $v === 'enabled' || $v === 'true';
+        }
+        return null;
+    }
+
+    /**
+     * P6: collect the backupGlobalsExcludeList — global variable names that
+     * must NOT be snapshotted/restored. PHPUnit 10/11 expresses these via the
+     * repeatable #[ExcludeGlobalVariableFromBackup('name')] attribute at class
+     * and/or method scope. Returns a flat list of variable names.
+     *
+     * @return list<string>
+     */
+    private static function backupGlobalsExcludeList(\ReflectionClass $ref, string $method): array
+    {
+        $names = [];
+        $collect = static function (array $attrs) use (&$names): void {
+            foreach ($attrs as $attr) {
+                if ($attr->getName() === 'PHPUnit\\Framework\\Attributes\\ExcludeGlobalVariableFromBackup') {
+                    $names[] = $attr->newInstance()->globalVariableName();
+                }
+            }
+        };
+        $collect($ref->getAttributes());
+        if ($ref->hasMethod($method)) {
+            $collect($ref->getMethod($method)->getAttributes());
+        }
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * P6: snapshot $GLOBALS for backupGlobals. Prefer SebastianBergmann's
+     * GlobalState\Snapshot (ships with phpunit) so we match vanilla's exclude
+     * semantics exactly; fall back to a plain $GLOBALS array copy when the
+     * library is unavailable. Returns an opaque handle consumed by
+     * restoreGlobals — either a Snapshot or a ['__plain__' => array] copy.
+     *
+     * @param list<string> $excludeList
+     * @return object|array
+     */
+    private static function snapshotGlobals(array $excludeList)
+    {
+        if (class_exists('SebastianBergmann\\GlobalState\\Snapshot')
+            && class_exists('SebastianBergmann\\GlobalState\\ExcludeList')) {
+            $exclude = new \SebastianBergmann\GlobalState\ExcludeList();
+            foreach ($excludeList as $name) {
+                $exclude->addGlobalVariable($name);
+            }
+            // Mirror vanilla createGlobalStateSnapshot: globals on, everything
+            // else off (we only back up $GLOBALS here; static properties are
+            // handled separately / out of scope — see concerns).
+            return new \SebastianBergmann\GlobalState\Snapshot(
+                $exclude,
+                true,   // includeGlobalVariables
+                false,  // includeStaticProperties
+                false, false, false, false, false, false, false
+            );
+        }
+
+        // Fallback: shallow copy of $GLOBALS minus excluded keys. Sufficient for
+        // scalar/array markers; matches the documented degraded mode.
+        $copy = [];
+        foreach ($GLOBALS as $k => $v) {
+            if (in_array($k, $excludeList, true)) {
+                continue;
+            }
+            $copy[$k] = $v;
+        }
+        return ['__plain__' => $copy, '__exclude__' => $excludeList];
+    }
+
+    /**
+     * P6: restore $GLOBALS from a snapshot taken by snapshotGlobals.
+     *
+     * @param object|array $backup
+     * @param list<string> $excludeList
+     */
+    private static function restoreGlobals($backup, array $excludeList): void
+    {
+        if ($backup instanceof \SebastianBergmann\GlobalState\Snapshot) {
+            (new \SebastianBergmann\GlobalState\Restorer())->restoreGlobalVariables($backup);
+            return;
+        }
+
+        // Plain fallback: drop keys added since the snapshot, then overwrite the
+        // rest with the saved values. Excluded keys are left untouched.
+        if (is_array($backup) && isset($backup['__plain__'])) {
+            $saved = $backup['__plain__'];
+            foreach (array_keys($GLOBALS) as $k) {
+                if ($k === 'GLOBALS' || in_array($k, $excludeList, true)) {
+                    continue;
+                }
+                if (!array_key_exists($k, $saved)) {
+                    unset($GLOBALS[$k]);
+                }
+            }
+            foreach ($saved as $k => $v) {
+                if ($k === 'GLOBALS') {
+                    continue;
+                }
+                $GLOBALS[$k] = $v;
+            }
+        }
     }
 }
