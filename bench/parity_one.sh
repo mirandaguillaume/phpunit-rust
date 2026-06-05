@@ -20,6 +20,60 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="${SCRIPT_DIR}/oss_suites.tsv"
+
+# Worker-death markers the runner/worker write into the dump's message field
+# (Class::method|Status|message) when a child is lost mid-batch. A death on a
+# single-row method synthesises EXACTLY one Error per lost method, so the
+# executed-count is preserved — the count-equality gate would PASS while those
+# tests never actually ran. count_worker_deaths() lets the gate refuse such a
+# run. Markers, with their source:
+#   "worker process died: signal N" / "...: exit code N"  runner.rs (slot_died)
+#   "worker process crashed before reporting this test"   runner.rs (EOF reap)
+#   "worker process terminated before this class could run" worker_fork.php
+# The common substring "worker process " (note the trailing space) matches all
+# three without false-positiving on benign user messages that merely say
+# "worker" (e.g. "expected the worker pool size to be 4").
+WORKER_DEATH_RE='worker process '
+
+# count_worker_deaths <dump-path> — echo the number of dump rows whose MESSAGE
+# field carries a worker-death marker (0 if the dump is missing/empty). Only
+# the message field (3rd '|'-delimited column) is inspected so a test NAMED
+# after a worker (Class::testWorkerProcess...) cannot trip the scan.
+count_worker_deaths() {
+    local dump="$1"
+    [[ -s "${dump}" ]] || { echo 0; return; }
+    awk -F'|' -v re="${WORKER_DEATH_RE}" \
+        'index($3, re) > 0 { n++ } END { print n+0 }' "${dump}"
+}
+
+# gate_verdict <name> <van> <rust> <dump> — the gate's decision, factored out
+# so it is testable in isolation and shares ONE policy between the PASS and
+# FAIL paths. Echoes the human verdict and RETURNS the exit code the gate must
+# use: 0 = true parity, 1 = mismatch OR death-despite-matching-counts.
+#
+# The death check runs even when counts match: that is the whole point — a
+# synthesised one-error-per-lost-method death keeps the count equal, so without
+# this the gate would green-light a run in which tests silently never executed.
+gate_verdict() {
+    local name="$1" van="$2" rust="$3" dump="$4"
+    if [[ "${van}" =~ ^[0-9]+$ && "${rust}" =~ ^[0-9]+$ && "${van}" == "${rust}" ]]; then
+        local deaths
+        deaths="$(count_worker_deaths "${dump}")"
+        if [[ "${deaths}" -gt 0 ]]; then
+            echo "[parity] ${name} FAIL — ${deaths} worker-death row(s) present despite matching counts (van=${van} rust=${rust}); a lost single-row method synthesises one Error and hides the loss behind an equal count" >&2
+            return 1
+        fi
+        echo "[parity] ${name} PASS (workers=${WORKERS:-?}: ${rust} == vanilla ${van})"
+        return 0
+    fi
+    echo "[parity] ${name} FAIL — workers=${WORKERS:-?}: rust=${rust:-?} vs vanilla=${van:-?} (not a like-for-like run)" >&2
+    return 1
+}
+
+# When sourced (PARITY_ONE_SOURCED=1, e.g. by parity_death_scan_test.sh) stop
+# here: expose the functions above without running the clone/build/gate body.
+[[ "${PARITY_ONE_SOURCED:-0}" == "1" ]] && return 0
+
 SUITE="${1:?Usage: $0 <suite-name>}"
 SMOKE="${SMOKE:-/tmp/phpunit-rust-smoke}"
 BINARY="${BINARY:-${SCRIPT_DIR}/../target/release/phpunit-rust}"
@@ -150,11 +204,21 @@ forensics() {
 }
 
 echo "[parity] ${name} (workers=${WORKERS}): vanilla=${van:-?} rust=${rust:-?}" >&2
-if [[ "${van}" =~ ^[0-9]+$ && "${rust}" =~ ^[0-9]+$ && "${van}" == "${rust}" ]]; then
+
+# Single source of truth for the verdict. gate_verdict FAILS (returns 1) when
+# counts match BUT the dump carries worker-death rows — the load-bearing case
+# the bare count check misses: a death on single-row methods synthesises one
+# Error per lost method, so the count stays equal while the tests never ran.
+if gate_verdict "${name}" "${van:-?}" "${rust:-?}" "${DUMP}"; then
+    # True parity. Forensics only on explicit request (the run was clean).
     [[ "${PARITY_FORCE_FORENSICS:-0}" == "1" ]] && forensics
-    echo "[parity] ${name} PASS (workers=${WORKERS}: ${rust} == vanilla ${van})"
     exit 0
 fi
+
+# Any failure — count mismatch OR death-despite-matching-counts — runs the
+# forensics so the CI log names the divergent methods / killer batch, then
+# exits 1 (the mismatch code; 2 is reserved for usage/setup). The death-scan
+# path benefits especially: forensics' "in-flight victims" block reads the very
+# rows count_worker_deaths flagged and names the test that took its worker down.
 forensics
-echo "[parity] ${name} FAIL — workers=${WORKERS}: rust=${rust:-?} vs vanilla=${van:-?} (not a like-for-like run)" >&2
 exit 1
