@@ -137,62 +137,60 @@ done
 # Target format:
 #   | <name> | <vanTests> / <rustTests> | <van> ms | <rust> ms | <speedup>× |
 
-python3 - "${raw_table_file}" "${OUTPUT_FILE}" << 'PYEOF'
-import sys, re
+# PHP, not python: the CI bench container is php:8.4-cli-based and ships no
+# python3 — this step only ever runs once every gate is green, which is why
+# the gap went unnoticed until the gates' first all-green run.
+php -- "${raw_table_file}" "${OUTPUT_FILE}" << 'PHPEOF'
+<?php
+[, $rawFile, $outFile] = $argv;
 
-raw_file = sys.argv[1]
-out_file  = sys.argv[2]
+$rows = []; // name => [van_tests, rust_tests, van_ms, rust_ms]
 
-rows = {}  # name -> {'van_tests': str, 'rust_tests': str, 'van_ms': int, 'rust_ms': int}
+foreach (file($rawFile, FILE_IGNORE_NEW_LINES) ?: [] as $line) {
+    $line = trim($line);
+    if (!str_starts_with($line, '|')) continue;
+    $parts = array_map('trim', explode('|', trim($line, '|')));
+    if (count($parts) < 5) continue;
+    [$name, $runner, , $tests, $wall] = $parts;
+    // wall looks like "23281 ms" or "  821 ms"
+    if (!preg_match('/(\d+)/', $wall, $m)) continue;
+    $ms = (int) $m[1];
+    $rows[$name] ??= [];
+    if (str_contains($runner, 'vanilla')) {
+        $rows[$name]['van_tests'] = $tests;
+        $rows[$name]['van_ms']    = $ms;
+    } elseif (str_contains($runner, 'phpunit-rust')) {
+        $rows[$name]['rust_tests'] = $tests;
+        $rows[$name]['rust_ms']    = $ms;
+    }
+}
 
-with open(raw_file) as f:
-    for line in f:
-        line = line.strip()
-        if not line.startswith('|'):
-            continue
-        parts = [p.strip() for p in line.strip('|').split('|')]
-        if len(parts) < 5:
-            continue
-        name, runner, workers, tests, wall = parts[0], parts[1], parts[2], parts[3], parts[4]
-        # wall looks like "23281 ms" or "  821 ms"
-        m = re.search(r'(\d+)', wall)
-        if not m:
-            continue
-        ms_val = int(m.group(1))
-        if name not in rows:
-            rows[name] = {}
-        if 'vanilla' in runner:
-            rows[name]['van_tests'] = tests
-            rows[name]['van_ms']    = ms_val
-        elif 'phpunit-rust' in runner:
-            rows[name]['rust_tests'] = tests
-            rows[name]['rust_ms']    = ms_val
+$lines = [
+    '| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |',
+    '|---|---|---|---|---|',
+];
 
-lines = []
-lines.append('| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |')
-lines.append('|---|---|---|---|---|')
+foreach ($rows as $name => $d) {
+    $vanT   = $d['van_tests']  ?? '?';
+    $rustT  = $d['rust_tests'] ?? '?';
+    $vanMs  = $d['van_ms']     ?? 0;
+    $rustMs = $d['rust_ms']    ?? 0;
 
-for name, d in rows.items():
-    van_t  = d.get('van_tests',  '?')
-    rust_t = d.get('rust_tests', '?')
-    van_ms = d.get('van_ms',  0)
-    rust_ms= d.get('rust_ms', 0)
+    if ($rustMs > 0 && $vanMs > $rustMs) {
+        $speedup = sprintf('%.1f×', $vanMs / $rustMs);
+    } elseif ($rustMs > 0) {
+        $speedup = sprintf('%.2f×', $vanMs / $rustMs);
+    } else {
+        $speedup = '—';
+    }
 
-    if rust_ms > 0 and van_ms > rust_ms:
-        speedup = f'{van_ms/rust_ms:.1f}×'
-    elif rust_ms > 0:
-        speedup = f'{van_ms/rust_ms:.2f}×'
-    else:
-        speedup = '—'
+    $lines[] = "| {$name} | {$vanT} / {$rustT} | {$vanMs} ms | {$rustMs} ms | {$speedup} |";
+}
 
-    lines.append(f'| {name} | {van_t} / {rust_t} | {van_ms} ms | {rust_ms} ms | {speedup} |')
-
-table = '\n'.join(lines)
-with open(out_file, 'w') as f:
-    f.write(table + '\n')
-
-print(table)
-PYEOF
+$table = implode("\n", $lines);
+file_put_contents($outFile, $table . "\n");
+echo $table, "\n";
+PHPEOF
 
 echo "[oss-bench] Table written to ${OUTPUT_FILE}" >&2
 
