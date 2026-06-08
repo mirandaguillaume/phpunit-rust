@@ -109,7 +109,8 @@ fn reduce_one_test(
     // from the AST OR a single no-provider invocation.
     let rows = collect_rows(project, &logical, test);
 
-    let reduced = project.with_program(&logical, |program, _file, names| {
+    let reduced = project.with_program(&logical, |program, file, names| {
+        let source = file.contents.as_ref();
         let Some(method) = find_method(program, body_class, &test.method) else {
             return vec![bailed(test, None, "method body not found")];
         };
@@ -178,6 +179,7 @@ fn reduce_one_test(
                     this_value.clone(),
                     resolver,
                     names,
+                    source,
                 );
                 ReducedTest {
                     class: test.class.clone(),
@@ -237,6 +239,7 @@ fn collect_rows(
 
 /// Reduce one row: bind args to the method's parameters (+ the test-case `$this`)
 /// and run the body.
+#[allow(clippy::too_many_arguments)]
 fn reduce_row(
     block: &Block,
     param_names: &[Vec<u8>],
@@ -244,6 +247,7 @@ fn reduce_row(
     this_value: Option<Value>,
     resolver: &BridgeResolver,
     names: &mago_names::ResolvedNames,
+    source: &[u8],
 ) -> Outcome {
     // SURPLUS provider columns (more columns than parameters) are NOT an error in
     // PHP/PHPUnit: data-provider rows are bound positionally via
@@ -262,7 +266,7 @@ fn reduce_row(
     }
     // Parameters past the provided args are unbound; if the body reads one it
     // bails (UnboundVariable) — fail-closed, no defaults invented here.
-    run_method_body_with_names(block, givens, resolver, names)
+    run_method_body_with_names(block, givens, resolver, names, source)
 }
 
 // ─── AST helpers ──────────────────────────────────────────────────────────────
@@ -936,6 +940,63 @@ class TimeTest extends TestCase {
         assert!(
             matches!(reduced[0].outcome, Outcome::Bailed(_)),
             "an unknown stateful call must BAIL, not guess; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn closure_returned_from_helper_reduces() {
+        // A closure CREATED inside an inlined helper function escapes that helper's
+        // own re-parse arena (subst.rs nested `with_program`) and is invoked back in
+        // the test body. With the old raw-pointer Value::Closure this read a dropped
+        // arena (UAF); the owned-source closure must reduce cleanly to Pass.
+        let dir = write_suite(&[(
+            "AdderTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+function makeAdder(int $x) { return fn($y) => $x + $y; }
+class AdderTest extends TestCase {
+    public function testAdder(): void {
+        $add = makeAdder(5);
+        $this->assertSame(8, $add(3));
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("AdderTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "a closure returned from an inlined helper must reduce to Pass (was UAF); got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn closure_stored_in_this_via_setup_reduces() {
+        // setUp() stores a closure into $this->cb; the closure is created inside the
+        // setUp re-parse arena and survives into the test body via the seeded
+        // Value::Object. The owned-source closure must invoke cleanly (was UAF).
+        let dir = write_suite(&[(
+            "CbTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class CbTest extends TestCase {
+    private $cb;
+    protected function setUp(): void {
+        $this->cb = fn() => 7;
+    }
+    public function testCb(): void {
+        $this->assertSame(7, ($this->cb)());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("CbTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "a closure stored into $this via setUp must reduce to Pass (was UAF); got {reduced:?}"
         );
     }
 }

@@ -122,13 +122,15 @@ impl BridgeResolver<'_> {
         // Everything below runs INSIDE the closure — the AST is arena-scoped.
         let outcome = self
             .project
-            .with_program(&logical_name, |program, _file, names| {
+            .with_program(&logical_name, |program, file, names| {
                 let func = find_function(program, name)
                     .ok_or_else(|| BailReason::UnknownCall(String::from_utf8_lossy(name).into()))?;
                 let bindings = bind_params(func, args)?;
                 // Recurse through THIS resolver so nested user calls inline too;
                 // names = the callee file's table (FQCN resolution for `new C`).
-                run_body_returning_with_names(&func.body, bindings, self, names).map(Some)
+                // source = the callee file (so a closure RETURNED here owns its bytes).
+                run_body_returning_with_names(&func.body, bindings, self, names, &file.contents)
+                    .map(Some)
             });
 
         match outcome {
@@ -194,7 +196,7 @@ impl BridgeResolver<'_> {
 
         let outcome = self
             .project
-            .with_program(&logical_name, |program, _file, names| {
+            .with_program(&logical_name, |program, file, names| {
                 let m = find_class_method(program, &declaring_fqcn, method).ok_or_else(|| {
                     BailReason::UnknownCall(format!(
                         "{}::{}",
@@ -215,7 +217,9 @@ impl BridgeResolver<'_> {
                 // automatically: `run_body_returning` does NOT enable property
                 // writes, so the assignment handler rejects it (frontier §2).
                 // names = the declaring file's table (resolves `new C` in the body).
-                run_body_returning_with_names(block, bindings, self, names).map(Some)
+                // source = the declaring file (so a closure returned here owns its bytes).
+                run_body_returning_with_names(block, bindings, self, names, &file.contents)
+                    .map(Some)
             });
         outcome.unwrap_or_else(|| Err(BailReason::Other("could not re-parse method file".into())))
     }
@@ -284,12 +288,12 @@ impl BridgeResolver<'_> {
                 let this = make_object(record_class.clone(), props);
                 let built = self
                     .project
-                    .with_program(&ctor_logical, |program, _file, names| {
+                    .with_program(&ctor_logical, |program, file, names| {
                         let ctor = find_class_method(program, &ctor_class, b"__construct")
                             .ok_or_else(|| {
                                 BailReason::Other("constructor AST not found after re-parse".into())
                             })?;
-                        run_constructor(resolver, ctor, this.clone(), args, names)
+                        run_constructor(resolver, ctor, this.clone(), args, names, &file.contents)
                     })
                     .unwrap_or_else(|| {
                         Err(BailReason::Other(
@@ -363,7 +367,7 @@ impl BridgeResolver<'_> {
             let resolver = self;
             this =
                 self.project
-                    .with_program(&logical, |program, _file, names| {
+                    .with_program(&logical, |program, file, names| {
                         let m = find_class_method(program, &setup_class, b"setUp").ok_or_else(
                             || BailReason::Other("setUp AST not found after re-parse".into()),
                         )?;
@@ -375,7 +379,14 @@ impl BridgeResolver<'_> {
                         // setUp takes no positional args; bind only `$this`.
                         let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
                         bindings.insert(b"this".to_vec(), this.clone());
-                        super::eval::run_ctor_body_with_names(block, bindings, resolver, names)
+                        // source = the setUp file (so a closure stored into $this owns its bytes).
+                        super::eval::run_ctor_body_with_names(
+                            block,
+                            bindings,
+                            resolver,
+                            names,
+                            &file.contents,
+                        )
                     })
                     .unwrap_or_else(|| {
                         Err(BailReason::Other("could not re-parse setUp file".into()))
@@ -465,6 +476,7 @@ fn run_constructor(
     this: Value,
     args: &[Value],
     names: &mago_names::ResolvedNames,
+    source: &[u8],
 ) -> Result<Value, BailReason> {
     let Value::Object { class, mut props } = this else {
         return Err(BailReason::Other(
@@ -524,7 +536,7 @@ fn run_constructor(
             "abstract constructor body".into(),
         ));
     };
-    run_ctor_body_with_names(block, bindings, resolver, names)
+    run_ctor_body_with_names(block, bindings, resolver, names, source)
 }
 
 /// Seed plain (non-promoted) property declarations carrying a literal default,
@@ -853,9 +865,15 @@ mod tests {
             .collect();
 
         project
-            .with_program(&logical, |program, _file, names| {
+            .with_program(&logical, |program, file, names| {
                 let block = find_method_block(program, method).expect("method block");
-                super::super::eval::run_method_body_with_names(block, given_map, &resolver, names)
+                super::super::eval::run_method_body_with_names(
+                    block,
+                    given_map,
+                    &resolver,
+                    names,
+                    &file.contents,
+                )
             })
             .expect("with_program")
     }

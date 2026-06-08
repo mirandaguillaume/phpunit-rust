@@ -61,39 +61,28 @@ pub enum Value {
     /// here — the gate/eval BAIL before ever producing such a closure (frontier:
     /// impurity, fail-closed).
     ///
-    /// `params` (bare parameter names) + `body` are **raw pointers into the
-    /// arena** that holds the closure's source AST. This is sound ONLY because a
-    /// closure is created and invoked inside the SAME `with_program` evaluation
-    /// scope (one arena, which outlives the whole `exec_statements` call). A
-    /// closure that escapes to a different file's arena is never invoked by us (it
-    /// reaches an unmodelled boundary and bails first). The pointers are read back
-    /// to typed AST refs only inside [`super::eval`] (`invoke_closure`).
+    /// The closure OWNS its source text (`src`, the exact bytes of the
+    /// `function(...){...}` / `fn(...) => expr` expression, sliced from the file
+    /// source at creation) plus the by-value `captured` environment. There is NO
+    /// arena pointer: at invoke time [`super::eval::invoke_closure`] re-parses
+    /// `src` into a fresh arena that lives for the whole invocation, so a closure
+    /// returned from an inlined helper or stored into `$this` (whose creating arena
+    /// has since dropped) is invoked soundly — no use-after-free.
     Closure(ClosureRef),
 }
 
-/// The arena-pointer payload of a [`Value::Closure`]. Type-erased so [`value`]
-/// stays free of `mago_syntax` types; [`super::eval`] casts the pointers back.
+/// The owned payload of a [`Value::Closure`] (Inc-4 Task 1 remediation).
 ///
-/// `body` is `ClosureBodyPtr::Block` for `function(){...}`/`fn(){...}` (a
-/// statement body) and `ClosureBodyPtr::Expr` for `fn(...) => expr` (an arrow
-/// expression body). `captured` is the by-value capture environment.
+/// `src` is the exact source bytes of the closure expression (`function (...) use
+/// (...) {...}` or `fn (...) => expr`), copied from the file at creation time so
+/// the closure carries no borrow into any arena. `captured` is the by-value
+/// capture environment (the `use(...)` list, or the arrow auto-capture).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClosureRef {
-    /// `*const FunctionLikeParameterList` — the parameter list AST node.
-    pub params: *const (),
-    /// The body AST node (block or expression), tagged by kind.
-    pub body: ClosureBodyPtr,
+    /// The owned source bytes of the closure expression.
+    pub src: Vec<u8>,
     /// Captured variables (name → value), by value at creation time.
     pub captured: Vec<(Vec<u8>, Value)>,
-}
-
-/// Which AST node kind the closure body pointer refers to.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ClosureBodyPtr {
-    /// `*const Block` — a `{ ... }` statement body (`function`/`fn` block form).
-    Block(*const ()),
-    /// `*const Expression` — an arrow-function `=> expr` body.
-    Expr(*const ()),
 }
 
 /// A PHP array key — only `int` or (byte) `string`. Float/bool/null keys are

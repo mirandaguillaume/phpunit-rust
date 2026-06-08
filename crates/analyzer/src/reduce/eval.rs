@@ -29,7 +29,9 @@ use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::ast::unary::UnaryPrefixOperator;
 use mago_syntax::ast::ast::variable::Variable;
 
-use super::value::{ArrayKey, ClosureBodyPtr, ClosureRef, Value};
+use mago_span::HasSpan;
+
+use super::value::{ArrayKey, ClosureRef, Value};
 
 // ─── Outcome + bail taxonomy ──────────────────────────────────────────────────
 
@@ -157,6 +159,13 @@ pub struct Scope<'r> {
     /// falls back to the raw identifier. Each inlined body carries the names of
     /// ITS declaring file (set when re-entering the evaluator via `with_program`).
     names: Option<&'r mago_names::ResolvedNames<'r>>,
+    /// The raw source bytes of the file whose body is being evaluated. Used ONLY to
+    /// slice a closure expression's span into owned bytes at creation
+    /// (`make_closure`/`make_arrow`, Inc-4 Task 1) so the closure carries no arena
+    /// borrow. `None` in scopes that never create a closure from this file (e.g. a
+    /// re-parsed closure body's inner scope, where any nested closure literal is
+    /// itself re-sliced from the inner snippet).
+    source: Option<&'r [u8]>,
     /// Whether `$this->prop = ...` writes are permitted (true ONLY while a
     /// constructor body is being inlined to seed props). A write to `$this->prop`
     /// in any non-constructor body is a MUTATOR — fail-closed BAIL (frontier §2),
@@ -174,6 +183,7 @@ impl<'r> Scope<'r> {
             max_steps: 10_000_000,
             resolver,
             names: None,
+            source: None,
             allow_this_write: false,
         }
     }
@@ -182,6 +192,13 @@ impl<'r> Scope<'r> {
     /// class-name resolution at `new`/static-call sites can produce a FQCN.
     pub fn with_names(mut self, names: &'r mago_names::ResolvedNames<'r>) -> Self {
         self.names = Some(names);
+        self
+    }
+
+    /// Attach the file source so a closure literal can own its source bytes
+    /// (sliced by span) at creation — see [`Value::Closure`] (Inc-4 Task 1).
+    pub fn with_source(mut self, source: &'r [u8]) -> Self {
+        self.source = Some(source);
         self
     }
 
@@ -231,7 +248,7 @@ pub fn run_method_body(
     givens: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Outcome {
-    run_method_body_inner(block, givens, resolver, None)
+    run_method_body_inner(block, givens, resolver, None, None)
 }
 
 /// Like [`run_method_body`] but with the body file's resolved-names table attached
@@ -241,8 +258,9 @@ pub fn run_method_body_with_names(
     givens: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: &mago_names::ResolvedNames,
+    source: &[u8],
 ) -> Outcome {
-    run_method_body_inner(block, givens, resolver, Some(names))
+    run_method_body_inner(block, givens, resolver, Some(names), Some(source))
 }
 
 fn run_method_body_inner(
@@ -250,10 +268,14 @@ fn run_method_body_inner(
     givens: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: Option<&mago_names::ResolvedNames>,
+    source: Option<&[u8]>,
 ) -> Outcome {
     let mut scope = Scope::new(givens, resolver);
     if let Some(n) = names {
         scope = scope.with_names(n);
+    }
+    if let Some(s) = source {
+        scope = scope.with_source(s);
     }
     match exec_statements(block.statements.iter(), &mut scope) {
         Ok(Flow::Asserted(outcome)) => outcome,
@@ -273,18 +295,20 @@ pub fn run_body_returning(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
-    run_body_returning_inner(block, bindings, resolver, None)
+    run_body_returning_inner(block, bindings, resolver, None, None)
 }
 
 /// Like [`run_body_returning`] but with the body file's resolved-names table
-/// attached (Inc-3 class-name resolution inside an inlined body).
+/// attached (Inc-3 class-name resolution inside an inlined body) plus the body
+/// file's source (so a closure literal RETURNED from this body owns its bytes).
 pub fn run_body_returning_with_names(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: &mago_names::ResolvedNames,
+    source: &[u8],
 ) -> Result<Value, BailReason> {
-    run_body_returning_inner(block, bindings, resolver, Some(names))
+    run_body_returning_inner(block, bindings, resolver, Some(names), Some(source))
 }
 
 fn run_body_returning_inner(
@@ -292,10 +316,14 @@ fn run_body_returning_inner(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: Option<&mago_names::ResolvedNames>,
+    source: Option<&[u8]>,
 ) -> Result<Value, BailReason> {
     let mut scope = Scope::new(bindings, resolver);
     if let Some(n) = names {
         scope = scope.with_names(n);
+    }
+    if let Some(s) = source {
+        scope = scope.with_source(s);
     }
     match exec_statements(block.statements.iter(), &mut scope)? {
         Flow::Returned(v) => Ok(v),
@@ -325,18 +353,21 @@ pub fn run_ctor_body(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
-    run_ctor_body_inner(block, bindings, resolver, None)
+    run_ctor_body_inner(block, bindings, resolver, None, None)
 }
 
 /// Like [`run_ctor_body`] but with the body file's resolved-names table attached
-/// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN).
+/// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN) plus
+/// the body file's source (so a closure literal stored into `$this` here owns its
+/// bytes — Inc-4 Task 1).
 pub fn run_ctor_body_with_names(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: &mago_names::ResolvedNames,
+    source: &[u8],
 ) -> Result<Value, BailReason> {
-    run_ctor_body_inner(block, bindings, resolver, Some(names))
+    run_ctor_body_inner(block, bindings, resolver, Some(names), Some(source))
 }
 
 fn run_ctor_body_inner(
@@ -344,10 +375,14 @@ fn run_ctor_body_inner(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: Option<&mago_names::ResolvedNames>,
+    source: Option<&[u8]>,
 ) -> Result<Value, BailReason> {
     let mut scope = Scope::new(bindings, resolver);
     if let Some(n) = names {
         scope = scope.with_names(n);
+    }
+    if let Some(s) = source {
+        scope = scope.with_source(s);
     }
     scope.allow_this_writes();
     match exec_statements(block.statements.iter(), &mut scope)? {
@@ -1648,13 +1683,23 @@ fn make_closure(
             captured.push((name, value));
         }
     }
-    let params: *const () = (&c.parameter_list as *const _) as *const ();
-    let body = ClosureBodyPtr::Block((&c.body as *const _) as *const ());
-    Ok(Value::Closure(ClosureRef {
-        params,
-        body,
-        captured,
-    }))
+    let src = closure_source(c.span(), scope)?;
+    Ok(Value::Closure(ClosureRef { src, captured }))
+}
+
+/// Slice the owned source bytes of a closure expression from the current file's
+/// source (Inc-4 Task 1). Bails (fail-closed) if no source is attached or the span
+/// is out of range — never reads dropped/aliased AST memory.
+fn closure_source(span: mago_span::Span, scope: &Scope) -> Result<Vec<u8>, BailReason> {
+    let source = scope.source.ok_or_else(|| {
+        BailReason::UnsupportedConstruct("closure literal without a file source attached".into())
+    })?;
+    let start = span.start.offset as usize;
+    let end = span.end.offset as usize;
+    source
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| BailReason::Other("closure span out of source range".into()))
 }
 
 /// Build a `Value::Closure` from an `fn (...) => expr` arrow function. Arrow
@@ -1672,41 +1717,90 @@ fn make_arrow(
         .filter(|(k, _)| k.as_slice() != b"this")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let params: *const () = (&a.parameter_list as *const _) as *const ();
-    let body = ClosureBodyPtr::Expr((a.expression as *const _) as *const ());
-    Ok(Value::Closure(ClosureRef {
-        params,
-        body,
-        captured,
-    }))
+    let src = closure_source(a.span(), scope)?;
+    Ok(Value::Closure(ClosureRef { src, captured }))
 }
 
 /// Invoke a `Value::Closure` over concrete `args`, returning its result.
 ///
-/// SAFETY: the `params`/`body` raw pointers are read back to typed AST refs. This
-/// is sound because a closure is only ever invoked inside the SAME `with_program`
-/// evaluation scope that created it (one arena, alive for the whole
-/// `exec_statements` call) — see [`Value::Closure`]. The bindings are the
-/// captured env (by value) overlaid with the bound parameters; the body runs in a
-/// FRESH scope (closures do not see the caller's other locals) carrying the same
-/// resolver + names + step budget.
+/// The closure owns its source bytes (`closure.src`, Inc-4 Task 1). We re-parse
+/// that source into a FRESH arena that lives for the whole invocation and walk the
+/// re-parsed body with the existing evaluator — so a closure whose CREATING arena
+/// has dropped (returned from an inlined helper, stored into `$this`) is invoked
+/// soundly, no use-after-free. The re-parsed snippet carries NO original-file name
+/// table (`names = None`): a pure closure over params + captured values + builtins
+/// needs none, and anything that would need the outer file's FQCN table bails
+/// fail-closed at the unknown-call/class boundary.
+///
+/// The bindings are the captured env (by value) overlaid with the bound
+/// parameters; the body runs in a FRESH scope (closures do not see the caller's
+/// other locals) carrying the same resolver + step budget. For a callback invoked
+/// in a loop (`array_map`/`array_filter`/…), parse ONCE via [`ParsedClosure`] and
+/// reuse it across iterations rather than re-parsing per element.
 fn invoke_closure(
     closure: &ClosureRef,
     args: &[Value],
     scope: &mut Scope,
 ) -> Result<Value, BailReason> {
-    use mago_syntax::ast::ast::block::Block;
-    use mago_syntax::ast::ast::expression::Expression as Expr;
-    use mago_syntax::ast::ast::function_like::parameter::FunctionLikeParameterList;
+    with_parsed_closure(&closure.src, |kind, snippet| {
+        invoke_parsed_closure(kind, snippet, &closure.captured, args, scope)
+    })
+}
 
-    // Recover the typed parameter list and bind params + captured env.
-    // SAFETY: see the doc comment — the arena outlives this call.
-    let param_list: &FunctionLikeParameterList =
-        unsafe { &*(closure.params as *const FunctionLikeParameterList) };
+/// A re-parsed closure / arrow-function node, borrowing from a local arena that
+/// lives only for the duration of [`with_parsed_closure`]'s callback.
+enum ParsedClosureKind<'p> {
+    Closure(&'p mago_syntax::ast::ast::function_like::closure::Closure<'p>),
+    Arrow(&'p mago_syntax::ast::ast::function_like::arrow_function::ArrowFunction<'p>),
+}
+
+/// Re-parse `<?php ( <closure-src> );` into a FRESH local arena and call `f` with
+/// the single closure / arrow node plus the snippet bytes the node spans into. The
+/// arena lives for the whole callback and is dropped after — the borrow never
+/// escapes, so this is fully safe (no `unsafe`, no dangling pointer). For a
+/// callback invoked in a loop (`array_map`/…), `f` runs the entire loop so the
+/// parse happens once. Bails (fail-closed) if the snippet is not exactly one
+/// closure expression.
+fn with_parsed_closure<R>(
+    src: &[u8],
+    f: impl FnOnce(&ParsedClosureKind, &[u8]) -> Result<R, BailReason>,
+) -> Result<R, BailReason> {
+    use mago_database::file::File;
+    use mago_syntax::parser::parse_file;
+
+    let arena = bumpalo::Bump::new();
+    let mut full: Vec<u8> = Vec::with_capacity(src.len() + 9);
+    full.extend_from_slice(b"<?php (");
+    full.extend_from_slice(src);
+    full.extend_from_slice(b");");
+    let file = File::ephemeral(
+        std::borrow::Cow::Borrowed(b"closure.php".as_slice()),
+        std::borrow::Cow::Owned(full.clone()),
+    );
+    let program = parse_file(&arena, &file);
+    let kind = find_closure_node(program)
+        .ok_or_else(|| BailReason::Other("closure source did not re-parse to a closure".into()))?;
+    f(&kind, &full)
+}
+
+/// Bind `captured` + `args` onto a re-parsed closure node and evaluate its body in
+/// a fresh scope. `snippet` is the re-parsed source so a closure literal NESTED in
+/// the body can own its own bytes via its span into THIS snippet.
+fn invoke_parsed_closure(
+    kind: &ParsedClosureKind,
+    snippet: &[u8],
+    captured: &[(Vec<u8>, Value)],
+    args: &[Value],
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let param_list = match kind {
+        ParsedClosureKind::Closure(c) => &c.parameter_list,
+        ParsedClosureKind::Arrow(a) => &a.parameter_list,
+    };
 
     let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
     // Captured env first; parameters then overlay (a param shadows a capture).
-    for (k, v) in &closure.captured {
+    for (k, v) in captured {
         bindings.insert(k.clone(), v.clone());
     }
 
@@ -1743,19 +1837,18 @@ fn invoke_closure(
         bindings.insert(name, value);
     }
 
-    // Run the body in a fresh scope sharing the resolver/names/budget, so the
-    // step budget is global (a closure called in a loop can still bail on runaway)
-    // and class-name resolution inside the body still works.
-    let mut inner = Scope::new(bindings, scope.resolver);
-    inner.names = scope.names;
+    // Run the body in a fresh scope sharing the resolver/budget (so the step
+    // budget stays global and a callback in a loop can still bail on runaway).
+    // `source` = the re-parsed snippet (a nested closure literal re-slices from it);
+    // no `names`: the snippet has its own (empty) name table, so anything needing
+    // the outer file's FQCN table bails fail-closed.
+    let mut inner = Scope::new(bindings, scope.resolver).with_source(snippet);
     inner.steps = scope.steps;
     inner.max_steps = scope.max_steps;
 
-    let result = match closure.body {
-        // SAFETY: same arena-lifetime argument as above.
-        ClosureBodyPtr::Block(p) => {
-            let block: &Block = unsafe { &*(p as *const Block) };
-            match exec_statements(block.statements.iter(), &mut inner)? {
+    let result = match kind {
+        ParsedClosureKind::Closure(c) => {
+            match exec_statements(c.body.statements.iter(), &mut inner)? {
                 Flow::Returned(v) => v,
                 Flow::Normal => Value::Null,
                 Flow::Asserted(_) => {
@@ -1765,14 +1858,36 @@ fn invoke_closure(
                 }
             }
         }
-        ClosureBodyPtr::Expr(p) => {
-            let expr: &Expr = unsafe { &*(p as *const Expr) };
-            eval_expr(expr, &mut inner)?
-        }
+        ParsedClosureKind::Arrow(a) => eval_expr(a.expression, &mut inner)?,
     };
     // Propagate the consumed step budget back to the caller.
     scope.steps = inner.steps;
     Ok(result)
+}
+
+/// Find the single closure / arrow-function node in a re-parsed snippet program.
+fn find_closure_node<'p>(
+    program: &'p mago_syntax::ast::Program<'p>,
+) -> Option<ParsedClosureKind<'p>> {
+    use mago_syntax::ast::ast::expression::Expression as Expr;
+
+    fn unwrap_expr<'p>(expr: &'p Expr<'p>) -> Option<ParsedClosureKind<'p>> {
+        match expr {
+            Expr::Closure(c) => Some(ParsedClosureKind::Closure(c)),
+            Expr::ArrowFunction(a) => Some(ParsedClosureKind::Arrow(a)),
+            Expr::Parenthesized(p) => unwrap_expr(p.expression),
+            _ => None,
+        }
+    }
+
+    for stmt in program.statements.iter() {
+        if let Statement::Expression(es) = stmt {
+            if let Some(k) = unwrap_expr(es.expression) {
+                return Some(k);
+            }
+        }
+    }
+    None
 }
 
 /// Higher-order builtins that take a closure callback. `Ok(None)` = not one of
@@ -1799,12 +1914,20 @@ fn call_closure_builtin(
     match (name, args) {
         // array_map(callback, array) — single-array form, keys preserved.
         (b"array_map", [Value::Closure(cl), Value::Arr(items)]) => {
-            let mut out: Vec<(ArrayKey, Value)> = Vec::with_capacity(items.len());
-            for (k, v) in items {
-                let mapped = invoke_closure(cl, std::slice::from_ref(v), scope)?;
-                out.push((k.clone(), mapped));
-            }
-            Ok(Some(Value::Arr(out)))
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut out: Vec<(ArrayKey, Value)> = Vec::with_capacity(items.len());
+                for (k, v) in items {
+                    let mapped = invoke_parsed_closure(
+                        kind,
+                        snip,
+                        &cl.captured,
+                        std::slice::from_ref(v),
+                        scope,
+                    )?;
+                    out.push((k.clone(), mapped));
+                }
+                Ok(Some(Value::Arr(out)))
+            })
         }
         // array_map(null, ...) or the multi-array form → bail (not modelled).
         (b"array_map", [Value::Closure(_), _, _, ..]) => Err(BailReason::UnsupportedConstruct(
@@ -1813,14 +1936,22 @@ fn call_closure_builtin(
         // array_filter(array, callback) — default mode (callback sees the VALUE),
         // original keys preserved.
         (b"array_filter", [Value::Arr(items), Value::Closure(cl)]) => {
-            let mut out: Vec<(ArrayKey, Value)> = Vec::new();
-            for (k, v) in items {
-                let keep = invoke_closure(cl, std::slice::from_ref(v), scope)?;
-                if keep.to_bool() {
-                    out.push((k.clone(), v.clone()));
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut out: Vec<(ArrayKey, Value)> = Vec::new();
+                for (k, v) in items {
+                    let keep = invoke_parsed_closure(
+                        kind,
+                        snip,
+                        &cl.captured,
+                        std::slice::from_ref(v),
+                        scope,
+                    )?;
+                    if keep.to_bool() {
+                        out.push((k.clone(), v.clone()));
+                    }
                 }
-            }
-            Ok(Some(Value::Arr(out)))
+                Ok(Some(Value::Arr(out)))
+            })
         }
         // array_filter with a 3rd `mode` arg (USE_KEY / USE_BOTH) → bail.
         (b"array_filter", [Value::Arr(_), Value::Closure(_), _, ..]) => {
@@ -1830,18 +1961,24 @@ fn call_closure_builtin(
         }
         // array_reduce(array, callback, initial?) — left fold.
         (b"array_reduce", [Value::Arr(items), Value::Closure(cl)]) => {
-            let mut acc = Value::Null;
-            for (_, v) in items {
-                acc = invoke_closure(cl, &[acc, v.clone()], scope)?;
-            }
-            Ok(Some(acc))
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut acc = Value::Null;
+                for (_, v) in items {
+                    acc =
+                        invoke_parsed_closure(kind, snip, &cl.captured, &[acc, v.clone()], scope)?;
+                }
+                Ok(Some(acc))
+            })
         }
         (b"array_reduce", [Value::Arr(items), Value::Closure(cl), initial]) => {
-            let mut acc = initial.clone();
-            for (_, v) in items {
-                acc = invoke_closure(cl, &[acc, v.clone()], scope)?;
-            }
-            Ok(Some(acc))
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut acc = initial.clone();
+                for (_, v) in items {
+                    acc =
+                        invoke_parsed_closure(kind, snip, &cl.captured, &[acc, v.clone()], scope)?;
+                }
+                Ok(Some(acc))
+            })
         }
         // PHP 8.4 array predicate/search builtins. Their callback takes (value,
         // key) — value FIRST (RFC: "array_find"/"array_any"/"array_all"). Pure iff
@@ -1849,45 +1986,57 @@ fn call_closure_builtin(
         // as PHP does.
         // array_any(array, fn(value, key)): true iff fn is truthy for ANY element.
         (b"array_any", [Value::Arr(items), Value::Closure(cl)]) => {
-            for (k, v) in items {
-                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
-                if hit.to_bool() {
-                    return Ok(Some(Value::Bool(true)));
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if hit.to_bool() {
+                        return Ok(Some(Value::Bool(true)));
+                    }
                 }
-            }
-            Ok(Some(Value::Bool(false)))
+                Ok(Some(Value::Bool(false)))
+            })
         }
         // array_all(array, fn(value, key)): true iff fn is truthy for EVERY element.
         (b"array_all", [Value::Arr(items), Value::Closure(cl)]) => {
-            for (k, v) in items {
-                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
-                if !hit.to_bool() {
-                    return Ok(Some(Value::Bool(false)));
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if !hit.to_bool() {
+                        return Ok(Some(Value::Bool(false)));
+                    }
                 }
-            }
-            Ok(Some(Value::Bool(true)))
+                Ok(Some(Value::Bool(true)))
+            })
         }
         // array_find(array, fn(value, key)): the first VALUE where fn is truthy,
         // else null.
         (b"array_find", [Value::Arr(items), Value::Closure(cl)]) => {
-            for (k, v) in items {
-                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
-                if hit.to_bool() {
-                    return Ok(Some(v.clone()));
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if hit.to_bool() {
+                        return Ok(Some(v.clone()));
+                    }
                 }
-            }
-            Ok(Some(Value::Null))
+                Ok(Some(Value::Null))
+            })
         }
         // array_find_key(array, fn(value, key)): the first KEY where fn is truthy,
         // else null.
         (b"array_find_key", [Value::Arr(items), Value::Closure(cl)]) => {
-            for (k, v) in items {
-                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
-                if hit.to_bool() {
-                    return Ok(Some(array_key_to_value(k)));
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if hit.to_bool() {
+                        return Ok(Some(array_key_to_value(k)));
+                    }
                 }
-            }
-            Ok(Some(Value::Null))
+                Ok(Some(Value::Null))
+            })
         }
         // usort & friends mutate by reference → bail (fail-closed): a by-value
         // model cannot write the sorted array back to the caller's variable.
@@ -2196,7 +2345,8 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.as_bytes().to_vec(), v))
             .collect();
-        run_method_body(block, givens, &NoResolver)
+        // Attach the file source so a closure literal in `body` owns its bytes.
+        run_method_body_inner(block, givens, &NoResolver, None, Some(&file.contents))
     }
 
     fn first_function_block<'a>(
@@ -2220,7 +2370,7 @@ mod tests {
         );
         let program = parse_file(&arena, &file);
         let block = first_function_block(program).unwrap();
-        let mut scope = Scope::new(HashMap::new(), &NoResolver);
+        let mut scope = Scope::new(HashMap::new(), &NoResolver).with_source(&file.contents);
         // The body is a single `return <expr>;`.
         for stmt in block.statements.iter() {
             if let Statement::Return(ret) = stmt {
