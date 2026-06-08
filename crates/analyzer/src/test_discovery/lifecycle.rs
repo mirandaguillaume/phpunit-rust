@@ -4,8 +4,8 @@
 //! Lifecycle methods are matched by exact name; case-sensitive per PHPUnit convention.
 
 use super::TestMethod;
-use crate::mago_bridge::MagoProject;
-use mago_reflection::class_like::ClassLikeReflection;
+use crate::mago_bridge::{MagoProject, word_to_string};
+use mago_codex::metadata::class_like::ClassLikeMetadata;
 use std::collections::HashMap;
 
 /// Walk each test method's owning class and flag which lifecycle methods are defined.
@@ -14,9 +14,9 @@ use std::collections::HashMap;
 /// `tearDownAfterClass`. Any other names are ignored.
 pub fn bind_lifecycle_methods(project: &MagoProject, methods: &mut [TestMethod]) {
     // Build lowercased FQCN → reflection index (consistent with Task 8's testcase.rs).
-    let class_index: HashMap<String, &ClassLikeReflection> = project
+    let class_index: HashMap<String, &ClassLikeMetadata> = project
         .class_likes()
-        .map(|(name, refl)| (project.class_name_str(name).to_lowercase(), refl))
+        .map(|refl| (word_to_string(&refl.name).to_lowercase(), refl))
         .collect();
 
     for tm in methods.iter_mut() {
@@ -24,9 +24,9 @@ pub fn bind_lifecycle_methods(project: &MagoProject, methods: &mut [TestMethod])
         let Some(class_refl) = class_index.get(&key) else {
             continue;
         };
-        for (method_id, _method_refl) in class_refl.methods.members.iter() {
-            let method_name = project.interner().lookup(method_id);
-            match method_name {
+        for method_word in class_refl.methods.iter() {
+            let method_name = word_to_string(method_word).to_lowercase();
+            match method_name.as_str() {
                 "setup" => tm.lifecycle.set_up = true,
                 "teardown" => tm.lifecycle.tear_down = true,
                 "setupbeforeclass" => tm.lifecycle.set_up_before_class = true,
