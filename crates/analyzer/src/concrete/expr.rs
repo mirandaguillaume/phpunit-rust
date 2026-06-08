@@ -96,9 +96,9 @@ pub fn compute(expr: &Expression, ctx: &mut Context) -> Result<PhpValue, Compute
 fn compute_inner(expr: &Expression, ctx: &mut Context) -> Result<PhpValue, ComputeError> {
     match expr {
         Expression::Literal(lit) => compute_literal(lit),
-        Expression::Parenthesized(p) => compute(&p.expression, ctx),
-        Expression::UnaryPrefix(u) => compute_unary_prefix(&u.operator, &u.operand, ctx),
-        Expression::Binary(b) => compute_binary(&b.lhs, &b.operator, &b.rhs, ctx),
+        Expression::Parenthesized(p) => compute(p.expression, ctx),
+        Expression::UnaryPrefix(u) => compute_unary_prefix(&u.operator, u.operand, ctx),
+        Expression::Binary(b) => compute_binary(b.lhs, &b.operator, b.rhs, ctx),
         Expression::Array(arr) => compute_array(arr, ctx),
         Expression::LegacyArray(arr) => compute_legacy_array(arr, ctx),
         other => Err(ComputeError::Unsupported(format!("{}", other))),
@@ -109,10 +109,15 @@ fn compute_inner(expr: &Expression, ctx: &mut Context) -> Result<PhpValue, Compu
 
 fn compute_literal(lit: &Literal) -> Result<PhpValue, ComputeError> {
     match lit {
-        Literal::Integer(i) => Ok(PhpValue::Int(i.value as i64)),
+        Literal::Integer(i) => match i.value {
+            Some(v) => Ok(PhpValue::Int(v as i64)),
+            None => Err(ComputeError::Unsupported(
+                "LiteralInteger with unresolved value (overflow)".into(),
+            )),
+        },
         Literal::Float(f) => Ok(PhpValue::Float(*f.value)),
         Literal::String(s) => match &s.value {
-            Some(v) => Ok(PhpValue::String(v.clone())),
+            Some(v) => Ok(PhpValue::String(String::from_utf8_lossy(v).into_owned())),
             None => Err(ComputeError::Unsupported(
                 "LiteralString with unresolved value (complex escape sequence)".into(),
             )),
@@ -257,8 +262,8 @@ fn build_php_array(elements: &[ArrayElement], ctx: &mut Context) -> Result<PhpVa
     for element in elements {
         match element {
             ArrayElement::KeyValue(kv) => {
-                let k = compute(&kv.key, ctx)?;
-                let v = compute(&kv.value, ctx)?;
+                let k = compute(kv.key, ctx)?;
+                let v = compute(kv.value, ctx)?;
                 let key = php_value_to_array_key(k)?;
                 if let ArrayKey::Int(n) = &key {
                     if *n >= next_int_key {
@@ -268,7 +273,7 @@ fn build_php_array(elements: &[ArrayElement], ctx: &mut Context) -> Result<PhpVa
                 map.insert(key, v);
             }
             ArrayElement::Value(ve) => {
-                let v = compute(&ve.value, ctx)?;
+                let v = compute(ve.value, ctx)?;
                 map.insert(ArrayKey::Int(next_int_key), v);
                 next_int_key += 1;
             }
@@ -367,19 +372,26 @@ fn numeric_op(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mago_interner::ThreadedInterner;
-    use mago_source::Source;
+    use bumpalo::Bump;
+    use mago_database::file::File;
     use mago_syntax::ast::ast::statement::Statement;
+    use mago_syntax::parser::parse_file;
 
-    /// Parse `<?php <snippet>;` and return the first expression statement's expression.
-    fn parse_expr(snippet: &str) -> Expression {
+    /// Parse `<?php <snippet>;` and return the first expression statement's
+    /// expression. The arena is leaked so the returned reference is `'static`
+    /// (test-only; the leak is bounded by the test process lifetime).
+    fn parse_expr(snippet: &str) -> &'static Expression<'static> {
         let full = format!("<?php {};", snippet);
-        let interner = ThreadedInterner::new();
-        let source = Source::standalone(&interner, "test.php", &full);
-        let (program, _err) = mago_syntax::parser::parse_source(&interner, &source);
+        let arena: &'static Bump = Box::leak(Box::new(Bump::new()));
+        let file = File::ephemeral(
+            std::borrow::Cow::Borrowed(b"test.php".as_slice()),
+            std::borrow::Cow::Owned(full.clone().into_bytes()),
+        );
+        let file: &'static File = Box::leak(Box::new(file));
+        let program = parse_file(arena, file);
         for stmt in program.statements.iter() {
             if let Statement::Expression(es) = stmt {
-                return (*es.expression).clone();
+                return es.expression;
             }
         }
         panic!("no ExpressionStatement found in: {}", full);
@@ -393,7 +405,7 @@ mod tests {
             max_depth: 100,
         };
         assert!(matches!(
-            compute(&expr, &mut ctx),
+            compute(expr, &mut ctx),
             Err(ComputeError::DepthExceeded)
         ));
     }
@@ -402,7 +414,7 @@ mod tests {
     fn evaluates_integer_literal() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("42"), &mut ctx).unwrap(),
+            compute(parse_expr("42"), &mut ctx).unwrap(),
             PhpValue::Int(42)
         );
     }
@@ -411,7 +423,7 @@ mod tests {
     fn evaluates_negative_integer() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("-42"), &mut ctx).unwrap(),
+            compute(parse_expr("-42"), &mut ctx).unwrap(),
             PhpValue::Int(-42)
         );
     }
@@ -422,7 +434,7 @@ mod tests {
     #[test]
     fn evaluates_float_literal() {
         let mut ctx = Context::new();
-        match compute(&parse_expr("3.14"), &mut ctx).unwrap() {
+        match compute(parse_expr("3.14"), &mut ctx).unwrap() {
             PhpValue::Float(f) => assert!((f - 3.14).abs() < 1e-10),
             v => panic!("expected Float, got {:?}", v),
         }
@@ -432,7 +444,7 @@ mod tests {
     fn evaluates_string_literal() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("'hello'"), &mut ctx).unwrap(),
+            compute(parse_expr("'hello'"), &mut ctx).unwrap(),
             PhpValue::String("hello".into())
         );
     }
@@ -441,7 +453,7 @@ mod tests {
     fn evaluates_double_quoted_string() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("\"world\""), &mut ctx).unwrap(),
+            compute(parse_expr("\"world\""), &mut ctx).unwrap(),
             PhpValue::String("world".into())
         );
     }
@@ -450,15 +462,15 @@ mod tests {
     fn evaluates_true_false_null() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("true"), &mut ctx).unwrap(),
+            compute(parse_expr("true"), &mut ctx).unwrap(),
             PhpValue::Bool(true)
         );
         assert_eq!(
-            compute(&parse_expr("false"), &mut ctx).unwrap(),
+            compute(parse_expr("false"), &mut ctx).unwrap(),
             PhpValue::Bool(false)
         );
         assert_eq!(
-            compute(&parse_expr("null"), &mut ctx).unwrap(),
+            compute(parse_expr("null"), &mut ctx).unwrap(),
             PhpValue::Null
         );
     }
@@ -467,7 +479,7 @@ mod tests {
     fn evaluates_int_addition() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("1 + 2"), &mut ctx).unwrap(),
+            compute(parse_expr("1 + 2"), &mut ctx).unwrap(),
             PhpValue::Int(3)
         );
     }
@@ -476,7 +488,7 @@ mod tests {
     fn evaluates_int_subtraction() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("10 - 3"), &mut ctx).unwrap(),
+            compute(parse_expr("10 - 3"), &mut ctx).unwrap(),
             PhpValue::Int(7)
         );
     }
@@ -485,7 +497,7 @@ mod tests {
     fn evaluates_int_multiplication() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("6 * 7"), &mut ctx).unwrap(),
+            compute(parse_expr("6 * 7"), &mut ctx).unwrap(),
             PhpValue::Int(42)
         );
     }
@@ -494,7 +506,7 @@ mod tests {
     fn evaluates_int_division_exact() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("10 / 2"), &mut ctx).unwrap(),
+            compute(parse_expr("10 / 2"), &mut ctx).unwrap(),
             PhpValue::Int(5)
         );
     }
@@ -502,7 +514,7 @@ mod tests {
     #[test]
     fn evaluates_int_division_to_float() {
         let mut ctx = Context::new();
-        match compute(&parse_expr("7 / 2"), &mut ctx).unwrap() {
+        match compute(parse_expr("7 / 2"), &mut ctx).unwrap() {
             PhpValue::Float(f) => assert!((f - 3.5).abs() < 1e-10),
             v => panic!("expected Float, got {:?}", v),
         }
@@ -512,7 +524,7 @@ mod tests {
     fn evaluates_string_concat() {
         let mut ctx = Context::new();
         assert_eq!(
-            compute(&parse_expr("'hello' . ' world'"), &mut ctx).unwrap(),
+            compute(parse_expr("'hello' . ' world'"), &mut ctx).unwrap(),
             PhpValue::String("hello world".into())
         );
     }
@@ -520,7 +532,7 @@ mod tests {
     #[test]
     fn evaluates_array_literal() {
         let mut ctx = Context::new();
-        match compute(&parse_expr("[1, 2, 3]"), &mut ctx).unwrap() {
+        match compute(parse_expr("[1, 2, 3]"), &mut ctx).unwrap() {
             PhpValue::Array(map) => {
                 assert_eq!(map.get(&ArrayKey::Int(0)), Some(&PhpValue::Int(1)));
                 assert_eq!(map.get(&ArrayKey::Int(1)), Some(&PhpValue::Int(2)));
@@ -533,7 +545,7 @@ mod tests {
     #[test]
     fn evaluates_array_with_string_keys() {
         let mut ctx = Context::new();
-        match compute(&parse_expr("['a' => 1, 'b' => 2]"), &mut ctx).unwrap() {
+        match compute(parse_expr("['a' => 1, 'b' => 2]"), &mut ctx).unwrap() {
             PhpValue::Array(map) => {
                 assert_eq!(
                     map.get(&ArrayKey::String("a".into())),
@@ -552,7 +564,7 @@ mod tests {
     fn unsupported_variable_returns_error() {
         let mut ctx = Context::new();
         assert!(matches!(
-            compute(&parse_expr("$x"), &mut ctx),
+            compute(parse_expr("$x"), &mut ctx),
             Err(ComputeError::Unsupported(_))
         ));
     }
