@@ -411,6 +411,7 @@ fn exec_stmt(stmt: &Statement, scope: &mut Scope) -> Result<Flow, BailReason> {
         Statement::Block(b) => exec_statements(b.statements.iter(), scope),
         Statement::If(if_stmt) => exec_if(if_stmt, scope),
         Statement::While(w) => exec_while(w, scope),
+        Statement::For(f) => exec_for(f, scope),
         Statement::Foreach(f) => exec_foreach(f, scope),
         other => Err(BailReason::UnsupportedConstruct(format!(
             "statement: {}",
@@ -421,7 +422,6 @@ fn exec_stmt(stmt: &Statement, scope: &mut Scope) -> Result<Flow, BailReason> {
 
 fn stmt_kind(s: &Statement) -> &'static str {
     match s {
-        Statement::For(_) => "for",
         Statement::Switch(_) => "switch",
         Statement::Echo(_) => "echo",
         Statement::Try(_) => "try",
@@ -480,6 +480,70 @@ fn exec_while(
             Flow::Normal => {}
             // `break`/`continue` are not modelled; a return/assert propagates.
             other => return Ok(other),
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+/// C-style `for (init; cond; step) body`. Same step-budget guard as `while` →
+/// a runaway loop bails (never hangs). PHP allows comma-separated init/step
+/// expressions and a comma-separated condition list whose LAST element is the
+/// truthiness test (gold-tested vs `php -r`); an EMPTY condition is always-true.
+/// `break`/`continue` inside the body are not modelled — a `return`/assertion
+/// propagates, but a `break`-relying loop would mis-run, so the loop's body is
+/// executed via `exec_stmt` whose unmodelled `break` bails (fail-closed).
+fn exec_for(
+    f: &mago_syntax::ast::ast::r#loop::r#for::For,
+    scope: &mut Scope,
+) -> Result<Flow, BailReason> {
+    use mago_syntax::ast::ast::r#loop::r#for::ForBody;
+
+    // init: evaluate every initialization expression once, in order.
+    for init in f.initializations.iter() {
+        eval_expr(init, scope)?;
+    }
+
+    loop {
+        scope.tick()?;
+        // condition: PHP evaluates ALL condition expressions; the loop continues
+        // iff the LAST one is truthy. An empty condition list is always-true.
+        let mut keep_going = true;
+        let mut last: Option<Value> = None;
+        for cond in f.conditions.iter() {
+            last = Some(eval_expr(cond, scope)?);
+        }
+        if let Some(v) = last {
+            keep_going = v.to_bool();
+        }
+        if !keep_going {
+            break;
+        }
+
+        let flow = match &f.body {
+            ForBody::Statement(s) => exec_stmt(s, scope)?,
+            ForBody::ColonDelimited(body) => {
+                let mut acc = Flow::Normal;
+                for s in body.statements.iter() {
+                    match exec_stmt(s, scope)? {
+                        Flow::Normal => {}
+                        other => {
+                            acc = other;
+                            break;
+                        }
+                    }
+                }
+                acc
+            }
+        };
+        match flow {
+            Flow::Normal => {}
+            // `break`/`continue` are not modelled; a return/assert propagates.
+            other => return Ok(other),
+        }
+
+        // step: evaluate every increment expression once, in order.
+        for step in f.increments.iter() {
+            eval_expr(step, scope)?;
         }
     }
     Ok(Flow::Normal)
@@ -783,6 +847,7 @@ fn eval_expr(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> 
             "indirect/nested variable".into(),
         )),
         Expression::UnaryPrefix(u) => eval_unary(&u.operator, u.operand, scope),
+        Expression::UnaryPostfix(u) => eval_postfix(u.operand, &u.operator, scope),
         Expression::Binary(b) => eval_binary(b.lhs, &b.operator, b.rhs, scope),
         Expression::Assignment(a) => eval_assignment(a, scope),
         Expression::Conditional(c) => eval_conditional(c, scope),
@@ -1010,6 +1075,12 @@ fn eval_unary(
         UnaryPrefixOperator::Not(_) => Ok(Value::Bool(!eval_expr(operand, scope)?.to_bool())),
         UnaryPrefixOperator::Negation(_) => php_negate(eval_expr(operand, scope)?),
         UnaryPrefixOperator::Plus(_) => php_unary_plus(eval_expr(operand, scope)?),
+        // `++$x` / `--$x`: mutate then return the NEW value. Only a simple `$var`
+        // numeric lvalue is modelled (the loop-counter case); string/null
+        // increment has PHP-specific quirks (perl-style string ++, `null++`→1 but
+        // `null--`→null) → bail there, fail-closed.
+        UnaryPrefixOperator::PreIncrement(_) => incdec_lvalue(operand, true, true, scope),
+        UnaryPrefixOperator::PreDecrement(_) => incdec_lvalue(operand, false, true, scope),
         UnaryPrefixOperator::IntCast(..) | UnaryPrefixOperator::IntegerCast(..) => {
             Ok(Value::Int(eval_expr(operand, scope)?.to_int()))
         }
@@ -1053,6 +1124,65 @@ fn php_unary_plus(v: Value) -> Result<Value, BailReason> {
         Value::Arr(_) => Err(BailReason::TypeError("unary + on array".into())),
         Value::Object { .. } => Err(BailReason::TypeError("unary + on object".into())),
     }
+}
+
+/// `$x++` / `$x--`: mutate then return the OLD value (postfix).
+fn eval_postfix(
+    operand: &Expression,
+    op: &mago_syntax::ast::ast::unary::UnaryPostfixOperator,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::unary::UnaryPostfixOperator as Op;
+    match op {
+        Op::PostIncrement(_) => incdec_lvalue(operand, true, false, scope),
+        Op::PostDecrement(_) => incdec_lvalue(operand, false, false, scope),
+    }
+}
+
+/// Shared `++`/`--` on a simple `$var` lvalue. `inc` selects increment vs
+/// decrement; `prefix` selects whether the NEW (prefix) or OLD (postfix) value is
+/// returned. Only an Int/Float counter is modelled — a string/null/bool/array
+/// target bails (PHP's perl-style string `++`, `null--`→null, etc. are quirks we
+/// refuse to guess). The target must be a bound `$var`; an unbound one bails.
+fn incdec_lvalue(
+    operand: &Expression,
+    inc: bool,
+    prefix: bool,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let Expression::Variable(Variable::Direct(v)) = operand else {
+        return Err(BailReason::UnsupportedConstruct(
+            "++/-- on a non-simple lvalue".into(),
+        ));
+    };
+    let key = var_name(v.name);
+    let cur = scope.vars.get(&key).cloned().ok_or_else(|| {
+        BailReason::UnboundVariable(String::from_utf8_lossy(&key).into_owned())
+    })?;
+    let new = match &cur {
+        Value::Int(n) => {
+            let stepped = if inc { n.checked_add(1) } else { n.checked_sub(1) };
+            match stepped {
+                Some(r) => Value::Int(r),
+                // PHP_INT_MAX++ → float (overflow→float), like arithmetic.
+                None => Value::Float(if inc {
+                    *n as f64 + 1.0
+                } else {
+                    *n as f64 - 1.0
+                }),
+            }
+        }
+        Value::Float(f) => Value::Float(if inc { f + 1.0 } else { f - 1.0 }),
+        // String/null/bool/array ++/-- have PHP-specific semantics we won't guess.
+        other => {
+            return Err(BailReason::UnsupportedConstruct(format!(
+                "++/-- on a {} (only numeric counters modelled)",
+                other.type_name()
+            )))
+        }
+    };
+    scope.vars.insert(key, new.clone());
+    Ok(if prefix { new } else { cur })
 }
 
 fn eval_binary(
@@ -2182,6 +2312,64 @@ mod tests {
             vec![],
         );
         assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn for_loop_accumulates() {
+        // sum 0..4 = 10 (classic C-style for).
+        let outcome = run_body(
+            "$s = 0; for ($i = 0; $i < 5; $i++) { $s = $s + $i; } $this->assertSame(10, $s);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn for_loop_with_break_and_return() {
+        // a `return` out of a for propagates; a body assertion failing is terminal.
+        assert_eq!(
+            run_returning(
+                "for ($i = 0; $i < 100; $i = $i + 1) { if ($i == 3) { return $i; } } return -1;",
+                vec![]
+            )
+            .unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn for_loop_multi_init_and_step() {
+        // PHP allows comma-separated init and step expressions; condition is the
+        // LAST condition expression (gold: php -r with $i,$j twin counters).
+        let outcome = run_body(
+            "$s = 0; for ($i = 0, $j = 10; $i < 3; $i = $i + 1, $j = $j - 1) { $s = $s + $j; } $this->assertSame(27, $s);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn for_loop_empty_condition_needs_break_or_return() {
+        // `for (;;)` with no condition loops forever in PHP; with a return inside it
+        // terminates. (Empty condition = always true.)
+        assert_eq!(
+            run_returning(
+                "$i = 0; for (;;) { if ($i >= 4) { return $i; } $i = $i + 1; }",
+                vec![]
+            )
+            .unwrap(),
+            Value::Int(4)
+        );
+    }
+
+    #[test]
+    fn for_loop_runaway_bails_on_step_budget() {
+        // A genuinely infinite for with no exit must hit the step budget → bail,
+        // never hang or guess.
+        assert!(matches!(
+            run_returning("for (;;) { $x = 1; } return 0;", vec![]),
+            Err(BailReason::StepBudget)
+        ));
     }
 
     #[test]
