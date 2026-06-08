@@ -26,9 +26,15 @@ use crate::concrete::PhpValue;
 
 /// A concrete PHP value with a **byte-backed** string, for the reducer.
 ///
-/// `Float` keeps a raw `f64` (NOT `OrderedFloat`): float equality is PHP `==`,
-/// computed by us in [`super::value`] comparisons, never derived structurally.
-#[derive(Debug, Clone)]
+/// `Float` keeps a raw `f64` (NOT `OrderedFloat`): PHP `==`/`===`/`<=>` are the
+/// hand-written [`Value::php_loose_eq`] / [`Value::php_strict_eq`] /
+/// [`Value::php_compare`], never the derived `PartialEq`.
+///
+/// The derived `PartialEq` is **structural** (`f64` bit/value compare, byte-exact
+/// strings, positional arrays) and exists ONLY for test assertions and for the
+/// `PartialEq` on [`super::eval::Outcome`]. It is deliberately NOT used anywhere
+/// for PHP value semantics — those go through the `php_*` methods above.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Bool(bool),
