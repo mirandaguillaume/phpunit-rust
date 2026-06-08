@@ -165,6 +165,9 @@ impl BridgeResolver<'_> {
         args: &[Value],
     ) -> Result<Option<Value>, BailReason> {
         let codebase = self.project.codebase();
+        // Strip a leading `\` so a fully-qualified `\App\Calc` matches mago's key.
+        let class = normalize_fqcn(class);
+        let class = class.as_slice();
         // Resolve the concrete declaring method (follows inheritance/traits).
         let Some(meta) = codebase.get_declaring_method(class, method) else {
             return Ok(None);
@@ -220,6 +223,9 @@ impl BridgeResolver<'_> {
     /// (resolved via its own declaring class), so it is run in its declaring file.
     fn construct_object(&self, class: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
         let codebase = self.project.codebase();
+        // Strip a leading `\` so a fully-qualified `\App\Calc` matches mago's key.
+        let class = normalize_fqcn(class);
+        let class = class.as_slice();
         // The original-cased FQCN for the record's `class` tag (so object `==`
         // compares the real class name, not a lowercased key).
         let class_meta = match codebase.get_class_like(class) {
@@ -709,19 +715,43 @@ mod tests {
         program: &'a mago_syntax::ast::Program<'a>,
         method: &str,
     ) -> Option<&'a mago_syntax::ast::ast::block::Block<'a>> {
+        find_method_block_in(program.statements.iter(), method)
+    }
+
+    fn find_method_block_in<'s>(
+        stmts: impl Iterator<Item = &'s Statement<'s>>,
+        method: &str,
+    ) -> Option<&'s mago_syntax::ast::ast::block::Block<'s>> {
         use mago_syntax::ast::ast::class_like::member::ClassLikeMember;
         use mago_syntax::ast::ast::class_like::method::MethodBody;
-        for stmt in program.statements.iter() {
-            if let Statement::Class(class) = stmt {
-                for member in class.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if m.name.value.eq_ignore_ascii_case(method.as_bytes()) {
-                            if let MethodBody::Concrete(block) = &m.body {
-                                return Some(block);
+        use mago_syntax::ast::ast::namespace::NamespaceBody;
+        for stmt in stmts {
+            match stmt {
+                Statement::Class(class) => {
+                    for member in class.members.iter() {
+                        if let ClassLikeMember::Method(m) = member {
+                            if m.name.value.eq_ignore_ascii_case(method.as_bytes()) {
+                                if let MethodBody::Concrete(block) = &m.body {
+                                    return Some(block);
+                                }
                             }
                         }
                     }
                 }
+                Statement::Namespace(ns) => {
+                    let found = match &ns.body {
+                        NamespaceBody::Implicit(b) => {
+                            find_method_block_in(b.statements.iter(), method)
+                        }
+                        NamespaceBody::BraceDelimited(b) => {
+                            find_method_block_in(b.statements.iter(), method)
+                        }
+                    };
+                    if found.is_some() {
+                        return found;
+                    }
+                }
+                _ => {}
             }
         }
         None
@@ -971,5 +1001,83 @@ class ConfigTest {
             reduce_with_subst(src, "ConfigTest", "testDefaults", vec![]),
             Outcome::Pass
         );
+    }
+
+    #[test]
+    fn fqn_aware_resolution_binds_the_right_namespace_body() {
+        // Two classes with the SAME simple name `Calc` in different namespaces,
+        // each with a `value()` returning a DIFFERENT constant. The method resolver
+        // is FQN-aware: a fully-qualified `\App\Calc` must bind `App\Calc::value`
+        // → 100, never `Lib\Calc::value` → 1 (the simple-name match it replaced
+        // could have bound the wrong body — a silent divergence). The class is
+        // referenced fully-qualified so it resolves without `use`-alias name
+        // resolution (unqualified-name resolution at the call site is inc-3).
+        let src = r#"<?php
+namespace Lib { final class Calc { public function value(): int { return 1; } } }
+namespace App {
+    final class Calc { public function value(): int { return 100; } }
+}
+namespace {
+    class CalcTest {
+        public function testValue(): void {
+            $this->assertSame(100, (new \App\Calc())->value());
+            $this->assertSame(1, (new \Lib\Calc())->value());
+        }
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "CalcTest", "testValue", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn nested_object_structural_equals() {
+        // assertEquals over objects whose props are themselves objects (recursive
+        // per-prop loose compare).
+        let src = r#"<?php
+final class Inner { public function __construct(public int $v) {} }
+final class Outer { public function __construct(public Inner $a, public Inner $b) {} }
+class NestTest {
+    public function testEquals(): void {
+        $this->assertEquals(
+            new Outer(new Inner(1), new Inner(2)),
+            new Outer(new Inner(1), new Inner(2))
+        );
+        $this->assertNotEquals(
+            new Outer(new Inner(1), new Inner(2)),
+            new Outer(new Inner(9), new Inner(2))
+        );
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "NestTest", "testEquals", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn read_of_unseeded_property_bails() {
+        // A constructor that does not seed a (non-default) property, then a method
+        // reads it: PHP would warn + return null; the reducer bails (fail-closed).
+        let src = r#"<?php
+final class Partial {
+    public int $a;
+    public int $b;
+    public function __construct(int $a) { $this->a = $a; }
+    public function b(): int { return $this->b; }
+}
+class PartialTest {
+    public function testReadUnset(): void {
+        $this->assertSame(0, (new Partial(1))->b());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "PartialTest", "testReadUnset", vec![]),
+            Outcome::Bailed(_)
+        ));
     }
 }
