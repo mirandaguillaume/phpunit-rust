@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 
-use mago_interner::ThreadedInterner;
 use mago_syntax::ast::binary::{Binary, BinaryOperator};
 use mago_syntax::ast::control_flow::r#if::{If, IfBody};
 use mago_syntax::ast::{
@@ -14,7 +13,7 @@ use mago_syntax::ast::{
 };
 
 use crate::boundary::{Boundary, BoundaryResolver};
-use crate::mago_bridge::MagoProject;
+use crate::mago_bridge::{MagoProject, word_to_string};
 
 /// Cyclomatic complexity and location data for one class method.
 #[derive(Debug, Clone)]
@@ -30,36 +29,39 @@ pub struct MethodComplexity {
 
 /// Compute cyclomatic complexity for all methods of project-boundary classes.
 pub fn compute_all(project: &MagoProject, boundary: &BoundaryResolver) -> Vec<MethodComplexity> {
-    let interner = project.interner();
+    let codebase = project.codebase();
     let mut result = Vec::new();
 
-    for (name, refl) in project.class_likes() {
-        let source_id = refl.span.start.source;
-        let Some(src) = project.source_by_id(source_id) else {
+    for refl in project.class_likes() {
+        let Some(src) = project.file_of_span(&refl.span) else {
             continue;
         };
-        let file = PathBuf::from(interner.lookup(&src.identifier.0).to_string());
+        let file = match &src.path {
+            Some(p) => p.clone(),
+            None => PathBuf::from(String::from_utf8_lossy(&src.name).into_owned()),
+        };
 
         if boundary.classify(&file) != Boundary::Project {
             continue;
         }
 
-        let class_name = project.class_name_str(name);
+        let class_name = word_to_string(&refl.name);
+        let logical_name = String::from_utf8_lossy(&src.name).into_owned();
 
-        let program = project.get_or_parse(src);
+        for method_word in refl.methods.iter() {
+            let Some(method_refl) = codebase.get_method(refl.name.as_bytes(), method_word.as_bytes())
+            else {
+                continue;
+            };
+            let method_name = word_to_string(method_word);
+            let start_line = src.line_number(method_refl.span.start.offset) + 1;
+            let end_line = src.line_number(method_refl.span.end.offset) + 1;
 
-        for (method_key, method_refl) in &refl.methods.members {
-            let method_name = interner.lookup(method_key).to_string();
-            let start_line = src.line_number(method_refl.span.start.offset) as u32 + 1;
-            let end_line = src.line_number(method_refl.span.end.offset) as u32 + 1;
-
-            let cc = navigate(
-                program.statements.iter(),
-                &class_name,
-                &method_name,
-                interner,
-            )
-            .unwrap_or(0);
+            let cc = project
+                .with_program(&logical_name, |program, _file, _names| {
+                    navigate(program.statements.iter(), &class_name, &method_name).unwrap_or(0)
+                })
+                .unwrap_or(0);
 
             result.push(MethodComplexity {
                 class: class_name.clone(),
@@ -81,24 +83,36 @@ fn simple_name(class: &str) -> &str {
     class.rsplit('\\').next().unwrap_or(class)
 }
 
+/// Case-insensitive compare an AST identifier's raw bytes against a `&str`.
+fn name_eq_ignore_case(bytes: &[u8], s: &str) -> bool {
+    String::from_utf8_lossy(bytes).eq_ignore_ascii_case(s)
+}
+
+/// Lowercase an AST identifier's raw bytes into an owned `String`.
+fn name_to_lower(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_lowercase()
+}
+
 /// Walk `stmts` to find the class + method and return its decision-point count.
-fn navigate<'s>(
-    stmts: impl Iterator<Item = &'s Statement>,
+fn navigate<'a, 's>(
+    stmts: impl Iterator<Item = &'s Statement<'a>>,
     class: &str,
     method: &str,
-    interner: &ThreadedInterner,
-) -> Option<u32> {
+) -> Option<u32>
+where
+    'a: 's,
+{
     let simple = simple_name(class);
     let method_lc = method.to_lowercase();
 
     for stmt in stmts {
         match stmt {
-            Statement::Class(c) if interner.lookup(&c.name.value).eq_ignore_ascii_case(simple) => {
+            Statement::Class(c) if name_eq_ignore_case(c.name.value, simple) => {
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                        if name_to_lower(m.name.value) == method_lc {
                             if let MethodBody::Concrete(block) = &m.body {
-                                return Some(count_block(block, interner));
+                                return Some(count_block(block));
                             }
                             return Some(0);
                         }
@@ -106,12 +120,12 @@ fn navigate<'s>(
                 }
                 return None;
             }
-            Statement::Trait(t) if interner.lookup(&t.name.value).eq_ignore_ascii_case(simple) => {
+            Statement::Trait(t) if name_eq_ignore_case(t.name.value, simple) => {
                 for member in t.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                        if name_to_lower(m.name.value) == method_lc {
                             if let MethodBody::Concrete(block) = &m.body {
-                                return Some(count_block(block, interner));
+                                return Some(count_block(block));
                             }
                             return Some(0);
                         }
@@ -122,12 +136,8 @@ fn navigate<'s>(
             Statement::Namespace(ns) => {
                 use mago_syntax::ast::namespace::NamespaceBody;
                 let found = match &ns.body {
-                    NamespaceBody::Implicit(b) => {
-                        navigate(b.statements.iter(), class, method, interner)
-                    }
-                    NamespaceBody::BraceDelimited(b) => {
-                        navigate(b.statements.iter(), class, method, interner)
-                    }
+                    NamespaceBody::Implicit(b) => navigate(b.statements.iter(), class, method),
+                    NamespaceBody::BraceDelimited(b) => navigate(b.statements.iter(), class, method),
                 };
                 if found.is_some() {
                     return found;
@@ -141,85 +151,84 @@ fn navigate<'s>(
 
 // ── Decision-point counters ───────────────────────────────────────────────────
 
-fn count_block(block: &Block, interner: &ThreadedInterner) -> u32 {
-    block
-        .statements
-        .iter()
-        .map(|s| count_stmt(s, interner))
-        .sum()
+fn count_block(block: &Block) -> u32 {
+    block.statements.iter().map(count_stmt).sum()
 }
 
-fn count_stmts<'s>(stmts: impl Iterator<Item = &'s Statement>, interner: &ThreadedInterner) -> u32 {
-    stmts.map(|s| count_stmt(s, interner)).sum()
+fn count_stmts<'a, 's>(stmts: impl Iterator<Item = &'s Statement<'a>>) -> u32
+where
+    'a: 's,
+{
+    stmts.map(count_stmt).sum()
 }
 
-fn count_stmt(stmt: &Statement, interner: &ThreadedInterner) -> u32 {
+fn count_stmt(stmt: &Statement) -> u32 {
     match stmt {
-        Statement::If(if_stmt) => count_if(if_stmt, interner),
-        Statement::While(w) => 1 + count_while_body(w, interner),
-        Statement::DoWhile(dw) => 1 + count_stmt(&dw.statement, interner),
-        Statement::For(f) => 1 + count_stmts(f.body.statements().iter(), interner),
-        Statement::Foreach(fe) => 1 + count_stmts(fe.body.statements().iter(), interner),
-        Statement::Switch(sw) => count_switch(sw, interner),
-        Statement::Try(t) => count_try(t, interner),
-        Statement::Block(b) => count_block(b, interner),
-        Statement::Expression(e) => count_expr(&e.expression),
-        Statement::Return(r) => r.value.as_ref().map_or(0, count_expr),
+        Statement::If(if_stmt) => count_if(if_stmt),
+        Statement::While(w) => 1 + count_while_body(w),
+        Statement::DoWhile(dw) => 1 + count_stmt(dw.statement),
+        Statement::For(f) => 1 + count_stmts(f.body.statements().iter()),
+        Statement::Foreach(fe) => 1 + count_stmts(fe.body.statements().iter()),
+        Statement::Switch(sw) => count_switch(sw),
+        Statement::Try(t) => count_try(t),
+        Statement::Block(b) => count_block(b),
+        Statement::Expression(e) => count_expr(e.expression),
+        Statement::Return(r) => r.value.map_or(0, count_expr),
         _ => 0,
     }
 }
 
-fn count_if(if_stmt: &If, interner: &ThreadedInterner) -> u32 {
-    let mut cc = 1 + count_expr(&if_stmt.condition);
+fn count_if(if_stmt: &If) -> u32 {
+    let mut cc = 1 + count_expr(if_stmt.condition);
     match &if_stmt.body {
         IfBody::Statement(sb) => {
-            cc += count_stmt(&sb.statement, interner);
+            cc += count_stmt(sb.statement);
             for ei in sb.else_if_clauses.iter() {
-                cc += 1 + count_expr(&ei.condition) + count_stmt(&ei.statement, interner);
+                cc += 1 + count_expr(ei.condition) + count_stmt(ei.statement);
             }
             if let Some(el) = &sb.else_clause {
-                cc += count_stmt(&el.statement, interner);
+                cc += count_stmt(el.statement);
             }
         }
         IfBody::ColonDelimited(cb) => {
-            cc += count_stmts(cb.statements.iter(), interner);
+            cc += count_stmts(cb.statements.iter());
             for ei in cb.else_if_clauses.iter() {
-                cc += 1 + count_expr(&ei.condition) + count_stmts(ei.statements.iter(), interner);
+                cc += 1 + count_expr(ei.condition) + count_stmts(ei.statements.iter());
             }
             if let Some(el) = &cb.else_clause {
-                cc += count_stmts(el.statements.iter(), interner);
+                cc += count_stmts(el.statements.iter());
             }
         }
     }
     cc
 }
 
-fn count_while_body(w: &While, interner: &ThreadedInterner) -> u32 {
+fn count_while_body(w: &While) -> u32 {
     use mago_syntax::ast::WhileBody;
     match &w.body {
-        WhileBody::Statement(s) => count_stmt(s, interner),
-        WhileBody::ColonDelimited(cb) => count_stmts(cb.statements.iter(), interner),
+        WhileBody::Statement(s) => count_stmt(s),
+        WhileBody::ColonDelimited(cb) => count_stmts(cb.statements.iter()),
     }
 }
 
-fn count_switch(sw: &Switch, interner: &ThreadedInterner) -> u32 {
+fn count_switch(sw: &Switch) -> u32 {
     sw.body
         .cases()
         .iter()
         .map(|case| match case {
-            SwitchCase::Expression(ec) => 1 + count_stmts(ec.statements.iter(), interner),
-            SwitchCase::Default(dc) => count_stmts(dc.statements.iter(), interner),
+            SwitchCase::Expression(ec) => 1 + count_stmts(ec.statements.iter()),
+            SwitchCase::Default(dc) => count_stmts(dc.statements.iter()),
         })
         .sum()
 }
 
-fn count_try(t: &Try, interner: &ThreadedInterner) -> u32 {
-    let mut cc = count_block(&t.block, interner);
+fn count_try(t: &Try) -> u32 {
+    let mut cc = count_block(&t.block);
     for catch in t.catch_clauses.iter() {
-        cc += 1 + count_block(&catch.block, interner);
+        cc += 1 + count_block(&catch.block);
     }
     if let Some(finally) = &t.finally_clause {
-        cc += count_block(&finally.block, interner);
+        cc += count_block(&finally.block);
     }
     cc
 }
@@ -228,9 +237,9 @@ fn count_expr(expr: &Expression) -> u32 {
     match expr {
         Expression::Binary(b) => count_binary(b),
         Expression::Conditional(c) => {
-            1 + count_expr(&c.condition)
-                + c.then.as_ref().map_or(0, |e| count_expr(e))
-                + count_expr(&c.r#else)
+            1 + count_expr(c.condition)
+                + c.then.map_or(0, count_expr)
+                + count_expr(c.r#else)
         }
         Expression::Match(m) => count_match(m),
         _ => 0,
@@ -243,11 +252,10 @@ fn count_binary(b: &Binary) -> u32 {
         | BinaryOperator::Or(_)
         | BinaryOperator::LowAnd(_)
         | BinaryOperator::LowOr(_)
-        | BinaryOperator::Elvis(_)
         | BinaryOperator::NullCoalesce(_) => 1,
         _ => 0,
     };
-    self_cc + count_expr(&b.lhs) + count_expr(&b.rhs)
+    self_cc + count_expr(b.lhs) + count_expr(b.rhs)
 }
 
 fn count_match(m: &Match) -> u32 {
