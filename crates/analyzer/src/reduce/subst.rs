@@ -22,12 +22,18 @@
 //! a computable default, too many arguments, or a recursion depth cap.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 
+use mago_syntax::ast::ast::class_like::member::ClassLikeMember;
+use mago_syntax::ast::ast::class_like::method::{Method, MethodBody};
 use mago_syntax::ast::ast::function_like::function::Function;
+use mago_syntax::ast::ast::function_like::parameter::FunctionLikeParameter;
 use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::Program;
 
-use super::eval::{run_body_returning, BailReason, CallResolver, NoResolver, Scope};
+use super::eval::{
+    make_object, run_body_returning, run_ctor_body, BailReason, CallResolver, NoResolver, Scope,
+};
 use super::value::Value;
 use crate::mago_bridge::MagoProject;
 
@@ -69,6 +75,32 @@ impl CallResolver for BridgeResolver<'_> {
         self.depth.set(d);
         result
     }
+
+    fn resolve_instance_method(
+        &self,
+        this: &Value,
+        method: &[u8],
+        args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        // The class comes from the RUNTIME receiver record (never a static type).
+        let Value::Object { class, .. } = this else {
+            return Ok(None);
+        };
+        self.with_depth(|s| s.inline_method(class, method, Some(this.clone()), args))
+    }
+
+    fn resolve_static_method(
+        &self,
+        class: &[u8],
+        method: &[u8],
+        args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        self.with_depth(|s| s.inline_method(class, method, None, args))
+    }
+
+    fn construct(&self, class: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
+        self.with_depth(|s| s.construct_object(class, args))
+    }
 }
 
 impl BridgeResolver<'_> {
@@ -103,6 +135,460 @@ impl BridgeResolver<'_> {
             None => Err(BailReason::Other("could not re-parse callee file".into())),
         }
     }
+
+    /// Run `f` under the recursion-depth guard (shared by every inlining entry).
+    fn with_depth(
+        &self,
+        f: impl FnOnce(&Self) -> Result<Option<Value>, BailReason>,
+    ) -> Result<Option<Value>, BailReason> {
+        let d = self.depth.get();
+        if d >= self.max_depth {
+            return Err(BailReason::Other("recursion depth cap".into()));
+        }
+        self.depth.set(d + 1);
+        let result = f(self);
+        self.depth.set(d);
+        result
+    }
+
+    /// Inline `class::method(args)` (with `$this` bound for an instance call).
+    /// Resolution is FQN/namespace-aware (Task C CRITICAL): the DECLARING class is
+    /// resolved through mago's inheritance-following `get_declaring_method_class`,
+    /// then the body AST is located by matching the FULLY-QUALIFIED class name —
+    /// never a bare simple-name match (which could bind the wrong body across
+    /// namespaces, a silent divergence). Abstract bodies and mutators bail.
+    fn inline_method(
+        &self,
+        class: &[u8],
+        method: &[u8],
+        this: Option<Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        let codebase = self.project.codebase();
+        // Resolve the concrete declaring method (follows inheritance/traits).
+        let Some(meta) = codebase.get_declaring_method(class, method) else {
+            return Ok(None);
+        };
+        // Abstract dispatch → bail (frontier §5).
+        if meta
+            .method_metadata
+            .as_ref()
+            .is_some_and(|m| m.is_abstract)
+        {
+            return Err(BailReason::UnsupportedConstruct(
+                "abstract method dispatch".into(),
+            ));
+        }
+        // The exact FQCN of the class that DECLARES the body (not the receiver's).
+        let declaring_fqcn = codebase
+            .get_declaring_method_class(class, method)
+            .map(|w| w.as_bytes().to_vec())
+            .unwrap_or_else(|| class.to_vec());
+
+        let file = self
+            .project
+            .file_of_span(&meta.span)
+            .ok_or_else(|| BailReason::Other("method's declaring file not loaded".into()))?;
+        let logical_name = String::from_utf8_lossy(&file.name).into_owned();
+
+        let outcome = self
+            .project
+            .with_program(&logical_name, |program, _file, _names| {
+                let m = find_class_method(program, &declaring_fqcn, method).ok_or_else(|| {
+                    BailReason::UnknownCall(format!(
+                        "{}::{}",
+                        String::from_utf8_lossy(&declaring_fqcn),
+                        String::from_utf8_lossy(method)
+                    ))
+                })?;
+                let MethodBody::Concrete(block) = &m.body else {
+                    return Err(BailReason::UnsupportedConstruct(
+                        "abstract/interface method body".into(),
+                    ));
+                };
+                let mut bindings = bind_method_params(&m.parameter_list, args)?;
+                if let Some(this_val) = this {
+                    bindings.insert(b"this".to_vec(), this_val);
+                }
+                // A mutator (`$this->prop = ...`) in a non-constructor body bails
+                // automatically: `run_body_returning` does NOT enable property
+                // writes, so the assignment handler rejects it (frontier §2).
+                run_body_returning(block, bindings, self).map(Some)
+            });
+        outcome.unwrap_or_else(|| Err(BailReason::Other("could not re-parse method file".into())))
+    }
+
+    /// Construct `new class(args)` (Task B): seed props from plain literal property
+    /// defaults + promoted params, then run the constructor body (property writes
+    /// permitted) and return the populated record. The constructor may be inherited
+    /// (resolved via its own declaring class), so it is run in its declaring file.
+    fn construct_object(
+        &self,
+        class: &[u8],
+        args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        let codebase = self.project.codebase();
+        // The original-cased FQCN for the record's `class` tag (so object `==`
+        // compares the real class name, not a lowercased key).
+        let class_meta = match codebase.get_class_like(class) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let record_class = class_meta.original_name.as_bytes().to_vec();
+        let class_file = self
+            .project
+            .file_of_span(&class_meta.span)
+            .ok_or_else(|| BailReason::Other("class declaring file not loaded".into()))?;
+        let class_logical = String::from_utf8_lossy(&class_file.name).into_owned();
+        let class_fqcn = class_meta.name.as_bytes().to_vec();
+
+        // 1) Seed plain (non-promoted) property declarations with literal defaults.
+        //    (Read off THIS class's own AST. Inherited-property defaults are not
+        //    modelled in v2 — a read of an unseeded prop bails, fail-closed.)
+        let resolver = self;
+        let mut props: Vec<(Vec<u8>, Value)> = self
+            .project
+            .with_program(&class_logical, |program, _file, _names| {
+                let Some(class_node) = find_class(program, &class_fqcn) else {
+                    return Err(BailReason::Other("class AST not found after re-parse".into()));
+                };
+                let mut p: Vec<(Vec<u8>, Value)> = Vec::new();
+                seed_plain_property_defaults(class_node, &mut p, resolver)?;
+                Ok(p)
+            })
+            .unwrap_or_else(|| Err(BailReason::Other("could not re-parse class file".into())))?;
+
+        // 2) Run the constructor (promoted-param seeding + body). Resolved through
+        //    the DECLARING class so an inherited constructor inlines correctly.
+        let ctor_meta = codebase.get_declaring_method(class, b"__construct");
+        match ctor_meta {
+            Some(meta) => {
+                if meta
+                    .method_metadata
+                    .as_ref()
+                    .is_some_and(|m| m.is_abstract)
+                {
+                    return Err(BailReason::UnsupportedConstruct(
+                        "abstract constructor".into(),
+                    ));
+                }
+                let ctor_class = codebase
+                    .get_declaring_method_class(class, b"__construct")
+                    .map(|w| w.as_bytes().to_vec())
+                    .unwrap_or_else(|| class_fqcn.clone());
+                let ctor_file = self
+                    .project
+                    .file_of_span(&meta.span)
+                    .ok_or_else(|| BailReason::Other("constructor file not loaded".into()))?;
+                let ctor_logical = String::from_utf8_lossy(&ctor_file.name).into_owned();
+
+                let this = make_object(record_class.clone(), props);
+                let built = self
+                    .project
+                    .with_program(&ctor_logical, |program, _file, _names| {
+                        let ctor = find_class_method(program, &ctor_class, b"__construct")
+                            .ok_or_else(|| {
+                                BailReason::Other("constructor AST not found after re-parse".into())
+                            })?;
+                        run_constructor(resolver, ctor, this.clone(), args)
+                    })
+                    .unwrap_or_else(|| {
+                        Err(BailReason::Other("could not re-parse constructor file".into()))
+                    })?;
+                Ok(Some(built))
+            }
+            None => {
+                if !args.is_empty() {
+                    // No constructor but args were passed → PHP would error.
+                    return Err(BailReason::TypeError(
+                        "arguments passed to a class with no constructor".into(),
+                    ));
+                }
+                Ok(Some(make_object(record_class, std::mem::take(&mut props))))
+            }
+        }
+    }
+}
+
+/// Run a constructor AST over a fresh `$this` record: seed promoted params, bind
+/// plain params, then run the body with property writes enabled. Returns the
+/// populated record.
+fn run_constructor(
+    resolver: &BridgeResolver,
+    ctor: &Method,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, BailReason> {
+    let Value::Object {
+        class,
+        mut props,
+    } = this
+    else {
+        return Err(BailReason::Other("constructor $this is not an object".into()));
+    };
+
+    let params: Vec<&FunctionLikeParameter> = ctor.parameter_list.parameters.iter().collect();
+    if args.len() > params.len() {
+        return Err(BailReason::Other(
+            "more constructor arguments than parameters (variadic?)".into(),
+        ));
+    }
+
+    let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
+    for (i, param) in params.iter().enumerate() {
+        if param.ellipsis.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "variadic constructor parameter".into(),
+            ));
+        }
+        if param.ampersand.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "by-reference constructor parameter".into(),
+            ));
+        }
+        let bare = strip_dollar(param.variable.name);
+        let value = match args.get(i) {
+            Some(a) => a.clone(),
+            None => match &param.default_value {
+                Some(default) => {
+                    let mut scope = Scope::new(HashMap::new(), &NoResolver);
+                    super::eval::eval_default(default.value, &mut scope)?
+                }
+                None => {
+                    return Err(BailReason::Other(
+                        "constructor parameter has no argument and no default".into(),
+                    ))
+                }
+            },
+        };
+        // A promoted property seeds `$this->name` directly (PHP semantics).
+        if param.is_promoted_property() {
+            if has_readonly_modifier(param) {
+                // readonly is fine for a write-once seed at construction time, so
+                // we allow it here; any LATER mutation of the prop bails because
+                // mutator methods bail. (No special handling needed.)
+            }
+            set_prop(&mut props, bare.clone(), value.clone());
+        }
+        bindings.insert(bare, value);
+    }
+    bindings.insert(b"this".to_vec(), make_object(class, props));
+
+    let MethodBody::Concrete(block) = &ctor.body else {
+        return Err(BailReason::UnsupportedConstruct(
+            "abstract constructor body".into(),
+        ));
+    };
+    run_ctor_body(block, bindings, resolver)
+}
+
+/// Seed plain (non-promoted) property declarations carrying a literal default,
+/// e.g. `public int $x = 5;`. Static / readonly / hooked / non-literal-default
+/// properties BAIL (frontier §4). Properties with no default are left unset (a
+/// later read of one bails).
+fn seed_plain_property_defaults(
+    class_node: &mago_syntax::ast::ast::class_like::Class,
+    props: &mut Vec<(Vec<u8>, Value)>,
+    _resolver: &BridgeResolver,
+) -> Result<(), BailReason> {
+    use mago_syntax::ast::ast::class_like::property::{Property, PropertyItem};
+    use mago_syntax::ast::ast::modifier::Modifier;
+
+    for member in class_node.members.iter() {
+        let ClassLikeMember::Property(property) = member else {
+            continue;
+        };
+        match property {
+            Property::Plain(plain) => {
+                // Static properties are not part of an instance record → bail if
+                // present (the singleton-memo pattern must never be emulated).
+                for m in plain.modifiers.iter() {
+                    if matches!(m, Modifier::Static(_)) {
+                        return Err(BailReason::UnsupportedConstruct(
+                            "static property".into(),
+                        ));
+                    }
+                }
+                for item in plain.items.iter() {
+                    match item {
+                        // No default → leave unset (read-before-init bails later).
+                        PropertyItem::Abstract(_) => {}
+                        PropertyItem::Concrete(c) => {
+                            // A non-literal default (function call, new, etc.) bails.
+                            let mut scope = Scope::new(HashMap::new(), &NoResolver);
+                            let v = super::eval::eval_default(c.value, &mut scope)?;
+                            let name = strip_dollar(c.variable.name);
+                            set_prop(props, name, v);
+                        }
+                    }
+                }
+            }
+            // Property hooks (get/set) change read/write semantics → bail.
+            Property::Hooked(_) => {
+                return Err(BailReason::UnsupportedConstruct(
+                    "property hooks".into(),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a parameter carries the `readonly` modifier.
+fn has_readonly_modifier(param: &FunctionLikeParameter) -> bool {
+    use mago_syntax::ast::ast::modifier::Modifier;
+    param
+        .modifiers
+        .iter()
+        .any(|m| matches!(m, Modifier::Readonly(_)))
+}
+
+/// Strip a leading `$` from a variable token to get the bare property/param name.
+fn strip_dollar(name: &[u8]) -> Vec<u8> {
+    name.strip_prefix(b"$").unwrap_or(name).to_vec()
+}
+
+/// Set-or-update a prop in the insertion-ordered record (last write wins).
+fn set_prop(props: &mut Vec<(Vec<u8>, Value)>, name: Vec<u8>, val: Value) {
+    match props.iter_mut().find(|(k, _)| *k == name) {
+        Some(slot) => slot.1 = val,
+        None => props.push((name, val)),
+    }
+}
+
+/// Bind positional `args` to a method's parameters (+ defaults). Variadic/by-ref,
+/// or a parameter with neither an argument nor a computable default, bail.
+fn bind_method_params(
+    param_list: &mago_syntax::ast::ast::function_like::parameter::FunctionLikeParameterList,
+    args: &[Value],
+) -> Result<HashMap<Vec<u8>, Value>, BailReason> {
+    let params: Vec<&FunctionLikeParameter> = param_list.parameters.iter().collect();
+    if args.len() > params.len() {
+        return Err(BailReason::Other(
+            "more arguments than method parameters (variadic call?)".into(),
+        ));
+    }
+    let mut bindings = HashMap::new();
+    for (i, param) in params.iter().enumerate() {
+        if param.ellipsis.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "variadic parameter".into(),
+            ));
+        }
+        if param.ampersand.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "by-reference parameter".into(),
+            ));
+        }
+        let key = strip_dollar(param.variable.name);
+        let value = match args.get(i) {
+            Some(a) => a.clone(),
+            None => match &param.default_value {
+                Some(default) => {
+                    let mut scope = Scope::new(HashMap::new(), &NoResolver);
+                    super::eval::eval_default(default.value, &mut scope)?
+                }
+                None => {
+                    return Err(BailReason::Other(
+                        "parameter has no argument and no default".into(),
+                    ))
+                }
+            },
+        };
+        bindings.insert(key, value);
+    }
+    Ok(bindings)
+}
+
+// ─── FQN-aware class / method resolution (Task C CRITICAL) ────────────────────
+//
+// The shared simple-name `find_method` matches a class by its bare tail, which can
+// bind the WRONG body across namespaces (a silent divergence). These finders build
+// each class's FULLY-QUALIFIED name from the enclosing namespace and compare it
+// (case-insensitively) against the target FQCN that mago resolved.
+
+/// Find the class node whose fully-qualified name equals `fqcn` (case-insensitive),
+/// descending through namespaces and building the FQN from the namespace prefix.
+fn find_class<'a>(
+    program: &'a Program<'a>,
+    fqcn: &[u8],
+) -> Option<&'a mago_syntax::ast::ast::class_like::Class<'a>> {
+    let target = normalize_fqcn(fqcn);
+    find_class_in(program.statements.iter(), &[], &target)
+}
+
+fn find_class_in<'a, 's>(
+    stmts: impl Iterator<Item = &'s Statement<'s>>,
+    ns: &[u8],
+    target: &[u8],
+) -> Option<&'s mago_syntax::ast::ast::class_like::Class<'s>>
+where
+    's: 'a,
+{
+    use mago_syntax::ast::ast::namespace::NamespaceBody;
+    for stmt in stmts {
+        match stmt {
+            Statement::Class(class) => {
+                if qualified_name(ns, class.name.value).eq_ignore_ascii_case(target) {
+                    return Some(class);
+                }
+            }
+            Statement::Namespace(nsd) => {
+                let inner = match nsd.name {
+                    Some(n) => qualified_name(ns, n.value()),
+                    None => ns.to_vec(),
+                };
+                let found = match &nsd.body {
+                    NamespaceBody::Implicit(b) => {
+                        find_class_in(b.statements.iter(), &inner, target)
+                    }
+                    NamespaceBody::BraceDelimited(b) => {
+                        find_class_in(b.statements.iter(), &inner, target)
+                    }
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Find `class_fqcn::method` (FQN-aware) and return the method AST.
+fn find_class_method<'a>(
+    program: &'a Program<'a>,
+    class_fqcn: &[u8],
+    method: &[u8],
+) -> Option<&'a Method<'a>> {
+    let class = find_class(program, class_fqcn)?;
+    for member in class.members.iter() {
+        if let ClassLikeMember::Method(m) = member {
+            if m.name.value.eq_ignore_ascii_case(method) {
+                return Some(m);
+            }
+        }
+    }
+    None
+}
+
+/// Join a namespace prefix with a (possibly already-qualified) name.
+fn qualified_name(ns: &[u8], name: &[u8]) -> Vec<u8> {
+    let name = name.strip_prefix(b"\\").unwrap_or(name);
+    if ns.is_empty() {
+        name.to_vec()
+    } else {
+        let mut out = ns.to_vec();
+        out.push(b'\\');
+        out.extend_from_slice(name);
+        out
+    }
+}
+
+/// Strip a leading `\` so a `\Foo\Bar` FQCN compares equal to `Foo\Bar`.
+fn normalize_fqcn(fqcn: &[u8]) -> Vec<u8> {
+    fqcn.strip_prefix(b"\\").unwrap_or(fqcn).to_vec()
 }
 
 /// Find a top-level `function <name>(...) {...}`, descending through namespaces.
@@ -325,5 +811,179 @@ class T {
             reduce_with_subst(src, "T", "testV", vec![]),
             Outcome::Bailed(_)
         ));
+    }
+
+    // ── Increment 2: objects + methods (the Point fixture) ──
+
+    /// The `Point` value object — exercises every inc-2 mechanic: `new` with a
+    /// promoted-param constructor, `$this` bind, instance-method inline,
+    /// `$this->x` read, a fresh-object return, and a scalar `assertSame`.
+    const POINT_SRC: &str = r#"<?php
+final class Point {
+    public function __construct(public int $x, public int $y) {}
+    public function plus(Point $p): Point { return new Point($this->x + $p->x, $this->y + $p->y); }
+    public function getX(): int { return $this->x; }
+    public function getY(): int { return $this->y; }
+}
+class PointTest {
+    public function testPlusGetX(): void {
+        $this->assertSame(4, (new Point(1, 2))->plus(new Point(3, 0))->getX());
+    }
+    public function testPromotedReadback(): void {
+        $p = new Point(7, 9);
+        $this->assertSame(7, $p->getX());
+        $this->assertSame(9, $p->getY());
+    }
+    public function testFreshObjectIsImmutable(): void {
+        $a = new Point(1, 2);
+        $b = $a->plus(new Point(10, 20));
+        $this->assertSame(1, $a->getX());
+        $this->assertSame(11, $b->getX());
+        $this->assertSame(22, $b->getY());
+    }
+    public function testStructuralEquals(): void {
+        $this->assertEquals(new Point(1, 2), new Point(1, 2));
+        $this->assertNotEquals(new Point(1, 2), new Point(9, 2));
+    }
+}
+"#;
+
+    #[test]
+    fn point_plus_get_x_reduces() {
+        assert_eq!(
+            reduce_with_subst(POINT_SRC, "PointTest", "testPlusGetX", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn point_promoted_readback_reduces() {
+        assert_eq!(
+            reduce_with_subst(POINT_SRC, "PointTest", "testPromotedReadback", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn point_fresh_object_is_immutable() {
+        assert_eq!(
+            reduce_with_subst(POINT_SRC, "PointTest", "testFreshObjectIsImmutable", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn point_structural_equals_reduces() {
+        assert_eq!(
+            reduce_with_subst(POINT_SRC, "PointTest", "testStructuralEquals", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn assert_same_on_object_bails() {
+        // assertSame on objects is REFERENCE identity — the reducer has no heap
+        // model, so it MUST bail (frontier §1), not guess structural equality.
+        let src = r#"<?php
+final class Box { public function __construct(public int $v) {} }
+class BoxTest {
+    public function testSame(): void {
+        $this->assertSame(new Box(1), new Box(1));
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "BoxTest", "testSame", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn mutator_method_bails() {
+        // A method that writes $this->prop is a mutator — the by-value model gets
+        // aliasing wrong, so inlining it must BAIL (frontier §2).
+        let src = r#"<?php
+final class Counter {
+    public function __construct(public int $n) {}
+    public function bump(): int { $this->n = $this->n + 1; return $this->n; }
+}
+class CounterTest {
+    public function testBump(): void {
+        $this->assertSame(2, (new Counter(1))->bump());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "CounterTest", "testBump", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn static_method_inlines() {
+        // `Class::make(...)` (a static factory) inlines without `$this`.
+        let src = r#"<?php
+final class Money {
+    public function __construct(public int $cents) {}
+    public static function fromDollars(int $d): Money { return new Money($d * 100); }
+    public function cents(): int { return $this->cents; }
+}
+class MoneyTest {
+    public function testFactory(): void {
+        $this->assertSame(500, Money::fromDollars(5)->cents());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "MoneyTest", "testFactory", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn self_static_reference_bails() {
+        // `self::` / `static::` have no enclosing-class context → bail (frontier §3).
+        let src = r#"<?php
+final class Maker {
+    public function __construct(public int $v) {}
+    public static function zero(): Maker { return new Maker(0); }
+    public static function viaSelf(): Maker { return self::zero(); }
+    public function v(): int { return $this->v; }
+}
+class MakerTest {
+    public function testSelf(): void {
+        $this->assertSame(0, Maker::viaSelf()->v());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "MakerTest", "testSelf", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn plain_property_default_seeds() {
+        // A non-promoted property with a literal default + a ctor body write.
+        let src = r#"<?php
+final class Config {
+    public int $level = 3;
+    public string $name;
+    public function __construct(string $name) { $this->name = $name; }
+    public function level(): int { return $this->level; }
+    public function name(): string { return $this->name; }
+}
+class ConfigTest {
+    public function testDefaults(): void {
+        $c = new Config('prod');
+        $this->assertSame(3, $c->level());
+        $this->assertSame('prod', $c->name());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "ConfigTest", "testDefaults", vec![]),
+            Outcome::Pass
+        );
     }
 }

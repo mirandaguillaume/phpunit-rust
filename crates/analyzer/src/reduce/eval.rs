@@ -95,10 +95,44 @@ pub trait CallResolver {
     /// "not a user function I can resolve" (→ caller treats as unknown call);
     /// `Err` propagates a bail.
     fn resolve_function(&self, name: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason>;
+
+    /// Attempt to inline an **instance method** call `$obj->method(args)`. The
+    /// receiver `this` is the concrete runtime [`Value::Object`] (its `class` gives
+    /// the exact type — never a static type, spec §13). `Ok(None)` → not a method
+    /// the resolver can inline (caller bails); `Err` propagates a bail.
+    ///
+    /// Increment-2 default: no instance-method inlining (the [`NoResolver`] path).
+    fn resolve_instance_method(
+        &self,
+        _this: &Value,
+        _method: &[u8],
+        _args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
+
+    /// Attempt to inline a **static method** call `Class::method(args)`. `class` is
+    /// the resolved FQCN (`self`/`parent`/`static` are bailed by the caller — no
+    /// enclosing-class context in the [`Scope`]).
+    fn resolve_static_method(
+        &self,
+        _class: &[u8],
+        _method: &[u8],
+        _args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
+
+    /// Attempt to construct `new Class(args)`: inline the constructor over a fresh
+    /// `$this` record (promoted params seed props; plain literal property defaults
+    /// are read off the class AST) and return the populated [`Value::Object`].
+    fn construct(&self, _class: &[u8], _args: &[Value]) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
 }
 
-/// The Task-4 resolver: resolves nothing (all user calls bail). Substitution
-/// arrives in Task 5.
+/// A resolver that resolves nothing (all user calls bail). Used by the pure-eval
+/// unit tests; the real substitution is [`super::subst::BridgeResolver`].
 pub struct NoResolver;
 
 impl CallResolver for NoResolver {
@@ -116,6 +150,11 @@ pub struct Scope<'r> {
     steps: u64,
     max_steps: u64,
     resolver: &'r dyn CallResolver,
+    /// Whether `$this->prop = ...` writes are permitted (true ONLY while a
+    /// constructor body is being inlined to seed props). A write to `$this->prop`
+    /// in any non-constructor body is a MUTATOR — fail-closed BAIL (frontier §2),
+    /// because the by-value scope model would get aliasing wrong.
+    allow_this_write: bool,
 }
 
 impl<'r> Scope<'r> {
@@ -127,7 +166,13 @@ impl<'r> Scope<'r> {
             // 10M steps — a runaway loop bails rather than hanging (spec §6).
             max_steps: 10_000_000,
             resolver,
+            allow_this_write: false,
         }
+    }
+
+    /// Permit `$this->prop` writes in this scope (constructor seeding only).
+    pub fn allow_this_writes(&mut self) {
+        self.allow_this_write = true;
     }
 
     fn tick(&mut self) -> Result<(), BailReason> {
@@ -197,6 +242,39 @@ pub fn run_body_returning(
 /// substitution layer to compute a parameter's default-value expression.
 pub fn eval_default(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
     eval_expr(expr, scope)
+}
+
+/// Inline a **constructor** body to seed a fresh `$this` record (Task B). The
+/// `bindings` carry `this` (the partially-seeded object: promoted params + plain
+/// literal defaults already filled) plus the constructor's parameters. Property
+/// writes are PERMITTED here (seeding); the body runs and the mutated `$this`
+/// record is returned. A `return` inside a constructor is ignored by PHP, so we
+/// always return the `$this` record.
+pub fn run_ctor_body(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+) -> Result<Value, BailReason> {
+    let mut scope = Scope::new(bindings, resolver);
+    scope.allow_this_writes();
+    match exec_statements(block.statements.iter(), &mut scope)? {
+        // Whatever the body did (returned early or fell through), the constructed
+        // value is the (possibly mutated) `$this` record.
+        Flow::Normal | Flow::Returned(_) => scope
+            .vars
+            .remove(b"this".as_slice())
+            .ok_or_else(|| BailReason::Other("constructor lost its \\$this".into())),
+        Flow::Asserted(_) => Err(BailReason::UnsupportedConstruct(
+            "assertion inside a constructor body".into(),
+        )),
+    }
+}
+
+/// Build a `Value::Object` from a class name and seed props directly (no body) —
+/// used when a class has promoted params + an empty constructor body, or no
+/// constructor at all.
+pub fn make_object(class: Vec<u8>, props: Vec<(Vec<u8>, Value)>) -> Value {
+    Value::Object { class, props }
 }
 
 // ─── Statement execution ──────────────────────────────────────────────────────
@@ -445,10 +523,14 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
     Ok(match name {
         b"assertSame" => {
             let (e, a) = two_args(args)?;
+            // assertSame on objects is REFERENCE identity (e.g. a static singleton):
+            // the reducer has no heap/identity model → BAIL, never guess (frontier §1).
+            bail_if_object_operand(e, a)?;
             pass(assert_same(e, a), "assertSame")
         }
         b"assertNotSame" => {
             let (e, a) = two_args(args)?;
+            bail_if_object_operand(e, a)?;
             pass(!assert_same(e, a), "assertNotSame")
         }
         b"assertEquals" => {
@@ -482,6 +564,18 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
             ))
         }
     })
+}
+
+/// `assertSame`/`assertNotSame`/`===` over objects is REFERENCE identity — the
+/// reducer models structure, not heap identity, so it MUST abstain when either
+/// operand is an object (frontier §1). `assertEquals`/`==` stays modelable.
+fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if matches!(a, Value::Object { .. }) || matches!(b, Value::Object { .. }) {
+        return Err(BailReason::UnsupportedConstruct(
+            "=== / assertSame on an object (reference identity, no heap model)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Two-argument assertions: exactly `(expected, actual)`. A 3rd *string* arg
@@ -528,10 +622,80 @@ fn eval_expr(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> 
         Expression::Array(arr) => eval_array(arr, scope),
         Expression::LegacyArray(arr) => eval_legacy_array(arr, scope),
         Expression::Call(call) => eval_call(call, scope),
+        // `new C(args)` (Task B) — resolve C's FQCN and inline its constructor.
+        Expression::Instantiation(inst) => eval_instantiation(inst, scope),
+        // Property/const access. Only `$obj->prop` (read) is modelled (Task D);
+        // static-property / class-constant / null-safe access bail.
+        Expression::Access(access) => eval_access(access, scope),
         other => Err(BailReason::UnsupportedConstruct(format!(
             "expression: {}",
             expr_kind(other)
         ))),
+    }
+}
+
+/// `new C(args)` (Task B): resolve the FQCN (Identifier only — `new $var`/
+/// anonymous classes bail) and ask the resolver to construct the record.
+fn eval_instantiation(
+    inst: &mago_syntax::ast::ast::instantiation::Instantiation,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let class = resolve_class_name(inst.class)?;
+    let args = match &inst.argument_list {
+        Some(list) => eval_arguments(list, scope)?,
+        None => Vec::new(),
+    };
+    match scope.resolver.construct(&class, &args)? {
+        Some(v) => Ok(v),
+        None => Err(BailReason::UnknownCall(format!(
+            "new {}",
+            String::from_utf8_lossy(&class)
+        ))),
+    }
+}
+
+/// `$obj->prop` read (Task D). The receiver must evaluate to a [`Value::Object`];
+/// the property name must be a static identifier. A missing property, a non-object
+/// receiver, static-property / class-constant / null-safe access all BAIL.
+fn eval_access(
+    access: &mago_syntax::ast::ast::access::Access,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::access::Access;
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
+    match access {
+        Access::Property(pa) => {
+            let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
+                return Err(BailReason::UnsupportedConstruct(
+                    "dynamic property selector".into(),
+                ));
+            };
+            let receiver = eval_expr(pa.object, scope)?;
+            let Value::Object { props, .. } = &receiver else {
+                return Err(BailReason::TypeError(format!(
+                    "property read on non-object ({})",
+                    receiver.type_name()
+                )));
+            };
+            match props.iter().find(|(k, _)| k.as_slice() == prop_id.value) {
+                Some((_, v)) => Ok(v.clone()),
+                // PHP would warn + return null for an undefined property; we bail
+                // (an unseeded prop usually means a default/hook we did not model).
+                None => Err(BailReason::UnsupportedConstruct(format!(
+                    "read of unset property ${}",
+                    String::from_utf8_lossy(prop_id.value)
+                ))),
+            }
+        }
+        Access::NullSafeProperty(_) => Err(BailReason::UnsupportedConstruct(
+            "null-safe property access (?->)".into(),
+        )),
+        Access::StaticProperty(_) => Err(BailReason::UnsupportedConstruct(
+            "static property access".into(),
+        )),
+        Access::ClassConstant(_) => Err(BailReason::UnsupportedConstruct(
+            "class constant access".into(),
+        )),
     }
 }
 
@@ -662,17 +826,37 @@ fn eval_binary(
         BinaryOperator::NotEqual(_) | BinaryOperator::AngledNotEqual(_) => {
             Ok(Value::Bool(!l.php_loose_eq(&r)))
         }
-        BinaryOperator::Identical(_) => Ok(Value::Bool(l.php_strict_eq(&r))),
-        BinaryOperator::NotIdentical(_) => Ok(Value::Bool(!l.php_strict_eq(&r))),
-        BinaryOperator::LessThan(_) => Ok(Value::Bool(l.php_compare(&r) == Ordering::Less)),
-        BinaryOperator::GreaterThan(_) => Ok(Value::Bool(l.php_compare(&r) == Ordering::Greater)),
+        // `===`/`!==` over objects is reference identity (frontier §1) → bail.
+        BinaryOperator::Identical(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_strict_eq(&r)))
+        }
+        BinaryOperator::NotIdentical(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(!l.php_strict_eq(&r)))
+        }
+        // Ordering on objects is uncomparable in PHP (and our model would guess) →
+        // bail when either operand is an object.
+        BinaryOperator::LessThan(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_compare(&r) == Ordering::Less))
+        }
+        BinaryOperator::GreaterThan(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_compare(&r) == Ordering::Greater))
+        }
         BinaryOperator::LessThanOrEqual(_) => {
+            bail_if_object_operand(&l, &r)?;
             Ok(Value::Bool(l.php_compare(&r) != Ordering::Greater))
         }
         BinaryOperator::GreaterThanOrEqual(_) => {
+            bail_if_object_operand(&l, &r)?;
             Ok(Value::Bool(l.php_compare(&r) != Ordering::Less))
         }
-        BinaryOperator::Spaceship(_) => Ok(Value::Int(match l.php_compare(&r) {
+        BinaryOperator::Spaceship(_) => Ok(Value::Int(match {
+            bail_if_object_operand(&l, &r)?;
+            l.php_compare(&r)
+        } {
             Ordering::Less => -1,
             Ordering::Equal => 0,
             Ordering::Greater => 1,
@@ -821,7 +1005,14 @@ fn eval_assignment(
 ) -> Result<Value, BailReason> {
     use mago_syntax::ast::ast::assignment::AssignmentOperator as Op;
 
-    // Only simple `$var <op>= rhs` is modelled.
+    // `$this->prop = rhs` (or another `$obj->prop`): a property write. Permitted
+    // ONLY while seeding a constructor's `$this` (frontier §2 — a mutator in any
+    // other body bails, because the by-value model gets aliasing wrong).
+    if let Expression::Access(mago_syntax::ast::ast::access::Access::Property(pa)) = a.lhs {
+        return eval_property_assignment(a, pa, scope);
+    }
+
+    // Only simple `$var <op>= rhs` is modelled (besides the property write above).
     let Expression::Variable(Variable::Direct(target)) = a.lhs else {
         return Err(BailReason::UnsupportedConstruct(
             "assignment to non-simple lvalue".into(),
@@ -864,6 +1055,64 @@ fn eval_assignment(
 
     scope.vars.insert(key, new_val.clone());
     Ok(new_val)
+}
+
+/// `$this->prop = rhs` — a property write (constructor seeding only). Frontier §2:
+/// permitted only when `scope.allow_this_write` is set; any other body that writes
+/// a property is a MUTATOR and BAILS. Only the receiver `$this` and a plain `=`
+/// are modelled; a write through any other object reference, or a compound op,
+/// bails (the by-value model cannot track aliased writes soundly).
+fn eval_property_assignment(
+    a: &mago_syntax::ast::ast::assignment::Assignment,
+    pa: &mago_syntax::ast::ast::access::PropertyAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::assignment::AssignmentOperator as Op;
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
+
+    if !scope.allow_this_write {
+        return Err(BailReason::UnsupportedConstruct(
+            "property write outside a constructor (mutator method)".into(),
+        ));
+    }
+    if !matches!(a.operator, Op::Assign(_)) {
+        return Err(BailReason::UnsupportedConstruct(
+            "compound property assignment".into(),
+        ));
+    }
+    // Receiver must be `$this`.
+    let Expression::Variable(Variable::Direct(recv)) = pa.object else {
+        return Err(BailReason::UnsupportedConstruct(
+            "property write through a non-$this reference".into(),
+        ));
+    };
+    if var_name(recv.name) != b"this" {
+        return Err(BailReason::UnsupportedConstruct(
+            "property write through a non-$this reference".into(),
+        ));
+    }
+    let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
+        return Err(BailReason::UnsupportedConstruct(
+            "dynamic property selector in write".into(),
+        ));
+    };
+    let rhs = eval_expr(a.rhs, scope)?;
+
+    // Functional update of the `$this` record in scope.
+    let this = scope.vars.get_mut(b"this".as_slice()).ok_or_else(|| {
+        BailReason::UnsupportedConstruct("property write with no bound \\$this".into())
+    })?;
+    let Value::Object { props, .. } = this else {
+        return Err(BailReason::TypeError(
+            "property write on a non-object \\$this".into(),
+        ));
+    };
+    let prop_name = prop_id.value.to_vec();
+    match props.iter_mut().find(|(k, _)| *k == prop_name) {
+        Some(slot) => slot.1 = rhs.clone(),
+        None => props.push((prop_name, rhs.clone())),
+    }
+    Ok(rhs)
 }
 
 fn eval_conditional(
@@ -945,6 +1194,7 @@ fn insert_key(items: &mut Vec<(ArrayKey, Value)>, key: ArrayKey, val: Value) {
 }
 
 fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
     match call {
         Call::Function(fc) => {
             let Some(name) = identifier_name(fc.function) else {
@@ -953,7 +1203,7 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
                 ));
             };
             let args = eval_arguments(&fc.argument_list, scope)?;
-            // First try a pure builtin; then the substitution resolver (Task 5).
+            // First try a pure builtin; then the substitution resolver.
             if let Some(v) = call_pure_builtin(name, &args)? {
                 return Ok(v);
             }
@@ -964,8 +1214,82 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
                 String::from_utf8_lossy(name).into_owned(),
             ))
         }
-        _ => Err(BailReason::UnsupportedConstruct(
-            "method/static call (outside assertions)".into(),
+        // `$obj->method(args)` — the receiver's RUNTIME class drives dispatch
+        // (Task C). Assertions like `$this->assertSame(...)` are intercepted
+        // upstream in `try_assertion`; this path is for real instance methods.
+        Call::Method(m) => {
+            let ClassLikeMemberSelector::Identifier(method_id) = &m.method else {
+                return Err(BailReason::UnsupportedConstruct(
+                    "dynamic method selector".into(),
+                ));
+            };
+            let receiver = eval_expr(m.object, scope)?;
+            if !matches!(receiver, Value::Object { .. }) {
+                return Err(BailReason::TypeError(format!(
+                    "method call on non-object ({})",
+                    receiver.type_name()
+                )));
+            }
+            let args = eval_arguments(&m.argument_list, scope)?;
+            match scope
+                .resolver
+                .resolve_instance_method(&receiver, method_id.value, &args)?
+            {
+                Some(v) => Ok(v),
+                None => Err(BailReason::UnknownCall(format!(
+                    "->{}",
+                    String::from_utf8_lossy(method_id.value)
+                ))),
+            }
+        }
+        // `Class::method(args)` (Task E). self/parent/static → bail (no enclosing
+        // class context in the Scope).
+        Call::StaticMethod(sm) => {
+            let ClassLikeMemberSelector::Identifier(method_id) = &sm.method else {
+                return Err(BailReason::UnsupportedConstruct(
+                    "dynamic static-method selector".into(),
+                ));
+            };
+            let class = resolve_class_name(sm.class)?;
+            let args = eval_arguments(&sm.argument_list, scope)?;
+            match scope
+                .resolver
+                .resolve_static_method(&class, method_id.value, &args)?
+            {
+                Some(v) => Ok(v),
+                None => Err(BailReason::UnknownCall(format!(
+                    "{}::{}",
+                    String::from_utf8_lossy(&class),
+                    String::from_utf8_lossy(method_id.value)
+                ))),
+            }
+        }
+        Call::NullSafeMethod(_) => Err(BailReason::UnsupportedConstruct(
+            "null-safe method call (?->)".into(),
+        )),
+    }
+}
+
+/// Resolve a class-name expression to a concrete FQCN (bytes). Only a plain
+/// `Identifier` (a real class name) resolves; `self`/`parent`/`static`, `$var`,
+/// and any dynamic class expression BAIL (frontier §3 — the reducer has no
+/// enclosing-class context and cannot pin a dynamic class soundly).
+fn resolve_class_name(expr: &Expression) -> Result<Vec<u8>, BailReason> {
+    match identifier_name(expr) {
+        Some(name) => {
+            // self/parent/static are parsed as identifiers in some positions; reject.
+            if name.eq_ignore_ascii_case(b"self")
+                || name.eq_ignore_ascii_case(b"parent")
+                || name.eq_ignore_ascii_case(b"static")
+            {
+                return Err(BailReason::UnsupportedConstruct(
+                    "self/parent/static class reference (no enclosing-class context)".into(),
+                ));
+            }
+            Ok(name.to_vec())
+        }
+        None => Err(BailReason::UnsupportedConstruct(
+            "dynamic/unresolvable class name (new \\$var / static::)".into(),
         )),
     }
 }
