@@ -556,6 +556,20 @@ mod tests {
                 100.0 * (pass + fail) as f64 / total as f64
             }
         );
+        println!("--- per-(method,row) ---");
+        for r in &reduced {
+            let tag = match &r.outcome {
+                Outcome::Pass => "PASS".to_string(),
+                Outcome::Fail(m) => format!("FAIL({m})"),
+                Outcome::Bailed(b) => format!("BAIL/{}", b.tag()),
+            };
+            println!(
+                "  {} [{}] -> {}",
+                r.method,
+                r.data_set.as_deref().unwrap_or("-"),
+                tag
+            );
+        }
         println!("--- bail histogram ---");
         for (reason, n) in &hist {
             println!("  {n:>3}  {reason}");
@@ -1003,6 +1017,35 @@ class CbTest extends TestCase {
             reduced[0].outcome,
             Outcome::Pass,
             "a closure stored into $this via setUp must reduce to Pass (was UAF); got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_return_type_coercion_bails_not_fails() {
+        // PHP coerces an inlined body's return to the declared scalar type: a
+        // `: string` method returning `true` yields "1", so assertSame('1', resolve(true))
+        // PASSES in real PHP. The reducer does not model that coercion; returning the
+        // un-coerced bool produced a divergent FAIL (the symfony LazyString::resolve
+        // false-FAIL). It must BAIL instead — never a wrong Fail on a green suite.
+        let dir = write_suite(&[(
+            "CoerceTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Box {
+    public static function resolve(bool $v): string { return $v; }
+}
+class CoerceTest extends TestCase {
+    public function testResolve(): void {
+        $this->assertSame('1', Box::resolve(true));
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("CoerceTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "scalar return-type coercion must BAIL, not produce a divergent Fail; got {reduced:?}"
         );
     }
 }

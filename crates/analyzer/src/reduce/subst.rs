@@ -32,8 +32,8 @@ use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::Program;
 
 use super::eval::{
-    make_object, run_body_returning_with_names, run_ctor_body_with_names, BailReason, CallResolver,
-    NoResolver, Scope,
+    bail_if_scalar_return_coerces, make_object, run_body_returning_with_names,
+    run_ctor_body_with_names, BailReason, CallResolver, NoResolver, Scope,
 };
 use super::value::Value;
 use crate::mago_bridge::MagoProject;
@@ -129,8 +129,18 @@ impl BridgeResolver<'_> {
                 // Recurse through THIS resolver so nested user calls inline too;
                 // names = the callee file's table (FQCN resolution for `new C`).
                 // source = the callee file (so a closure RETURNED here owns its bytes).
-                run_body_returning_with_names(&func.body, bindings, self, names, &file.contents)
-                    .map(Some)
+                let ret = run_body_returning_with_names(
+                    &func.body,
+                    bindings,
+                    self,
+                    names,
+                    &file.contents,
+                )?;
+                // PHP coerces the return to a declared scalar type; we don't model
+                // that, so a mismatch bails (fail-closed) rather than returning the
+                // un-coerced value.
+                bail_if_scalar_return_coerces(func.return_type_hint.as_ref(), &ret)?;
+                Ok(Some(ret))
             });
 
         match outcome {
@@ -218,8 +228,11 @@ impl BridgeResolver<'_> {
                 // writes, so the assignment handler rejects it (frontier §2).
                 // names = the declaring file's table (resolves `new C` in the body).
                 // source = the declaring file (so a closure returned here owns its bytes).
-                run_body_returning_with_names(block, bindings, self, names, &file.contents)
-                    .map(Some)
+                let ret =
+                    run_body_returning_with_names(block, bindings, self, names, &file.contents)?;
+                // PHP coerces the return to a declared scalar type; a mismatch bails.
+                bail_if_scalar_return_coerces(m.return_type_hint.as_ref(), &ret)?;
+                Ok(Some(ret))
             });
         outcome.unwrap_or_else(|| Err(BailReason::Other("could not re-parse method file".into())))
     }

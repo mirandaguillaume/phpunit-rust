@@ -342,6 +342,52 @@ pub fn eval_default(expr: &Expression, scope: &mut Scope) -> Result<Value, BailR
     eval_expr(expr, scope)
 }
 
+/// PHP coerces an inlined body's `return` value to the declared SCALAR return type
+/// (`: string`/`int`/`float`/`bool`) under weak typing — e.g. `function f(): string
+/// { return true; }` returns `"1"`, not `true`. The reducer does not model this
+/// coercion, so when a bare scalar return hint does not already match the returned
+/// value's type, BAIL (fail-closed) rather than return the un-coerced value — that
+/// was the symfony `LazyString::resolve(): string` false-FAIL. A non-scalar hint
+/// (class, union, nullable, void, mixed, …) needs no coercion and is left alone.
+pub fn bail_if_scalar_return_coerces(
+    hint: Option<&mago_syntax::ast::ast::function_like::r#return::FunctionLikeReturnTypeHint>,
+    value: &Value,
+) -> Result<(), BailReason> {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    let Some(rt) = hint else {
+        return Ok(());
+    };
+    let matches = match &rt.hint {
+        Hint::String(_) => matches!(value, Value::Str(_)),
+        Hint::Integer(_) => matches!(value, Value::Int(_)),
+        Hint::Float(_) => matches!(value, Value::Float(_)),
+        Hint::Bool(_) => matches!(value, Value::Bool(_)),
+        // Not a bare scalar hint → PHP performs no scalar coercion here.
+        _ => return Ok(()),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(BailReason::UnsupportedConstruct(format!(
+            "scalar return-type coercion ({} return on a {} value) not modelled",
+            scalar_hint_name(&rt.hint),
+            value.type_name(),
+        )))
+    }
+}
+
+/// Display name for a bare scalar return hint (for the bail message).
+fn scalar_hint_name(hint: &mago_syntax::ast::ast::type_hint::Hint) -> &'static str {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    match hint {
+        Hint::String(_) => "string",
+        Hint::Integer(_) => "int",
+        Hint::Float(_) => "float",
+        Hint::Bool(_) => "bool",
+        _ => "scalar",
+    }
+}
+
 /// Inline a **constructor** body to seed a fresh `$this` record (Task B). The
 /// `bindings` carry `this` (the partially-seeded object: promoted params + plain
 /// literal defaults already filled) plus the constructor's parameters. Property
