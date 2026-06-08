@@ -853,14 +853,14 @@ fn eval_binary(
             bail_if_object_operand(&l, &r)?;
             Ok(Value::Bool(l.php_compare(&r) != Ordering::Less))
         }
-        BinaryOperator::Spaceship(_) => Ok(Value::Int(match {
+        BinaryOperator::Spaceship(_) => {
             bail_if_object_operand(&l, &r)?;
-            l.php_compare(&r)
-        } {
-            Ordering::Less => -1,
-            Ordering::Equal => 0,
-            Ordering::Greater => 1,
-        })),
+            Ok(Value::Int(match l.php_compare(&r) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            }))
+        }
         other => Err(BailReason::UnsupportedConstruct(format!(
             "binary operator {:?}",
             std::mem::discriminant(other)

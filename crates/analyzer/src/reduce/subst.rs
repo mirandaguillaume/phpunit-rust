@@ -170,11 +170,7 @@ impl BridgeResolver<'_> {
             return Ok(None);
         };
         // Abstract dispatch → bail (frontier §5).
-        if meta
-            .method_metadata
-            .as_ref()
-            .is_some_and(|m| m.is_abstract)
-        {
+        if meta.method_metadata.as_ref().is_some_and(|m| m.is_abstract) {
             return Err(BailReason::UnsupportedConstruct(
                 "abstract method dispatch".into(),
             ));
@@ -222,11 +218,7 @@ impl BridgeResolver<'_> {
     /// defaults + promoted params, then run the constructor body (property writes
     /// permitted) and return the populated record. The constructor may be inherited
     /// (resolved via its own declaring class), so it is run in its declaring file.
-    fn construct_object(
-        &self,
-        class: &[u8],
-        args: &[Value],
-    ) -> Result<Option<Value>, BailReason> {
+    fn construct_object(&self, class: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
         let codebase = self.project.codebase();
         // The original-cased FQCN for the record's `class` tag (so object `==`
         // compares the real class name, not a lowercased key).
@@ -250,7 +242,9 @@ impl BridgeResolver<'_> {
             .project
             .with_program(&class_logical, |program, _file, _names| {
                 let Some(class_node) = find_class(program, &class_fqcn) else {
-                    return Err(BailReason::Other("class AST not found after re-parse".into()));
+                    return Err(BailReason::Other(
+                        "class AST not found after re-parse".into(),
+                    ));
                 };
                 let mut p: Vec<(Vec<u8>, Value)> = Vec::new();
                 seed_plain_property_defaults(class_node, &mut p, resolver)?;
@@ -263,11 +257,7 @@ impl BridgeResolver<'_> {
         let ctor_meta = codebase.get_declaring_method(class, b"__construct");
         match ctor_meta {
             Some(meta) => {
-                if meta
-                    .method_metadata
-                    .as_ref()
-                    .is_some_and(|m| m.is_abstract)
-                {
+                if meta.method_metadata.as_ref().is_some_and(|m| m.is_abstract) {
                     return Err(BailReason::UnsupportedConstruct(
                         "abstract constructor".into(),
                     ));
@@ -293,7 +283,9 @@ impl BridgeResolver<'_> {
                         run_constructor(resolver, ctor, this.clone(), args)
                     })
                     .unwrap_or_else(|| {
-                        Err(BailReason::Other("could not re-parse constructor file".into()))
+                        Err(BailReason::Other(
+                            "could not re-parse constructor file".into(),
+                        ))
                     })?;
                 Ok(Some(built))
             }
@@ -319,12 +311,10 @@ fn run_constructor(
     this: Value,
     args: &[Value],
 ) -> Result<Value, BailReason> {
-    let Value::Object {
-        class,
-        mut props,
-    } = this
-    else {
-        return Err(BailReason::Other("constructor $this is not an object".into()));
+    let Value::Object { class, mut props } = this else {
+        return Err(BailReason::Other(
+            "constructor $this is not an object".into(),
+        ));
     };
 
     let params: Vec<&FunctionLikeParameter> = ctor.parameter_list.parameters.iter().collect();
@@ -404,9 +394,7 @@ fn seed_plain_property_defaults(
                 // present (the singleton-memo pattern must never be emulated).
                 for m in plain.modifiers.iter() {
                     if matches!(m, Modifier::Static(_)) {
-                        return Err(BailReason::UnsupportedConstruct(
-                            "static property".into(),
-                        ));
+                        return Err(BailReason::UnsupportedConstruct("static property".into()));
                     }
                 }
                 for item in plain.items.iter() {
@@ -425,9 +413,7 @@ fn seed_plain_property_defaults(
             }
             // Property hooks (get/set) change read/write semantics → bail.
             Property::Hooked(_) => {
-                return Err(BailReason::UnsupportedConstruct(
-                    "property hooks".into(),
-                ))
+                return Err(BailReason::UnsupportedConstruct("property hooks".into()))
             }
         }
     }
