@@ -1,5 +1,5 @@
-use crate::mago_bridge::MagoProject;
-use mago_reflection::class_like::ClassLikeReflection;
+use crate::mago_bridge::{word_to_string, MagoProject};
+use mago_codex::metadata::class_like::ClassLikeMetadata;
 use std::collections::HashMap;
 
 const TESTCASE_FQCN_LOWER: &str = "phpunit\\framework\\testcase";
@@ -7,30 +7,27 @@ const MAX_INHERITANCE_DEPTH: usize = 50;
 
 /// Returns the FQCNs of classes that extend PHPUnit\Framework\TestCase
 /// (directly or transitively). FQCNs are returned in whatever casing
-/// mago-project produced — typically lowercased.
+/// mago produced — typically lowercased.
 pub fn find_testcase_subclasses(project: &MagoProject) -> Vec<String> {
     // Build lowercased-FQCN → reflection index.
-    let mut index: HashMap<String, &ClassLikeReflection> = HashMap::new();
-    for (name, refl) in project.class_likes() {
-        let key = project.class_name_str(name).to_lowercase();
+    let mut index: HashMap<String, &ClassLikeMetadata> = HashMap::new();
+    for refl in project.class_likes() {
+        let key = word_to_string(&refl.name).to_lowercase();
         index.insert(key, refl);
     }
 
     let mut out = Vec::new();
-    for (name, _refl) in project.class_likes() {
-        let fqcn = project.class_name_str(name);
-        if ascends_to_testcase(&fqcn, &index, project) {
-            out.push(fqcn);
+    for refl in project.class_likes() {
+        // Ascent uses the (lowercased) `name`; the returned FQCN uses
+        // `original_name` to preserve the source casing for display.
+        if ascends_to_testcase(&word_to_string(&refl.name), &index) {
+            out.push(word_to_string(&refl.original_name));
         }
     }
     out
 }
 
-fn ascends_to_testcase(
-    start_fqcn: &str,
-    index: &HashMap<String, &ClassLikeReflection>,
-    project: &MagoProject,
-) -> bool {
+fn ascends_to_testcase(start_fqcn: &str, index: &HashMap<String, &ClassLikeMetadata>) -> bool {
     let mut current = start_fqcn.to_lowercase();
     for _ in 0..MAX_INHERITANCE_DEPTH {
         if current == TESTCASE_FQCN_LOWER {
@@ -39,13 +36,10 @@ fn ascends_to_testcase(
         let Some(refl) = index.get(&current) else {
             return false;
         };
-        let Some(parent_name) = &refl.inheritance.direct_extended_class else {
+        let Some(parent_name) = &refl.direct_parent_class else {
             return false;
         };
-        let parent_fqcn = project
-            .interner()
-            .lookup(&parent_name.value)
-            .to_string()
+        let parent_fqcn = word_to_string(parent_name)
             .trim_start_matches('\\')
             .to_lowercase();
         if parent_fqcn == current {

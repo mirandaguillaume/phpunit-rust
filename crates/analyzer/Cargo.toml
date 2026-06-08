@@ -26,16 +26,18 @@ rayon        = { workspace = true }
 walkdir      = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
-# Mago crates: use mago-project 0.26 only — mago-analyzer 1.27 is incompatible
-# (different AST, span, and source/interner types).
-mago-project     = "0.26"
-mago-interner    = "0.26"
-mago-source      = "0.26"
-mago-syntax      = "0.26"
-mago-reflection  = "0.26"
-mago-span        = "0.26"
-mago-php-version = "0.26"
-mago-names       = "0.26"
+# Mago 1.x: mago-project/-reflection/-source/-interner were removed; their roles
+# moved to mago-database (file/source model + FileId) + mago-codex (codebase
+# metadata / reflection) + the arena-based mago-analyzer.
+mago-analyzer    = "1.30"
+mago-codex       = "1.30"
+mago-database    = "1.30"
+mago-syntax      = "1.30"
+mago-span        = "1.30"
+mago-php-version = "1.30"
+mago-names       = "1.30"
+mago-word        = "1.30"
+bumpalo          = "3"
 
 [dev-dependencies]
 tempfile   = { workspace = true }

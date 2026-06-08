@@ -1,36 +1,28 @@
 //! Method identification for PHPUnit test classes.
 //!
-//! # API investigation findings (Task 9)
+//! # API model (mago 1.30)
 //!
-//! ## What mago-reflection 0.26 exposes for FunctionLikeReflection
-//! - `attribute_reflections: Vec<AttributeReflection>` — PHP 8 `#[...]` attributes ARE parsed.
-//!   - `AttributeReflection { name: Name, arguments: Option<AttributeArgumentListReflection>, … }`
-//!   - `AttributeArgumentReflection::Positional { value_type_reflection: TypeReflection, … }`
-//!   - `TypeReflection { kind: TypeKind, … }` where `TypeKind::Value(ValueTypeKind::String { value, … })`
-//!     carries the interned string literal — usable for `#[DataProvider("name")]` extraction.
-//! - `name: FunctionLikeName::Method(ClassLikeName, Name)` — method name via `interner.lookup(&name.value)`.
-//! - `span: Span` — `span.start.source` is the `SourceIdentifier`, `span.start.offset` is the byte offset.
-//! - Line numbers: `Source::line_number(offset)` (0-based). We look up the `Source` via `project.source_by_id`.
-//! - File path: `interner.lookup(&span.start.source.0)` gives the name string used when creating the source
-//!   (which equals the file path string, since `MagoProject::load` uses `path.display().to_string()` as the name).
-//!
-//! ## What is NOT available
-//! - **Doc comments**: `FunctionLikeReflection` has no `doc_comment` field.
-//!   Therefore `@test` and `@dataProvider` PHPDoc annotation detection is NOT possible
-//!   through the reflection layer alone. Only PHP 8 attribute syntax is supported.
+//! The codex `ClassLikeMetadata.methods` is a `WordSet` of method NAMES only,
+//! and `FunctionLikeMetadata` (looked up via `codebase.get_method`) carries the
+//! span but NOT attribute argument values — `AttributeMetadata` in 1.30 exposes
+//! only `{ name, span }`. So `#[DataProvider("name")]` argument extraction and
+//! `@test` PHPDoc detection both require walking the AST, which we do on demand
+//! via [`MagoProject::with_program`] (the AST is arena-bound, so all reads happen
+//! inside the closure and only owned `TestMethod`s escape).
 
 use std::path::PathBuf;
 
-use mago_reflection::attribute::AttributeArgumentReflection;
-use mago_reflection::identifier::FunctionLikeName;
-use mago_reflection::r#type::kind::{TypeKind, ValueTypeKind};
+use mago_span::HasSpan;
+use mago_syntax::ast::ast::class_like::member::ClassLikeMember;
+use mago_syntax::ast::ast::statement::Statement;
+use mago_syntax::ast::Method;
 
 use super::TestMethod;
-use crate::mago_bridge::MagoProject;
+use crate::mago_bridge::{word_to_string, MagoProject};
 
 /// Attribute FQNs for the `#[Test]` and `#[DataProvider("name")]` attributes.
-/// mago-reflection stores attribute names as they appear after name resolution,
-/// i.e., the FQCN without the leading backslash.
+/// mago stores attribute names as they appear after name resolution, i.e., the
+/// FQCN without the leading backslash.
 const ATTR_TEST: &str = "PHPUnit\\Framework\\Attributes\\Test";
 const ATTR_DATA_PROVIDER: &str = "PHPUnit\\Framework\\Attributes\\DataProvider";
 
@@ -39,121 +31,224 @@ const ATTR_DATA_PROVIDER: &str = "PHPUnit\\Framework\\Attributes\\DataProvider";
 /// A method is considered a "test method" if any of:
 /// 1. Its name starts with `test` (case-sensitive, PHPUnit convention).
 /// 2. It carries the `#[PHPUnit\Framework\Attributes\Test]` attribute.
+/// 3. It has a `/** @test */` PHPDoc annotation.
 ///
 /// `has_data_provider` is set when the method carries a
 /// `#[PHPUnit\Framework\Attributes\DataProvider("name")]` attribute.
-///
-/// Note: `@test` and `@dataProvider` doc annotations are NOT supported because
-/// `FunctionLikeReflection` in mago-reflection 0.26 does not expose doc comments.
 pub fn find_test_methods(project: &MagoProject, test_classes: &[String]) -> Vec<TestMethod> {
-    let interner = project.interner();
+    let mut out = Vec::new();
 
     // Build a lowercased FQCN → reflection lookup.
     let class_index: std::collections::HashMap<
         String,
-        &mago_reflection::class_like::ClassLikeReflection,
+        &mago_codex::metadata::class_like::ClassLikeMetadata,
     > = project
         .class_likes()
-        .map(|(name, refl)| (project.class_name_str(name).to_lowercase(), refl))
+        .map(|refl| (word_to_string(&refl.name).to_lowercase(), refl))
         .collect();
 
-    let mut out = Vec::new();
-
     for class_name in test_classes {
-        let key = class_name.to_lowercase();
+        let key = class_name.trim_start_matches('\\').to_lowercase();
         let Some(class_refl) = class_index.get(&key) else {
             continue;
         };
+        let Some(file) = project.file_of_span(&class_refl.span) else {
+            continue;
+        };
+        let logical_name = String::from_utf8_lossy(&file.name).into_owned();
+        let file_path: PathBuf = match &file.path {
+            Some(p) => p.clone(),
+            None => PathBuf::from(logical_name.clone()),
+        };
 
-        for (_method_id, method_refl) in class_refl.methods.members.iter() {
-            // Extract the plain method name from FunctionLikeName.
-            let method_name: String = match &method_refl.name {
-                FunctionLikeName::Method(_, name) => interner.lookup(&name.value).to_string(),
-                _ => continue, // skip closures / bare functions (shouldn't occur here)
-            };
+        let methods = project
+            .with_program(&logical_name, |program, file, names| {
+                let mut found = Vec::new();
+                collect_methods_in_statements(
+                    program.statements.iter(),
+                    class_name,
+                    file,
+                    &file_path,
+                    names,
+                    &mut found,
+                );
+                found
+            })
+            .unwrap_or_default();
 
-            // Determine if this is a test method.
-            let has_test_attr = has_attribute(method_refl, ATTR_TEST, interner);
-            let is_test = method_name.starts_with("test") || has_test_attr || {
-                // Fall back to raw source scan for `@test` PHPDoc annotations.
-                // (mago-reflection 0.26 does not expose doc comments.)
-                let src_id = method_refl.span.start.source;
-                project.source_by_id(src_id).is_some_and(|src| {
-                    let text = interner.lookup(&src.content);
-                    has_doc_test_annotation(text, method_refl.span.start.offset)
-                })
-            };
-            if !is_test {
-                continue;
-            }
-
-            // Extract DataProvider attribute argument if present.
-            let has_data_provider = extract_data_provider(method_refl, interner);
-
-            // Resolve file path and line number from the span.
-            let span = method_refl.span;
-            let source_id = span.start.source;
-            let file: PathBuf = PathBuf::from(interner.lookup(&source_id.0).to_string());
-            let line: u32 = project
-                .source_by_id(source_id)
-                .map(|src| src.line_number(span.start.offset) as u32 + 1) // convert 0-based → 1-based
-                .unwrap_or(0);
-
-            out.push(TestMethod {
-                class: class_name.clone(),
-                method: method_name,
-                file,
-                line,
-                has_data_provider,
-                lifecycle: Default::default(), // filled by Task 10
-            });
-        }
+        out.extend(methods);
     }
 
     out
 }
 
-/// Returns `true` if the method carries the given attribute (by FQCN, case-insensitive tail match).
-fn has_attribute(
-    method_refl: &mago_reflection::function_like::FunctionLikeReflection,
-    attr_fqcn: &str,
-    interner: &mago_interner::ThreadedInterner,
-) -> bool {
-    method_refl.attribute_reflections.iter().any(|attr| {
-        let name = interner.lookup(&attr.name.value);
-        names_match(name, attr_fqcn)
+/// Recursively walk a statement list (descending into namespaces) for the named
+/// class, and collect its test methods into `out`.
+fn collect_methods_in_statements<'s, 'arena, I>(
+    stmts: I,
+    class_name: &str,
+    file: &mago_database::file::File,
+    file_path: &std::path::Path,
+    names: &mago_names::ResolvedNames,
+    out: &mut Vec<TestMethod>,
+) where
+    'arena: 's,
+    I: Iterator<Item = &'s Statement<'arena>>,
+{
+    let simple_class = simple_name(class_name);
+    for stmt in stmts {
+        match stmt {
+            Statement::Class(class) if name_eq_ignore_case(class.name.value, simple_class) => {
+                let source_text = String::from_utf8_lossy(&file.contents);
+                // mago lowercases reflection FQCNs; recover the original casing from
+                // the AST node by replacing the last `\`-segment of `class_name`.
+                let display_class = display_class_name(class_name, class.name.value);
+                for member in class.members.iter() {
+                    let ClassLikeMember::Method(method) = member else {
+                        continue;
+                    };
+                    if let Some(tm) =
+                        method_to_test(method, &display_class, file, file_path, names, &source_text)
+                    {
+                        out.push(tm);
+                    }
+                }
+            }
+            Statement::Namespace(ns) => {
+                use mago_syntax::ast::ast::namespace::NamespaceBody;
+                match &ns.body {
+                    NamespaceBody::Implicit(b) => collect_methods_in_statements(
+                        b.statements.iter(),
+                        class_name,
+                        file,
+                        file_path,
+                        names,
+                        out,
+                    ),
+                    NamespaceBody::BraceDelimited(b) => collect_methods_in_statements(
+                        b.statements.iter(),
+                        class_name,
+                        file,
+                        file_path,
+                        names,
+                        out,
+                    ),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Classify an AST method node into a `TestMethod` if it qualifies.
+fn method_to_test(
+    method: &Method,
+    class_name: &str,
+    file: &mago_database::file::File,
+    file_path: &std::path::Path,
+    names: &mago_names::ResolvedNames,
+    source_text: &str,
+) -> Option<TestMethod> {
+    let method_name = String::from_utf8_lossy(method.name.value).into_owned();
+
+    let has_test_attr = has_attribute(method, names, ATTR_TEST);
+    let method_offset = method.span().start.offset;
+    let is_test = method_name.starts_with("test")
+        || has_test_attr
+        || has_doc_test_annotation(source_text, method_offset as usize);
+    if !is_test {
+        return None;
+    }
+
+    let has_data_provider = extract_data_provider(method, names);
+    let line = file.line_number(method_offset) + 1; // 0-based → 1-based
+
+    Some(TestMethod {
+        class: class_name.to_string(),
+        method: method_name,
+        file: file_path.to_path_buf(),
+        line,
+        has_data_provider,
+        lifecycle: Default::default(),
     })
 }
 
-/// Extract the DataProvider name from the first positional string argument of
-/// a `#[DataProvider("name")]` attribute, if present.
-fn extract_data_provider(
-    method_refl: &mago_reflection::function_like::FunctionLikeReflection,
-    interner: &mago_interner::ThreadedInterner,
-) -> Option<String> {
-    for attr in &method_refl.attribute_reflections {
-        let attr_name = interner.lookup(&attr.name.value);
-        if !names_match(attr_name, ATTR_DATA_PROVIDER) {
-            continue;
+/// Resolve an attribute's identifier to its fully-qualified name using the
+/// name-resolution table; falls back to the raw written name.
+fn resolved_attr_name(
+    names: &mago_names::ResolvedNames,
+    attr_name: &mago_syntax::ast::Identifier,
+) -> String {
+    match names.resolve(attr_name) {
+        Some(fqcn) => String::from_utf8_lossy(fqcn).into_owned(),
+        None => String::from_utf8_lossy(attr_name.value()).into_owned(),
+    }
+}
+
+/// Returns `true` if the method carries the given attribute (by FQCN,
+/// case-insensitive, leading-backslash-insensitive).
+fn has_attribute(method: &Method, names: &mago_names::ResolvedNames, attr_fqcn: &str) -> bool {
+    for attr_list in method.attribute_lists.iter() {
+        for attr in attr_list.attributes.iter() {
+            let name = resolved_attr_name(names, &attr.name);
+            if names_match(&name, attr_fqcn) {
+                return true;
+            }
         }
-        // Found the DataProvider attribute — look for the first positional string arg.
-        if let Some(arg_list) = &attr.arguments {
-            for arg in &arg_list.arguments {
-                if let AttributeArgumentReflection::Positional {
-                    value_type_reflection,
-                    ..
-                } = arg
-                {
-                    if let TypeKind::Value(ValueTypeKind::String { value, .. }) =
-                        &value_type_reflection.kind
-                    {
-                        return Some(interner.lookup(value).to_string());
+    }
+    false
+}
+
+/// Extract the DataProvider name from the first positional string argument of a
+/// `#[DataProvider("name")]` attribute, if present.
+fn extract_data_provider(method: &Method, names: &mago_names::ResolvedNames) -> Option<String> {
+    use mago_syntax::ast::ast::argument::Argument;
+    use mago_syntax::ast::ast::expression::Expression;
+    use mago_syntax::ast::ast::literal::Literal;
+
+    for attr_list in method.attribute_lists.iter() {
+        for attr in attr_list.attributes.iter() {
+            let name = resolved_attr_name(names, &attr.name);
+            if !names_match(&name, ATTR_DATA_PROVIDER) {
+                continue;
+            }
+            let Some(arg_list) = &attr.argument_list else {
+                continue;
+            };
+            for arg in arg_list.arguments.iter() {
+                let expr = match arg {
+                    Argument::Positional(p) => p.value,
+                    Argument::Named(n) => n.value,
+                };
+                if let Expression::Literal(Literal::String(s)) = expr {
+                    if let Some(v) = s.value {
+                        return Some(String::from_utf8_lossy(v).into_owned());
                     }
                 }
             }
         }
     }
     None
+}
+
+/// Strip a PHP namespace prefix: `My\\Ns\\ClassName` → `ClassName`.
+fn simple_name(fqcn: &str) -> &str {
+    fqcn.rsplit('\\').next().unwrap_or(fqcn)
+}
+
+/// Build a display FQCN by replacing the last `\`-segment of `fqcn` (whose casing
+/// mago lowercased) with the original-cased `ast_simple` from the AST node.
+fn display_class_name(fqcn: &str, ast_simple: &[u8]) -> String {
+    let simple = String::from_utf8_lossy(ast_simple);
+    match fqcn.rfind('\\') {
+        Some(pos) => format!("{}\\{}", &fqcn[..pos], simple),
+        None => simple.into_owned(),
+    }
+}
+
+/// Case-insensitive compare an AST identifier's raw bytes against a `&str`.
+fn name_eq_ignore_case(bytes: &[u8], s: &str) -> bool {
+    String::from_utf8_lossy(bytes).eq_ignore_ascii_case(s)
 }
 
 /// Returns `true` if the raw source text has a `/** @test */` docblock immediately

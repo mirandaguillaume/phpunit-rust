@@ -6,13 +6,13 @@
 
 use super::{Coverage, TestId};
 use crate::boundary::BoundaryResolver;
-use crate::mago_bridge::MagoProject;
+use crate::mago_bridge::{word_to_string, MagoProject};
 use crate::opacity::{self, Opacity, ReceiverType};
 use crate::test_discovery::TestMethod;
 use crate::types::env::TypeEnv;
 use crate::types::walker::{walk_block, CallSiteEvent, WalkerCtx};
-use mago_reflection::function_like::FunctionLikeReflection;
-use mago_reflection::identifier::FunctionLikeName;
+use mago_codex::metadata::function_like::FunctionLikeMetadata;
+use mago_codex::symbol::SymbolKind;
 use mago_syntax::ast::class_like::member::ClassLikeMember;
 use mago_syntax::ast::class_like::method::MethodBody;
 use mago_syntax::ast::Statement;
@@ -99,10 +99,8 @@ fn trace_method(
         if let Some(cc) = call_site.callee_class.clone() {
             let method_lc = call_site.callee_method.to_lowercase();
             if let Some((m_refl, _)) = find_method_in_hierarchy(project, &cc, &method_lc) {
-                if let Some(src) = project.source_by_id(m_refl.span.start.source) {
-                    call_site.callee_file = Some(PathBuf::from(
-                        project.interner().lookup(&src.identifier.0).to_string(),
-                    ));
+                if let Some(src) = project.file_of_span(&m_refl.span) {
+                    call_site.callee_file = Some(file_path_of(src));
                 }
             }
         }
@@ -112,8 +110,8 @@ fn trace_method(
         if call_site.receiver_type == ReceiverType::Mock {
             if let Some(cc) = call_site.callee_class.clone() {
                 let is_traceable_class = project
-                    .find_class_reflection(&cc)
-                    .map(|r| !r.is_interface() && !r.is_trait())
+                    .find_class(&cc)
+                    .map(|r| r.kind != SymbolKind::Interface && r.kind != SymbolKind::Trait)
                     .unwrap_or(false);
                 if is_traceable_class {
                     call_site.receiver_type = ReceiverType::Concrete(cc);
@@ -152,7 +150,6 @@ fn collect_method_info(
     class: &str,
     method: &str,
 ) -> Option<(PathBuf, u32, u32, Vec<CallSiteEvent>)> {
-    let interner = project.interner();
     let target_method_lc = method.to_lowercase();
 
     // 1. Walk the inheritance chain to find which class defines the method.
@@ -164,30 +161,25 @@ fn collect_method_info(
 
     // 2. Resolve span → file path + line range.
     let span = method_refl.span;
-    let source_id = span.start.source;
-    let source = project.source_by_id(source_id)?;
-    let file_path = PathBuf::from(interner.lookup(&source.identifier.0).to_string());
-    let start_line = source.line_number(span.start.offset) as u32 + 1;
-    let end_line = source.line_number(span.end.offset) as u32 + 1;
+    let source = project.file_of_span(&span)?;
+    let file_path = file_path_of(source);
+    let start_line = source.line_number(span.start.offset) + 1;
+    let end_line = source.line_number(span.end.offset) + 1;
+    let logical_name = String::from_utf8_lossy(&source.name).into_owned();
 
-    // 3. Parse the source — result is cached by MagoProject so each unique file is
-    //    parsed at most once regardless of how many tests trace into it.
-    let program = project.get_or_parse(source);
-
-    // Phase 2.5: compute resolved names for the program so the walker can
-    // look up FQCNs at class-name sites.
-    let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
-
-    // 4. Seed TypeEnv with the ORIGINAL (call-site) class so that `$this` inside
-    //    an inherited method body correctly dispatches back to the subclass.
+    // 3. Seed parameter types from the method reflection (independent of the AST).
     let mut env = TypeEnv::for_class(class);
     seed_param_types(&mut env, project, method_refl);
 
-    // 5. Walk the method body. Use `defining_class` for AST navigation (the
-    //    source file contains `class JsonFormatter`, not `class Subclass`).
-    let mut ctx = WalkerCtx::new(env, interner, project, names);
-    walk_method_body(&mut ctx, &program, &defining_class, method);
-    let events = ctx.events;
+    // 4. Re-parse the declaring file on demand and walk the method body inside the
+    //    closure (the AST + resolved names are arena-bound). Use `defining_class`
+    //    for AST navigation (the source contains `class JsonFormatter`, not the
+    //    subclass name).
+    let events = project.with_program(&logical_name, |program, _file, names| {
+        let mut ctx = WalkerCtx::new(env, project, names);
+        walk_method_body(&mut ctx, program, &defining_class, method);
+        ctx.events
+    })?;
 
     Some((file_path, start_line, end_line, events))
 }
@@ -199,53 +191,52 @@ fn find_method_in_hierarchy<'a>(
     project: &'a MagoProject,
     start_class: &str,
     method_lc: &str,
-) -> Option<(&'a FunctionLikeReflection, String)> {
-    let interner = project.interner();
-    let mut current = start_class.to_lowercase();
+) -> Option<(&'a FunctionLikeMetadata, String)> {
+    let codebase = project.codebase();
+    let mut current = start_class.trim_start_matches('\\').to_lowercase();
 
     for _ in 0..MAX_RECURSION_DEPTH {
-        // Find the reflection for `current`.
-        let (class_fqcn, class_refl) = project.find_class(&current)?;
+        // Find the metadata for `current`.
+        let class_refl = project.find_class(&current)?;
+        let class_fqcn = word_to_string(&class_refl.name);
 
-        // Look for the method directly on this class.
-        for (_id, m_refl) in class_refl.methods.members.iter() {
-            let mname = match &m_refl.name {
-                FunctionLikeName::Method(_, n) => interner.lookup(&n.value).to_string(),
-                _ => continue,
-            };
-            if mname.to_lowercase() == method_lc {
+        // Look for the method directly on this class (names are in `methods`).
+        if class_refl
+            .methods
+            .iter()
+            .any(|m| word_to_string(m).to_lowercase() == method_lc)
+        {
+            if let Some(m_refl) = codebase.get_method(current.as_bytes(), method_lc.as_bytes()) {
                 return Some((m_refl, class_fqcn));
             }
         }
 
-        // Not in own methods — search traits used by this class.
-        // mago-reflection does NOT inline trait methods into methods.members,
-        // so we must look up each trait's reflection explicitly.
-        for trait_name in &class_refl.used_traits {
-            let trait_fqcn_lc = interner
-                .lookup(&trait_name.value)
+        // Not in own methods — search traits used by this class. Trait methods
+        // are not inlined into `methods`, so look up each trait explicitly.
+        for trait_name in class_refl.used_traits.iter() {
+            let trait_fqcn_lc = word_to_string(trait_name)
                 .trim_start_matches('\\')
                 .to_lowercase();
-            if let Some((t_fqcn, t_refl)) = project.find_class(&trait_fqcn_lc) {
-                for (_id, m_refl) in t_refl.methods.members.iter() {
-                    let mname = match &m_refl.name {
-                        FunctionLikeName::Method(_, n) => interner.lookup(&n.value).to_string(),
-                        _ => continue,
-                    };
-                    if mname.to_lowercase() == method_lc {
-                        return Some((m_refl, t_fqcn));
+            if let Some(t_refl) = project.find_class(&trait_fqcn_lc) {
+                if t_refl
+                    .methods
+                    .iter()
+                    .any(|m| word_to_string(m).to_lowercase() == method_lc)
+                {
+                    if let Some(m_refl) =
+                        codebase.get_method(trait_fqcn_lc.as_bytes(), method_lc.as_bytes())
+                    {
+                        return Some((m_refl, word_to_string(&t_refl.name)));
                     }
                 }
             }
         }
 
         // Not found here — try the direct parent.
-        let Some(parent_name) = &class_refl.inheritance.direct_extended_class else {
+        let Some(parent_name) = &class_refl.direct_parent_class else {
             return None;
         };
-        let parent_fqcn = interner
-            .lookup(&parent_name.value)
-            .to_string()
+        let parent_fqcn = word_to_string(parent_name)
             .trim_start_matches('\\')
             .to_lowercase();
         if parent_fqcn == current {
@@ -261,22 +252,17 @@ fn find_method_in_hierarchy<'a>(
 ///
 /// For each parameter that has a declared type, we resolve it and bind
 /// `$paramName → Type` in the env so the walker can track it.
-fn seed_param_types(
-    env: &mut TypeEnv,
-    project: &MagoProject,
-    method_refl: &FunctionLikeReflection,
-) {
-    let interner = project.interner();
+fn seed_param_types(env: &mut TypeEnv, project: &MagoProject, method_refl: &FunctionLikeMetadata) {
     for param in &method_refl.parameters {
-        let name_str = interner.lookup(&param.name).to_string();
+        let name_str = word_to_string(&param.name.0);
         // param.name already includes the leading `$` (same as properties).
         let var = if name_str.starts_with('$') {
             name_str
         } else {
             format!("${name_str}")
         };
-        let ty = if let Some(type_refl) = &param.type_reflection {
-            crate::types::walker::type_kind_to_type_pub(project, interner, &type_refl.kind, env)
+        let ty = if let Some(type_meta) = &param.type_metadata {
+            crate::types::walker::type_union_to_type_pub(project, &type_meta.type_union, env)
         } else {
             crate::types::Type::Mixed
         };
@@ -296,9 +282,10 @@ fn walk_method_body(
 
 /// Recursively walk statements looking for the target class + method,
 /// descending into namespace wrappers as needed.
-fn walk_method_body_impl<'s, I>(ctx: &mut WalkerCtx, stmts: I, class: &str, method: &str)
+fn walk_method_body_impl<'s, 'arena, I>(ctx: &mut WalkerCtx, stmts: I, class: &str, method: &str)
 where
-    I: Iterator<Item = &'s Statement>,
+    'arena: 's,
+    I: Iterator<Item = &'s Statement<'arena>>,
 {
     // Strip any leading namespace from class name for matching purposes.
     // The AST `Class.name` is a LocalIdentifier, so it only contains the
@@ -309,12 +296,10 @@ where
     for stmt in stmts {
         match stmt {
             Statement::Class(c) => {
-                let ast_name = ctx.interner.lookup(&c.name.value);
-                if ast_name.eq_ignore_ascii_case(simple_class) {
+                if name_eq_ignore_case(c.name.value, simple_class) {
                     for member in c.members.iter() {
                         if let ClassLikeMember::Method(m) = member {
-                            if ctx.interner.lookup(&m.name.value).to_lowercase() == target_method_lc
-                            {
+                            if name_to_lower(m.name.value) == target_method_lc {
                                 if let MethodBody::Concrete(block) = &m.body {
                                     walk_block(ctx, block);
                                     return;
@@ -326,12 +311,10 @@ where
                 }
             }
             Statement::Trait(t) => {
-                let ast_name = ctx.interner.lookup(&t.name.value);
-                if ast_name.eq_ignore_ascii_case(simple_class) {
+                if name_eq_ignore_case(t.name.value, simple_class) {
                     for member in t.members.iter() {
                         if let ClassLikeMember::Method(m) = member {
-                            if ctx.interner.lookup(&m.name.value).to_lowercase() == target_method_lc
-                            {
+                            if name_to_lower(m.name.value) == target_method_lc {
                                 if let MethodBody::Concrete(block) = &m.body {
                                     walk_block(ctx, block);
                                     return;
@@ -343,14 +326,15 @@ where
                 }
             }
             Statement::Namespace(ns) => {
-                // NamespaceBody has both Implicit and BraceDelimited variants;
-                // both expose `.statements` via a method.
                 use mago_syntax::ast::namespace::NamespaceBody;
-                let inner_stmts = match &ns.body {
-                    NamespaceBody::Implicit(b) => b.statements.iter(),
-                    NamespaceBody::BraceDelimited(b) => b.statements.iter(),
+                match &ns.body {
+                    NamespaceBody::Implicit(b) => {
+                        walk_method_body_impl(ctx, b.statements.iter(), class, method)
+                    }
+                    NamespaceBody::BraceDelimited(b) => {
+                        walk_method_body_impl(ctx, b.statements.iter(), class, method)
+                    }
                 };
-                walk_method_body_impl(ctx, inner_stmts, class, method);
                 if !ctx.events.is_empty() {
                     // Found and walked the method, return early.
                     return;
@@ -364,6 +348,24 @@ where
 /// Strip a PHP namespace prefix: `My\\Ns\\ClassName` → `ClassName`.
 fn simple_name(fqcn: &str) -> &str {
     fqcn.rsplit('\\').next().unwrap_or(fqcn)
+}
+
+/// Case-insensitive compare an AST identifier's raw bytes against a `&str`.
+fn name_eq_ignore_case(bytes: &[u8], s: &str) -> bool {
+    String::from_utf8_lossy(bytes).eq_ignore_ascii_case(s)
+}
+
+/// Lowercase an AST identifier's raw bytes into an owned `String`.
+fn name_to_lower(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_lowercase()
+}
+
+/// Resolve a loaded `File` to its on-disk path (falls back to logical name).
+fn file_path_of(file: &mago_database::file::File) -> PathBuf {
+    match &file.path {
+        Some(p) => p.clone(),
+        None => PathBuf::from(String::from_utf8_lossy(&file.name).into_owned()),
+    }
 }
 
 #[cfg(test)]
