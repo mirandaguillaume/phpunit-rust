@@ -771,10 +771,14 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
         }
         b"assertEquals" => {
             let (e, a) = two_args(args)?;
+            // assertEquals on a closure is reference identity (no heap model) → bail
+            // rather than let php_loose_eq short-circuit to a false-green result.
+            bail_if_closure_operand(e, a)?;
             pass(assert_equals(e, a), "assertEquals")
         }
         b"assertNotEquals" => {
             let (e, a) = two_args(args)?;
+            bail_if_closure_operand(e, a)?;
             pass(!assert_equals(e, a), "assertNotEquals")
         }
         b"assertTrue" => {
@@ -823,6 +827,20 @@ fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
     {
         return Err(BailReason::UnsupportedConstruct(
             "=== / assertSame on an object (reference identity, no heap model)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `==`/`!=`/`assertEquals`/`assertNotEquals` on a `Value::Closure` is reference
+/// identity in PHP (two closures are `==` iff they are the SAME instance). The
+/// reducer models no heap identity, so it MUST abstain when either operand is a
+/// closure — otherwise `php_loose_eq` short-circuits to `false` and produces a
+/// false-green Pass (Inc-4 Task 4). Objects stay modelable (gate on Closure only).
+fn bail_if_closure_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if matches!(a, Value::Closure(_)) || matches!(b, Value::Closure(_)) {
+        return Err(BailReason::UnsupportedConstruct(
+            "== / != / assertEquals on a closure (reference identity, no heap model)".into(),
         ));
     }
     Ok(())
@@ -1275,8 +1293,13 @@ fn eval_binary(
         BinaryOperator::Modulo(_) => php_mod(&l, &r),
         BinaryOperator::Exponentiation(_) => php_pow(&l, &r),
         BinaryOperator::StringConcat(_) => php_concat(&l, &r),
-        BinaryOperator::Equal(_) => Ok(Value::Bool(l.php_loose_eq(&r))),
+        BinaryOperator::Equal(_) => {
+            // `==` on a closure is reference identity (no heap model) → bail.
+            bail_if_closure_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_loose_eq(&r)))
+        }
         BinaryOperator::NotEqual(_) | BinaryOperator::AngledNotEqual(_) => {
+            bail_if_closure_operand(&l, &r)?;
             Ok(Value::Bool(!l.php_loose_eq(&r)))
         }
         // `===`/`!==` over objects is reference identity (frontier §1) → bail.
@@ -2979,6 +3002,56 @@ mod tests {
         assert!(matches!(
             run_body(
                 "$n = 0; $f = function () use (&$n) { $n = 5; }; $f(); $this->assertSame(5, $n);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn assert_not_equals_on_closures_bails_not_passes() {
+        // assertNotEquals($f, $g) on two closures: PHP `==` on closures is reference
+        // identity → $f == $g is FALSE → assertNotEquals PASSES in real PHP. The
+        // reducer has no heap-identity model, so php_loose_eq short-circuited to
+        // false → a false-GREEN Pass. It must BAIL instead (no model, no guess).
+        assert!(
+            matches!(
+                run_body(
+                    "$f = fn() => 1; $g = $f; $this->assertNotEquals($f, $g);",
+                    vec![]
+                ),
+                Outcome::Bailed(_)
+            ),
+            "assertNotEquals on closures must bail, not return a false-green Pass"
+        );
+    }
+
+    #[test]
+    fn assert_equals_on_closures_bails() {
+        // assertEquals($f, $g) on closures must bail too (no heap model).
+        assert!(matches!(
+            run_body(
+                "$f = fn() => 1; $g = fn() => 1; $this->assertEquals($f, $g);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn closure_loose_eq_operator_bails() {
+        // The `==` / `!=` operators on a closure operand must bail (the binary path,
+        // not just the assertion helper).
+        assert!(matches!(
+            run_body(
+                "$f = fn() => 1; $r = ($f == $f); $this->assertTrue($r);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body(
+                "$f = fn() => 1; $r = ($f != $f); $this->assertFalse($r);",
                 vec![]
             ),
             Outcome::Bailed(_)
