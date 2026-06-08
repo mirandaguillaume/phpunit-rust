@@ -267,6 +267,26 @@ fn method_to_test(
 ) -> Option<TestMethod> {
     let method_name = String::from_utf8_lossy(method.name.value).into_owned();
 
+    // PHPUnit collects ONLY public, non-static, non-abstract methods as tests. A
+    // protected/private/static/abstract `test*` (or `#[Test]`) method is never run
+    // as a test — surfacing it as a phantom row is a divergence, amplified by inc-4's
+    // parent-chain surfacing onto every concrete descendant. A method with NO
+    // visibility modifier is implicitly public (so we reject only an EXPLICIT
+    // protected/private read-visibility modifier).
+    if method.is_static() || method.is_abstract() {
+        return None;
+    }
+    let is_non_public = method.modifiers.iter().any(|m| {
+        matches!(
+            m,
+            mago_syntax::ast::ast::modifier::Modifier::Protected(..)
+                | mago_syntax::ast::ast::modifier::Modifier::Private(..)
+        )
+    });
+    if is_non_public {
+        return None;
+    }
+
     let has_test_attr = has_attribute(method, names, ATTR_TEST);
     let method_offset = method.span().start.offset;
     let is_test = method_name.starts_with("test")
@@ -615,6 +635,23 @@ mod tests {
             methods[0].line > 0,
             "expected a non-zero line number; got {}",
             methods[0].line
+        );
+    }
+
+    #[test]
+    fn only_public_non_static_methods_are_tests() {
+        // PHPUnit collects only PUBLIC, NON-STATIC, non-abstract `test*` methods.
+        // protected/private/static `test*` methods are NOT tests; emitting them as
+        // phantom rows (amplified by inc-4's parent-chain surfacing) is a divergence.
+        let (_d, project) = project_with(
+            "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass VisTest extends TestCase {\n  public function testPublic(): void {}\n  protected function testProtected(): void {}\n  private function testPrivate(): void {}\n  public static function testStatic(): void {}\n}",
+        );
+        let methods = find_test_methods(&project, &["VisTest".to_string()]);
+        let names: Vec<String> = methods.iter().map(|m| m.method.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["testPublic".to_string()],
+            "only the public non-static test method must be collected; got {names:?}"
         );
     }
 }
