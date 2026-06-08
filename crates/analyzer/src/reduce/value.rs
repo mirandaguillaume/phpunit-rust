@@ -43,6 +43,15 @@ pub enum Value {
     Str(Vec<u8>),
     /// Ordered key→value map (insertion order preserved), PHP array.
     Arr(Vec<(ArrayKey, Value)>),
+    /// An object value: a record of fields (spec §13). `class` is the runtime
+    /// FQCN (byte-exact, from the construction site); `props` is the
+    /// insertion-ordered field list. Increment 2 models only immutable value
+    /// objects — a method that writes `$this->prop` (a mutator) or any by-ref
+    /// aliasing bails before an `Object` is ever shared (driver/eval frontier).
+    Object {
+        class: Vec<u8>,
+        props: Vec<(Vec<u8>, Value)>,
+    },
 }
 
 /// A PHP array key — only `int` or (byte) `string`. Float/bool/null keys are
@@ -63,6 +72,7 @@ impl Value {
             Value::Float(_) => "float",
             Value::Str(_) => "string",
             Value::Arr(_) => "array",
+            Value::Object { .. } => "object",
         }
     }
 
@@ -102,6 +112,8 @@ impl Value {
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !(s.is_empty() || s.as_slice() == b"0"),
             Value::Arr(a) => !a.is_empty(),
+            // An object is always truthy in PHP.
+            Value::Object { .. } => true,
         }
     }
 
@@ -120,6 +132,10 @@ impl Value {
             Value::Str(s) => str_leading_numeric(s).map(|n| n.to_int()).unwrap_or(0),
             // PHP: (int) of a non-empty array is 1, empty array is 0.
             Value::Arr(a) => (!a.is_empty()) as i64,
+            // (int)$object is a PHP error/warning; the eval layer (arithmetic,
+            // casts) bails on an object operand before reaching here. The `1`
+            // sentinel is never observed — kept only to make the match total.
+            Value::Object { .. } => 1,
         }
     }
 
@@ -136,6 +152,8 @@ impl Value {
             Value::Float(f) => *f,
             Value::Str(s) => str_leading_numeric(s).map(|n| n.to_float()).unwrap_or(0.0),
             Value::Arr(a) => (!a.is_empty()) as i64 as f64,
+            // (float)$object errors in PHP; arithmetic/cast bails first (see to_int).
+            Value::Object { .. } => 1.0,
         }
     }
 
@@ -156,6 +174,9 @@ impl Value {
             Value::Str(s) => s.clone(),
             // PHP would emit "Array" + a notice; we bail rather than model that.
             Value::Arr(_) => return None,
+            // Object→string needs `__toString` (frontier §6, not modelled in v2);
+            // bail by returning None so the caller (concat/cast) abstains.
+            Value::Object { .. } => return None,
         })
     }
 
@@ -177,6 +198,8 @@ impl Value {
                 None => ArrayKey::Str(s.clone()),
             },
             Value::Arr(_) => return None,
+            // An object cannot be an array key (PHP TypeError); caller bails.
+            Value::Object { .. } => return None,
         })
     }
 
@@ -514,6 +537,47 @@ impl Value {
                     acc
                 }
             }
+            // object vs object: same class → compare prop-by-prop (lhs prop order),
+            // PHP `<=>` over objects (used by `==`). Different classes are
+            // "uncomparable" in PHP — we report `Greater` (the `==` path only ever
+            // checks for `Equal`, so a non-`Equal` verdict is a correct `!=`).
+            (
+                Object {
+                    class: ca,
+                    props: pa,
+                },
+                Object {
+                    class: cb,
+                    props: pb,
+                },
+            ) => {
+                if ca != cb || pa.len() != pb.len() {
+                    return Ordering::Greater;
+                }
+                let mut acc = Ordering::Equal;
+                for (k, av) in pa {
+                    match pb.iter().find(|(bk, _)| bk == k) {
+                        Some((_, bv)) => {
+                            let e = av.php_compare(bv);
+                            if e != Ordering::Equal {
+                                acc = e;
+                                break;
+                            }
+                        }
+                        None => {
+                            acc = Ordering::Greater;
+                            break;
+                        }
+                    }
+                }
+                acc
+            }
+            // An object vs a non-object scalar/array is uncomparable in PHP; the
+            // eval layer bails on `<`/`>`/`<=>` with an object operand, and the
+            // `==`/`===` paths handle objects separately, so this is never observed.
+            // Report a stable non-`Equal` direction (object > everything else).
+            (Object { .. }, _) => Ordering::Greater,
+            (_, Object { .. }) => Ordering::Less,
             // scalar vs array → the array is greater.
             (Arr(_), _) => Ordering::Greater,
             (_, Arr(_)) => Ordering::Less,
@@ -535,6 +599,34 @@ impl Value {
                     .find(|(yk, _)| yk == k)
                     .is_some_and(|(_, yv)| xv.php_loose_eq(yv))
             });
+        }
+        // Object `==`: same class AND same property set with loosely-equal values
+        // (order-independent, like arrays). `assertEquals`/`==` IS modelable for
+        // objects (structural). `assertSame`/`===` on objects is REFERENCE
+        // identity — the eval layer BAILS on that (frontier §1).
+        if let (
+            Value::Object {
+                class: ca,
+                props: pa,
+            },
+            Value::Object {
+                class: cb,
+                props: pb,
+            },
+        ) = (self, other)
+        {
+            if ca != cb || pa.len() != pb.len() {
+                return false;
+            }
+            return pa.iter().all(|(k, av)| {
+                pb.iter()
+                    .find(|(bk, _)| bk == k)
+                    .is_some_and(|(_, bv)| av.php_loose_eq(bv))
+            });
+        }
+        // An object vs a non-object is never loosely equal.
+        if matches!(self, Value::Object { .. }) || matches!(other, Value::Object { .. }) {
+            return false;
         }
         self.php_compare(other) == std::cmp::Ordering::Equal
     }
@@ -868,6 +960,55 @@ mod tests {
             arr(vec![(ArrayKey::Int(0), i(1))]).php_compare(&Value::Bool(true)),
             Equal
         );
+    }
+
+    fn obj(class: &str, props: Vec<(&str, Value)>) -> Value {
+        Value::Object {
+            class: class.as_bytes().to_vec(),
+            props: props
+                .into_iter()
+                .map(|(k, v)| (k.as_bytes().to_vec(), v))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn object_value_basics() {
+        let p = obj("Point", vec![("x", i(1)), ("y", i(2))]);
+        assert_eq!(p.type_name(), "object");
+        assert!(p.to_bool()); // objects are truthy
+        assert!(p.to_php_string().is_none()); // no __toString route → bail
+        assert!(p.to_array_key().is_none()); // not a valid array key → bail
+    }
+
+    #[test]
+    fn object_loose_eq_is_structural_same_class() {
+        // assertEquals/== over objects: same class + per-prop loose, order-free.
+        let a = obj("Point", vec![("x", i(1)), ("y", i(2))]);
+        let b = obj("Point", vec![("y", i(2)), ("x", i(1))]); // reordered props
+        assert!(a.php_loose_eq(&b));
+        // loose: 1 == 1.0 holds inside the prop compare.
+        let c = obj("Point", vec![("x", Value::Float(1.0)), ("y", i(2))]);
+        assert!(a.php_loose_eq(&c));
+        // different class → not equal.
+        let d = obj("Vec2", vec![("x", i(1)), ("y", i(2))]);
+        assert!(!a.php_loose_eq(&d));
+        // different prop value → not equal.
+        let e = obj("Point", vec![("x", i(9)), ("y", i(2))]);
+        assert!(!a.php_loose_eq(&e));
+        // object vs non-object → never equal.
+        assert!(!a.php_loose_eq(&i(1)));
+    }
+
+    #[test]
+    fn object_strict_eq_stays_false_safe_direction() {
+        // `===` over objects is reference identity; we keep the safe `false`
+        // direction here (the eval layer BAILS on assertSame-with-object before
+        // this is reached). Two structurally-equal records are NOT `===`.
+        let a = obj("Point", vec![("x", i(1))]);
+        let b = obj("Point", vec![("x", i(1))]);
+        assert!(!a.php_strict_eq(&b));
+        assert!(!a.php_strict_eq(&i(1)));
     }
 
     #[test]

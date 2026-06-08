@@ -607,6 +607,7 @@ fn php_negate(v: Value) -> Result<Value, BailReason> {
         Value::Float(f) => Ok(Value::Float(-f)),
         Value::Str(_) | Value::Bool(_) | Value::Null => php_negate(coerce_number(&v)),
         Value::Arr(_) => Err(BailReason::TypeError("negate array".into())),
+        Value::Object { .. } => Err(BailReason::TypeError("negate object".into())),
     }
 }
 
@@ -615,6 +616,7 @@ fn php_unary_plus(v: Value) -> Result<Value, BailReason> {
         Value::Int(_) | Value::Float(_) => Ok(v),
         Value::Str(_) | Value::Bool(_) | Value::Null => Ok(coerce_number(&v)),
         Value::Arr(_) => Err(BailReason::TypeError("unary + on array".into())),
+        Value::Object { .. } => Err(BailReason::TypeError("unary + on object".into())),
     }
 }
 
@@ -696,9 +698,10 @@ fn coerce_number(v: &Value) -> Value {
             // PHP 8: a non-numeric string in arithmetic is a TypeError; we abstain.
             None => Value::Int(v.to_int()),
         },
-        // Arrays never reach here: every arithmetic/unary path excludes them and
-        // bails first (`php_add`, `arithmetic_operand`, `php_negate`/`php_unary_plus`).
-        Value::Arr(_) => v.clone(),
+        // Arrays/objects never reach here: every arithmetic/unary path excludes
+        // them and bails first (`php_add`, `arithmetic_operand`,
+        // `php_negate`/`php_unary_plus`).
+        Value::Arr(_) | Value::Object { .. } => v.clone(),
     }
 }
 
@@ -715,6 +718,9 @@ fn arithmetic_operand(v: &Value) -> Result<Value, BailReason> {
             )),
         },
         Value::Arr(_) => Err(BailReason::TypeError("array in arithmetic".into())),
+        // An object in arithmetic is a PHP TypeError (no __toString/numeric route
+        // in v2) — bail fail-closed (frontier §6).
+        Value::Object { .. } => Err(BailReason::TypeError("object in arithmetic".into())),
     }
 }
 
