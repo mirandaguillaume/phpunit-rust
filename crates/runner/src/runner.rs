@@ -520,6 +520,16 @@ pub fn run_with_profiler(
                 if let Some(lost) = slot_in_flight[slot].take() {
                     let cause = if signal != 0 {
                         format!("worker process died: signal {signal}")
+                    } else if exit_code == 0 {
+                        // Forensic breadcrumb: exit code 0 with a batch still
+                        // in flight means a test/provider/teardown called
+                        // exit(0)/die() mid-batch (a clean recycle exits with
+                        // the reserved code 6 and never lands here, because it
+                        // emits batch_done first so in_flight is None). Name
+                        // the cause so the report explains the lost batch.
+                        "worker process died: exit code 0 (test code called \
+                         exit/die mid-batch)"
+                            .to_string()
                     } else {
                         format!("worker process died: exit code {exit_code}")
                     };
