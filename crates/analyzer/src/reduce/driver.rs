@@ -197,11 +197,12 @@ fn reduce_row(
     args: &[Value],
     resolver: &BridgeResolver,
 ) -> Outcome {
-    if args.len() > param_names.len() {
-        return Outcome::Bailed(BailReason::Other(
-            "more provider columns than parameters".into(),
-        ));
-    }
+    // SURPLUS provider columns (more columns than parameters) are NOT an error in
+    // PHP/PHPUnit: data-provider rows are bound positionally via
+    // call_user_func_array, and a non-variadic method silently ignores the extra
+    // columns (verified vs `php -r`). The `zip` below already binds only the first
+    // `param_names.len()` columns, matching PHPUnit — so we must NOT bail here
+    // (Task G; was the "48 more provider columns than parameters" false bail).
     let mut givens: HashMap<Vec<u8>, Value> = HashMap::new();
     for (name, val) in param_names.iter().zip(args.iter()) {
         givens.insert(name.clone(), val.clone());
@@ -492,6 +493,63 @@ class TwTest extends TestCase {
             reduced.iter().all(|r| r.outcome == Outcome::Pass),
             "got {reduced:?}"
         );
+    }
+
+    #[test]
+    fn surplus_provider_columns_are_ignored_not_bailed() {
+        // PHPUnit binds provider columns positionally; a row with MORE columns
+        // than the method has parameters silently ignores the surplus (verified vs
+        // `php -r`). The reducer must reduce, not bail (Task G).
+        let dir = write_suite(&[(
+            "SurplusTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+class SurplusTest extends TestCase {
+    public static function rows(): array {
+        // 3 columns, but the test takes only 2 params — the 3rd is surplus.
+        return ['r' => [2, 3, 999]];
+    }
+
+    #[DataProvider('rows')]
+    public function testAdd(int $a, int $b): void {
+        $this->assertSame(5, $a + $b);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("SurplusTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "surplus columns must be ignored, not bailed; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn reduces_an_object_value_test() {
+        // A method-level object test reduces through the full driver path: new +
+        // instance method + $this read + scalar assertSame.
+        let dir = write_suite(&[(
+            "PointDriverTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Point {
+    public function __construct(public int $x, public int $y) {}
+    public function plus(Point $p): Point { return new Point($this->x + $p->x, $this->y + $p->y); }
+    public function getX(): int { return $this->x; }
+}
+class PointDriverTest extends TestCase {
+    public function testPlus(): void {
+        $this->assertSame(4, (new Point(1, 2))->plus(new Point(3, 0))->getX());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("PointDriverTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
     }
 
     #[test]
