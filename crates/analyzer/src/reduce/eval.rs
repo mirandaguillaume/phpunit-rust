@@ -827,7 +827,7 @@ fn eval_instantiation(
 
 /// `$obj->prop` read. The receiver must evaluate to a [`Value::Object`]; the
 /// property name must be a static identifier. A missing property bails (PHP warns
-/// + returns null; under `??` the caller swallows this), a non-object receiver
+/// then returns null; under `??` the caller swallows this), a non-object receiver
 /// type-errors, a dynamic selector bails.
 fn eval_property_read(
     pa: &mago_syntax::ast::ast::access::PropertyAccess,
