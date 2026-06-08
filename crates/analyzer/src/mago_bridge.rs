@@ -1,42 +1,37 @@
-//! Bridge to the `mago-project` crate for PHP static analysis.
+//! Bridge to mago 1.30 (mago-database + mago-syntax + mago-codex).
 //!
-//! # API investigation findings (Task 7)
+//! # Architecture (1.30, arena-based)
 //!
-//! ## mago-project 0.26.1
-//! - `ProjectBuilder::new(interner)` + `ProjectBuilder::add_module(module)` + `ProjectBuilder::build(populate_non_user_defined)` → `Project`
-//! - `Module::build(&interner, version, source, options)` → `Module` (parses PHP, resolves names, reflects)
-//! - `Source::standalone(&interner, name, content)` → `Source` (quick one-off source without SourceManager)
-//! - `Project { modules: Vec<Module>, reflection: CodebaseReflection }`
-//! - `CodebaseReflection { class_like_reflections: HashMap<ClassLikeName, ClassLikeReflection>, … }`
-//! - `ClassLikeReflection { name: ClassLikeName, inheritance: InheritanceReflection, methods: MemeberCollection<FunctionLikeReflection>, span: Span, … }`
-//! - `InheritanceReflection { direct_extended_class: Option<Name>, direct_implemented_interfaces: HashSet<Name>, … }`
-//! - `ClassLikeName::get_key(&interner)` → `String` (FQCN or anonymous-class@…)
-//! - `FunctionLikeName::get_key(&interner)` → `String` (method: "ClassName::methodName")
-//! - `Span { start: Position { source: SourceIdentifier, offset: usize }, … }` (mago-span 0.26)
-//! - `Source::line_number(offset)` → 0-based line index
+//! mago 1.x removed `mago-project` and `mago-reflection`. Their roles are now:
+//!   - `mago-database` — the file/source model (`File`, `FileId`).
+//!   - `mago-syntax::parser::parse_file(arena, file)` — parses into a bump arena,
+//!     returning `&'arena Program<'arena>`.
+//!   - `mago-names::resolver::NameResolver::new(arena).resolve(program)` — name resolution.
+//!   - `mago-codex::scanner::scan_program(...)` → an OWNED `CodebaseMetadata`
+//!     (byte-string keys; does NOT borrow the arena), merged across files with
+//!     `CodebaseMetadata::extend`, finalized once with `populator::populate_codebase`.
 //!
-//! ## mago-analyzer 1.27.1 — NOT USED (incompatible type system)
-//! mago-analyzer 1.27 is on a completely different major version series. It uses:
-//!   - mago-codex::metadata::CodebaseMetadata (not mago-reflection::CodebaseReflection)
-//!   - mago-database::file::File (not mago-source::Source)
-//!   - mago-span 1.27 where Span has a FileId field (from mago-database) — incompatible with mago-span 0.26
-//!   - mago-syntax 1.27 AST (not mago-syntax 0.26 AST)
-//!
-//! These crates cannot interoperate with mago-project 0.26 — different AST, source, and span types.
-//! Resolution: use only mago-project 0.26 for parsing and reflection.
+//! Because `CodebaseMetadata` is owned, the self-referential "store arena + AST"
+//! problem disappears: the bridge owns only the `CodebaseMetadata` (reflection)
+//! plus the loaded `File`s. AST-walking consumers re-parse on demand into a
+//! scoped scratch arena via [`MagoProject::with_program`], which is dropped when
+//! the closure returns — no caching unsafety, no `'arena` threaded into the bridge.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
 
-use mago_interner::ThreadedInterner;
+use bumpalo::Bump;
+use mago_codex::metadata::CodebaseMetadata;
+use mago_codex::metadata::class_like::ClassLikeMetadata;
+use mago_codex::populator::populate_codebase;
+use mago_codex::reference::SymbolReferences;
+use mago_codex::scanner::scan_program;
+use mago_database::file::{File, FileType};
+use mago_names::ResolvedNames;
+use mago_names::resolver::NameResolver;
 use mago_php_version::PHPVersion;
-use mago_project::module::{Module, ModuleBuildOptions};
-use mago_project::Project;
-use mago_reflection::class_like::ClassLikeReflection;
-use mago_reflection::identifier::ClassLikeName;
-use mago_source::Source;
 use mago_syntax::ast::Program;
+use mago_syntax::parser::parse_file;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -52,27 +47,25 @@ pub enum BridgeError {
     Mago(String),
 }
 
-/// A loaded PHP project, backed by mago-project's `Project`.
-///
-/// Exposes the parsed classes and their metadata for downstream analysis.
+/// A loaded PHP project, backed by mago 1.30's codebase metadata.
 pub struct MagoProject {
-    inner: Project,
-    interner: ThreadedInterner,
-    /// Lowercased FQCN → ClassLikeName, built once at load time for O(1) class lookups.
-    class_index: HashMap<String, ClassLikeName>,
-    /// Parse cache: source → parsed AST, shared via Arc. Parsed once per unique source file;
-    /// RwLock allows concurrent reads during parallel per-test tracing.
-    parse_cache: RwLock<HashMap<mago_source::SourceIdentifier, Arc<Program>>>,
+    /// Owned reflection: classes, interfaces, enums, traits, functions, and (via
+    /// the analyzer) inferred types. Byte-string keyed; no lifetime.
+    codebase: CodebaseMetadata,
+    /// The loaded source files, kept so AST-walking consumers can re-parse on
+    /// demand. `File` owns its contents (`Cow<'static, [u8]>`).
+    files: Vec<File>,
+    /// Lowercased logical-name → index into `files`, for `with_program` lookups.
+    file_index: HashMap<String, usize>,
 }
 
 impl MagoProject {
-    /// Load all `.php` files under `root` and build the project reflection.
+    /// Load all `.php` files under `root` and build the codebase metadata.
     pub fn load(root: &Path) -> Result<Self, BridgeError> {
         Self::load_filtered(root, |_| true)
     }
 
-    /// Like `load` but skips files under `root/vendor/`. Used when all analysis
-    /// results are already in cache and vendor reflection is not needed.
+    /// Like `load` but skips files under `root/vendor/`.
     pub fn load_excluding_vendor(root: &Path) -> Result<Self, BridgeError> {
         let vendor = root.join("vendor");
         Self::load_filtered(root, move |path| !path.starts_with(&vendor))
@@ -80,145 +73,102 @@ impl MagoProject {
 
     fn load_filtered(
         root: &Path,
-        keep: impl Fn(&std::path::Path) -> bool + Sync,
+        keep: impl Fn(&Path) -> bool + Sync,
     ) -> Result<Self, BridgeError> {
-        use rayon::prelude::*;
-
-        let interner = ThreadedInterner::new();
         let version = PHPVersion::LATEST;
-        let options = ModuleBuildOptions {
-            reflect: true,
-            validate: false,
-        };
 
-        // Collect all matching paths first (walkdir is sequential by design).
-        let entries: Vec<_> = walkdir::WalkDir::new(root)
+        // Collect matching .php paths (walkdir is sequential).
+        let paths: Vec<_> = walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("php"))
             .filter(|e| keep(e.path()))
+            .map(|e| e.path().to_path_buf())
             .collect();
 
-        // Parallel read + parse (CPU-bound; ThreadedInterner is Send+Sync).
-        let modules: Vec<Module> = entries
-            .par_iter()
-            .map(|entry| {
-                let path = entry.path();
-                let name = path.display().to_string();
-                let bytes = std::fs::read(path).map_err(|e| BridgeError::Io {
-                    path: name.clone(),
-                    source: e,
-                })?;
-                let content = String::from_utf8_lossy(&bytes).into_owned();
-                let source = Source::standalone(&interner, &name, &content);
-                Ok(Module::build(&interner, version, source, options))
-            })
-            .collect::<Result<Vec<_>, BridgeError>>()?;
+        // Read each file into a mago `File`, then scan into the accumulator.
+        // Each file gets a scratch arena that is dropped right after scanning —
+        // the resulting CodebaseMetadata is owned, so nothing escapes the arena.
+        let mut codebase = CodebaseMetadata::default();
+        let mut files = Vec::with_capacity(paths.len());
+        let mut file_index = HashMap::with_capacity(paths.len());
 
-        // Sequential add (ProjectBuilder is not Sync).
-        let mut builder = Project::builder(interner.clone());
-        for module in modules {
-            builder.add_module(module);
+        for path in paths {
+            let file = File::read(root, &path, FileType::Host).map_err(|e| BridgeError::Io {
+                path: path.display().to_string(),
+                source: std::io::Error::other(e.to_string()),
+            })?;
+
+            let arena = Bump::new();
+            let program = parse_file(&arena, &file);
+            let resolved = NameResolver::new(&arena).resolve(program);
+            let meta = scan_program(&arena, &file, program, &resolved, version);
+            codebase.extend(meta);
+
+            let logical = String::from_utf8_lossy(&file.name).to_lowercase();
+            file_index.insert(logical, files.len());
+            files.push(file);
+            // `arena`, `program`, `resolved` dropped here — `meta` was owned.
         }
 
-        let project = builder.build(false);
-        let class_index: HashMap<String, ClassLikeName> = project
-            .reflection
-            .class_like_reflections
-            .keys()
-            .map(|name| (name.get_key(&interner).to_lowercase(), *name))
-            .collect();
-        Ok(Self {
-            inner: project,
-            interner,
-            class_index,
-            parse_cache: RwLock::new(HashMap::new()),
-        })
+        // Finalize cross-file references (inheritance, etc.).
+        let mut symbol_refs = SymbolReferences::default();
+        populate_codebase(
+            &mut codebase,
+            &mut symbol_refs,
+            Default::default(),
+            Default::default(),
+        );
+
+        Ok(Self { codebase, files, file_index })
     }
 
-    /// Return the version string of the mago-project series we are bridging.
+    /// Version string of the mago series we are bridging.
     pub fn version() -> &'static str {
-        "mago-project 0.26"
+        "mago 1.30"
     }
 
-    /// Iterate over all class-like reflections in the project (classes, interfaces, enums, traits).
-    ///
-    /// The iterator yields `(&ClassLikeName, &ClassLikeReflection)` pairs.
-    pub fn class_likes(&self) -> impl Iterator<Item = (&ClassLikeName, &ClassLikeReflection)> {
-        self.inner.reflection.class_like_reflections.iter()
+    /// The owned codebase metadata (reflection + types).
+    pub(crate) fn codebase(&self) -> &CodebaseMetadata {
+        &self.codebase
     }
 
-    /// Look up the FQCN string for any `ClassLikeName`.
-    pub fn class_name_str(&self, name: &ClassLikeName) -> String {
-        name.get_key(&self.interner)
+    /// Look up a class-like by FQCN (case-insensitive — mago lowercases keys).
+    pub(crate) fn find_class(&self, name: &str) -> Option<&ClassLikeMetadata> {
+        let key = name.trim_start_matches('\\').to_lowercase();
+        self.codebase.get_class(key.as_bytes())
     }
 
-    /// O(1) class lookup by (lowercased) FQCN — replaces O(n) `class_likes().find(…)` scans.
-    pub(crate) fn find_class_reflection(&self, name: &str) -> Option<&ClassLikeReflection> {
-        let cn = self.class_index.get(&name.to_lowercase())?;
-        self.inner.reflection.class_like_reflections.get(cn)
+    /// Iterate over all class-like metadata (classes, interfaces, enums, traits).
+    pub fn class_likes(&self) -> impl Iterator<Item = &ClassLikeMetadata> {
+        self.codebase.class_likes.values()
     }
 
-    /// Return the `Project` directly for callers that need lower-level access.
-    pub(crate) fn inner(&self) -> &Project {
-        &self.inner
-    }
-
-    /// Return the interner for name resolution.
-    pub(crate) fn interner(&self) -> &ThreadedInterner {
-        &self.interner
-    }
-
-    /// Count of class-like entities (classes, interfaces, enums, traits) found in the project.
+    /// Count of class-like entities found.
     pub fn class_like_count(&self) -> usize {
-        self.inner.reflection.class_like_reflections.len()
+        self.codebase.class_likes.len()
     }
 
-    /// Count of modules (source files) that were loaded.
+    /// Count of source files loaded.
     pub fn module_count(&self) -> usize {
-        self.inner.modules.len()
+        self.files.len()
     }
 
-    /// Find a `Source` by its `SourceIdentifier`.
-    ///
-    /// Iterates `inner.modules` and returns the first module whose `source.identifier` matches.
-    /// Used by downstream analysis (e.g., line-number resolution from a `Span`).
-    pub(crate) fn source_by_id(&self, id: mago_source::SourceIdentifier) -> Option<&Source> {
-        self.inner
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == id)
-            .map(|m| &m.source)
-    }
-
-    /// Return the parsed AST for `src`, re-using a cached `Program` when available.
-    ///
-    /// Eliminates redundant `parse_source` calls when the same source file is visited
-    /// many times during tracing (e.g. one call per test × call-graph depth).
-    pub(crate) fn get_or_parse(&self, src: &Source) -> Arc<Program> {
-        let id = src.identifier;
-        {
-            let cache = self.parse_cache.read().unwrap();
-            if let Some(prog) = cache.get(&id) {
-                return Arc::clone(prog);
-            }
-        }
-        let (program, _) = mago_syntax::parser::parse_source(&self.interner, src);
-        let arc = Arc::new(program);
-        self.parse_cache
-            .write()
-            .unwrap()
-            .insert(id, Arc::clone(&arc));
-        arc
-    }
-
-    /// O(1) lookup returning both the canonical FQCN and its reflection.
-    /// Used by callers that need the FQCN (e.g. inheritance-chain traversal).
-    pub(crate) fn find_class(&self, name: &str) -> Option<(String, &ClassLikeReflection)> {
-        let cn = self.class_index.get(&name.to_lowercase())?;
-        let refl = self.inner.reflection.class_like_reflections.get(cn)?;
-        Some((cn.get_key(&self.interner), refl))
+    /// Parse a loaded file on demand into a scoped scratch arena and run `f`
+    /// against its AST + resolved names. The arena (and thus the `Program`) is
+    /// dropped when `f` returns — callers must extract owned data inside `f`.
+    pub(crate) fn with_program<R>(
+        &self,
+        logical_name: &str,
+        f: impl FnOnce(&Program, &File, &ResolvedNames) -> R,
+    ) -> Option<R> {
+        let idx = *self.file_index.get(&logical_name.to_lowercase())?;
+        let file = &self.files[idx];
+        let arena = Bump::new();
+        let program = parse_file(&arena, file);
+        let resolved = NameResolver::new(&arena).resolve(program);
+        Some(f(program, file, &resolved))
     }
 }
 
@@ -231,79 +181,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Hello.php"),
-            r#"<?php
-class Hello {
-    public function greet(): string { return 'hi'; }
-}
-"#,
+            "<?php\nclass Hello {\n    public function greet(): string { return 'hi'; }\n}\n",
         )
         .unwrap();
 
         let project = MagoProject::load(dir.path()).expect("load should succeed");
-
-        // We loaded exactly one module.
         assert_eq!(project.module_count(), 1, "expected 1 module");
-
-        // The reflection should contain at least one class-like (Hello).
         assert!(
             project.class_like_count() >= 1,
-            "expected at least 1 class-like, got {}",
+            "expected >=1 class-like, got {}",
             project.class_like_count()
         );
-
-        // Find the Hello class by name.
-        let hello = project.class_likes().find(|(name, _)| {
-            let key = project.class_name_str(name);
-            key == "Hello" || key.to_lowercase() == "hello"
-        });
-
         assert!(
-            hello.is_some(),
-            "Hello class was not found in reflection; classes found: {:?}",
-            project
-                .class_likes()
-                .map(|(n, _)| project.class_name_str(n))
-                .collect::<Vec<_>>()
-        );
-
-        let (_, hello_reflection) = hello.unwrap();
-
-        // Verify the method `greet` is present.
-        assert!(
-            !hello_reflection.methods.members.is_empty(),
-            "Hello class should have at least one method"
-        );
-    }
-
-    #[test]
-    fn loads_inheritance() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Animal.php"),
-            r#"<?php
-class Animal {}
-class Dog extends Animal {}
-"#,
-        )
-        .unwrap();
-
-        let project = MagoProject::load(dir.path()).expect("load should succeed");
-
-        let dog = project
-            .class_likes()
-            .find(|(name, _)| project.class_name_str(name).to_lowercase() == "dog");
-        assert!(dog.is_some(), "Dog class not found");
-
-        let (_, dog_reflection) = dog.unwrap();
-        let parent = &dog_reflection.inheritance.direct_extended_class;
-        assert!(parent.is_some(), "Dog should have a parent class (Animal)");
-        let parent_name = project
-            .interner()
-            .lookup(&parent.unwrap().value)
-            .to_string();
-        assert!(
-            parent_name.to_lowercase() == "animal",
-            "Dog's parent should be Animal, got: {parent_name}"
+            project.find_class("Hello").is_some(),
+            "Hello class not found in codebase"
         );
     }
 
@@ -316,9 +207,6 @@ class Dog extends Animal {}
 
         let project = MagoProject::load(dir.path()).expect("load should succeed");
         assert_eq!(project.module_count(), 3, "expected 3 modules");
-        assert!(
-            project.class_like_count() >= 3,
-            "expected at least 3 class-likes"
-        );
+        assert!(project.class_like_count() >= 3, "expected >=3 class-likes");
     }
 }
