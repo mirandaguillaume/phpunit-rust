@@ -701,6 +701,10 @@ fn eval_expr(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> 
         // Property/const access. Only `$obj->prop` (read) is modelled (Task D);
         // static-property / class-constant / null-safe access bail.
         Expression::Access(access) => eval_access(access, scope),
+        // `$arr[$key]` read over any expression evaluating to an array (Task D).
+        // A BARE read of a missing key bails (PHP would warn) — only `?? default`
+        // (handled in `eval_binary`'s NullCoalesce) tolerates a missing key.
+        Expression::ArrayAccess(aa) => eval_array_access(aa, scope),
         other => Err(BailReason::UnsupportedConstruct(format!(
             "expression: {}",
             expr_kind(other)
@@ -728,6 +732,38 @@ fn eval_instantiation(
     }
 }
 
+/// `$obj->prop` read. The receiver must evaluate to a [`Value::Object`]; the
+/// property name must be a static identifier. A missing property bails (PHP warns
+/// + returns null; under `??` the caller swallows this), a non-object receiver
+/// type-errors, a dynamic selector bails.
+fn eval_property_read(
+    pa: &mago_syntax::ast::ast::access::PropertyAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
+    let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
+        return Err(BailReason::UnsupportedConstruct(
+            "dynamic property selector".into(),
+        ));
+    };
+    let receiver = eval_expr(pa.object, scope)?;
+    let Value::Object { props, .. } = &receiver else {
+        return Err(BailReason::TypeError(format!(
+            "property read on non-object ({})",
+            receiver.type_name()
+        )));
+    };
+    match props.iter().find(|(k, _)| k.as_slice() == prop_id.value) {
+        Some((_, v)) => Ok(v.clone()),
+        // PHP would warn + return null for an undefined property; we bail
+        // (an unseeded prop usually means a default/hook we did not model).
+        None => Err(BailReason::UnsupportedConstruct(format!(
+            "read of unset property ${}",
+            String::from_utf8_lossy(prop_id.value)
+        ))),
+    }
+}
+
 /// `$obj->prop` read (Task D). The receiver must evaluate to a [`Value::Object`];
 /// the property name must be a static identifier. A missing property, a non-object
 /// receiver, static-property / class-constant / null-safe access all BAIL.
@@ -736,31 +772,8 @@ fn eval_access(
     scope: &mut Scope,
 ) -> Result<Value, BailReason> {
     use mago_syntax::ast::ast::access::Access;
-    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
     match access {
-        Access::Property(pa) => {
-            let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
-                return Err(BailReason::UnsupportedConstruct(
-                    "dynamic property selector".into(),
-                ));
-            };
-            let receiver = eval_expr(pa.object, scope)?;
-            let Value::Object { props, .. } = &receiver else {
-                return Err(BailReason::TypeError(format!(
-                    "property read on non-object ({})",
-                    receiver.type_name()
-                )));
-            };
-            match props.iter().find(|(k, _)| k.as_slice() == prop_id.value) {
-                Some((_, v)) => Ok(v.clone()),
-                // PHP would warn + return null for an undefined property; we bail
-                // (an unseeded prop usually means a default/hook we did not model).
-                None => Err(BailReason::UnsupportedConstruct(format!(
-                    "read of unset property ${}",
-                    String::from_utf8_lossy(prop_id.value)
-                ))),
-            }
-        }
+        Access::Property(pa) => eval_property_read(pa, scope),
         Access::NullSafeProperty(_) => Err(BailReason::UnsupportedConstruct(
             "null-safe property access (?->)".into(),
         )),
@@ -770,6 +783,97 @@ fn eval_access(
         Access::ClassConstant(_) => Err(BailReason::UnsupportedConstruct(
             "class constant access".into(),
         )),
+    }
+}
+
+/// `$arr[$key]` read (Task D) over ANY expression evaluating to an array. A bare
+/// read (not under `??`) of a missing key BAILS (PHP would emit a warning + null;
+/// a strict suite could escalate that — fail-closed). Subscripting a non-array
+/// (string-offset, ArrayAccess object) bails. Returns `Ok(None)` from the lookup
+/// when `coalesce` is set and the key is missing OR its value is null (isset
+/// semantics) — the `??` caller then uses the default.
+fn eval_array_access(
+    aa: &mago_syntax::ast::ast::array::ArrayAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    match array_access_lookup(aa, scope, false)? {
+        Some(v) => Ok(v),
+        None => Err(BailReason::UnsupportedConstruct(
+            "read of a missing array key (PHP warning)".into(),
+        )),
+    }
+}
+
+/// Shared subscript lookup. `coalesce=false`: a present key returns `Some(value)`
+/// (even a null value), a missing key returns `None` (caller bails on a bare read).
+/// `coalesce=true` (under `??`): a missing key OR a present-but-null value both
+/// return `None` (isset semantics — `$a[$k] ?? $d` uses `$d` when unset OR null).
+fn array_access_lookup(
+    aa: &mago_syntax::ast::ast::array::ArrayAccess,
+    scope: &mut Scope,
+    coalesce: bool,
+) -> Result<Option<Value>, BailReason> {
+    let receiver = eval_expr(aa.array, scope)?;
+    let Value::Arr(items) = &receiver else {
+        return Err(BailReason::TypeError(format!(
+            "array subscript on a non-array ({})",
+            receiver.type_name()
+        )));
+    };
+    let index = eval_expr(aa.index, scope)?;
+    let key = index
+        .to_array_key()
+        .ok_or_else(|| BailReason::TypeError("array/object used as a subscript key".into()))?;
+    match items.iter().find(|(k, _)| *k == key) {
+        Some((_, v)) => {
+            if coalesce && matches!(v, Value::Null) {
+                Ok(None)
+            } else {
+                Ok(Some(v.clone()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Evaluate the lhs of a `??` with isset semantics: returns `None` when the lhs
+/// is unset/missing (a missing array key, an unset object property) OR evaluates
+/// to `null`; otherwise `Some(value)`. A subscript/property lhs is looked up in
+/// "coalesce mode" so a missing key/prop does NOT bail (the `??` default applies).
+fn eval_coalesce_lhs(lhs: &Expression, scope: &mut Scope) -> Result<Option<Value>, BailReason> {
+    use mago_syntax::ast::ast::access::Access;
+    match lhs {
+        // `$arr[$k] ?? d`: a missing key or a null value → use the default.
+        Expression::ArrayAccess(aa) => array_access_lookup(aa, scope, true),
+        // `$obj->prop ?? d`: an unset (unmodelled) property → use the default
+        // rather than bailing; a null-valued property → use the default too.
+        Expression::Access(Access::Property(pa)) => {
+            match eval_property_read(pa, scope) {
+                Ok(v) => Ok(if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v)
+                }),
+                // An unset property bails in a bare read; under `??` it is "unset"
+                // → use the default. Only the unset-property bail is swallowed;
+                // any other bail (non-object receiver, dynamic selector) propagates.
+                Err(BailReason::UnsupportedConstruct(msg))
+                    if msg.starts_with("read of unset") || msg.starts_with("read of a missing") =>
+                {
+                    Ok(None)
+                }
+                Err(other) => Err(other),
+            }
+        }
+        // Any other lhs: normal eval, treat null as "use default".
+        _ => {
+            let v = eval_expr(lhs, scope)?;
+            Ok(if matches!(v, Value::Null) {
+                None
+            } else {
+                Some(v)
+            })
+        }
     }
 }
 
@@ -876,11 +980,14 @@ fn eval_binary(
             return Ok(Value::Bool(l.to_bool() || eval_expr(rhs, scope)?.to_bool()));
         }
         BinaryOperator::NullCoalesce(_) => {
-            let l = eval_expr(lhs, scope)?;
-            return Ok(if matches!(l, Value::Null) {
-                eval_expr(rhs, scope)?
-            } else {
-                l
+            // `??` is isset-based: a missing array key / unset property on the lhs
+            // yields the default WITHOUT a warning (unlike a bare read). So a
+            // subscript/property lhs is evaluated in coalesce mode (missing → None);
+            // any other lhs uses normal eval and we test for Null.
+            let l = eval_coalesce_lhs(lhs, scope)?;
+            return Ok(match l {
+                Some(v) => v,
+                None => eval_expr(rhs, scope)?,
             });
         }
         _ => {}
@@ -1570,6 +1677,44 @@ mod tests {
             Value::Str(b"1.5".to_vec())
         );
         assert_eq!(eval_one("(bool)'0'").unwrap(), Value::Bool(false));
+    }
+
+    // ── array subscript read (Task D) ──
+
+    #[test]
+    fn subscript_read_over_variable() {
+        // $a[$k] on an existing key reads the element (gold: $a=[1,2,3]; $a[1]===2).
+        let outcome = run_body("$a = [10, 20, 30]; $this->assertSame(20, $a[1]);", vec![]);
+        assert_eq!(outcome, Outcome::Pass);
+        // string key
+        assert_eq!(
+            run_body(
+                "$a = ['x' => 'X', 'y' => 'Y']; $this->assertSame('Y', $a['y']);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn subscript_missing_key_bails_but_coalesce_defaults() {
+        // A BARE read of a missing key would warn in PHP → bail (fail-closed).
+        assert!(matches!(
+            eval_one("[1, 2][5]"),
+            Err(BailReason::UnsupportedConstruct(_))
+        ));
+        // `?? null` over a missing key yields null (no warning).
+        assert_eq!(eval_one("([1, 2][5] ?? null)").unwrap(), Value::Null);
+        // `?? default` over a missing key yields the default.
+        assert_eq!(eval_one("(['a' => 1]['b'] ?? 99)").unwrap(), Value::Int(99));
+        // `?? default` over an EXISTING non-null key yields the element.
+        assert_eq!(eval_one("(['a' => 1]['a'] ?? 99)").unwrap(), Value::Int(1));
+        // `?? default` over an existing NULL-valued key yields the default (isset
+        // treats null as unset — gold: ['k'=>null]['k'] ?? 'D' === 'D').
+        assert_eq!(
+            eval_one("(['k' => null]['k'] ?? 'D')").unwrap(),
+            Value::Str(b"D".to_vec())
+        );
     }
 
     #[test]
