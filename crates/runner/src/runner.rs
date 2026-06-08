@@ -1609,6 +1609,7 @@ mod tests {
     ///     `ReceivedOutcomes`),
     ///   - the PHP shutdown handler emitted a single `B::<class>` error row
     ///     carrying the fatal text (also recorded).
+    ///
     /// Rust must then synthesise NOTHING for A (every method already covered)
     /// and NOTHING extra for B (the `<class>` row covers the whole class),
     /// otherwise A flips green→red and B is double-reported.
