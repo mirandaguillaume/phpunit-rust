@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use mago_codex::symbol::SymbolKind;
+
 use crate::analyzer::{Coverage, TestId};
 use crate::boundary::{Boundary, BoundaryResolver};
-use crate::mago_bridge::MagoProject;
+use crate::mago_bridge::{word_to_string, MagoProject};
 
 /// Add proxy coverage entries for interfaces/empty stubs with a covered implementor.
 ///
@@ -23,24 +25,21 @@ pub fn add_proxy_coverage(
     boundary: &BoundaryResolver,
     coverage: &mut Coverage,
 ) {
-    let interner = project.interner();
-
     // 1. Collect proxy targets: uncovered interfaces and empty classes in project boundary.
     //    Key: fqcn (lowercased, no leading '\')
     //    Value: (file_path, 1-based declaration line)
     let mut proxy_targets: HashMap<String, (PathBuf, u32)> = HashMap::new();
-    for (name, refl) in project.class_likes() {
-        let is_candidate =
-            refl.is_interface() || (refl.is_class() && refl.methods.members.is_empty());
+    for refl in project.class_likes() {
+        let is_candidate = refl.kind == SymbolKind::Interface
+            || (refl.kind == SymbolKind::Class && refl.methods.is_empty());
         if !is_candidate {
             continue;
         }
 
-        let source_id = refl.span.start.source;
-        let Some(src) = project.source_by_id(source_id) else {
+        let Some(src) = project.file_of_span(&refl.span) else {
             continue;
         };
-        let file = PathBuf::from(interner.lookup(&src.identifier.0).to_string());
+        let file = file_path_of(src);
 
         if boundary.classify(&file) != Boundary::Project {
             continue;
@@ -49,9 +48,8 @@ pub fn add_proxy_coverage(
             continue; // already covered by the main pass
         }
 
-        let line = src.line_number(refl.span.start.offset) as u32 + 1;
-        let fqcn = project
-            .class_name_str(name)
+        let line = src.line_number(refl.span.start.offset) + 1;
+        let fqcn = word_to_string(&refl.name)
             .trim_start_matches('\\')
             .to_lowercase();
         proxy_targets.insert(fqcn, (file, line));
@@ -65,16 +63,15 @@ pub fn add_proxy_coverage(
     //    via its inheritance chain.
     let mut proxy_additions: HashMap<PathBuf, (u32, Vec<TestId>)> = HashMap::new();
 
-    for (_, refl) in project.class_likes() {
-        if refl.is_interface() || refl.is_trait() {
+    for refl in project.class_likes() {
+        if refl.kind == SymbolKind::Interface || refl.kind == SymbolKind::Trait {
             continue;
         }
 
-        let source_id = refl.span.start.source;
-        let Some(src) = project.source_by_id(source_id) else {
+        let Some(src) = project.file_of_span(&refl.span) else {
             continue;
         };
-        let file = PathBuf::from(interner.lookup(&src.identifier.0).to_string());
+        let file = file_path_of(src);
 
         let Some(line_map) = coverage.get(&file) else {
             continue;
@@ -85,9 +82,8 @@ pub fn add_proxy_coverage(
         }
 
         // Check all interfaces this class implements (direct + transitive).
-        for iface_name in &refl.inheritance.all_implemented_interfaces {
-            let fqcn = interner
-                .lookup(&iface_name.value)
+        for iface_name in refl.all_parent_interfaces.iter() {
+            let fqcn = word_to_string(iface_name)
                 .trim_start_matches('\\')
                 .to_lowercase();
             if let Some((proxy_file, proxy_line)) = proxy_targets.get(&fqcn) {
@@ -99,9 +95,8 @@ pub fn add_proxy_coverage(
         }
 
         // Check all parent classes (direct + transitive) — covers empty stub base classes.
-        for parent_name in &refl.inheritance.all_extended_classes {
-            let fqcn = interner
-                .lookup(&parent_name.value)
+        for parent_name in refl.all_parent_classes.iter() {
+            let fqcn = word_to_string(parent_name)
                 .trim_start_matches('\\')
                 .to_lowercase();
             if let Some((proxy_file, proxy_line)) = proxy_targets.get(&fqcn) {
@@ -128,6 +123,15 @@ pub fn add_proxy_coverage(
             .entry(line)
             .or_default()
             .extend(test_ids);
+    }
+}
+
+/// Resolve a loaded `File` to the `PathBuf` used as a coverage-map key.
+/// Prefers the on-disk path; falls back to the logical name.
+fn file_path_of(file: &mago_database::file::File) -> PathBuf {
+    match &file.path {
+        Some(p) => p.clone(),
+        None => PathBuf::from(String::from_utf8_lossy(&file.name).into_owned()),
     }
 }
 

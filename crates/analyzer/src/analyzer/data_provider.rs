@@ -1,29 +1,29 @@
 //! Data provider expansion: turn a parameterized test method into one
 //! ExpandedTest per data row.
 //!
-//! # Approach: direct AST walk (Fallback A — re-parse per module)
+//! # Approach: direct AST walk (re-parse on demand via the bridge)
 //!
-//! mago-project's `Module` does not cache the parsed `Program`; the AST is
-//! discarded after reflection is built.  We recover it on demand via
-//! `Module::parse(&interner)`, which re-runs `mago_syntax::parser::parse_source`
-//! on the in-memory source bytes.  This is slightly wasteful but avoids storing
-//! the AST across threads, and is fast enough for the analysis-time use case.
+//! mago 1.30 does not cache the parsed `Program`; the AST is discarded after
+//! reflection is built.  We recover it on demand via
+//! [`MagoProject::with_program`], which re-parses the file into a scoped scratch
+//! arena.  Because the AST is arena-bound (`'arena` lifetime), the concrete
+//! evaluation of the provider's return expression happens INSIDE the closure —
+//! we extract only the owned `PhpValue`, never the AST node.
 //!
 //! Walk:
-//!   Project.modules → Module with matching source identifier
-//!     → module.parse(&interner) → Program.statements
-//!       → flatten through Namespace wrappers
-//!         → Statement::Class whose name matches `class_name`
-//!           → ClassLikeMember::Method whose name matches `provider_name`
-//!             → MethodBody::Concrete(block)
-//!               → first Statement::Return → Return.value
+//!   class reflection → declaring file → with_program(file) → Program.statements
+//!     → flatten through Namespace wrappers
+//!       → Statement::Class whose name matches `class_name`
+//!         → ClassLikeMember::Method whose name matches `provider_name`
+//!           → MethodBody::Concrete(block)
+//!             → first Statement::Return → Return.value → compute() → PhpValue
 
 use mago_syntax::ast::ast::class_like::member::ClassLikeMember;
 use mago_syntax::ast::ast::expression::Expression;
 use mago_syntax::ast::ast::statement::Statement;
 
 use crate::concrete::{compute, ArrayKey, Context, PhpValue};
-use crate::mago_bridge::MagoProject;
+use crate::mago_bridge::{word_to_string, MagoProject};
 use crate::test_discovery::TestMethod;
 
 /// A test invocation with concrete arguments. For non-parameterized tests
@@ -54,14 +54,8 @@ pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
         return no_data();
     };
 
-    let Some(return_expr) = find_provider_return_expr(project, &test.class, provider_name) else {
+    let Some(value) = compute_provider_return(project, &test.class, provider_name) else {
         return no_data();
-    };
-
-    let mut ctx = Context::new();
-    let value = match compute(&return_expr, &mut ctx) {
-        Ok(v) => v,
-        Err(_) => return no_data(),
     };
 
     let PhpValue::Array(rows) = value else {
@@ -88,60 +82,46 @@ pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
         .collect()
 }
 
-/// Find the return Expression of `class_name::provider_name` by re-parsing
-/// the module that contains the class and walking the AST.
+/// Concretely evaluate the return value of `class_name::provider_name` by
+/// re-parsing the file that declares the class and walking the AST.
 ///
-/// Returns `None` whenever anything along the way fails.
-fn find_provider_return_expr(
+/// The evaluation happens inside [`MagoProject::with_program`] because the AST
+/// is arena-bound; only the owned `PhpValue` escapes. Returns `None` whenever
+/// anything along the way fails (class not found, no concrete return, the
+/// expression is not concretely-computable).
+fn compute_provider_return(
     project: &MagoProject,
     class_name: &str,
     provider_name: &str,
-) -> Option<Expression> {
-    let interner = project.interner();
-    let inner = project.inner();
+) -> Option<PhpValue> {
+    // Find the file that declares the class via the codebase reflection.
+    let class_key = class_name.trim_start_matches('\\').to_lowercase();
+    let refl = project.class_likes().find(|r| {
+        word_to_string(&r.name)
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case(&class_key)
+    })?;
+    let file = project.file_of_span(&refl.span)?;
+    let logical_name = String::from_utf8_lossy(&file.name).into_owned();
 
-    // Find the Module that contains the class definition.
-    // We use the class reflection to get the span → source identifier, then
-    // find the Module whose source identifier matches.
-    let class_source_id = {
-        let class_key = class_name.to_lowercase();
-        let mut found: Option<mago_source::SourceIdentifier> = None;
-        for (name, refl) in project.class_likes() {
-            if project.class_name_str(name).to_lowercase() == class_key {
-                found = Some(refl.span.start.source);
-                break;
-            }
-        }
-        found?
-    };
-
-    // Locate the matching Module and re-parse it.
-    let module = inner
-        .modules
-        .iter()
-        .find(|m| m.source.identifier == class_source_id)?;
-
-    let program = module.parse(interner);
-
-    // Walk statements, transparently descending into Namespace wrappers.
-    find_return_in_statements(
-        program.statements.iter(),
-        class_name,
-        provider_name,
-        interner,
-    )
+    project.with_program(&logical_name, |program, _file, _names| {
+        let return_expr =
+            find_return_in_statements(program.statements.iter(), class_name, provider_name)?;
+        let mut ctx = Context::new();
+        compute(return_expr, &mut ctx).ok()
+    })?
 }
 
 /// Recursively walk a statement list, descending into namespaces, looking for
 /// the named class + method and returning its first return expression.
-fn find_return_in_statements<'s, I>(
+fn find_return_in_statements<'s, 'arena, I>(
     stmts: I,
     class_name: &str,
     provider_name: &str,
-    interner: &mago_interner::ThreadedInterner,
-) -> Option<Expression>
+) -> Option<&'s Expression<'arena>>
 where
-    I: Iterator<Item = &'s Statement>,
+    'arena: 's,
+    I: Iterator<Item = &'s Statement<'arena>>,
 {
     // Strip any leading namespace from class_name for matching purposes.
     // The AST `Class.name` is a LocalIdentifier, so it only contains the
@@ -152,23 +132,24 @@ where
     for stmt in stmts {
         match stmt {
             Statement::Class(class) => {
-                let ast_name = interner.lookup(&class.name.value);
-                if ast_name.eq_ignore_ascii_case(simple_class) {
-                    return find_method_return(&class.members, simple_provider, interner);
+                if name_eq_ignore_case(class.name.value, simple_class) {
+                    return find_method_return(&class.members, simple_provider);
                 }
             }
             Statement::Namespace(ns) => {
                 // NamespaceBody has both Implicit and BraceDelimited variants;
-                // both expose `.statements` via a method.
+                // both expose `.statements`.
                 use mago_syntax::ast::ast::namespace::NamespaceBody;
-                let inner_stmts = match &ns.body {
-                    NamespaceBody::Implicit(b) => b.statements.iter(),
-                    NamespaceBody::BraceDelimited(b) => b.statements.iter(),
+                let found = match &ns.body {
+                    NamespaceBody::Implicit(b) => {
+                        find_return_in_statements(b.statements.iter(), class_name, provider_name)
+                    }
+                    NamespaceBody::BraceDelimited(b) => {
+                        find_return_in_statements(b.statements.iter(), class_name, provider_name)
+                    }
                 };
-                if let Some(expr) =
-                    find_return_in_statements(inner_stmts, class_name, provider_name, interner)
-                {
-                    return Some(expr);
+                if found.is_some() {
+                    return found;
                 }
             }
             _ => {}
@@ -179,19 +160,17 @@ where
 
 /// Search `members` for a concrete method named `provider_name` and return
 /// the expression from its first `return` statement.
-fn find_method_return(
-    members: &mago_syntax::ast::sequence::Sequence<ClassLikeMember>,
+fn find_method_return<'s, 'arena>(
+    members: &'s mago_syntax::ast::sequence::Sequence<'arena, ClassLikeMember<'arena>>,
     provider_name: &str,
-    interner: &mago_interner::ThreadedInterner,
-) -> Option<Expression> {
+) -> Option<&'s Expression<'arena>> {
     use mago_syntax::ast::ast::class_like::method::MethodBody;
 
     for member in members.iter() {
         let ClassLikeMember::Method(method) = member else {
             continue;
         };
-        let ast_name = interner.lookup(&method.name.value);
-        if !ast_name.eq_ignore_ascii_case(provider_name) {
+        if !name_eq_ignore_case(method.name.value, provider_name) {
             continue;
         }
         let MethodBody::Concrete(block) = &method.body else {
@@ -200,13 +179,18 @@ fn find_method_return(
         // Find first `return <expr>;` with a value.
         for stmt in block.statements.iter() {
             if let Statement::Return(ret) = stmt {
-                if let Some(expr) = &ret.value {
-                    return Some(expr.clone());
+                if let Some(expr) = ret.value {
+                    return Some(expr);
                 }
             }
         }
     }
     None
+}
+
+/// Case-insensitive compare an AST identifier's raw bytes against a `&str`.
+fn name_eq_ignore_case(bytes: &[u8], s: &str) -> bool {
+    String::from_utf8_lossy(bytes).eq_ignore_ascii_case(s)
 }
 
 /// Strip a PHP namespace prefix: `My\\Ns\\ClassName` → `ClassName`.
