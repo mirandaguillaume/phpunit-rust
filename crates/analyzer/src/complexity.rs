@@ -13,7 +13,7 @@ use mago_syntax::ast::{
 };
 
 use crate::boundary::{Boundary, BoundaryResolver};
-use crate::mago_bridge::{MagoProject, word_to_string};
+use crate::mago_bridge::{word_to_string, MagoProject};
 
 /// Cyclomatic complexity and location data for one class method.
 #[derive(Debug, Clone)]
@@ -49,7 +49,8 @@ pub fn compute_all(project: &MagoProject, boundary: &BoundaryResolver) -> Vec<Me
         let logical_name = String::from_utf8_lossy(&src.name).into_owned();
 
         for method_word in refl.methods.iter() {
-            let Some(method_refl) = codebase.get_method(refl.name.as_bytes(), method_word.as_bytes())
+            let Some(method_refl) =
+                codebase.get_method(refl.name.as_bytes(), method_word.as_bytes())
             else {
                 continue;
             };
@@ -137,7 +138,9 @@ where
                 use mago_syntax::ast::namespace::NamespaceBody;
                 let found = match &ns.body {
                     NamespaceBody::Implicit(b) => navigate(b.statements.iter(), class, method),
-                    NamespaceBody::BraceDelimited(b) => navigate(b.statements.iter(), class, method),
+                    NamespaceBody::BraceDelimited(b) => {
+                        navigate(b.statements.iter(), class, method)
+                    }
                 };
                 if found.is_some() {
                     return found;
@@ -237,9 +240,7 @@ fn count_expr(expr: &Expression) -> u32 {
     match expr {
         Expression::Binary(b) => count_binary(b),
         Expression::Conditional(c) => {
-            1 + count_expr(c.condition)
-                + c.then.map_or(0, count_expr)
-                + count_expr(c.r#else)
+            1 + count_expr(c.condition) + c.then.map_or(0, count_expr) + count_expr(c.r#else)
         }
         Expression::Match(m) => count_match(m),
         _ => 0,

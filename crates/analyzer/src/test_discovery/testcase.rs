@@ -1,4 +1,4 @@
-use crate::mago_bridge::{MagoProject, word_to_string};
+use crate::mago_bridge::{word_to_string, MagoProject};
 use mago_codex::metadata::class_like::ClassLikeMetadata;
 use std::collections::HashMap;
 

@@ -79,8 +79,8 @@ use super::type_repr::Type;
 use crate::mago_bridge::word_to_string;
 use mago_codex::metadata::function_like::FunctionLikeMetadata;
 use mago_codex::symbol::SymbolKind;
-use mago_codex::ttype::atomic::TAtomic;
 use mago_codex::ttype::atomic::object::TObject;
+use mago_codex::ttype::atomic::TAtomic;
 use mago_codex::ttype::union::TUnion;
 use mago_names::ResolvedNames;
 use mago_span::HasSpan;
@@ -276,9 +276,7 @@ fn walk_instantiation_simple(env: &mut TypeEnv, inst: &Instantiation) -> Type {
             None => Type::Mixed,
         },
         Expression::Parent(_) => Type::Mixed,
-        Expression::Identifier(id) => {
-            Type::Class(String::from_utf8_lossy(id.value()).into_owned())
-        }
+        Expression::Identifier(id) => Type::Class(String::from_utf8_lossy(id.value()).into_owned()),
         _ => Type::Mixed,
     }
 }
@@ -1266,7 +1264,7 @@ pub fn walk_statement_ctx(ctx: &mut WalkerCtx, stmt: &Statement) {
 fn walk_statement_ctx_inner(ctx: &mut WalkerCtx, stmt: &Statement) {
     match stmt {
         Statement::Expression(e) => {
-            walk_expression(ctx, &e.expression);
+            walk_expression(ctx, e.expression);
         }
         Statement::If(if_stmt) => walk_if(ctx, if_stmt),
         Statement::Return(ret) => walk_return(ctx, ret),
@@ -1280,7 +1278,7 @@ fn walk_statement_ctx_inner(ctx: &mut WalkerCtx, stmt: &Statement) {
         // 0..n times, so narrowing them buys nothing). Nested statements go
         // back through `walk_statement_ctx` so the depth guard keeps applying.
         Statement::Foreach(f) => {
-            walk_expression(ctx, &f.expression);
+            walk_expression(ctx, f.expression);
             if let Some(key) = f.target.key() {
                 walk_expression(ctx, key);
             }
@@ -1304,20 +1302,20 @@ fn walk_statement_ctx_inner(ctx: &mut WalkerCtx, stmt: &Statement) {
             }
         }
         Statement::While(w) => {
-            walk_expression(ctx, &w.condition);
+            walk_expression(ctx, w.condition);
             for s in w.body.statements() {
                 walk_statement_ctx(ctx, s);
             }
         }
         Statement::DoWhile(d) => {
-            walk_statement_ctx(ctx, &d.statement);
-            walk_expression(ctx, &d.condition);
+            walk_statement_ctx(ctx, d.statement);
+            walk_expression(ctx, d.condition);
         }
         Statement::Switch(sw) => {
-            walk_expression(ctx, &sw.expression);
+            walk_expression(ctx, sw.expression);
             for case in sw.body.cases() {
                 if let mago_syntax::ast::SwitchCase::Expression(c) = case {
-                    walk_expression(ctx, &c.expression);
+                    walk_expression(ctx, c.expression);
                 }
                 for s in case.statements() {
                     walk_statement_ctx(ctx, s);
@@ -1372,7 +1370,7 @@ pub fn walk_block(ctx: &mut WalkerCtx, block: &Block) {
 fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
     // Walk condition, collecting any instanceof narrowings.
     ctx.pending_narrowings.clear();
-    walk_expression(ctx, &if_stmt.condition);
+    walk_expression(ctx, if_stmt.condition);
     let narrowings: Vec<crate::types::narrowing::Narrowing> =
         std::mem::take(&mut ctx.pending_narrowings);
 
@@ -1393,7 +1391,7 @@ fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
         IfBody::Statement(sb) => {
             for elseif in sb.else_if_clauses.iter() {
                 ctx.pending_narrowings.clear();
-                walk_expression(ctx, &elseif.condition);
+                walk_expression(ctx, elseif.condition);
                 let ei_narrowings: Vec<crate::types::narrowing::Narrowing> =
                     std::mem::take(&mut ctx.pending_narrowings);
                 let saved = ctx.env.clone();
@@ -1402,20 +1400,20 @@ fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
                     .map(|n| (n.var.clone(), n.ty.clone()))
                     .collect();
                 ctx.env.apply_narrowing(&tuples);
-                walk_statement_ctx(ctx, &elseif.statement);
+                walk_statement_ctx(ctx, elseif.statement);
                 ctx.env = saved;
             }
             // Else branch: no narrowing applied (negation not modelled in Phase 2).
             if let Some(else_clause) = &sb.else_clause {
                 let saved = ctx.env.clone();
-                walk_statement_ctx(ctx, &else_clause.statement);
+                walk_statement_ctx(ctx, else_clause.statement);
                 ctx.env = saved;
             }
         }
         IfBody::ColonDelimited(cb) => {
             for elseif in cb.else_if_clauses.iter() {
                 ctx.pending_narrowings.clear();
-                walk_expression(ctx, &elseif.condition);
+                walk_expression(ctx, elseif.condition);
                 let ei_narrowings: Vec<crate::types::narrowing::Narrowing> =
                     std::mem::take(&mut ctx.pending_narrowings);
                 let saved = ctx.env.clone();
@@ -1443,7 +1441,7 @@ fn walk_if(ctx: &mut WalkerCtx, if_stmt: &If) {
 /// Walk the true-branch body of an if-statement (one statement or a sequence).
 fn walk_if_body_true(ctx: &mut WalkerCtx, body: &IfBody) {
     match body {
-        IfBody::Statement(sb) => walk_statement_ctx(ctx, &sb.statement),
+        IfBody::Statement(sb) => walk_statement_ctx(ctx, sb.statement),
         IfBody::ColonDelimited(cb) => {
             for s in cb.statements.iter() {
                 walk_statement_ctx(ctx, s);

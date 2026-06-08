@@ -21,15 +21,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bumpalo::Bump;
-use mago_codex::metadata::CodebaseMetadata;
 use mago_codex::metadata::class_like::ClassLikeMetadata;
+use mago_codex::metadata::CodebaseMetadata;
 use mago_codex::populator::populate_codebase;
 use mago_codex::reference::SymbolReferences;
 use mago_codex::scanner::scan_program;
-use mago_database::file::{File, FileType};
 use mago_database::file::FileId;
-use mago_names::ResolvedNames;
+use mago_database::file::{File, FileType};
 use mago_names::resolver::NameResolver;
+use mago_names::ResolvedNames;
 use mago_php_version::PHPVersion;
 use mago_span::Span;
 use mago_syntax::ast::Program;
@@ -134,7 +134,12 @@ impl MagoProject {
             Default::default(),
         );
 
-        Ok(Self { codebase, files, file_index, by_file_id })
+        Ok(Self {
+            codebase,
+            files,
+            file_index,
+            by_file_id,
+        })
     }
 
     /// The `File` a span belongs to (e.g. a class's declaring file from `span.file_id`).

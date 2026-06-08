@@ -201,7 +201,11 @@ fn find_method_in_hierarchy<'a>(
         let class_fqcn = word_to_string(&class_refl.name);
 
         // Look for the method directly on this class (names are in `methods`).
-        if class_refl.methods.iter().any(|m| word_to_string(m).to_lowercase() == method_lc) {
+        if class_refl
+            .methods
+            .iter()
+            .any(|m| word_to_string(m).to_lowercase() == method_lc)
+        {
             if let Some(m_refl) = codebase.get_method(current.as_bytes(), method_lc.as_bytes()) {
                 return Some((m_refl, class_fqcn));
             }
@@ -248,11 +252,7 @@ fn find_method_in_hierarchy<'a>(
 ///
 /// For each parameter that has a declared type, we resolve it and bind
 /// `$paramName → Type` in the env so the walker can track it.
-fn seed_param_types(
-    env: &mut TypeEnv,
-    project: &MagoProject,
-    method_refl: &FunctionLikeMetadata,
-) {
+fn seed_param_types(env: &mut TypeEnv, project: &MagoProject, method_refl: &FunctionLikeMetadata) {
     for param in &method_refl.parameters {
         let name_str = word_to_string(&param.name.0);
         // param.name already includes the leading `$` (same as properties).
@@ -271,7 +271,12 @@ fn seed_param_types(
 }
 
 /// Walk the body of the named method within the given program's AST.
-fn walk_method_body(ctx: &mut WalkerCtx, program: &mago_syntax::ast::Program, class: &str, method: &str) {
+fn walk_method_body(
+    ctx: &mut WalkerCtx,
+    program: &mago_syntax::ast::Program,
+    class: &str,
+    method: &str,
+) {
     walk_method_body_impl(ctx, program.statements.iter(), class, method);
 }
 

@@ -39,11 +39,13 @@ pub fn find_test_methods(project: &MagoProject, test_classes: &[String]) -> Vec<
     let mut out = Vec::new();
 
     // Build a lowercased FQCN → reflection lookup.
-    let class_index: std::collections::HashMap<String, &mago_codex::metadata::class_like::ClassLikeMetadata> =
-        project
-            .class_likes()
-            .map(|refl| (word_to_string(&refl.name).to_lowercase(), refl))
-            .collect();
+    let class_index: std::collections::HashMap<
+        String,
+        &mago_codex::metadata::class_like::ClassLikeMetadata,
+    > = project
+        .class_likes()
+        .map(|refl| (word_to_string(&refl.name).to_lowercase(), refl))
+        .collect();
 
     for class_name in test_classes {
         let key = class_name.trim_start_matches('\\').to_lowercase();
@@ -173,7 +175,10 @@ fn method_to_test(
 
 /// Resolve an attribute's identifier to its fully-qualified name using the
 /// name-resolution table; falls back to the raw written name.
-fn resolved_attr_name(names: &mago_names::ResolvedNames, attr_name: &mago_syntax::ast::Identifier) -> String {
+fn resolved_attr_name(
+    names: &mago_names::ResolvedNames,
+    attr_name: &mago_syntax::ast::Identifier,
+) -> String {
     match names.resolve(attr_name) {
         Some(fqcn) => String::from_utf8_lossy(fqcn).into_owned(),
         None => String::from_utf8_lossy(attr_name.value()).into_owned(),
