@@ -32,7 +32,8 @@ use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::Program;
 
 use super::eval::{
-    make_object, run_body_returning, run_ctor_body, BailReason, CallResolver, NoResolver, Scope,
+    make_object, run_body_returning_with_names, run_ctor_body_with_names, BailReason, CallResolver,
+    NoResolver, Scope,
 };
 use super::value::Value;
 use crate::mago_bridge::MagoProject;
@@ -121,12 +122,13 @@ impl BridgeResolver<'_> {
         // Everything below runs INSIDE the closure — the AST is arena-scoped.
         let outcome = self
             .project
-            .with_program(&logical_name, |program, _file, _names| {
+            .with_program(&logical_name, |program, _file, names| {
                 let func = find_function(program, name)
                     .ok_or_else(|| BailReason::UnknownCall(String::from_utf8_lossy(name).into()))?;
                 let bindings = bind_params(func, args)?;
-                // Recurse through THIS resolver so nested user calls inline too.
-                run_body_returning(&func.body, bindings, self).map(Some)
+                // Recurse through THIS resolver so nested user calls inline too;
+                // names = the callee file's table (FQCN resolution for `new C`).
+                run_body_returning_with_names(&func.body, bindings, self, names).map(Some)
             });
 
         match outcome {
@@ -192,7 +194,7 @@ impl BridgeResolver<'_> {
 
         let outcome = self
             .project
-            .with_program(&logical_name, |program, _file, _names| {
+            .with_program(&logical_name, |program, _file, names| {
                 let m = find_class_method(program, &declaring_fqcn, method).ok_or_else(|| {
                     BailReason::UnknownCall(format!(
                         "{}::{}",
@@ -212,7 +214,8 @@ impl BridgeResolver<'_> {
                 // A mutator (`$this->prop = ...`) in a non-constructor body bails
                 // automatically: `run_body_returning` does NOT enable property
                 // writes, so the assignment handler rejects it (frontier §2).
-                run_body_returning(block, bindings, self).map(Some)
+                // names = the declaring file's table (resolves `new C` in the body).
+                run_body_returning_with_names(block, bindings, self, names).map(Some)
             });
         outcome.unwrap_or_else(|| Err(BailReason::Other("could not re-parse method file".into())))
     }
@@ -281,12 +284,12 @@ impl BridgeResolver<'_> {
                 let this = make_object(record_class.clone(), props);
                 let built = self
                     .project
-                    .with_program(&ctor_logical, |program, _file, _names| {
+                    .with_program(&ctor_logical, |program, _file, names| {
                         let ctor = find_class_method(program, &ctor_class, b"__construct")
                             .ok_or_else(|| {
                                 BailReason::Other("constructor AST not found after re-parse".into())
                             })?;
-                        run_constructor(resolver, ctor, this.clone(), args)
+                        run_constructor(resolver, ctor, this.clone(), args, names)
                     })
                     .unwrap_or_else(|| {
                         Err(BailReason::Other(
@@ -360,7 +363,7 @@ impl BridgeResolver<'_> {
             let resolver = self;
             this =
                 self.project
-                    .with_program(&logical, |program, _file, _names| {
+                    .with_program(&logical, |program, _file, names| {
                         let m = find_class_method(program, &setup_class, b"setUp").ok_or_else(
                             || BailReason::Other("setUp AST not found after re-parse".into()),
                         )?;
@@ -372,7 +375,7 @@ impl BridgeResolver<'_> {
                         // setUp takes no positional args; bind only `$this`.
                         let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
                         bindings.insert(b"this".to_vec(), this.clone());
-                        super::eval::run_ctor_body(block, bindings, resolver)
+                        super::eval::run_ctor_body_with_names(block, bindings, resolver, names)
                     })
                     .unwrap_or_else(|| {
                         Err(BailReason::Other("could not re-parse setUp file".into()))
@@ -461,6 +464,7 @@ fn run_constructor(
     ctor: &Method,
     this: Value,
     args: &[Value],
+    names: &mago_names::ResolvedNames,
 ) -> Result<Value, BailReason> {
     let Value::Object { class, mut props } = this else {
         return Err(BailReason::Other(
@@ -520,7 +524,7 @@ fn run_constructor(
             "abstract constructor body".into(),
         ));
     };
-    run_ctor_body(block, bindings, resolver)
+    run_ctor_body_with_names(block, bindings, resolver, names)
 }
 
 /// Seed plain (non-promoted) property declarations carrying a literal default,
@@ -818,7 +822,7 @@ fn bind_params(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reduce::eval::{run_method_body, Outcome};
+    use crate::reduce::eval::Outcome;
     use std::collections::HashMap;
 
     /// Build a project from a single test file source, run the named test method's
@@ -849,9 +853,9 @@ mod tests {
             .collect();
 
         project
-            .with_program(&logical, |program, _file, _names| {
+            .with_program(&logical, |program, _file, names| {
                 let block = find_method_block(program, method).expect("method block");
-                run_method_body(block, given_map, &resolver)
+                super::super::eval::run_method_body_with_names(block, given_map, &resolver, names)
             })
             .expect("with_program")
     }
@@ -1269,6 +1273,30 @@ class T {
 "#;
         assert_eq!(
             reduce_with_subst(src, "T", "testStatic", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn unqualified_new_resolves_via_use_alias() {
+        // Inc-3 name resolution: a `use`-imported class referenced by its SIMPLE
+        // name in a `new` must resolve to its FQCN (the codebase key), not bail on
+        // the bare identifier. Two namespaces declare `Box`; the test imports the
+        // App one, so `new Box(7)` must build App\Box, never Lib\Box.
+        let src = r#"<?php
+namespace Lib { final class Box { public function __construct(public int $v) {} public function v(): int { return $this->v; } } }
+namespace App { final class Box { public function __construct(public int $v) {} public function v(): int { return $this->v + 1000; } } }
+namespace Test {
+    use App\Box;
+    class BoxTest {
+        public function testNew(): void {
+            $this->assertSame(1007, (new Box(7))->v());
+        }
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "Test\\BoxTest", "testNew", vec![]),
             Outcome::Pass
         );
     }

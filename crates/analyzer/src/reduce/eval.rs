@@ -150,6 +150,13 @@ pub struct Scope<'r> {
     steps: u64,
     max_steps: u64,
     resolver: &'r dyn CallResolver,
+    /// The resolved-names table for the CURRENT body's file (Inc-3): maps each
+    /// name occurrence (by source position) to its fully-qualified name, so an
+    /// unqualified / `use`-aliased `new ClassName` / `ClassName::m()` resolves to
+    /// the real FQCN. `None` (unit tests / a body whose names weren't threaded)
+    /// falls back to the raw identifier. Each inlined body carries the names of
+    /// ITS declaring file (set when re-entering the evaluator via `with_program`).
+    names: Option<&'r mago_names::ResolvedNames<'r>>,
     /// Whether `$this->prop = ...` writes are permitted (true ONLY while a
     /// constructor body is being inlined to seed props). A write to `$this->prop`
     /// in any non-constructor body is a MUTATOR — fail-closed BAIL (frontier §2),
@@ -166,8 +173,25 @@ impl<'r> Scope<'r> {
             // 10M steps — a runaway loop bails rather than hanging (spec §6).
             max_steps: 10_000_000,
             resolver,
+            names: None,
             allow_this_write: false,
         }
+    }
+
+    /// Attach the resolved-names table for the body about to be evaluated, so
+    /// class-name resolution at `new`/static-call sites can produce a FQCN.
+    pub fn with_names(mut self, names: &'r mago_names::ResolvedNames<'r>) -> Self {
+        self.names = Some(names);
+        self
+    }
+
+    /// Resolve a class identifier at `position` to its FQCN via the names table,
+    /// if one is attached and has an entry. Returns `None` to fall back to the raw
+    /// identifier (self/parent/static keywords are handled by the caller).
+    fn resolve_name_at<T: mago_span::HasPosition>(&self, position: &T) -> Option<Vec<u8>> {
+        self.names
+            .and_then(|n| n.resolve(position))
+            .map(|b| b.to_vec())
     }
 
     /// Permit `$this->prop` writes in this scope (constructor seeding only).
@@ -207,7 +231,30 @@ pub fn run_method_body(
     givens: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Outcome {
+    run_method_body_inner(block, givens, resolver, None)
+}
+
+/// Like [`run_method_body`] but with the body file's resolved-names table attached
+/// so `new ClassName` / `ClassName::m()` resolve to a FQCN (Inc-3).
+pub fn run_method_body_with_names(
+    block: &Block,
+    givens: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+) -> Outcome {
+    run_method_body_inner(block, givens, resolver, Some(names))
+}
+
+fn run_method_body_inner(
+    block: &Block,
+    givens: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: Option<&mago_names::ResolvedNames>,
+) -> Outcome {
     let mut scope = Scope::new(givens, resolver);
+    if let Some(n) = names {
+        scope = scope.with_names(n);
+    }
     match exec_statements(block.statements.iter(), &mut scope) {
         Ok(Flow::Asserted(outcome)) => outcome,
         // Body completed (or returned) with no failing assertion → Pass.
@@ -226,7 +273,30 @@ pub fn run_body_returning(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
+    run_body_returning_inner(block, bindings, resolver, None)
+}
+
+/// Like [`run_body_returning`] but with the body file's resolved-names table
+/// attached (Inc-3 class-name resolution inside an inlined body).
+pub fn run_body_returning_with_names(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+) -> Result<Value, BailReason> {
+    run_body_returning_inner(block, bindings, resolver, Some(names))
+}
+
+fn run_body_returning_inner(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: Option<&mago_names::ResolvedNames>,
+) -> Result<Value, BailReason> {
     let mut scope = Scope::new(bindings, resolver);
+    if let Some(n) = names {
+        scope = scope.with_names(n);
+    }
     match exec_statements(block.statements.iter(), &mut scope)? {
         Flow::Returned(v) => Ok(v),
         // Fell off the end with no `return` → PHP returns null.
@@ -255,7 +325,30 @@ pub fn run_ctor_body(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
+    run_ctor_body_inner(block, bindings, resolver, None)
+}
+
+/// Like [`run_ctor_body`] but with the body file's resolved-names table attached
+/// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN).
+pub fn run_ctor_body_with_names(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+) -> Result<Value, BailReason> {
+    run_ctor_body_inner(block, bindings, resolver, Some(names))
+}
+
+fn run_ctor_body_inner(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: Option<&mago_names::ResolvedNames>,
+) -> Result<Value, BailReason> {
     let mut scope = Scope::new(bindings, resolver);
+    if let Some(n) = names {
+        scope = scope.with_names(n);
+    }
     scope.allow_this_writes();
     match exec_statements(block.statements.iter(), &mut scope)? {
         // Whatever the body did (returned early or fell through), the constructed
@@ -718,7 +811,7 @@ fn eval_instantiation(
     inst: &mago_syntax::ast::ast::instantiation::Instantiation,
     scope: &mut Scope,
 ) -> Result<Value, BailReason> {
-    let class = resolve_class_name(inst.class)?;
+    let class = resolve_class_name_in_scope(inst.class, scope)?;
     let args = match &inst.argument_list {
         Some(list) => eval_arguments(list, scope)?,
         None => Vec::new(),
@@ -1439,7 +1532,7 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
                     "dynamic static-method selector".into(),
                 ));
             };
-            let class = resolve_class_name(sm.class)?;
+            let class = resolve_class_name_in_scope(sm.class, scope)?;
             let args = eval_arguments(&sm.argument_list, scope)?;
             match scope
                 .resolver
@@ -1459,28 +1552,40 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
     }
 }
 
-/// Resolve a class-name expression to a concrete FQCN (bytes). Only a plain
-/// `Identifier` (a real class name) resolves; `self`/`parent`/`static`, `$var`,
-/// and any dynamic class expression BAIL (frontier §3 — the reducer has no
-/// enclosing-class context and cannot pin a dynamic class soundly).
-fn resolve_class_name(expr: &Expression) -> Result<Vec<u8>, BailReason> {
-    match identifier_name(expr) {
-        Some(name) => {
-            // self/parent/static are parsed as identifiers in some positions; reject.
-            if name.eq_ignore_ascii_case(b"self")
-                || name.eq_ignore_ascii_case(b"parent")
-                || name.eq_ignore_ascii_case(b"static")
-            {
-                return Err(BailReason::UnsupportedConstruct(
-                    "self/parent/static class reference (no enclosing-class context)".into(),
-                ));
-            }
-            Ok(name.to_vec())
-        }
-        None => Err(BailReason::UnsupportedConstruct(
-            "dynamic/unresolvable class name (new \\$var / static::)".into(),
-        )),
+/// Resolve a class-name expression to a concrete FQCN, consulting the scope's
+/// resolved-names table (Inc-3): an unqualified / `use`-aliased `new ClassName`
+/// becomes the real FQCN. `self`/`parent`/`static` still bail (no enclosing-class
+/// context). Falls back to the raw identifier when no names table is attached
+/// (unit tests) or the identifier is already fully qualified.
+fn resolve_class_name_in_scope(expr: &Expression, scope: &Scope) -> Result<Vec<u8>, BailReason> {
+    // self/parent/static keyword variants → bail (handled by the raw resolver too,
+    // but check here so a names-table hit can never mask them).
+    if matches!(
+        expr,
+        Expression::Self_(_) | Expression::Static(_) | Expression::Parent(_)
+    ) {
+        return Err(BailReason::UnsupportedConstruct(
+            "self/parent/static class reference (no enclosing-class context)".into(),
+        ));
     }
+    if let Some(name) = identifier_name(expr) {
+        if name.eq_ignore_ascii_case(b"self")
+            || name.eq_ignore_ascii_case(b"parent")
+            || name.eq_ignore_ascii_case(b"static")
+        {
+            return Err(BailReason::UnsupportedConstruct(
+                "self/parent/static class reference (no enclosing-class context)".into(),
+            ));
+        }
+        // Prefer the resolved FQCN for this identifier's position; else the raw name.
+        if let Some(fqcn) = scope.resolve_name_at(expr) {
+            return Ok(fqcn);
+        }
+        return Ok(name.to_vec());
+    }
+    Err(BailReason::UnsupportedConstruct(
+        "dynamic/unresolvable class name (new \\$var / static::)".into(),
+    ))
 }
 
 /// A pure-builtin whitelist (spec §9). Each is exact PHP-8 byte semantics.

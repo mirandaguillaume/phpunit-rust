@@ -24,7 +24,7 @@ use mago_syntax::ast::ast::class_like::method::{Method, MethodBody};
 use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::Program;
 
-use super::eval::{run_method_body, BailReason, Outcome};
+use super::eval::{run_method_body_with_names, BailReason, Outcome};
 use super::subst::BridgeResolver;
 use super::value::Value;
 use crate::analyzer::data_provider::expand;
@@ -99,7 +99,7 @@ fn reduce_one_test(
     // from the AST OR a single no-provider invocation.
     let rows = collect_rows(project, &logical, test);
 
-    let reduced = project.with_program(&logical, |program, _file, _names| {
+    let reduced = project.with_program(&logical, |program, _file, names| {
         let Some(method) = find_method(program, &test.class, &test.method) else {
             return vec![bailed(test, None, "method body not found")];
         };
@@ -161,7 +161,14 @@ fn reduce_one_test(
 
         rows.iter()
             .map(|(data_set, args)| {
-                let outcome = reduce_row(block, &param_names, args, this_value.clone(), resolver);
+                let outcome = reduce_row(
+                    block,
+                    &param_names,
+                    args,
+                    this_value.clone(),
+                    resolver,
+                    names,
+                );
                 ReducedTest {
                     class: test.class.clone(),
                     method: test.method.clone(),
@@ -226,6 +233,7 @@ fn reduce_row(
     args: &[Value],
     this_value: Option<Value>,
     resolver: &BridgeResolver,
+    names: &mago_names::ResolvedNames,
 ) -> Outcome {
     // SURPLUS provider columns (more columns than parameters) are NOT an error in
     // PHP/PHPUnit: data-provider rows are bound positionally via
@@ -244,7 +252,7 @@ fn reduce_row(
     }
     // Parameters past the provided args are unbound; if the body reads one it
     // bails (UnboundVariable) — fail-closed, no defaults invented here.
-    run_method_body(block, givens, resolver)
+    run_method_body_with_names(block, givens, resolver, names)
 }
 
 // ─── AST helpers ──────────────────────────────────────────────────────────────
@@ -392,6 +400,153 @@ fn bailed(test: &TestMethod, data_set: Option<String>, reason: &str) -> ReducedT
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measurement harness (Inc-3 acceptance): run the reducer on a real
+    /// doctrine/collections accessor file and print the reduced fraction + bail
+    /// histogram. Ignored by default (needs a cloned + composer-installed checkout
+    /// at /tmp/doctrine-collections). Run with:
+    ///   cargo test -p analyzer --lib reduce::driver::tests::measure_doctrine_collections -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_doctrine_collections() {
+        use std::collections::BTreeMap;
+        let root = Path::new("/tmp/doctrine-collections");
+        // The accessor tests are DECLARED in the abstract ArrayCollectionTestCase
+        // (the concrete ArrayCollectionTest only adds buildCollection + one test).
+        let test_file = root.join("tests/ArrayCollectionTestCase.php");
+        if !test_file.exists() {
+            eprintln!("SKIP: {} not present", test_file.display());
+            return;
+        }
+
+        // FAITHFUL measurement: PHPUnit runs the inherited accessor tests as the
+        // CONCRETE subclass `ArrayCollectionTest`, whose `buildCollection` returns a
+        // real `ArrayCollection`. Discovery attributes inherited methods to their
+        // DECLARING class, so a plain `reduce_in_root` would bind `$this` to the
+        // abstract parent and bail every row on "abstract method dispatch". Here we
+        // reduce each declared test body against a `$this` bound to the concrete
+        // class so the inc-3 object model (A–E) is exercised against real code.
+        let concrete = "Doctrine\\Tests\\Common\\Collections\\ArrayCollectionTest";
+        let reduced = reduce_as_concrete(root, &test_file, concrete);
+
+        let total = reduced.len();
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        let mut bail = 0usize;
+        let mut hist: BTreeMap<String, usize> = BTreeMap::new();
+        for r in &reduced {
+            match &r.outcome {
+                Outcome::Pass => pass += 1,
+                Outcome::Fail(_) => fail += 1,
+                Outcome::Bailed(reason) => {
+                    bail += 1;
+                    let detail = match reason {
+                        BailReason::UnsupportedConstruct(m)
+                        | BailReason::UnknownCall(m)
+                        | BailReason::Other(m)
+                        | BailReason::TypeError(m)
+                        | BailReason::UnboundVariable(m) => {
+                            format!("{}: {}", reason.tag(), m)
+                        }
+                        other => other.tag().to_string(),
+                    };
+                    *hist.entry(detail).or_default() += 1;
+                }
+            }
+        }
+        println!("\n=== doctrine/collections ArrayCollectionTest.php ===");
+        println!(
+            "rows={total}  PASS={pass}  FAIL={fail}  BAIL={bail}  reduced={:.1}%",
+            if total == 0 {
+                0.0
+            } else {
+                100.0 * (pass + fail) as f64 / total as f64
+            }
+        );
+        println!("--- per-(method,row) ---");
+        for r in &reduced {
+            let tag = match &r.outcome {
+                Outcome::Pass => "PASS".to_string(),
+                Outcome::Fail(_) => "FAIL".to_string(),
+                Outcome::Bailed(b) => format!("BAIL/{}", b.tag()),
+            };
+            println!(
+                "  {} [{}] -> {}",
+                r.method,
+                r.data_set.as_deref().unwrap_or("-"),
+                tag
+            );
+        }
+        println!("--- bail histogram ---");
+        for (reason, n) in &hist {
+            println!("  {n:>3}  {reason}");
+        }
+    }
+
+    /// Reduce every test method DECLARED in `test_file`, but with `$this` bound to
+    /// the runtime `concrete_class` (modelling PHPUnit running an inherited test as
+    /// the concrete subclass). Used only by the doctrine measurement harness.
+    fn reduce_as_concrete(root: &Path, test_file: &Path, concrete_class: &str) -> Vec<ReducedTest> {
+        let project = MagoProject::load(root).expect("load");
+        let cache = CacheStore::open(root, MagoProject::version()).expect("cache");
+        let tests = discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover");
+        let resolver = BridgeResolver::new(&project);
+
+        let Some(class_meta) =
+            project.find_class(&tests.first().map(|t| t.class.clone()).unwrap_or_default())
+        else {
+            return vec![];
+        };
+        let file = project.file_of_span(&class_meta.span).expect("file");
+        let logical = String::from_utf8_lossy(&file.name).into_owned();
+
+        // Build the concrete `$this` ONCE (setUp seeding is row-independent here).
+        let this_value = resolver.build_test_case_this(concrete_class).ok().flatten();
+
+        let mut out = Vec::new();
+        for test in &tests {
+            let rows = collect_rows(&project, &logical, test);
+            let reduced = project.with_program(&logical, |program, _f, names| {
+                let Some(method) = find_method(program, &test.class, &test.method) else {
+                    return vec![bailed(test, None, "method body not found")];
+                };
+                let MethodBody::Concrete(block) = &method.body else {
+                    return vec![bailed(test, None, "abstract/interface method")];
+                };
+                let param_names = match method_param_names(method) {
+                    Ok(n) => n,
+                    Err(reason) => {
+                        return rows
+                            .iter()
+                            .map(|(ds, _)| ReducedTest {
+                                class: concrete_class.to_string(),
+                                method: test.method.clone(),
+                                data_set: ds.clone(),
+                                outcome: Outcome::Bailed(reason.clone()),
+                            })
+                            .collect()
+                    }
+                };
+                rows.iter()
+                    .map(|(ds, args)| ReducedTest {
+                        class: concrete_class.to_string(),
+                        method: test.method.clone(),
+                        data_set: ds.clone(),
+                        outcome: reduce_row(
+                            block,
+                            &param_names,
+                            args,
+                            this_value.clone(),
+                            &resolver,
+                            names,
+                        ),
+                    })
+                    .collect()
+            });
+            out.extend(reduced.unwrap_or_default());
+        }
+        out
+    }
 
     fn write_suite(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
