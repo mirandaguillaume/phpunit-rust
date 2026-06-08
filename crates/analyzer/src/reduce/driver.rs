@@ -66,7 +66,14 @@ pub fn reduce_file(test_file: &Path) -> Result<Vec<ReducedTest>, DriverError> {
 /// dependency closure should be scanned). Useful when the test file's parent dir
 /// is not the right scan root.
 pub fn reduce_in_root(root: &Path, test_file: &Path) -> Result<Vec<ReducedTest>, DriverError> {
-    let project = MagoProject::load(root)?;
+    // Scope the codebase scan to the project, skipping vendor. The scan dominates
+    // the reducer's wall-time, and vendor is ~98% of the classes (measured on
+    // doctrine/collections: 2230 of 2269) yet a test's traversal is almost always
+    // its own src + test-case ancestry. Excluding vendor is a ~36x scan speedup
+    // (1.5s → 42ms there) and is FAIL-CLOSED: a test that genuinely traverses a
+    // vendored class can't resolve its body → it bails, never reduces wrong.
+    // TODO: scope to the exact transitive dependency closure for the last mile.
+    let project = MagoProject::load_excluding_vendor(root)?;
     let cache = CacheStore::open(root, MagoProject::version())
         .map_err(|e| DriverError::Cache(e.to_string()))?;
     let tests = discover(&project, &cache, &[test_file.to_path_buf()])
@@ -487,7 +494,7 @@ mod tests {
     /// the runtime `concrete_class` (modelling PHPUnit running an inherited test as
     /// the concrete subclass). Used only by the doctrine measurement harness.
     fn reduce_as_concrete(root: &Path, test_file: &Path, concrete_class: &str) -> Vec<ReducedTest> {
-        let project = MagoProject::load(root).expect("load");
+        let project = MagoProject::load_excluding_vendor(root).expect("load");
         let cache = CacheStore::open(root, MagoProject::version()).expect("cache");
         let tests = discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover");
         let resolver = BridgeResolver::new(&project);
