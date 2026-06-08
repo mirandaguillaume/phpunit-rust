@@ -1033,6 +1033,29 @@ namespace {
     }
 
     #[test]
+    fn fluent_return_this_and_method_chain_on_this() {
+        // `return $this;` (no mutation) + a method that chains `$this->m()->n()`.
+        // Exercises $this read + nested instance-method inline with $this rebound.
+        let src = r#"<?php
+final class Builder {
+    public function __construct(public int $a, public int $b) {}
+    public function self(): Builder { return $this; }
+    public function sum(): int { return $this->a + $this->b; }
+    public function viaThis(): int { return $this->self()->sum(); }
+}
+class BuilderTest {
+    public function testChain(): void {
+        $this->assertSame(7, (new Builder(3, 4))->viaThis());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "BuilderTest", "testChain", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
     fn nested_object_structural_equals() {
         // assertEquals over objects whose props are themselves objects (recursive
         // per-prop loose compare).
