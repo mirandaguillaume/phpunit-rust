@@ -9,6 +9,7 @@ pub mod concrete;
 pub mod config;
 pub mod mago_bridge;
 pub mod opacity;
+pub mod reduce;
 pub mod output;
 pub mod report;
 pub mod test_discovery;
