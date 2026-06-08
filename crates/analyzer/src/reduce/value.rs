@@ -242,7 +242,7 @@ pub(crate) fn is_numeric_string(s: &[u8]) -> bool {
 
 /// Parse a *full* numeric string (the `is_numeric` grammar). Returns the numeric
 /// value when the ENTIRE string (modulo surrounding whitespace) is numeric.
-fn full_numeric(s: &[u8]) -> Option<NumericString> {
+pub(crate) fn full_numeric(s: &[u8]) -> Option<NumericString> {
     // PHP allows leading AND trailing whitespace for is_numeric (PHP 8).
     let trimmed = trim_php_ws(s);
     if trimmed.is_empty() {
@@ -439,6 +439,169 @@ pub(crate) fn php_float_to_string(f: f64) -> String {
     }
 }
 
+// ─── PHP 8 comparison: ==, ===, <=> ───────────────────────────────────────────
+//
+// All rules transcribed from host `php -r` (the PHP-8 "saner numeric strings"
+// semantics; see the gold tests). The float comparison is OURS — never an
+// `OrderedFloat`/structural `Eq` (spec §12.2/§12.4).
+
+impl Value {
+    /// PHP `<=>` (`zend_compare`), PHP 8 semantics. Returns `Less`/`Equal`/
+    /// `Greater`.
+    ///
+    /// Float comparison is the raw `f64` ordering (our own), not `OrderedFloat`.
+    /// NaN never arises from the modelled arithmetic; if it ever did, `<`/`>`/`==`
+    /// would all be false and `cmp` would report `Equal` — callers that need
+    /// exact float identity must gate via the eval cross-check, not this fn.
+    pub fn php_compare(&self, other: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        use Value::*;
+        match (self, other) {
+            // A bool on either side → compare as bools (precedence over array).
+            (Bool(_), _) | (_, Bool(_)) => cmp_i64(self.to_bool() as i64, other.to_bool() as i64),
+            // null vs array: null behaves as the empty array.
+            (Null, Arr(x)) => cmp_i64(0, x.len() as i64),
+            (Arr(x), Null) => cmp_i64(x.len() as i64, 0),
+            // null on either side (non-array, non-bool) → compare as bools.
+            (Null, _) | (_, Null) => cmp_i64(self.to_bool() as i64, other.to_bool() as i64),
+            // number vs number.
+            (Int(a), Int(b)) => cmp_i64(*a, *b),
+            (Int(_) | Float(_), Int(_) | Float(_)) => cmp_f64(self.to_float(), other.to_float()),
+            // number vs string: numeric string → numeric; else string compare
+            // (the number is cast to its string form).
+            (Int(_) | Float(_), Str(s)) => match full_numeric(s) {
+                Some(n) => cmp_numeric(self, n),
+                None => cmp_bytes(&self.to_php_string().unwrap_or_default(), s),
+            },
+            (Str(s), Int(_) | Float(_)) => match full_numeric(s) {
+                Some(n) => cmp_numeric_rev(n, other),
+                None => cmp_bytes(s, &other.to_php_string().unwrap_or_default()),
+            },
+            // string vs string: both numeric → numeric; else byte compare.
+            (Str(x), Str(y)) => match (full_numeric(x), full_numeric(y)) {
+                (Some(p), Some(q)) => cmp_numeric_strings(p, q),
+                _ => cmp_bytes(x, y),
+            },
+            // array vs array: by length, then element-wise on the lhs key order.
+            (Arr(x), Arr(y)) => {
+                let by_len = cmp_i64(x.len() as i64, y.len() as i64);
+                if by_len != Ordering::Equal {
+                    by_len
+                } else {
+                    let mut acc = Ordering::Equal;
+                    for (k, xv) in x {
+                        match y.iter().find(|(yk, _)| yk == k) {
+                            Some((_, yv)) => {
+                                let e = xv.php_compare(yv);
+                                if e != Ordering::Equal {
+                                    acc = e;
+                                    break;
+                                }
+                            }
+                            // Missing key → lhs is "uncomparable-greater" in PHP.
+                            None => {
+                                acc = Ordering::Greater;
+                                break;
+                            }
+                        }
+                    }
+                    acc
+                }
+            }
+            // scalar vs array → the array is greater.
+            (Arr(_), _) => Ordering::Greater,
+            (_, Arr(_)) => Ordering::Less,
+        }
+    }
+
+    /// PHP loose equality (`==`), PHP 8 semantics.
+    ///
+    /// Arrays are equal when they have the same key set and loosely-equal values
+    /// (order-independent — `['a'=>1,'b'=>2] == ['b'=>2,'a'=>1]` is true). Every
+    /// other pair is equal iff [`Value::php_compare`] is `Equal`.
+    pub fn php_loose_eq(&self, other: &Value) -> bool {
+        if let (Value::Arr(x), Value::Arr(y)) = (self, other) {
+            if x.len() != y.len() {
+                return false;
+            }
+            return x.iter().all(|(k, xv)| {
+                y.iter()
+                    .find(|(yk, _)| yk == k)
+                    .is_some_and(|(_, yv)| xv.php_loose_eq(yv))
+            });
+        }
+        self.php_compare(other) == std::cmp::Ordering::Equal
+    }
+
+    /// PHP strict equality (`===`): identical type AND value; arrays must match
+    /// key order too. No type juggling.
+    pub fn php_strict_eq(&self, other: &Value) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Null, Null) => true,
+            (Bool(a), Bool(b)) => a == b,
+            (Int(a), Int(b)) => a == b,
+            // Float `===` is bit-for-bit value equality (our own, not OrderedFloat).
+            (Float(a), Float(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Arr(a), Arr(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((ak, av), (bk, bv))| ak == bk && av.php_strict_eq(bv))
+            }
+            _ => false, // different types are never strictly equal
+        }
+    }
+}
+
+/// `assertSame($expected, $actual)` ≈ `===`.
+pub fn assert_same(expected: &Value, actual: &Value) -> bool {
+    expected.php_strict_eq(actual)
+}
+
+/// `assertEquals($expected, $actual)` ≈ `==` (no delta).
+pub fn assert_equals(expected: &Value, actual: &Value) -> bool {
+    expected.php_loose_eq(actual)
+}
+
+// `assertEquals($e, $a, delta: ...)` is NOT modelled — the caller must BailOut on
+// a non-zero delta (spec §12.2/§12.4): epsilon float equality is not `==`.
+
+fn cmp_i64(a: i64, b: i64) -> std::cmp::Ordering {
+    a.cmp(&b)
+}
+
+/// Raw `f64` ordering, OUR PHP-`==` float comparison (not `OrderedFloat`).
+fn cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn cmp_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    a.cmp(b)
+}
+
+/// Compare a numeric `lhs` value against the numeric form `n` of a string.
+fn cmp_numeric(lhs: &Value, n: NumericString) -> std::cmp::Ordering {
+    match (lhs, n) {
+        (Value::Int(a), NumericString::Int(b)) => cmp_i64(*a, b),
+        _ => cmp_f64(lhs.to_float(), n.to_float()),
+    }
+}
+
+/// Compare the numeric form `n` of a string against a numeric `rhs` value.
+fn cmp_numeric_rev(n: NumericString, rhs: &Value) -> std::cmp::Ordering {
+    cmp_numeric(rhs, n).reverse()
+}
+
+/// Compare two numeric strings: both-int → integer compare (exact), else float.
+fn cmp_numeric_strings(p: NumericString, q: NumericString) -> std::cmp::Ordering {
+    match (p, q) {
+        (NumericString::Int(a), NumericString::Int(b)) => cmp_i64(a, b),
+        _ => cmp_f64(p.to_float(), q.to_float()),
+    }
+}
+
 // ─── Tests (gold-tested vs host `php -r`; expectations transcribed) ───────────
 
 #[cfg(test)]
@@ -597,5 +760,117 @@ mod tests {
             Value::Str(b) => assert_eq!(b, "héllo".as_bytes()),
             _ => panic!("expected Str"),
         }
+    }
+
+    fn i(n: i64) -> Value {
+        Value::Int(n)
+    }
+    fn arr(items: Vec<(ArrayKey, Value)>) -> Value {
+        Value::Arr(items)
+    }
+
+    #[test]
+    fn loose_eq_juggling_matches_php() {
+        // php -r 'var_dump($a == $b);'
+        assert!(s("1").php_loose_eq(&s("01"))); // numeric strings
+        assert!(s("10").php_loose_eq(&s("1e1")));
+        assert!(!i(0).php_loose_eq(&s("a"))); // PHP8: 0 == 'a' is FALSE
+        assert!(!s("").php_loose_eq(&s("0")));
+        assert!(Value::Null.php_loose_eq(&s("")));
+        assert!(Value::Null.php_loose_eq(&i(0)));
+        assert!(Value::Null.php_loose_eq(&Value::Bool(false)));
+        assert!(!i(0).php_loose_eq(&s(""))); // 0 == '' is FALSE (string compare)
+        assert!(i(0).php_loose_eq(&Value::Null)); // but 0 == null is TRUE
+        assert!(s("abc").php_loose_eq(&s("abc")));
+        assert!(i(1).php_loose_eq(&Value::Float(1.0)));
+        assert!(i(1).php_loose_eq(&Value::Bool(true)));
+        assert!(i(0).php_loose_eq(&Value::Bool(false)));
+        assert!(s("1").php_loose_eq(&i(1)));
+        assert!(s("1.0").php_loose_eq(&i(1)));
+        assert!(s("1.0").php_loose_eq(&s("1")));
+        assert!(i(100).php_loose_eq(&s("1e2")));
+        assert!(s("0").php_loose_eq(&Value::Bool(false)));
+        assert!(!s("abc").php_loose_eq(&i(0))); // PHP8: non-numeric string vs 0
+        assert!(!i(12).php_loose_eq(&s("12abc"))); // string compare "12" vs "12abc"
+        assert!(s(" 1").php_loose_eq(&s("1"))); // leading ws numeric
+        assert!(s("1 ").php_loose_eq(&s("1"))); // trailing ws numeric (PHP8)
+                                                // arrays, order-independent
+        let a1 = arr(vec![
+            (ArrayKey::Str(b"a".to_vec()), i(1)),
+            (ArrayKey::Str(b"b".to_vec()), i(2)),
+        ]);
+        let a2 = arr(vec![
+            (ArrayKey::Str(b"b".to_vec()), i(2)),
+            (ArrayKey::Str(b"a".to_vec()), i(1)),
+        ]);
+        assert!(a1.php_loose_eq(&a2));
+        assert!(arr(vec![]).php_loose_eq(&Value::Bool(false)));
+        assert!(arr(vec![]).php_loose_eq(&Value::Null));
+    }
+
+    #[test]
+    fn strict_eq_matches_php() {
+        // php -r 'var_dump($a === $b);'
+        assert!(!i(1).php_strict_eq(&Value::Float(1.0))); // 1 === 1.0 is FALSE
+        assert!(i(1).php_strict_eq(&i(1)));
+        assert!(!s("1").php_strict_eq(&i(1)));
+        assert!(Value::Null.php_strict_eq(&Value::Null));
+        assert!(!Value::Null.php_strict_eq(&Value::Bool(false)));
+        assert!(Value::Float(1.0).php_strict_eq(&Value::Float(1.0)));
+        // array key-order matters for ===
+        let ordered = arr(vec![
+            (ArrayKey::Str(b"a".to_vec()), i(1)),
+            (ArrayKey::Str(b"b".to_vec()), i(2)),
+        ]);
+        let reordered = arr(vec![
+            (ArrayKey::Str(b"b".to_vec()), i(2)),
+            (ArrayKey::Str(b"a".to_vec()), i(1)),
+        ]);
+        assert!(!ordered.php_strict_eq(&reordered));
+        assert!(ordered.php_strict_eq(&ordered.clone()));
+    }
+
+    #[test]
+    fn ordering_matches_php() {
+        use std::cmp::Ordering::*;
+        // php -r 'echo $a <=> $b;'
+        assert_eq!(i(1).php_compare(&i(2)), Less);
+        assert_eq!(s("10").php_compare(&s("9")), Greater); // both numeric → numeric
+        assert_eq!(i(0).php_compare(&s("a")), Less); // "0" vs "a" string compare
+        assert_eq!(s("a").php_compare(&i(0)), Greater);
+        assert_eq!(s("1.5").php_compare(&s("1.50")), Equal);
+        assert_eq!(i(10).php_compare(&s("10")), Equal);
+        assert_eq!(s("").php_compare(&i(0)), Less); // "" vs "0"
+        assert_eq!(Value::Null.php_compare(&i(1)), Less);
+        assert_eq!(Value::Bool(true).php_compare(&i(2)), Equal); // both true
+        assert_eq!(Value::Bool(false).php_compare(&s("")), Equal);
+        assert_eq!(Value::Bool(true).php_compare(&Value::Bool(false)), Greater);
+        assert_eq!(s("0x1A").php_compare(&i(26)), Less); // non-numeric → "0x1A" vs "26"
+        assert_eq!(s("abc").php_compare(&s("ab")), Greater);
+        assert_eq!(s("10").php_compare(&s("9a")), Less); // "9a" non-numeric → string
+        assert_eq!(s("10.0").php_compare(&s("10")), Equal);
+        assert_eq!(s("-1").php_compare(&s("1")), Less);
+        // null vs array (null = empty array)
+        assert_eq!(Value::Null.php_compare(&arr(vec![])), Equal);
+        assert_eq!(
+            Value::Null.php_compare(&arr(vec![(ArrayKey::Int(0), i(1))])),
+            Less
+        );
+        // scalar vs array → array greater (but bool/array → bool compare)
+        assert_eq!(i(1).php_compare(&arr(vec![(ArrayKey::Int(0), i(1))])), Less);
+        assert_eq!(
+            arr(vec![(ArrayKey::Int(0), i(1))]).php_compare(&Value::Bool(true)),
+            Equal
+        );
+    }
+
+    #[test]
+    fn assert_intrinsics_wrap_eq() {
+        // assertSame ≈ ===, assertEquals ≈ ==.
+        assert!(assert_same(&i(1), &i(1)));
+        assert!(!assert_same(&i(1), &Value::Float(1.0)));
+        assert!(assert_equals(&i(1), &Value::Float(1.0)));
+        assert!(assert_equals(&s("1"), &i(1)));
+        assert!(!assert_equals(&i(0), &s("a")));
     }
 }
