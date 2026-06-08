@@ -219,34 +219,54 @@ final class MethodPlanner
     /** @return iterable<int|string, mixed>|null */
     public static function dataSetsFor(\ReflectionClass $ref, \ReflectionMethod $m): ?iterable
     {
-        // Collect provider method names from both styles:
+        // Collect provider sources from every supported style. Each source is a
+        // `[?class, method]` pair: a null class means "the test class itself".
+        // Vanilla PHPUnit treats #[DataProvider], #[DataProviderExternal] and the
+        // legacy `@dataProvider` annotation (including its cross-class
+        // `Class::method` form) uniformly — they all become DataProvider metadata
+        // that flow through the same merge with the same duplicate-key check.
         //   - PHPUnit 10+ attribute: #[DataProvider('foo')]
-        //   - PHPUnit 9 / legacy:    @dataProvider foo  (in PHPDoc)
+        //   - PHPUnit 10+ attribute: #[DataProviderExternal(Other::class, 'foo')]
+        //   - PHPUnit 9 / legacy:    @dataProvider foo               (same class)
+        //   - PHPUnit 9 / legacy:    @dataProvider \Other::foo       (cross-class)
         // Many PHPUnit 10 codebases still use the PHPDoc style for back-compat,
         // and PHPUnit 9 has no attributes at all.
-        $providerNames = [];
+        //
+        // @var list<array{class:?string,method:string}> $providerSources
+        $providerSources = [];
+        $addSource = static function (?string $class, string $method) use (&$providerSources): void {
+            foreach ($providerSources as $existing) {
+                if ($existing['class'] === $class && $existing['method'] === $method) {
+                    return; // de-dupe identical declarations (mirrors prior name-set logic)
+                }
+            }
+            $providerSources[] = ['class' => $class, 'method' => $method];
+        };
         foreach ($m->getAttributes(DataProvider::class) as $attr) {
-            $providerNames[] = $attr->newInstance()->methodName();
+            $addSource(null, $attr->newInstance()->methodName());
+        }
+        // PHPUnit 10+ #[DataProviderExternal] — provider in a different class,
+        // already require_once'd by the worker via required_files.
+        foreach ($m->getAttributes(DataProviderExternal::class) as $attr) {
+            $inst = $attr->newInstance();
+            $addSource($inst->className(), $inst->methodName());
         }
         $doc = $m->getDocComment();
         if (is_string($doc) && preg_match_all('/@dataProvider\s+(\S+)/', $doc, $matches)) {
             foreach ($matches[1] as $name) {
-                if (!in_array($name, $providerNames, true)) {
-                    $providerNames[] = $name;
+                // Legacy cross-class form `@dataProvider \Some\Provider::rows`:
+                // vanilla's annotation parser splits on '::' and reflects the
+                // EXTERNAL class. The leading backslash (if any) is accepted by
+                // ReflectionClass as-is, so we keep the token verbatim. Without
+                // this split the planner reflected the literal 'Provider::rows'
+                // on the TEST class, throwing ReflectionException and collapsing
+                // the whole method to a single provider_error.
+                if (str_contains($name, '::')) {
+                    [$extClass, $extMeth] = explode('::', $name, 2);
+                    $addSource($extClass, $extMeth);
+                } else {
+                    $addSource(null, $name);
                 }
-            }
-        }
-
-        // PHPUnit 10+ #[DataProviderExternal] — provider in a different class,
-        // already require_once'd by the worker via required_files.
-        $externalRows = [];
-        foreach ($m->getAttributes(DataProviderExternal::class) as $attr) {
-            $inst     = $attr->newInstance();
-            $extClass = $inst->className();
-            $extMeth  = $inst->methodName();
-            foreach ($extClass::$extMeth() as $key => $row) {
-                if (is_int($key)) { $externalRows[] = $row; }
-                else              { $externalRows[$key] = $row; }
             }
         }
 
@@ -294,37 +314,52 @@ final class MethodPlanner
             }
         }
 
-        if (empty($providerNames) && empty($testWithRows) && empty($externalRows)) {
+        if (empty($providerSources) && empty($testWithRows)) {
             return null;
         }
 
+        // Merge every provider source into one ordered accumulator. String keys
+        // are NAMED data sets: vanilla forbids the same named key being defined
+        // twice across the providers of a single method and throws
+        // InvalidDataProviderException. We mirror that loud per-method failure
+        // (surfaced as a provider_error by plan()'s catch) instead of silently
+        // last-winning. Integer keys are positional: PHP renumbers them on
+        // append, so colliding int keys (e.g. two providers each starting at 0,
+        // or `yield from [...]` segments) must append every row, never overwrite.
         $rows = [];
-        foreach ($providerNames as $providerName) {
-            $providerRef = $ref->getMethod($providerName);
+        foreach ($providerSources as $source) {
+            // Resolve against the test class (null) or the named external class.
+            $providerClassRef = $source['class'] === null
+                ? $ref
+                : new \ReflectionClass($source['class']);
+            $providerRef = $providerClassRef->getMethod($source['method']);
             $providerRef->setAccessible(true);
             $result = $providerRef->isStatic()
                 ? $providerRef->invoke(null)
-                : $providerRef->invoke($ref->newInstanceWithoutConstructor());
+                : $providerRef->invoke($providerClassRef->newInstanceWithoutConstructor());
             foreach ($result as $key => $row) {
-                // Integer keys (the default from yield-without-key and from
-                // bare array literals like `yield from [...]`) collide across
-                // generator segments — both start at 0. Append for ints to
-                // preserve every row; keep string keys for named data sets.
                 if (is_int($key)) {
                     $rows[] = $row;
                 } else {
+                    if (array_key_exists($key, $rows)) {
+                        // Loud, per-method failure mirroring vanilla PHPUnit's
+                        // DataProvider::dataProvidedByMethods. Thrown here so
+                        // plan()'s existing catch turns it into one
+                        // provider_error step for this method.
+                        throw new \RuntimeException(sprintf(
+                            'The key "%s" has already been defined by a previous data provider',
+                            $key,
+                        ));
+                    }
                     $rows[$key] = $row;
                 }
             }
         }
         // Append TestWith rows AFTER provider rows so PHPUnit-style dataset
         // indices match (provider rows numbered 0..N-1, TestWith rows N+).
+        // TestWith rows are always positional (no named keys), so they append.
         foreach ($testWithRows as $row) {
             $rows[] = $row;
-        }
-        foreach ($externalRows as $key => $row) {
-            if (is_int($key)) { $rows[] = $row; }
-            else              { $rows[$key] = $row; }
         }
         return $rows;
     }
