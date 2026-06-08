@@ -38,4 +38,5 @@
 pub mod driver;
 pub mod eval;
 pub mod gate;
+pub mod subst;
 pub mod value;

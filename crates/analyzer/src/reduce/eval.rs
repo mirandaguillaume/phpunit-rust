@@ -193,6 +193,12 @@ pub fn run_body_returning(
     }
 }
 
+/// Evaluate a single expression to a [`Value`] in the given scope. Used by the
+/// substitution layer to compute a parameter's default-value expression.
+pub fn eval_default(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
+    eval_expr(expr, scope)
+}
+
 // ─── Statement execution ──────────────────────────────────────────────────────
 
 fn exec_statements<'a, I>(stmts: I, scope: &mut Scope) -> Result<Flow, BailReason>
