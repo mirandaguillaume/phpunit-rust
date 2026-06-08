@@ -24,6 +24,42 @@ declare(strict_types=1);
 error_reporting(E_ALL & ~E_DEPRECATED);
 @set_time_limit(0);
 
+// Reserved child→master exit codes that signal a VOLUNTARY child exit. The
+// master's SIGCHLD handler treats ONLY these as intentional; every other exit
+// status — crucially a bare exit(0)/die() from test code mid-batch — is a
+// crash and gets a `slot_died` notice so Rust can recover the lost batch.
+//
+// Why a reserved code rather than exit(0): a child that finishes its K-batch
+// quota or a force_exit_after batch exits voluntarily so the master can fork a
+// warm replacement. That used to be exit(0) — indistinguishable from a test or
+// teardown calling exit(0)/die() in the middle of a batch. The implicit signal
+// stalled the run: the master forked a replacement (which blocks on stdin) and
+// emitted no slot_died, so the dispatcher waited until the 600 s watchdog
+// mass-errored everything. Making voluntariness EXPLICIT removes the ambiguity.
+//
+// 6 is chosen because PHP fatals/segfaults do not surface as exit 6 (fatals →
+// 255, signals → 128+signo), so it can't collide with a real crash. 7 keeps
+// its existing meaning: the child saw EOF on stdin (Rust closed the slot).
+const WORKER_EXIT_VOLUNTARY_RECYCLE = 6; // K-batch / force_exit_after recycle
+const WORKER_EXIT_STDIN_EOF         = 7; // Rust closed our stdin; slot is done
+
+// Main-body guard. The top-level `function` declarations below (write_line,
+// phpunit_rust_rmtree, runChild, emitError) are hoisted at compile time and so
+// remain callable even though we `return` here — which lets the PHP unit tests
+// `require` this file purely to exercise those helpers WITHOUT spawning the
+// fork-pool master. The master only runs when this file is the entry script
+// (php worker_fork.php …). We key on $_SERVER['SCRIPT_FILENAME'] — the actual
+// entry script PHP is executing — because $argv/$argc are NOT populated inside
+// an included file's scope (they exist only in the top-level script scope), so
+// an argv-based check misfires under PHPUnit. When this file is included by a
+// test, SCRIPT_FILENAME is the phpunit binary (or empty for `php -r`), never
+// this file, so we bail before any side effect (arg parsing, vendor autoload,
+// fork loop).
+$__entryScript = $_SERVER['SCRIPT_FILENAME'] ?? ($_SERVER['argv'][0] ?? '');
+if ($__entryScript === '' || realpath($__entryScript) !== realpath(__FILE__)) {
+    return;
+}
+
 // POC instrumentation: write phase timings to STDERR. Turn on with
 // PHPUNIT_RUST_TIMING=1 in the env. Output format:
 //   [TIMING] phase=name delta_ms=X total_ms=Y
@@ -63,6 +99,54 @@ function write_line($stream, array $payload): void
 {
     fwrite($stream, OutcomeBuilder::encodeLine($payload));
     fflush($stream);
+}
+
+/**
+ * Recursively remove a filesystem path with lstat (do-not-follow-symlinks)
+ * semantics. Used by the per-child TMPDIR shutdown cleanup.
+ *
+ * CRITICAL parity/robustness note: this MUST NOT follow symlinks. The earlier
+ * implementation decided recursion with is_dir($sub), which dereferences a
+ * symlink to its target — so a test that writes a symlink into its TMPDIR
+ * pointing at a directory OUTSIDE the worker temp (PHPUnit's own end-to-end
+ * fixtures legitimately create such links) would have the *link target's*
+ * contents recursively deleted at every worker exit. That is silent data loss
+ * outside the sandbox. lstat semantics fix it: a symlink is @unlink'd as a
+ * link (never traversed), a real directory is recursed into, anything else is
+ * @unlink'd. The TOP path is guarded the same way so a tree whose root is
+ * itself a symlink unlinks the link rather than nuking the target.
+ *
+ * Best-effort: every removal is silenced; a child exiting can't afford to
+ * fatal on a cleanup race, and tmpfs reclaims the rest when the container ends.
+ */
+function phpunit_rust_rmtree(string $path): void
+{
+    // Guard the top path with lstat semantics: a symlink (even one whose
+    // target is a directory) is unlinked as a link, never traversed.
+    if (is_link($path)) {
+        @unlink($path);
+        return;
+    }
+    if (!is_dir($path)) {
+        @unlink($path);
+        return;
+    }
+    foreach (@scandir($path) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $sub = $path . '/' . $entry;
+        if (is_link($sub)) {
+            // Symlink: remove the link itself, do NOT follow it. This is the
+            // load-bearing branch — is_dir($sub) would have followed the link.
+            @unlink($sub);
+        } elseif (is_dir($sub)) {
+            phpunit_rust_rmtree($sub);
+        } else {
+            @unlink($sub);
+        }
+    }
+    @rmdir($path);
 }
 
 // ---------------------------------------------------------------------------
@@ -383,26 +467,34 @@ pcntl_signal(SIGCHLD, function () use (
         $slot = array_search($deadPid, $slotPid, true);
         if ($slot === false) continue;
         $childPids = array_values(array_diff($childPids, [$deadPid]));
-        // exit code 7 = child saw EOF on stdin; Rust closed this slot.
-        if (pcntl_wifexited($status) && pcntl_wexitstatus($status) === 7) {
+        $exitCode = pcntl_wifexited($status) ? pcntl_wexitstatus($status) : -1;
+        // WORKER_EXIT_STDIN_EOF = child saw EOF on stdin; Rust closed this slot.
+        if ($exitCode === WORKER_EXIT_STDIN_EOF) {
             $slotClosed[$slot] = true;
             $slotPid[$slot] = 0;
             continue;
         }
-        // Distinguish a CRASH (non-zero exit, killed by signal) from a clean
-        // recycle (exit 0 — K-batches limit or force_exit_after). Only crashes
-        // need a slot_died notice: a clean recycle has already emitted
-        // batch_done so Rust's in_flight[slot] is None and the previous batch
-        // is fully accounted for. Sending slot_died here would race with the
-        // NEXT batch's dispatch and make Rust attribute the death to the new
+        // Distinguish a CRASH from a VOLUNTARY recycle. Voluntariness is now
+        // EXPLICIT: only the reserved WORKER_EXIT_VOLUNTARY_RECYCLE code means
+        // "K-batch limit / force_exit_after — fork a warm replacement, no
+        // slot_died". A voluntary recycle has already emitted batch_done so
+        // Rust's in_flight[slot] is None and the previous batch is fully
+        // accounted for; sending slot_died here would race with the NEXT
+        // batch's dispatch and make Rust attribute the death to the new
         // in-flight plan → synthetic errors for tests that ran fine.
-        $exitedClean    = pcntl_wifexited($status) && pcntl_wexitstatus($status) === 0;
-        $isCrash        = !$exitedClean;
+        //
+        // CRITICAL: a bare exit(0)/die() from a test/provider/teardown
+        // mid-batch is NOT the reserved code, so it falls through to the crash
+        // branch — exactly the fix. The child died before writing batch_done,
+        // so in_flight[slot] is still Some on the Rust side; slot_died lets
+        // Rust synthesise an error for the lost batch instead of hanging until
+        // the watchdog. Signals (fatals 255, segfault 139, …) are crashes too.
+        $isVoluntary = ($exitCode === WORKER_EXIT_VOLUNTARY_RECYCLE);
+        $isCrash     = !$isVoluntary;
         if ($isCrash
             && isset($childStdoutStreams[$slot])
             && is_resource($childStdoutStreams[$slot])) {
-            $exitCode = pcntl_wifexited($status)   ? pcntl_wexitstatus($status) : -1;
-            $signal   = pcntl_wifsignaled($status) ? pcntl_wtermsig($status)    :  0;
+            $signal = pcntl_wifsignaled($status) ? pcntl_wtermsig($status) : 0;
             @write_line($childStdoutStreams[$slot], [
                 'slot_died' => true,
                 'exit_code' => $exitCode,
@@ -463,16 +555,11 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         $_SERVER['TMPDIR'] = $childTmp;
         @ini_set('sys_temp_dir', $childTmp);
         register_shutdown_function(static function () use ($childTmp): void {
-            // Recursive rmdir — best effort, ignore failures.
-            $rmRec = static function (string $p) use (&$rmRec): void {
-                foreach (@scandir($p) ?: [] as $entry) {
-                    if ($entry === '.' || $entry === '..') continue;
-                    $sub = $p . '/' . $entry;
-                    is_dir($sub) ? $rmRec($sub) : @unlink($sub);
-                }
-                @rmdir($p);
-            };
-            $rmRec($childTmp);
+            // Recursive rmdir — best effort, ignore failures. Uses lstat
+            // semantics (see phpunit_rust_rmtree): a symlink a test wrote into
+            // its TMPDIR is unlinked as a link, NEVER followed, so an external
+            // target's contents are never deleted at worker exit.
+            phpunit_rust_rmtree($childTmp);
         });
     }
 
@@ -496,8 +583,9 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // entirely, so a death WITHOUT a fatal suffix points at a signal.
         $fatal  = error_get_last();
         $suffix = '';
-        if ($fatal !== null && in_array($fatal['type'],
-                [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+        $isFatalShutdown = $fatal !== null && in_array($fatal['type'],
+                [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true);
+        if ($isFatalShutdown) {
             $suffix = sprintf(' (php fatal: %s in %s:%d)',
                 $fatal['message'], $fatal['file'], $fatal['line']);
             // Redeclare-fatal breadcrumbs. NOTE: the include-registry check is
@@ -521,6 +609,19 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                 $suffix .= " [prewarm={$prewarm} leaked={$leaked} this-class-leaked={$thisLeaked}]";
             }
         }
+        // Only the child can name an UNCATCHABLE FATAL (its text never reaches
+        // the orchestrator otherwise), so emit a per-class row only then. A
+        // shutdown WITHOUT a fatal means a test/provider/teardown called a bare
+        // exit()/die() mid-batch: stay silent and let the master's `slot_died`
+        // path be the single source — it alone knows the exit code and words
+        // the cause ("exit code 0 … test code called exit/die mid-batch"). The
+        // lost classes are still accounted for: Rust synthesises an Error per
+        // lost method from `slot_died`. Emitting the generic "terminated before
+        // this class could run" row here too would only race ahead of and mask
+        // that breadcrumb (and, once dead-worker dedup lands, suppress it).
+        if (!$isFatalShutdown) {
+            return;
+        }
         for ($i = $nextIdx; $i < count($currentClasses); $i++) {
             $class = (string)($currentClasses[$i]['class'] ?? '');
             if ($class === '') continue;
@@ -540,9 +641,9 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
     while (true) {
         $line = fgets($stdinStream);
         if ($line === false || $line === '') {
-            // EOF on stdin: Rust closed the pipe. Tell master via exit(7)
-            // so it knows this slot is closed (don't respawn).
-            exit(7);
+            // EOF on stdin: Rust closed the pipe. Tell master via the reserved
+            // EOF code so it knows this slot is closed (don't respawn).
+            exit(WORKER_EXIT_STDIN_EOF);
         }
         $line = trim($line);
         if ($line === '') continue;
@@ -691,13 +792,19 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // PHPUNIT_RUST_NO_ISOLATION=1 disables the per-batch fresh-fork
         // for stateful classes — used only for A/B benchmarks to quantify
         // the parity-vs-perf trade-off.
+        // NOTE: both recycle exits below fire AFTER the batch_done write above,
+        // so Rust has already accounted for this batch (in_flight[slot] is
+        // None). They use the reserved voluntary code so the master forks a
+        // warm replacement WITHOUT emitting slot_died. A bare exit(0)/die()
+        // from test code mid-batch never reaches here (it fires inside the
+        // foreach above, before batch_done), so it correctly reads as a crash.
         if (!empty($plan['force_exit_after']) && !getenv('PHPUNIT_RUST_NO_ISOLATION')) {
-            exit(0);
+            exit(WORKER_EXIT_VOLUNTARY_RECYCLE);
         }
         if ($maxBatches > 0) {
             $batchesProcessed++;
             if ($batchesProcessed >= $maxBatches) {
-                exit(0);
+                exit(WORKER_EXIT_VOLUNTARY_RECYCLE);
             }
         }
     }
