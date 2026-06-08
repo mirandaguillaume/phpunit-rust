@@ -27,11 +27,19 @@ use mago_codex::populator::populate_codebase;
 use mago_codex::reference::SymbolReferences;
 use mago_codex::scanner::scan_program;
 use mago_database::file::{File, FileType};
+use mago_database::file::FileId;
 use mago_names::ResolvedNames;
 use mago_names::resolver::NameResolver;
 use mago_php_version::PHPVersion;
+use mago_span::Span;
 use mago_syntax::ast::Program;
 use mago_syntax::parser::parse_file;
+use mago_word::Word;
+
+/// Decode an interned `Word` (byte-string) into a Rust `String` (lossy).
+pub(crate) fn word_to_string(w: &Word) -> String {
+    String::from_utf8_lossy(w.as_bytes()).into_owned()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -57,6 +65,9 @@ pub struct MagoProject {
     files: Vec<File>,
     /// Lowercased logical-name → index into `files`, for `with_program` lookups.
     file_index: HashMap<String, usize>,
+    /// `FileId` → index into `files`, for resolving a span's file (e.g. a class's
+    /// declaring file from its `span.file_id`).
+    by_file_id: HashMap<FileId, usize>,
 }
 
 impl MagoProject {
@@ -93,6 +104,7 @@ impl MagoProject {
         let mut codebase = CodebaseMetadata::default();
         let mut files = Vec::with_capacity(paths.len());
         let mut file_index = HashMap::with_capacity(paths.len());
+        let mut by_file_id = HashMap::with_capacity(paths.len());
 
         for path in paths {
             let file = File::read(root, &path, FileType::Host).map_err(|e| BridgeError::Io {
@@ -106,8 +118,9 @@ impl MagoProject {
             let meta = scan_program(&arena, &file, program, &resolved, version);
             codebase.extend(meta);
 
-            let logical = String::from_utf8_lossy(&file.name).to_lowercase();
-            file_index.insert(logical, files.len());
+            let idx = files.len();
+            file_index.insert(String::from_utf8_lossy(&file.name).to_lowercase(), idx);
+            by_file_id.insert(file.id, idx);
             files.push(file);
             // `arena`, `program`, `resolved` dropped here — `meta` was owned.
         }
@@ -121,7 +134,13 @@ impl MagoProject {
             Default::default(),
         );
 
-        Ok(Self { codebase, files, file_index })
+        Ok(Self { codebase, files, file_index, by_file_id })
+    }
+
+    /// The `File` a span belongs to (e.g. a class's declaring file from `span.file_id`).
+    pub(crate) fn file_of_span(&self, span: &Span) -> Option<&File> {
+        let idx = *self.by_file_id.get(&span.file_id)?;
+        Some(&self.files[idx])
     }
 
     /// Version string of the mago series we are bridging.

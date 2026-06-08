@@ -36,6 +36,7 @@ mago-syntax      = "1.30"
 mago-span        = "1.30"
 mago-php-version = "1.30"
 mago-names       = "1.30"
+mago-word        = "1.30"
 bumpalo          = "3"
 
 [dev-dependencies]
