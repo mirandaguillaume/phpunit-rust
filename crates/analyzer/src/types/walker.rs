@@ -76,11 +76,13 @@ use std::path::PathBuf;
 
 use super::env::TypeEnv;
 use super::type_repr::Type;
-use mago_interner::ThreadedInterner;
-use mago_reflection::class_like::property::PropertyReflection;
-use mago_reflection::class_like::ClassLikeReflection;
-use mago_reflection::function_like::FunctionLikeReflection;
-use mago_reflection::r#type::kind::{ObjectTypeKind, TypeKind};
+use crate::mago_bridge::word_to_string;
+use mago_codex::metadata::function_like::FunctionLikeMetadata;
+use mago_codex::symbol::SymbolKind;
+use mago_codex::ttype::atomic::TAtomic;
+use mago_codex::ttype::atomic::object::TObject;
+use mago_codex::ttype::union::TUnion;
+use mago_names::ResolvedNames;
 use mago_span::HasSpan;
 use mago_syntax::ast::access::Access;
 use mago_syntax::ast::assignment::Assignment;
@@ -113,10 +115,12 @@ pub struct CallSiteEvent {
 
 // ── WalkerCtx ─────────────────────────────────────────────────────────────────
 
-/// Walker context: env + interner + project + accumulated events.
-pub struct WalkerCtx<'a> {
+/// Walker context: env + project (codebase) + accumulated events.
+///
+/// `'a` is the borrow of the project and the resolved-names table; `'arena` is
+/// the AST/`ResolvedNames` arena lifetime (mago 1.30 arena allocation).
+pub struct WalkerCtx<'a, 'arena> {
     pub env: TypeEnv,
-    pub interner: &'a ThreadedInterner,
     pub project: &'a crate::mago_bridge::MagoProject,
     pub events: Vec<CallSiteEvent>,
     /// Narrowings collected when walking the most recent conditional expression.
@@ -124,9 +128,9 @@ pub struct WalkerCtx<'a> {
     pub pending_narrowings: Vec<crate::types::narrowing::Narrowing>,
     /// Name resolution table for the current module's Program.
     /// Maps identifier byte-offsets to their resolved fully-qualified names.
-    /// Consulted by `resolve_class_fqcn` (Task 2.5.2) to translate raw
-    /// identifiers at class-name sites to FQCNs.
-    pub names: mago_names::ResolvedNames,
+    /// Consulted by `resolve_class_fqcn` to translate raw identifiers at
+    /// class-name sites to FQCNs. Borrowed transiently (mago 1.30 arena model).
+    pub names: &'a ResolvedNames<'arena>,
     /// Current AST recursion depth and the bound past which `walk_expression`
     /// / `walk_statement_ctx` bail to `Type::Mixed` instead of recursing.
     /// Guards against stack overflow on pathologically nested untrusted PHP
@@ -140,16 +144,14 @@ pub struct WalkerCtx<'a> {
 /// depth that would overflow a worker thread's stack.
 pub const WALKER_MAX_DEPTH: u32 = 512;
 
-impl<'a> WalkerCtx<'a> {
+impl<'a, 'arena> WalkerCtx<'a, 'arena> {
     pub fn new(
         env: TypeEnv,
-        interner: &'a ThreadedInterner,
         project: &'a crate::mago_bridge::MagoProject,
-        names: mago_names::ResolvedNames,
+        names: &'a ResolvedNames<'arena>,
     ) -> Self {
         Self {
             env,
-            interner,
             project,
             events: Vec::new(),
             pending_narrowings: Vec::new(),
@@ -169,37 +171,32 @@ impl<'a> WalkerCtx<'a> {
 /// Walk a sequence of statements, updating `env` in order.
 ///
 /// Returns nothing — callers query specific variables from `env` afterwards.
-pub fn walk_statements(
+pub fn walk_statements<'arena>(
     env: &mut TypeEnv,
-    interner: &ThreadedInterner,
-    stmts: impl IntoIterator<Item = impl AsRef<Statement>>,
+    stmts: impl IntoIterator<Item = impl AsRef<Statement<'arena>>>,
 ) {
     for stmt in stmts {
-        walk_statement(env, interner, stmt.as_ref());
+        walk_statement(env, stmt.as_ref());
     }
 }
 
 /// Walk a single statement. For expression statements, delegates to
-/// `walk_expression`; other statement kinds are ignored in Task 2.4.
-pub fn walk_statement(env: &mut TypeEnv, interner: &ThreadedInterner, stmt: &Statement) {
+/// `walk_expression_simple`; other statement kinds are ignored.
+pub fn walk_statement(env: &mut TypeEnv, stmt: &Statement) {
     if let Statement::Expression(expr_stmt) = stmt {
-        walk_expression_simple(env, interner, &expr_stmt.expression);
+        walk_expression_simple(env, expr_stmt.expression);
     }
 }
 
-/// Walk an expression with only env + interner (no project/event collection).
+/// Walk an expression with only env (no project/event collection).
 /// Used by the backward-compat helpers in tests.
-pub fn walk_expression_simple(
-    env: &mut TypeEnv,
-    interner: &ThreadedInterner,
-    expr: &Expression,
-) -> Type {
+pub fn walk_expression_simple(env: &mut TypeEnv, expr: &Expression) -> Type {
     match expr {
         Expression::Literal(_) => Type::Mixed,
-        Expression::Variable(v) => walk_variable_simple(env, interner, v),
-        Expression::Parenthesized(p) => walk_expression_simple(env, interner, &p.expression),
-        Expression::Instantiation(inst) => walk_instantiation_simple(env, interner, inst),
-        Expression::Assignment(a) => walk_assignment_simple(env, interner, a),
+        Expression::Variable(v) => walk_variable_simple(env, v),
+        Expression::Parenthesized(p) => walk_expression_simple(env, p.expression),
+        Expression::Instantiation(inst) => walk_instantiation_simple(env, inst),
+        Expression::Assignment(a) => walk_assignment_simple(env, a),
         // Call expressions: without a project we can't resolve return types or
         // emit events, but we do need to keep progressing so assignments like
         // `$x = $obj->method()` work (return Mixed for now).
@@ -208,7 +205,7 @@ pub fn walk_expression_simple(
     }
 }
 
-/// Walk an expression in a full `WalkerCtx` (env + interner + project + events).
+/// Walk an expression in a full `WalkerCtx` (env + project + events).
 ///
 /// Bounds recursion depth: past `ctx.max_depth` nested expressions/statements
 /// it bails to `Type::Mixed` (and stops walking the subtree) so pathologically
@@ -239,17 +236,17 @@ fn walk_expression_inner(ctx: &mut WalkerCtx, expr: &Expression) -> Type {
         // sites reachable only through a match arm still emit events. Match is
         // an expression, so this also covers `$r = match (...) { ... };`.
         Expression::Match(m) => {
-            walk_expression(ctx, &m.expression);
+            walk_expression(ctx, m.expression);
             for arm in m.arms.iter() {
                 match arm {
                     mago_syntax::ast::MatchArm::Expression(a) => {
                         for cond in a.conditions.iter() {
                             walk_expression(ctx, cond);
                         }
-                        walk_expression(ctx, &a.expression);
+                        walk_expression(ctx, a.expression);
                     }
                     mago_syntax::ast::MatchArm::Default(a) => {
-                        walk_expression(ctx, &a.expression);
+                        walk_expression(ctx, a.expression);
                     }
                 }
             }
@@ -261,19 +258,15 @@ fn walk_expression_inner(ctx: &mut WalkerCtx, expr: &Expression) -> Type {
 
 // ── simple (no-project) helpers ───────────────────────────────────────────────
 
-fn walk_variable_simple(env: &mut TypeEnv, interner: &ThreadedInterner, v: &Variable) -> Type {
-    match var_name(interner, v) {
+fn walk_variable_simple(env: &mut TypeEnv, v: &Variable) -> Type {
+    match var_name(v) {
         Some(name) => env.lookup(&name),
         None => Type::Mixed,
     }
 }
 
-fn walk_instantiation_simple(
-    env: &mut TypeEnv,
-    interner: &ThreadedInterner,
-    inst: &Instantiation,
-) -> Type {
-    match inst.class.as_ref() {
+fn walk_instantiation_simple(env: &mut TypeEnv, inst: &Instantiation) -> Type {
+    match inst.class {
         Expression::Self_(_) => match env.enclosing_class() {
             Some(cls) => Type::SelfRef(cls.to_string()),
             None => Type::Mixed,
@@ -283,17 +276,19 @@ fn walk_instantiation_simple(
             None => Type::Mixed,
         },
         Expression::Parent(_) => Type::Mixed,
-        Expression::Identifier(id) => Type::Class(interner.lookup(id.value()).to_string()),
+        Expression::Identifier(id) => {
+            Type::Class(String::from_utf8_lossy(id.value()).into_owned())
+        }
         _ => Type::Mixed,
     }
 }
 
-fn walk_assignment_simple(env: &mut TypeEnv, interner: &ThreadedInterner, a: &Assignment) -> Type {
-    let rhs_type = walk_expression_simple(env, interner, &a.rhs);
+fn walk_assignment_simple(env: &mut TypeEnv, a: &Assignment) -> Type {
+    let rhs_type = walk_expression_simple(env, a.rhs);
     use mago_syntax::ast::assignment::AssignmentOperator;
     if matches!(a.operator, AssignmentOperator::Assign(_)) {
-        if let Expression::Variable(v) = a.lhs.as_ref() {
-            if let Some(name) = var_name(interner, v) {
+        if let Expression::Variable(v) = a.lhs {
+            if let Some(name) = var_name(v) {
                 env.set(name, rhs_type.clone());
             }
         }
@@ -304,14 +299,14 @@ fn walk_assignment_simple(env: &mut TypeEnv, interner: &ThreadedInterner, a: &As
 // ── ctx helpers ───────────────────────────────────────────────────────────────
 
 fn walk_variable(ctx: &mut WalkerCtx, v: &Variable) -> Type {
-    match var_name(ctx.interner, v) {
+    match var_name(v) {
         Some(name) => ctx.env.lookup(&name),
         None => Type::Mixed,
     }
 }
 
 fn walk_parenthesized(ctx: &mut WalkerCtx, p: &Parenthesized) -> Type {
-    walk_expression(ctx, &p.expression)
+    walk_expression(ctx, p.expression)
 }
 
 fn walk_instantiation(ctx: &mut WalkerCtx, inst: &Instantiation) -> Type {
@@ -320,7 +315,7 @@ fn walk_instantiation(ctx: &mut WalkerCtx, inst: &Instantiation) -> Type {
         walk_argument_list(ctx, arg_list);
     }
 
-    let class_type = match inst.class.as_ref() {
+    let class_type = match inst.class {
         Expression::Self_(_) => match ctx.env.enclosing_class() {
             Some(cls) => Type::SelfRef(cls.to_string()),
             None => Type::Mixed,
@@ -352,8 +347,7 @@ fn walk_instantiation(ctx: &mut WalkerCtx, inst: &Instantiation) -> Type {
     // constructor body (Phase 2: instantiation tracing).
     if !matches!(class_type, Type::Mixed) {
         let line = line_of_span(ctx, inst.span());
-        let (callee_class, callee_file) =
-            resolve_callee(ctx.project, ctx.interner, &class_type, &ctx.env);
+        let (callee_class, callee_file) = resolve_callee(ctx.project, &class_type, &ctx.env);
         ctx.emit(CallSiteEvent {
             line,
             receiver: class_type.clone(),
@@ -367,11 +361,11 @@ fn walk_instantiation(ctx: &mut WalkerCtx, inst: &Instantiation) -> Type {
 }
 
 fn walk_assignment(ctx: &mut WalkerCtx, a: &Assignment) -> Type {
-    let rhs_type = walk_expression(ctx, &a.rhs);
+    let rhs_type = walk_expression(ctx, a.rhs);
     use mago_syntax::ast::assignment::AssignmentOperator;
     if matches!(a.operator, AssignmentOperator::Assign(_)) {
-        if let Expression::Variable(v) = a.lhs.as_ref() {
-            if let Some(name) = var_name(ctx.interner, v) {
+        if let Expression::Variable(v) = a.lhs {
+            if let Some(name) = var_name(v) {
                 ctx.env.set(name, rhs_type.clone());
             }
         }
@@ -392,24 +386,17 @@ fn walk_call(ctx: &mut WalkerCtx, call: &Call) -> Type {
 
 fn walk_method_call(ctx: &mut WalkerCtx, call: &MethodCall) -> Type {
     // Walk receiver to get its type (and propagate any nested call events).
-    let recv_type = walk_expression(ctx, &call.object);
+    let recv_type = walk_expression(ctx, call.object);
 
     // Extract static method name, fall through to Mixed for dynamic selectors.
-    let method_name = match selector_name(ctx.interner, &call.method) {
+    let method_name = match selector_name(&call.method) {
         Some(n) => n,
         None => return walk_args_and_return_mixed(ctx, &call.argument_list),
     };
 
     let line = line_of_span(ctx, call.object.span().join(call.argument_list.span()));
-    let (callee_class, callee_file) =
-        resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
-    let return_type = lookup_return_type(
-        ctx.project,
-        ctx.interner,
-        &recv_type,
-        &method_name,
-        &ctx.env,
-    );
+    let (callee_class, callee_file) = resolve_callee(ctx.project, &recv_type, &ctx.env);
+    let return_type = lookup_return_type(ctx.project, &recv_type, &method_name, &ctx.env);
 
     // Walk arguments for side effects (nested calls).
     walk_argument_list(ctx, &call.argument_list);
@@ -427,23 +414,16 @@ fn walk_method_call(ctx: &mut WalkerCtx, call: &MethodCall) -> Type {
 
 fn walk_null_safe_method_call(ctx: &mut WalkerCtx, call: &NullSafeMethodCall) -> Type {
     // Same logic as method call — nullable operator doesn't change type resolution.
-    let recv_type = walk_expression(ctx, &call.object);
+    let recv_type = walk_expression(ctx, call.object);
 
-    let method_name = match selector_name(ctx.interner, &call.method) {
+    let method_name = match selector_name(&call.method) {
         Some(n) => n,
         None => return walk_args_and_return_mixed(ctx, &call.argument_list),
     };
 
     let line = line_of_span(ctx, call.object.span().join(call.argument_list.span()));
-    let (callee_class, callee_file) =
-        resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
-    let return_type = lookup_return_type(
-        ctx.project,
-        ctx.interner,
-        &recv_type,
-        &method_name,
-        &ctx.env,
-    );
+    let (callee_class, callee_file) = resolve_callee(ctx.project, &recv_type, &ctx.env);
+    let return_type = lookup_return_type(ctx.project, &recv_type, &method_name, &ctx.env);
 
     walk_argument_list(ctx, &call.argument_list);
 
@@ -462,7 +442,7 @@ fn walk_static_method_call(ctx: &mut WalkerCtx, call: &StaticMethodCall) -> Type
     // The "class" expression for `ClassName::method()` is typically an Identifier.
     // `Expression::Identifier` is not handled by `walk_expression` (it falls through
     // to Mixed), so we resolve it here via FQCN lookup before falling back.
-    let class_type = match call.class.as_ref() {
+    let class_type = match call.class {
         Expression::Self_(_) => match ctx.env.enclosing_class() {
             Some(cls) => Type::SelfRef(cls.to_string()),
             None => Type::Mixed,
@@ -487,24 +467,17 @@ fn walk_static_method_call(ctx: &mut WalkerCtx, call: &StaticMethodCall) -> Type
                 _ => Type::Class(class_name),
             }
         }
-        _ => walk_expression(ctx, &call.class),
+        _ => walk_expression(ctx, call.class),
     };
 
-    let method_name = match selector_name(ctx.interner, &call.method) {
+    let method_name = match selector_name(&call.method) {
         Some(n) => n,
         None => return walk_args_and_return_mixed(ctx, &call.argument_list),
     };
 
     let line = line_of_span(ctx, call.class.span().join(call.argument_list.span()));
-    let (callee_class, callee_file) =
-        resolve_callee(ctx.project, ctx.interner, &class_type, &ctx.env);
-    let return_type = lookup_return_type(
-        ctx.project,
-        ctx.interner,
-        &class_type,
-        &method_name,
-        &ctx.env,
-    );
+    let (callee_class, callee_file) = resolve_callee(ctx.project, &class_type, &ctx.env);
+    let return_type = lookup_return_type(ctx.project, &class_type, &method_name, &ctx.env);
 
     walk_argument_list(ctx, &call.argument_list);
 
@@ -522,17 +495,15 @@ fn walk_static_method_call(ctx: &mut WalkerCtx, call: &StaticMethodCall) -> Type
 fn walk_function_call(ctx: &mut WalkerCtx, call: &FunctionCall) -> Type {
     // Invokable object: $obj($args) is sugar for $obj->__invoke($args).
     // When the callee is a variable holding a class type, emit a __invoke call site.
-    if let Expression::Variable(_) = call.function.as_ref() {
-        let recv_type = walk_expression(ctx, &call.function);
+    if let Expression::Variable(_) = call.function {
+        let recv_type = walk_expression(ctx, call.function);
         if matches!(
             recv_type,
             Type::Class(_) | Type::SelfRef(_) | Type::StaticRef(_) | Type::This | Type::Nullable(_)
         ) {
             let line = line_of_span(ctx, call.function.span().join(call.argument_list.span()));
-            let (callee_class, callee_file) =
-                resolve_callee(ctx.project, ctx.interner, &recv_type, &ctx.env);
-            let return_type =
-                lookup_return_type(ctx.project, ctx.interner, &recv_type, "__invoke", &ctx.env);
+            let (callee_class, callee_file) = resolve_callee(ctx.project, &recv_type, &ctx.env);
+            let return_type = lookup_return_type(ctx.project, &recv_type, "__invoke", &ctx.env);
             walk_argument_list(ctx, &call.argument_list);
             ctx.emit(CallSiteEvent {
                 line,
@@ -548,8 +519,8 @@ fn walk_function_call(ctx: &mut WalkerCtx, call: &FunctionCall) -> Type {
     // For top-level function calls we only walk arguments for side effects.
     // Function return-type lookup via mago-reflection (function_like_reflections)
     // is deferred to a later task; emit a minimal event with no receiver.
-    let fn_name = match call.function.as_ref() {
-        Expression::Identifier(id) => ctx.interner.lookup(id.value()).to_string(),
+    let fn_name = match call.function {
+        Expression::Identifier(id) => String::from_utf8_lossy(id.value()).into_owned(),
         _ => {
             walk_args_and_return_mixed(ctx, &call.argument_list);
             return Type::Mixed;
@@ -577,8 +548,8 @@ fn walk_function_call(ctx: &mut WalkerCtx, call: &FunctionCall) -> Type {
 fn walk_access(ctx: &mut WalkerCtx, access: &Access) -> Type {
     match access {
         Access::Property(prop) => {
-            let recv_type = walk_expression(ctx, &prop.object);
-            let prop_name = match selector_name(ctx.interner, &prop.property) {
+            let recv_type = walk_expression(ctx, prop.object);
+            let prop_name = match selector_name(&prop.property) {
                 Some(n) => n,
                 None => return Type::Mixed,
             };
@@ -586,8 +557,8 @@ fn walk_access(ctx: &mut WalkerCtx, access: &Access) -> Type {
         }
         Access::NullSafeProperty(prop) => {
             // Treat nullable-safe access the same as regular in Phase 2.
-            let recv_type = walk_expression(ctx, &prop.object);
-            let prop_name = match selector_name(ctx.interner, &prop.property) {
+            let recv_type = walk_expression(ctx, prop.object);
+            let prop_name = match selector_name(&prop.property) {
                 Some(n) => n,
                 None => return Type::Mixed,
             };
@@ -612,14 +583,12 @@ fn walk_class_constant_access(
 
     // Check whether the constant selector is the magic `class` keyword.
     let is_class_literal = match &cca.constant {
-        ClassLikeConstantSelector::Identifier(id) => {
-            ctx.interner.lookup(&id.value).to_lowercase() == "class"
-        }
-        ClassLikeConstantSelector::Expression(_) => false,
+        ClassLikeConstantSelector::Identifier(id) => name_to_lower(id.value) == "class",
+        ClassLikeConstantSelector::Expression(_) | ClassLikeConstantSelector::Missing(_) => false,
     };
 
     if is_class_literal {
-        if let Expression::Identifier(id) = cca.class.as_ref() {
+        if let Expression::Identifier(id) = cca.class {
             return Type::Class(resolve_class_fqcn(ctx, id));
         }
     }
@@ -634,8 +603,8 @@ fn walk_binary(ctx: &mut WalkerCtx, b: &Binary) -> Type {
         walk_instanceof(ctx, b)
     } else {
         // Walk both sides for side-effects (nested call sites, assignments).
-        walk_expression(ctx, &b.lhs);
-        walk_expression(ctx, &b.rhs);
+        walk_expression(ctx, b.lhs);
+        walk_expression(ctx, b.rhs);
         Type::Mixed
     }
 }
@@ -647,18 +616,18 @@ fn walk_binary(ctx: &mut WalkerCtx, b: &Binary) -> Type {
 /// (we don't model the bool result in Phase 2).
 fn walk_instanceof(ctx: &mut WalkerCtx, b: &Binary) -> Type {
     // Walk subject for side effects.
-    let _subject_type = walk_expression(ctx, &b.lhs);
+    let _subject_type = walk_expression(ctx, b.lhs);
 
     // Only narrow when subject is a simple direct variable.
-    let var = match b.lhs.as_ref() {
+    let var = match b.lhs {
         Expression::Variable(mago_syntax::ast::variable::Variable::Direct(dv)) => {
-            ctx.interner.lookup(&dv.name).to_string()
+            String::from_utf8_lossy(dv.name).into_owned()
         }
         _ => return Type::Mixed,
     };
 
     // Extract class name from RHS: Identifier or Self_/Static keywords.
-    let class_type: Type = match b.rhs.as_ref() {
+    let class_type: Type = match b.rhs {
         Expression::Identifier(id) => {
             let name = resolve_class_fqcn(ctx, id);
             match name.to_lowercase().as_str() {
@@ -718,110 +687,91 @@ fn resolve_property_type(ctx: &WalkerCtx, recv_type: &Type, prop_name: &str) -> 
     if fqcn.is_empty() {
         return Type::Mixed;
     }
-    lookup_property_type(ctx.project, ctx.interner, &fqcn, prop_name)
+    lookup_property_type(ctx.project, &fqcn, prop_name)
 }
 
 /// Walk the inheritance chain to find the declared type of a property.
 ///
-/// Properties in `MemeberCollection.members` are keyed by the raw variable
-/// `StringIdentifier` including the leading `$` (e.g., key is `"$repo"` for
-/// `private Repo $repo`). However, in the AST `$this->repo` the property selector
-/// gives `"repo"` (no `$`). We therefore match with a `$`-prefix added.
+/// Codex `ClassLikeMetadata.properties` is a `WordMap<PropertyMetadata>` keyed
+/// by the variable name including the leading `$` (e.g., `"$repo"`). The AST
+/// selector `$this->repo` gives `"repo"` (no `$`), so we match either form.
 ///
-/// Constructor-promoted properties (`private Repo $repo` in `__construct`) are
-/// NOT stored in `properties.members`; they only appear as parameters in the
-/// `__construct` method reflection. We fall back to scanning `__construct`
-/// parameters when the direct lookup misses.
+/// Constructor-promoted properties may also surface as `__construct` parameters;
+/// we fall back to scanning them (via `codebase.get_method`) when the direct
+/// property lookup misses.
 fn lookup_property_type(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
     fqcn: &str,
     property_name: &str,
 ) -> Type {
-    // The key in properties.members includes the leading `$` (raw DirectVariable name),
-    // but the property selector from `$this->prop` gives "prop" without `$`.
-    // Build both forms so we can match either.
     let key_with_dollar = format!("${}", property_name);
     let key_plain = property_name.to_string();
+    let codebase = project.codebase();
 
-    let mut current = Some(fqcn.to_lowercase());
+    let mut current = Some(fqcn.trim_start_matches('\\').to_lowercase());
     for _ in 0..50 {
         let Some(class_fqcn) = current.take() else {
             return Type::Mixed;
         };
 
-        let Some(refl) = project.find_class_reflection(&class_fqcn) else {
+        let Some(refl) = project.find_class(&class_fqcn) else {
             return Type::Mixed;
         };
 
-        // 1. Check plain declared properties.
-        for (id, prop_refl) in refl.properties.members.iter() {
-            let raw = interner.lookup(id);
-            // raw is the interned variable name, e.g. "$repo" or "repo" (try both).
+        // 1. Check declared properties (keyed by `$name`).
+        for (id, prop_refl) in refl.properties.iter() {
+            let raw = word_to_string(id);
             if raw == key_with_dollar || raw == key_plain {
-                return reflect_property_type(project, interner, prop_refl);
+                return reflect_property_type(project, prop_refl);
             }
         }
 
         // 2. Fall back: check __construct promoted properties.
-        // Methods are keyed by lowercase StringIdentifier; look up by iterating since
-        // `interner.get` may not have "__construct" if it wasn't interned by this interner.
-        let construct_refl = refl.methods.members.iter().find_map(|(mid, m)| {
-            let name = interner.lookup(mid);
-            if name == "__construct" {
-                Some(m)
-            } else {
-                None
-            }
-        });
-        if let Some(ctor) = construct_refl {
+        if let Some(ctor) = codebase.get_method(class_fqcn.as_bytes(), b"__construct") {
             for param in &ctor.parameters {
-                if !param.is_promoted_property {
-                    continue;
-                }
-                // param.name is the StringIdentifier for the variable (includes `$`).
-                let raw_param = interner.lookup(&param.name);
+                let raw_param = word_to_string(&param.name.0);
                 if raw_param == key_with_dollar || raw_param == key_plain {
-                    let Some(t_refl) = param.type_reflection.as_ref() else {
-                        return Type::Mixed;
+                    return match param.type_metadata.as_ref() {
+                        Some(t) => type_union_to_type(project, &t.type_union, &TypeEnv::default()),
+                        None => Type::Mixed,
                     };
-                    return type_kind_to_type(project, interner, &t_refl.kind, &TypeEnv::default());
                 }
             }
         }
 
         // Climb to parent.
         current = refl
-            .inheritance
-            .direct_extended_class
+            .direct_parent_class
             .as_ref()
-            .map(|n| interner.lookup(&n.value).to_string().to_lowercase());
+            .map(|n| word_to_string(n).trim_start_matches('\\').to_lowercase());
     }
     Type::Mixed
 }
 
-/// Convert a `PropertyReflection`'s declared type into our `Type`.
+/// Convert a `PropertyMetadata`'s declared type into our `Type`.
 fn reflect_property_type(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
-    prop_refl: &PropertyReflection,
+    prop_refl: &mago_codex::metadata::property::PropertyMetadata,
 ) -> Type {
-    let Some(t_refl) = prop_refl.type_reflection.as_ref() else {
+    let Some(t) = prop_refl.type_metadata.as_ref() else {
         return Type::Mixed;
     };
-    type_kind_to_type(project, interner, &t_refl.kind, &TypeEnv::default())
+    type_union_to_type(project, &t.type_union, &TypeEnv::default())
 }
 
 // ── Resolution helpers ────────────────────────────────────────────────────────
 
 /// Extract an identifier name from a `ClassLikeMemberSelector`.
 /// Returns `None` for dynamic (`Variable`/`Expression`) selectors.
-fn selector_name(interner: &ThreadedInterner, sel: &ClassLikeMemberSelector) -> Option<String> {
+fn selector_name(sel: &ClassLikeMemberSelector) -> Option<String> {
     match sel {
-        // `ClassLikeMemberSelector::Identifier(LocalIdentifier { value: StringIdentifier })`.
-        ClassLikeMemberSelector::Identifier(id) => Some(interner.lookup(&id.value).to_string()),
-        // Dynamic selector — can't statically resolve.
-        ClassLikeMemberSelector::Variable(_) | ClassLikeMemberSelector::Expression(_) => None,
+        ClassLikeMemberSelector::Identifier(id) => {
+            Some(String::from_utf8_lossy(id.value).into_owned())
+        }
+        // Dynamic / missing selector — can't statically resolve.
+        ClassLikeMemberSelector::Variable(_)
+        | ClassLikeMemberSelector::Expression(_)
+        | ClassLikeMemberSelector::Missing(_) => None,
     }
 }
 
@@ -830,8 +780,8 @@ fn walk_argument_list(ctx: &mut WalkerCtx, arg_list: &mago_syntax::ast::argument
     use mago_syntax::ast::argument::Argument;
     for arg in arg_list.arguments.iter() {
         let expr = match arg {
-            Argument::Positional(a) => &a.value,
-            Argument::Named(a) => &a.value,
+            Argument::Positional(a) => a.value,
+            Argument::Named(a) => a.value,
         };
         walk_expression(ctx, expr);
     }
@@ -856,7 +806,6 @@ fn walk_args_and_return_mixed(
 /// `(None, None)` for unresolvable receivers (Mixed, Union, etc.).
 fn resolve_callee(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
     recv_type: &Type,
     env: &TypeEnv,
 ) -> (Option<String>, Option<PathBuf>) {
@@ -864,7 +813,7 @@ fn resolve_callee(
         Type::Class(c) | Type::SelfRef(c) | Type::StaticRef(c) => Some(c.clone()),
         Type::This => env.enclosing_class().map(|c| c.to_string()),
         // Nullable: recurse into the inner type.
-        Type::Nullable(inner) => return resolve_callee(project, interner, inner, env),
+        Type::Nullable(inner) => return resolve_callee(project, inner, env),
         // Interface/Mock carry a name but are like Class for resolution purposes.
         Type::Interface(c) | Type::Mock(c) => Some(c.clone()),
         Type::Mixed | Type::Union(_, _) => None,
@@ -874,28 +823,30 @@ fn resolve_callee(
         return (None, None);
     };
 
-    // Find the class-like reflection whose name matches the FQCN (case-insensitive,
-    // PHP class names are case-insensitive).
-    let file = project.find_class_reflection(&fqcn).and_then(|refl| {
-        // The source path is stored as the interned `name` string passed to
-        // `Source::standalone` (= the file path from `path.display()`).
-        // `source.path` is None for standalone sources; use identifier.0 instead.
-        let src_id = refl.span.start.source;
-        project.source_by_id(src_id).map(|src| {
-            let name_str = interner.lookup(&src.identifier.0).to_string();
-            PathBuf::from(name_str)
-        })
-    });
+    // Find the class-like metadata whose name matches the FQCN (case-insensitive,
+    // PHP class names are case-insensitive), then resolve its declaring file.
+    let file = project
+        .find_class(&fqcn)
+        .and_then(|refl| project.file_of_span(&refl.span))
+        .map(file_path_of);
 
     (Some(fqcn), file)
 }
 
-/// Look up the declared return type of a method via mago-reflection.
+/// Resolve a loaded `File` to its on-disk path (falls back to logical name).
+fn file_path_of(file: &mago_database::file::File) -> PathBuf {
+    match &file.path {
+        Some(p) => p.clone(),
+        None => PathBuf::from(String::from_utf8_lossy(&file.name).into_owned()),
+    }
+}
+
+/// Look up the declared return type of a method via the codex metadata.
 ///
 /// Returns `Type::Mixed` when the class, method, or return type is not found.
+/// `codebase.get_method` resolves the method through the inheritance chain.
 fn lookup_return_type(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
     recv_type: &Type,
     method: &str,
     env: &TypeEnv,
@@ -906,7 +857,7 @@ fn lookup_return_type(
             .enclosing_class()
             .map(|c| c.to_string())
             .unwrap_or_default(),
-        Type::Nullable(inner) => return lookup_return_type(project, interner, inner, method, env),
+        Type::Nullable(inner) => return lookup_return_type(project, inner, method, env),
         Type::Interface(c) | Type::Mock(c) => c.clone(),
         _ => return Type::Mixed,
     };
@@ -914,49 +865,37 @@ fn lookup_return_type(
         return Type::Mixed;
     }
 
-    // O(1) index lookup (case-insensitive) — replaces an O(n) scan over all
-    // class reflections that re-lowercased every FQCN on each call site.
-    let class_refl: &ClassLikeReflection = match project.find_class_reflection(&fqcn) {
-        Some(r) => r,
-        None => return Type::Mixed,
+    let class_key = fqcn.trim_start_matches('\\').to_lowercase();
+    let method_lc = method.to_lowercase();
+    let codebase = project.codebase();
+    let Some(m_refl) = codebase.get_method(class_key.as_bytes(), method_lc.as_bytes()) else {
+        return Type::Mixed;
     };
 
-    // Methods are keyed by interned lowercase string in mago-reflection
-    // (mago normalises method names to lowercase for case-insensitive PHP).
-    let method_lc = method.to_lowercase();
-    for (id, m_refl) in class_refl.methods.members.iter() {
-        let name = interner.lookup(id);
-        if name == method_lc {
-            let declared = reflect_return_type(project, interner, m_refl, env);
-            // When the declared return is an interface, inspect the method body
-            // for a more concrete type (e.g. `return new Foo()` or a factory
-            // call whose declared return is a concrete class).
-            if matches!(declared, Type::Interface(_)) {
-                if let Some(narrowed) =
-                    narrow_return_type_from_body(project, interner, &fqcn, &method_lc, m_refl, env)
-                {
-                    return narrowed;
-                }
-            }
-            return declared;
+    let declared = reflect_return_type(project, m_refl, env);
+    // When the declared return is an interface, inspect the method body for a
+    // more concrete type (e.g. `return new Foo()` or a factory call whose
+    // declared return is a concrete class).
+    if matches!(declared, Type::Interface(_)) {
+        if let Some(narrowed) =
+            narrow_return_type_from_body(project, &fqcn, &method_lc, m_refl, env)
+        {
+            return narrowed;
         }
     }
-    Type::Mixed
+    declared
 }
 
 /// Convert a method's declared return type into our `Type`.
 fn reflect_return_type(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
-    method_refl: &FunctionLikeReflection,
+    method_refl: &FunctionLikeMetadata,
     env: &TypeEnv,
 ) -> Type {
-    // `return_type_reflection: Option<FunctionLikeReturnTypeReflection>`
-    // `FunctionLikeReturnTypeReflection.type_reflection.kind: TypeKind`
-    let Some(rt) = method_refl.return_type_reflection.as_ref() else {
+    let Some(rt) = method_refl.return_type_metadata.as_ref() else {
         return Type::Mixed;
     };
-    type_kind_to_type(project, interner, &rt.type_reflection.kind, env)
+    type_union_to_type(project, &rt.type_union, env)
 }
 
 // ── Return-type narrowing from method body ────────────────────────────────────
@@ -971,66 +910,66 @@ fn reflect_return_type(
 /// prevents cycles while still piercing one layer of factory indirection.
 fn narrow_return_type_from_body(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
     class_fqcn: &str,
     method_lc: &str,
-    method_refl: &FunctionLikeReflection,
+    method_refl: &FunctionLikeMetadata,
     env: &TypeEnv,
 ) -> Option<Type> {
-    let src = project.source_by_id(method_refl.span.start.source)?;
-    let program = project.get_or_parse(src);
-    let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
-
+    // Re-parse the file declaring the method into a scratch arena and inspect
+    // its return statements; the AST is arena-bound so the analysis runs inside
+    // the `with_program` closure and only the owned `Type` escapes.
+    let file = project.file_of_span(&method_refl.span)?;
+    let logical_name = String::from_utf8_lossy(&file.name).into_owned();
     let simple = class_fqcn.rsplit('\\').next().unwrap_or(class_fqcn);
-    let block = find_method_block_in_stmts(program.statements.iter(), simple, method_lc, interner)?;
 
-    let return_types: Vec<Type> = block
-        .statements
-        .iter()
-        .filter_map(|stmt| {
-            if let Statement::Return(ret) = stmt {
-                ret.value
-                    .as_ref()
-                    .map(|expr| narrow_expr_type(expr, project, interner, &names, class_fqcn, env))
-            } else {
-                None
-            }
-        })
-        .collect();
+    project.with_program(&logical_name, |program, _file, names| {
+        let block = find_method_block_in_stmts(program.statements.iter(), simple, method_lc)?;
 
-    if return_types.is_empty() {
-        return None;
-    }
-    let first = &return_types[0];
-    if matches!(first, Type::Class(_)) && return_types.iter().all(|t| t == first) {
-        Some(first.clone())
-    } else {
-        None
-    }
+        let return_types: Vec<Type> = block
+            .statements
+            .iter()
+            .filter_map(|stmt| {
+                if let Statement::Return(ret) = stmt {
+                    ret.value
+                        .map(|expr| narrow_expr_type(expr, project, names, class_fqcn, env))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if return_types.is_empty() {
+            return None;
+        }
+        let first = &return_types[0];
+        if matches!(first, Type::Class(_)) && return_types.iter().all(|t| t == first) {
+            Some(first.clone())
+        } else {
+            None
+        }
+    })?
 }
 
 /// Walk `stmts` to find a concrete method body block by class simple-name and
 /// method name. Descends into namespace wrappers.
-fn find_method_block_in_stmts<'a>(
-    stmts: impl Iterator<Item = &'a Statement>,
+fn find_method_block_in_stmts<'s, 'arena>(
+    stmts: impl Iterator<Item = &'s Statement<'arena>>,
     class_simple: &str,
     method_lc: &str,
-    interner: &ThreadedInterner,
-) -> Option<&'a Block> {
+) -> Option<&'s Block<'arena>>
+where
+    'arena: 's,
+{
     use mago_syntax::ast::class_like::member::ClassLikeMember;
     use mago_syntax::ast::class_like::method::MethodBody;
     use mago_syntax::ast::namespace::NamespaceBody;
 
     for stmt in stmts {
         match stmt {
-            Statement::Class(c)
-                if interner
-                    .lookup(&c.name.value)
-                    .eq_ignore_ascii_case(class_simple) =>
-            {
+            Statement::Class(c) if name_eq_ignore_case(c.name.value, class_simple) => {
                 for member in c.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                        if name_to_lower(m.name.value) == method_lc {
                             if let MethodBody::Concrete(block) = &m.body {
                                 return Some(block);
                             }
@@ -1039,14 +978,10 @@ fn find_method_block_in_stmts<'a>(
                 }
                 return None;
             }
-            Statement::Trait(t)
-                if interner
-                    .lookup(&t.name.value)
-                    .eq_ignore_ascii_case(class_simple) =>
-            {
+            Statement::Trait(t) if name_eq_ignore_case(t.name.value, class_simple) => {
                 for member in t.members.iter() {
                     if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() == method_lc {
+                        if name_to_lower(m.name.value) == method_lc {
                             if let MethodBody::Concrete(block) = &m.body {
                                 return Some(block);
                             }
@@ -1057,18 +992,12 @@ fn find_method_block_in_stmts<'a>(
             }
             Statement::Namespace(ns) => {
                 let found = match &ns.body {
-                    NamespaceBody::Implicit(b) => find_method_block_in_stmts(
-                        b.statements.iter(),
-                        class_simple,
-                        method_lc,
-                        interner,
-                    ),
-                    NamespaceBody::BraceDelimited(b) => find_method_block_in_stmts(
-                        b.statements.iter(),
-                        class_simple,
-                        method_lc,
-                        interner,
-                    ),
+                    NamespaceBody::Implicit(b) => {
+                        find_method_block_in_stmts(b.statements.iter(), class_simple, method_lc)
+                    }
+                    NamespaceBody::BraceDelimited(b) => {
+                        find_method_block_in_stmts(b.statements.iter(), class_simple, method_lc)
+                    }
                 };
                 if found.is_some() {
                     return found;
@@ -1089,15 +1018,14 @@ fn find_method_block_in_stmts<'a>(
 fn narrow_expr_type(
     expr: &Expression,
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
-    names: &mago_names::ResolvedNames,
+    names: &ResolvedNames,
     class_fqcn: &str,
     env: &TypeEnv,
 ) -> Type {
     match expr {
         Expression::Instantiation(inst) => {
-            let class_name = match inst.class.as_ref() {
-                Expression::Identifier(id) => narrow_resolve_fqcn(interner, names, id),
+            let class_name = match inst.class {
+                Expression::Identifier(id) => narrow_resolve_fqcn(names, id),
                 Expression::Self_(_) => class_fqcn.to_string(),
                 _ => return Type::Mixed,
             };
@@ -1108,45 +1036,49 @@ fn narrow_expr_type(
             }
         }
         Expression::Call(Call::StaticMethod(smc)) => {
-            let class_name = match smc.class.as_ref() {
-                Expression::Identifier(id) => narrow_resolve_fqcn(interner, names, id),
+            let class_name = match smc.class {
+                Expression::Identifier(id) => narrow_resolve_fqcn(names, id),
                 Expression::Self_(_) | Expression::Static(_) => class_fqcn.to_string(),
                 _ => return Type::Mixed,
             };
-            let method_name = match selector_name(interner, &smc.method) {
+            let method_name = match selector_name(&smc.method) {
                 Some(n) => n,
                 None => return Type::Mixed,
             };
             let method_lc = method_name.to_lowercase();
-            let Some(class_refl) = project.find_class_reflection(&class_name) else {
-                return Type::Mixed;
-            };
-            for (id, m_refl) in class_refl.methods.members.iter() {
-                if interner.lookup(id) == method_lc {
-                    return reflect_return_type(project, interner, m_refl, env);
-                }
+            let class_key = class_name.trim_start_matches('\\').to_lowercase();
+            match project
+                .codebase()
+                .get_method(class_key.as_bytes(), method_lc.as_bytes())
+            {
+                Some(m_refl) => reflect_return_type(project, m_refl, env),
+                None => Type::Mixed,
             }
-            Type::Mixed
         }
         Expression::Parenthesized(p) => {
-            narrow_expr_type(&p.expression, project, interner, names, class_fqcn, env)
+            narrow_expr_type(p.expression, project, names, class_fqcn, env)
         }
         _ => Type::Mixed,
     }
 }
 
-fn narrow_resolve_fqcn(
-    interner: &ThreadedInterner,
-    names: &mago_names::ResolvedNames,
-    id: &mago_syntax::ast::Identifier,
-) -> String {
-    use mago_span::HasSpan;
+fn narrow_resolve_fqcn(names: &ResolvedNames, id: &mago_syntax::ast::Identifier) -> String {
     let fqcn = if names.contains(&id.span().start) {
-        interner.lookup(names.get(id)).to_string()
+        String::from_utf8_lossy(names.get(id)).into_owned()
     } else {
-        interner.lookup(id.value()).to_string()
+        String::from_utf8_lossy(id.value()).into_owned()
     };
     fqcn.trim_start_matches('\\').to_string()
+}
+
+/// Case-insensitive compare an AST identifier's raw bytes against a `&str`.
+fn name_eq_ignore_case(bytes: &[u8], s: &str) -> bool {
+    String::from_utf8_lossy(bytes).eq_ignore_ascii_case(s)
+}
+
+/// Lowercase an AST identifier's raw bytes into an owned `String`.
+fn name_to_lower(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_lowercase()
 }
 
 /// Convert a `TypeKind` from mago-reflection into our `Type` enum.
@@ -1161,98 +1093,107 @@ fn narrow_resolve_fqcn(
 // justification: `env` is threaded for API consistency and future use across the
 // recursive type-resolution arms; keep it even though it is currently only forwarded.
 #[allow(clippy::only_used_in_recursion)]
-fn type_kind_to_type(
+fn type_union_to_type(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
-    kind: &TypeKind,
+    union: &TUnion,
     env: &TypeEnv,
 ) -> Type {
-    match kind {
-        TypeKind::Object(obj) => match obj {
-            ObjectTypeKind::NamedObject { name, .. } => {
-                let name_str = interner.lookup(name).to_string();
-                let is_iface = project
-                    .find_class_reflection(&name_str)
-                    .map(|r| r.is_interface())
-                    .unwrap_or(false);
-                if is_iface {
-                    Type::Interface(name_str)
-                } else {
-                    Type::Class(name_str)
+    let atoms: &[TAtomic] = union.types.as_ref();
+
+    // Partition into nulls and non-nulls (preserves the 0.26 nullable/union model).
+    let null_count = atoms.iter().filter(|a| matches!(a, TAtomic::Null)).count();
+    let non_nulls: Vec<&TAtomic> = atoms
+        .iter()
+        .filter(|a| !matches!(a, TAtomic::Null))
+        .collect();
+
+    if null_count > 0 && non_nulls.len() == 1 {
+        // Nullable<T>
+        let inner = type_atomic_to_type(project, non_nulls[0], env);
+        Type::Nullable(Box::new(inner))
+    } else if non_nulls.len() == 2 && null_count == 0 {
+        // Binary union T|U
+        let a = type_atomic_to_type(project, non_nulls[0], env);
+        let b = type_atomic_to_type(project, non_nulls[1], env);
+        Type::Union(Box::new(a), Box::new(b))
+    } else if non_nulls.len() == 1 {
+        // Single non-null element → unwrap.
+        type_atomic_to_type(project, non_nulls[0], env)
+    } else {
+        // 3+ non-null types or other complex unions → Mixed for Phase 2.
+        Type::Mixed
+    }
+}
+
+/// Convert a single `TAtomic` (mago_codex::ttype) into our `Type` enum.
+///
+/// Coverage:
+///   - named object → `Type::Interface` or `Type::Class` (by symbol kind);
+///     `static`/`$this` named objects map to `StaticRef`/`This`.
+///   - intersection (`A&B`) → first named concrete class (the
+///     `ConcreteClass&MockObject` PHPUnit pattern; concrete lets the tracer
+///     follow real implementations).
+///   - everything else (scalar, array, mixed, never, …) → `Type::Mixed`.
+fn type_atomic_to_type(
+    project: &crate::mago_bridge::MagoProject,
+    atomic: &TAtomic,
+    env: &TypeEnv,
+) -> Type {
+    match atomic {
+        TAtomic::Object(TObject::Named(named)) => {
+            // Intersection type: prefer the first named concrete class among the
+            // additional intersection members; otherwise fall through to primary.
+            if let Some(intersections) = &named.intersection_types {
+                for it in intersections.iter() {
+                    if let TAtomic::Object(TObject::Named(inner)) = it {
+                        let name_str = word_to_string(&inner.name);
+                        if !is_interface(project, &name_str) {
+                            return Type::Class(name_str);
+                        }
+                    }
                 }
             }
-            ObjectTypeKind::Self_ { scope } => Type::SelfRef(interner.lookup(scope).to_string()),
-            ObjectTypeKind::Static { scope } => Type::StaticRef(interner.lookup(scope).to_string()),
-            // AnyObject, TypedObject, AnonymousObject, EnumCase, Generator, Parent → Mixed
-            _ => Type::Mixed,
-        },
 
-        TypeKind::Union { kinds } => {
-            // Check for nullable pattern: Union of [T, null] or [null, T].
-            let null_count = kinds
-                .iter()
-                .filter(|k| {
-                    matches!(
-                        k,
-                        TypeKind::Value(mago_reflection::r#type::kind::ValueTypeKind::Null)
-                    )
-                })
-                .count();
-            let non_nulls: Vec<&TypeKind> = kinds
-                .iter()
-                .filter(|k| {
-                    !matches!(
-                        k,
-                        TypeKind::Value(mago_reflection::r#type::kind::ValueTypeKind::Null)
-                    )
-                })
-                .collect();
-
-            if null_count > 0 && non_nulls.len() == 1 {
-                // Nullable<T>
-                let inner = type_kind_to_type(project, interner, non_nulls[0], env);
-                Type::Nullable(Box::new(inner))
-            } else if non_nulls.len() == 2 && null_count == 0 {
-                // Binary union T|U
-                let a = type_kind_to_type(project, interner, non_nulls[0], env);
-                let b = type_kind_to_type(project, interner, non_nulls[1], env);
-                Type::Union(Box::new(a), Box::new(b))
-            } else if non_nulls.len() == 1 {
-                // Union with single non-null element (degenerate) → unwrap.
-                type_kind_to_type(project, interner, non_nulls[0], env)
+            let name_str = word_to_string(&named.name);
+            if named.is_this {
+                // `$this` return type → resolve via env where possible.
+                return match env.enclosing_class() {
+                    Some(_) => Type::This,
+                    None => Type::SelfRef(name_str),
+                };
+            }
+            if named.is_static {
+                return Type::StaticRef(name_str);
+            }
+            if is_interface(project, &name_str) {
+                Type::Interface(name_str)
             } else {
-                // 3+ non-null types or other complex unions → Mixed for Phase 2.
-                Type::Mixed
+                Type::Class(name_str)
             }
         }
-
-        // Intersection type (A&B): pick the first named concrete class.
-        // The pattern `ConcreteClass&MockObject` is common in PHPUnit tests;
-        // using the concrete class lets the tracer follow real implementations.
-        TypeKind::Intersection { kinds } => {
-            for k in kinds.iter() {
-                if let TypeKind::Object(ObjectTypeKind::NamedObject { name, .. }) = k {
-                    return Type::Class(interner.lookup(name).to_string());
-                }
-            }
-            Type::Mixed
-        }
-
-        // All other TypeKind variants (Void, Never, Mixed, Scalar, Array, Callable,
-        // Value, Conditional, KeyOf, ValueOf, etc.) → Mixed in Phase 2.
+        // AnyObject, Enum, WithProperties, HasMethod/HasProperty → Mixed.
+        TAtomic::Object(_) => Type::Mixed,
+        // Scalar, Array, Mixed, Never, Void, Callable, etc. → Mixed in Phase 2.
         _ => Type::Mixed,
     }
 }
 
-/// Public(crate) wrapper around `type_kind_to_type` for callers outside this module
+/// Whether the given FQCN names an interface (case-insensitive lookup).
+fn is_interface(project: &crate::mago_bridge::MagoProject, fqcn: &str) -> bool {
+    project
+        .find_class(fqcn)
+        .map(|r| r.kind == SymbolKind::Interface)
+        .unwrap_or(false)
+}
+
+/// Public(crate) wrapper for callers outside this module
 /// (e.g., `analyzer::trace::seed_param_types`).
-pub(crate) fn type_kind_to_type_pub(
+pub(crate) fn type_union_to_type_pub(
     project: &crate::mago_bridge::MagoProject,
-    interner: &ThreadedInterner,
-    kind: &TypeKind,
+    union: &TUnion,
     env: &TypeEnv,
 ) -> Type {
-    type_kind_to_type(project, interner, kind, env)
+    type_union_to_type(project, union, env)
 }
 
 // ── Span / line helper ────────────────────────────────────────────────────────
@@ -1261,9 +1202,9 @@ pub(crate) fn type_kind_to_type_pub(
 ///
 /// Falls back to 0 when the source cannot be found (e.g., built-in stubs).
 fn line_of_span(ctx: &WalkerCtx, span: mago_span::Span) -> u32 {
-    if let Some(source) = ctx.project.source_by_id(span.start.source) {
-        // Source::line_number returns a 0-based index; add 1 for 1-based.
-        source.line_number(span.start.offset) as u32 + 1
+    if let Some(file) = ctx.project.file_of_span(&span) {
+        // File::line_number returns a 0-based index; add 1 for 1-based.
+        file.line_number(span.start.offset) + 1
     } else {
         0
     }
@@ -1277,18 +1218,16 @@ fn line_of_span(ctx: &WalkerCtx, span: mago_span::Span) -> u32 {
 /// `ResolvedNames` table produced by mago-names). Falls back to the raw
 /// identifier value if no resolution exists at that position.
 ///
-/// The returned FQCN has any leading backslash stripped, because
-/// mago-project's reflection FQCNs don't carry one. Example: identifier
-/// `Logger` in `namespace Monolog;` resolves to `"Monolog\\Logger"`, NOT
-/// `"\\Monolog\\Logger"`.
+/// The returned FQCN has any leading backslash stripped, because mago's
+/// reflection FQCNs don't carry one. Example: identifier `Logger` in
+/// `namespace Monolog;` resolves to `"Monolog\\Logger"`, NOT `"\\Monolog\\Logger"`.
 fn resolve_class_fqcn(ctx: &WalkerCtx, id: &mago_syntax::ast::Identifier) -> String {
-    use mago_span::HasSpan;
     let position = id.span().start;
 
     let fqcn = if ctx.names.contains(&position) {
-        ctx.interner.lookup(ctx.names.get(id)).to_string()
+        String::from_utf8_lossy(ctx.names.get(id)).into_owned()
     } else {
-        ctx.interner.lookup(id.value()).to_string()
+        String::from_utf8_lossy(id.value()).into_owned()
     };
 
     fqcn.trim_start_matches('\\').to_string()
@@ -1298,12 +1237,11 @@ fn resolve_class_fqcn(ctx: &WalkerCtx, id: &mago_syntax::ast::Identifier) -> Str
 ///
 /// Only `Variable::Direct` has a static name; indirect (`${...}`) and nested
 /// (`$$foo`) are dynamic and return `None`.
-fn var_name(interner: &ThreadedInterner, v: &Variable) -> Option<String> {
+fn var_name(v: &Variable) -> Option<String> {
     match v {
         Variable::Direct(dv) => {
-            // StringIdentifier lookup returns the raw PHP source text, which
-            // already includes the `$` sigil (e.g., `"$x"`).
-            Some(interner.lookup(&dv.name).to_string())
+            // The raw identifier byte-string already includes the `$` sigil.
+            Some(String::from_utf8_lossy(dv.name).into_owned())
         }
         Variable::Indirect(_) | Variable::Nested(_) => None,
     }
