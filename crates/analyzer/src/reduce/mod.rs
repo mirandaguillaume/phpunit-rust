@@ -6,22 +6,34 @@
 //! runner wouldn't. Anything unmodelled becomes [`Outcome::Bailed`], never a guess
 //! (fail-closed; see the design spec §5 and §12).
 //!
+//! # The principle
+//!
+//! A test, given its complete Givens (data-provider row + fixtures), is a TRIVIAL
+//! deterministic computation. "Reduce" = perform that computation NATIVELY in Rust
+//! on the first run, skipping the PHP VM (no startup / bootstrap / IPC). There is
+//! no cache and no memoization — the win is first-run speed. The native evaluator
+//! ([`eval`]) is the center; it computes the values. mago is an accelerator for
+//! the reducibility decision and for resolving user-function calls, NOT the source
+//! of computed values.
+//!
 //! # Module map
 //! - [`value`] — the byte-backed [`Value`] + PHP conversions and PHP-8 comparisons.
-//! - [`eval`] — the concrete PHP-semantics evaluator (operator results computed
-//!   OURSELVES, never lifted from mago's folded result nodes) + the cross-check.
-//! - [`gate`] — the typed reducibility gate: lifts literals off mago's per-node
-//!   `AnalysisArtifacts`, fail-closed on anything not a single concrete literal.
+//! - [`eval`] — the native evaluator: runs the trivial ops a test touches
+//!   (arithmetic with PHP overflow→float, concat, comparisons, control flow, assert
+//!   intrinsics → Pass/Fail) over the concrete Givens. Each op gold-tested vs
+//!   `php -r`. Bails (fail-closed) on any op outside the modelled set.
+//! - [`gate`] — the reducibility decision: are the Givens complete (pure, every
+//!   operand concrete)? Uses mago's per-node types to decide; fail-closed on
+//!   `mixed` / widened / unmodelled.
 //! - [`driver`] — `reduce_file`: codebase build + per-test reduction + provider rows.
 //!
-//! # The load-bearing safety rules (spec §12.2)
-//! 1. Read literals only off LEAF/OPERAND nodes from the artifact; compute every
-//!    operator RESULT ourselves in PHP semantics. Never lift a folded result.
-//! 2. Cross-check: when a node's inputs are concrete and we computed its result,
-//!    if mago also folded it to a literal, compare and BailOut on divergence
-//!    (catches mago's non-PHP int saturation).
-//! 3. Gate only on the value-returning getters; missing key / mixed / non-single
-//!    / non-whitelisted atomic = BailOut.
+//! # Fail-closed (spec §5)
+//!
+//! Reducible IFF the Givens are complete (the test is pure: no hidden time / DB /
+//! random / network / global-state inputs) AND every op and value is modelled.
+//! Anything else → `Outcome::Bailed(reason)` (defined in [`eval`]). The standing
+//! differential (reduce vs the real runner) is the soundness backstop; it is
+//! driven separately.
 
 pub mod driver;
 pub mod eval;
