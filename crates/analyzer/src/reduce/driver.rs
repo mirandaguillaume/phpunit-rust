@@ -222,7 +222,13 @@ fn collect_rows(
             .collect();
     }
 
-    // #[TestWith([...])] rows from the raw method AST (in the body's class).
+    // #[TestWith([...])] rows from the raw method AST. Unlike #[DataProvider]
+    // (a SEPARATE method a subclass can override independently — resolved against
+    // the concrete class in `data_provider::expand`), #[TestWith] lives ON the test
+    // method, so its rows come from wherever the test method body is declared. That
+    // is exactly `body_class()`: discovery resolves the most-derived declaration of
+    // the method (an override sets `declaring_class = None` → the concrete class),
+    // so reading from `body_class()` already matches the concrete run class.
     let test_with = project
         .with_program(logical, |program, _file, _names| {
             find_method(program, test.body_class(), &test.method).map(read_test_with_rows)
