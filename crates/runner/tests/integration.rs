@@ -364,3 +364,202 @@ fn worker_crash_is_recovered_as_error() {
         crashed.message
     );
 }
+
+/// Counted-at-most-once regression: a multi-class bin `[A(passes), B(fatals)]`
+/// must yield A counted EXACTLY once as Pass and B counted EXACTLY once as
+/// Error. Multi-class bins are the default dispatch shape, so when B fatals
+/// mid-batch the dead-worker recovery used to synthesise a second (Error)
+/// outcome for A (whose real passes had already streamed) and double-report B
+/// (its `<class>` shutdown row PLUS Rust's per-method synth). This pins the fix:
+/// the synth paths skip any (class, method) already reported.
+///
+/// A is deliberately heavier (more methods) so LPT orders it first in the bin
+/// and it executes — and reports — before B triggers the uncatchable fatal.
+#[test]
+fn multi_class_bin_crash_counts_each_test_once() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
+    let autoload = project.join("vendor/autoload.php");
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_bin_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Helper: build a lifecycle-flagged case (forces the class-level batching
+    // path so classes flow into the LPT bin packer and can share one bin).
+    let mk = |file: &std::path::Path, class: &str, method: &str| TestCase {
+        file: file.to_path_buf(),
+        class: class.to_string(),
+        method: method.to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: true,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+
+    let mut cases: Vec<TestCase> = Vec::new();
+
+    // Padding class: 12 passing methods. With 1 worker and 16 total methods the
+    // LPT target is 4, so PadTest (cost 12 ≥ target) dispatches solo while the
+    // lighter PassTest (3) and FatalTest (1) pack into ONE multi-class bin —
+    // the default shape that triggered the double-count. (Distribution verified
+    // against build_queue.)
+    let pad_methods: Vec<String> = (0..12).map(|i| format!("testPad{i}")).collect();
+    let pad_body: String = pad_methods
+        .iter()
+        .map(|m| format!("    public function {m}(): void {{ $this->assertTrue(true); }}\n"))
+        .collect();
+    let pad_file = dir.join("PadTest.php");
+    std::fs::write(
+        &pad_file,
+        format!("<?php\nuse PHPUnit\\Framework\\TestCase;\nclass PadTest extends TestCase {{\n{pad_body}}}\n"),
+    )
+    .unwrap();
+    for m in &pad_methods {
+        cases.push(mk(&pad_file, "PadTest", m));
+    }
+
+    // Class A: three plain passing methods (LPT-orders it FIRST in the bin so it
+    // runs and reports before the bin-mate fatals).
+    let a_file = dir.join("PassTest.php");
+    std::fs::write(
+        &a_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass PassTest extends TestCase {\n    public function testP1(): void { $this->assertTrue(true); }\n    public function testP2(): void { $this->assertTrue(true); }\n    public function testP3(): void { $this->assertTrue(true); }\n}\n",
+    )
+    .unwrap();
+    for m in ["testP1", "testP2", "testP3"] {
+        cases.push(mk(&a_file, "PassTest", m));
+    }
+
+    // Class B: triggers an uncatchable E_ERROR (undefined function) so the PHP
+    // shutdown handler fires and emits the `<class>` fatal row, then the master
+    // reports slot_died. This is the precise path that double-counted A.
+    let b_file = dir.join("FatalTest.php");
+    std::fs::write(
+        &b_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass FatalTest extends TestCase {\n    public function testFatal(): void { __phpunit_rust_no_such_function_xyz(); }\n}\n",
+    )
+    .unwrap();
+    cases.push(mk(&b_file, "FatalTest", "testFatal"));
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        let mut pool = PhpForkPool::spawn(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            0,
+            None,
+        )
+        .expect("PhpForkPool::spawn failed");
+        // n_workers=1 with 16 total methods → target=4: PadTest dispatches solo,
+        // PassTest (3) + FatalTest (1) pack into ONE multi-class BatchPlan to the
+        // lone worker — the default shape that exercised the double-count.
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, cases, &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "run did not return within 25s — crash recovery hung"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let report = handle
+        .join()
+        .expect("run thread panicked")
+        .expect("run returned Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // PassTest: every one of its three methods counted EXACTLY once, all Pass.
+    // (The bug re-emitted them as Error after the bin-mate fataled.)
+    for m in ["testP1", "testP2", "testP3"] {
+        let rows: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| o.class == "PassTest" && o.method == m)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "PassTest::{m} must be counted exactly once; got: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].status,
+            TestStatus::Pass,
+            "PassTest::{m} must stay green, not flip to Error; got: {:?}",
+            rows[0]
+        );
+    }
+
+    // FatalTest: counted EXACTLY once, as Error. The single row is the PHP
+    // shutdown handler's `<class>` row (carrying the fatal text) — Rust must NOT
+    // add a redundant per-method synth for the same class.
+    let fatal_rows: Vec<_> = report
+        .outcomes
+        .iter()
+        .filter(|o| o.class == "FatalTest")
+        .collect();
+    assert_eq!(
+        fatal_rows.len(),
+        1,
+        "FatalTest must be reported exactly once (no double report); got: {fatal_rows:?}"
+    );
+    assert_eq!(
+        fatal_rows[0].status,
+        TestStatus::Error,
+        "FatalTest must be an Error; got: {:?}",
+        fatal_rows[0]
+    );
+
+    // PadTest: all 12 methods counted exactly once as Pass (the solo batch
+    // runs cleanly and must be untouched by the crash recovery).
+    let pad_passes = report
+        .outcomes
+        .iter()
+        .filter(|o| o.class == "PadTest" && o.status == TestStatus::Pass)
+        .count();
+    assert_eq!(pad_passes, 12, "PadTest's 12 passes must all survive");
+
+    // Total parity: 12 PadTest + 3 PassTest passes + 1 FatalTest error = 16
+    // outcomes, each test accounted for exactly once (vanilla-equivalent
+    // expansion). The bug inflated this with redundant per-method Error synths.
+    assert_eq!(
+        report.outcomes.len(),
+        16,
+        "total outcomes must equal the vanilla expansion (16), no inflation; got: {:?}",
+        report.outcomes
+    );
+}

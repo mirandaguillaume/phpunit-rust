@@ -78,14 +78,66 @@ pub struct RunConfig {
     pub worker_timeout: Option<std::time::Duration>,
 }
 
+/// Tracks every `(class, method)` outcome already received from the run so the
+/// crash/watchdog/EOF synth paths never re-emit an outcome that was reported.
+///
+/// This enforces the counted-at-most-once invariant: a multi-class bin (the
+/// default dispatch shape) routinely contains classes that already PASSED
+/// before a later class in the same bin fataled. Without this filter, the
+/// dead-worker recovery synthesises a second (Error) outcome for those passed
+/// classes — inflating the count and flipping green → red — and double-reports
+/// the fataling class (its `<class>` shutdown row PLUS Rust's per-method synth).
+///
+/// A received `<class>` row for class C (emitted by the PHP shutdown handler,
+/// carrying the precious fatal text) is treated as covering the ENTIRE class C:
+/// the handler runs once per class and naming any single method would be wrong,
+/// so the contract is "this whole class is accounted for". The shutdown row's
+/// stream order guarantees it lands before the master's `slot_died` notice (same
+/// FD, child shutdown runs before the master reaps SIGCHLD), so by the time a
+/// synth path runs every covering row is already recorded here.
+#[derive(Default)]
+struct ReceivedOutcomes {
+    /// Exact `(class, method)` pairs that produced a real outcome.
+    pairs: std::collections::HashSet<(String, String)>,
+    /// Classes whose `<class>` shutdown row was received — covers every method
+    /// of that class (see the type doc).
+    classes: std::collections::HashSet<String>,
+}
+
+impl ReceivedOutcomes {
+    /// Record one received outcome. A `<class>`-method row marks the whole
+    /// class covered; any other row marks that exact `(class, method)` pair.
+    fn record(&mut self, o: &TestOutcome) {
+        if o.method == "<class>" {
+            self.classes.insert(o.class.clone());
+        }
+        self.pairs.insert((o.class.clone(), o.method.clone()));
+    }
+
+    /// True when an outcome for `(class, method)` was already received — either
+    /// the exact pair, or a `<class>` row covering the whole class.
+    fn covers(&self, class: &str, method: &str) -> bool {
+        self.classes.contains(class)
+            || self
+                .pairs
+                .contains(&(class.to_string(), method.to_string()))
+    }
+}
+
 /// Synthesize one `Error` outcome per test method in `plan` (or one
 /// class-level error when the method list is unknown), reporting each via
 /// `on_progress`. Shared by the crash-recovery and inactivity-watchdog paths
 /// so a batch that can never complete still appears in the report — keeping
 /// test-count parity instead of silently dropping tests.
+///
+/// `received` is consulted first: any `(class, method)` whose outcome already
+/// streamed back (real outcomes AND the shutdown handler's `<class>` rows both
+/// count) is skipped, so a batch where some classes passed before a later one
+/// crashed is not double-counted.
 fn synth_error_outcomes(
     plan: &BatchPlan,
     cause: &str,
+    received: &ReceivedOutcomes,
     on_progress: &impl Fn(&TestOutcome),
     outcomes: &mut Vec<TestOutcome>,
 ) {
@@ -96,6 +148,12 @@ fn synth_error_outcomes(
             bc.methods.clone()
         };
         for m in methods {
+            // Skip anything already reported: a class that passed before a
+            // bin-mate crashed, or the fataling class whose `<class>` row the
+            // PHP shutdown handler already emitted (with the fatal text).
+            if received.covers(&bc.class, &m) {
+                continue;
+            }
             let o = TestOutcome {
                 class: bc.class.clone(),
                 method: m,
@@ -347,8 +405,14 @@ pub fn run_with_profiler(
     // sent to a PHP worker but must appear in the report to keep test-count
     // parity with vanilla PHPUnit.
     let mut outcomes: Vec<TestOutcome> = Vec::new();
+    // Every outcome we've seen for the run, keyed by (class, method). The
+    // dead-worker synth paths (SlotDied, EOF, watchdog) consult this so a
+    // class that already reported (passed, failed, or its `<class>` fatal row)
+    // is never re-synthesised as an Error — the counted-at-most-once invariant.
+    let mut received = ReceivedOutcomes::default();
     for o in synthetic {
         on_progress(&o);
+        received.record(&o);
         outcomes.push(o);
     }
     let mut total = 0.0f64;
@@ -392,6 +456,10 @@ pub fn run_with_profiler(
                     stopping = true;
                     queue.clear();
                 }
+                // Record before pushing so the synth paths can skip this
+                // (class, method) if its worker later dies mid-batch. A
+                // `<class>` shutdown row recorded here covers the whole class.
+                received.record(&o);
                 outcomes.push(o);
             }
             WorkerEvent::Message(slot, WorkerMessage::BatchDone { .. }) => {
@@ -440,45 +508,22 @@ pub fn run_with_profiler(
                 // we synthesise one error outcome per test in the lost batch
                 // so the report stays accurate and the dispatcher doesn't
                 // hang waiting for outcomes that will never arrive.
+                //
+                // Crucially, `synth_error_outcomes` skips any (class, method)
+                // already reported: multi-class bins are the default, so
+                // classes that PASSED before a bin-mate fataled already
+                // streamed their real outcomes. Re-synthesising them would
+                // flip green → red and inflate the count. The fataling class
+                // is likewise covered by the PHP shutdown handler's `<class>`
+                // row (which carries the fatal text) — we keep that row and
+                // suppress our redundant per-method synth for it.
                 if let Some(lost) = slot_in_flight[slot].take() {
                     let cause = if signal != 0 {
                         format!("worker process died: signal {signal}")
                     } else {
                         format!("worker process died: exit code {exit_code}")
                     };
-                    for bc in &lost.classes {
-                        // Empty methods vector in a BatchClass means "run all
-                        // methods of this class" — we don't have the list at
-                        // dispatch time. Emit one class-level error so the
-                        // class shows up in the report.
-                        if bc.methods.is_empty() {
-                            let o = TestOutcome {
-                                class: bc.class.clone(),
-                                method: "<class>".to_string(),
-                                dataset: None,
-                                status: TestStatus::Error,
-                                message: Some(cause.clone()),
-                                trace: None,
-                                duration_ms: 0.0,
-                            };
-                            on_progress(&o);
-                            outcomes.push(o);
-                        } else {
-                            for m in &bc.methods {
-                                let o = TestOutcome {
-                                    class: bc.class.clone(),
-                                    method: m.clone(),
-                                    dataset: None,
-                                    status: TestStatus::Error,
-                                    message: Some(cause.clone()),
-                                    trace: None,
-                                    duration_ms: 0.0,
-                                };
-                                on_progress(&o);
-                                outcomes.push(o);
-                            }
-                        }
-                    }
+                    synth_error_outcomes(&lost, &cause, &received, &on_progress, &mut outcomes);
                 }
                 // Record the failed batch's span too — useful for spotting
                 // worker crashes in the timeline view.
@@ -515,16 +560,25 @@ pub fn run_with_profiler(
                 // that were actually running when the worker died) AND the
                 // still-queued batches, so no test silently vanishes from the
                 // report. Slots already drained by a `slot_died` are `None`, so
-                // nothing is double-counted.
+                // nothing is double-counted at the batch level — and the
+                // `received` filter additionally suppresses any per-class
+                // outcome (real or `<class>` row) that already streamed back
+                // from a partially-processed batch on the dying worker.
                 if live_readers == 0 {
                     let cause = "worker process crashed before reporting this test";
                     for in_flight in slot_in_flight.iter_mut() {
                         if let Some(lost) = in_flight.take() {
-                            synth_error_outcomes(&lost, cause, &on_progress, &mut outcomes);
+                            synth_error_outcomes(
+                                &lost,
+                                cause,
+                                &received,
+                                &on_progress,
+                                &mut outcomes,
+                            );
                         }
                     }
                     while let Some(plan) = queue.pop_front() {
-                        synth_error_outcomes(&plan, cause, &on_progress, &mut outcomes);
+                        synth_error_outcomes(&plan, cause, &received, &on_progress, &mut outcomes);
                     }
                 }
             }
@@ -540,14 +594,16 @@ pub fn run_with_profiler(
         // Report every test that can never complete: the in-flight batches
         // (the stuck worker plus any peers mid-batch) and the queued batches
         // never dispatched. Without this they would silently vanish from the
-        // report, breaking test-count parity.
+        // report, breaking test-count parity. The `received` filter keeps a
+        // method a peer worker already reported (before the watchdog fired)
+        // from being re-synthesised as an Error.
         for in_flight in slot_in_flight.iter_mut().take(n) {
             if let Some(lost) = in_flight.take() {
-                synth_error_outcomes(&lost, &cause, &on_progress, &mut outcomes);
+                synth_error_outcomes(&lost, &cause, &received, &on_progress, &mut outcomes);
             }
         }
         while let Some(plan) = queue.pop_front() {
-            synth_error_outcomes(&plan, &cause, &on_progress, &mut outcomes);
+            synth_error_outcomes(&plan, &cause, &received, &on_progress, &mut outcomes);
         }
         // Kill the workers so their pipe write-ends close and the reader
         // threads below observe EOF and exit — a stuck child never would.
@@ -1543,6 +1599,202 @@ mod tests {
             .collect();
         sm.sort_unstable();
         assert_eq!(sm, vec!["testD", "testE"]);
+    }
+
+    /// Counted-at-most-once invariant for the crash-recovery synth path.
+    ///
+    /// A multi-class bin `[A(passed), B(fataled)]` is the default dispatch
+    /// shape. When the child crashes mid-batch:
+    ///   - A's real `pass` outcomes have already streamed back (recorded in
+    ///     `ReceivedOutcomes`),
+    ///   - the PHP shutdown handler emitted a single `B::<class>` error row
+    ///     carrying the fatal text (also recorded).
+    ///
+    /// Rust must then synthesise NOTHING for A (every method already covered)
+    /// and NOTHING extra for B (the `<class>` row covers the whole class),
+    /// otherwise A flips green→red and B is double-reported.
+    #[test]
+    fn synth_skips_classes_already_reported() {
+        let plan = BatchPlan {
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![
+                BatchClass {
+                    file: PathBuf::from("/A.php"),
+                    class: "A".to_string(),
+                    methods: vec!["testA1".to_string(), "testA2".to_string()],
+                    row_filter: None,
+                    required_files: vec![],
+                    is_isolated: false,
+                },
+                BatchClass {
+                    file: PathBuf::from("/B.php"),
+                    class: "B".to_string(),
+                    methods: vec!["testB1".to_string()],
+                    row_filter: None,
+                    required_files: vec![],
+                    is_isolated: false,
+                },
+            ],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
+        };
+
+        // Replay exactly what the wire would have delivered before SlotDied:
+        // A's two real passes, then B's single `<class>` fatal row.
+        let mut received = ReceivedOutcomes::default();
+        for (class, method, status) in [
+            ("A", "testA1", TestStatus::Pass),
+            ("A", "testA2", TestStatus::Pass),
+            ("B", "<class>", TestStatus::Error),
+        ] {
+            received.record(&TestOutcome {
+                class: class.to_string(),
+                method: method.to_string(),
+                dataset: None,
+                status,
+                message: None,
+                trace: None,
+                duration_ms: 0.0,
+            });
+        }
+
+        // `on_progress` and the `outcomes` Vec receive the same set, so we
+        // assert on `outcomes` (the `Fn` bound forbids a capturing-mut sink).
+        let progress_count = std::cell::Cell::new(0usize);
+        let mut outcomes: Vec<TestOutcome> = Vec::new();
+        synth_error_outcomes(
+            &plan,
+            "worker process died: signal 9",
+            &received,
+            &|_o| progress_count.set(progress_count.get() + 1),
+            &mut outcomes,
+        );
+
+        // Nothing synthesised: every (class, method) the lost batch covered was
+        // already reported (A by real outcomes, B by its `<class>` row).
+        assert!(
+            outcomes.is_empty(),
+            "no synthetic error must be emitted for already-reported classes; got: {outcomes:?}"
+        );
+        assert_eq!(progress_count.get(), 0, "on_progress must not fire");
+    }
+
+    /// The complement: a class whose methods were NOT reported (the worker died
+    /// before producing anything for it) must still be synthesised so it does
+    /// not silently vanish — count-parity in the other direction.
+    #[test]
+    fn synth_emits_for_classes_never_reported() {
+        let plan = BatchPlan {
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![
+                BatchClass {
+                    file: PathBuf::from("/A.php"),
+                    class: "A".to_string(),
+                    methods: vec!["testA1".to_string()],
+                    row_filter: None,
+                    required_files: vec![],
+                    is_isolated: false,
+                },
+                BatchClass {
+                    file: PathBuf::from("/C.php"),
+                    class: "C".to_string(),
+                    methods: vec!["testC1".to_string(), "testC2".to_string()],
+                    row_filter: None,
+                    required_files: vec![],
+                    is_isolated: false,
+                },
+            ],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
+        };
+
+        // Only A::testA1 reported; class C never produced anything.
+        let mut received = ReceivedOutcomes::default();
+        received.record(&TestOutcome {
+            class: "A".to_string(),
+            method: "testA1".to_string(),
+            dataset: None,
+            status: TestStatus::Pass,
+            message: None,
+            trace: None,
+            duration_ms: 0.0,
+        });
+
+        let progress_count = std::cell::Cell::new(0usize);
+        let mut outcomes: Vec<TestOutcome> = Vec::new();
+        synth_error_outcomes(
+            &plan,
+            "cause",
+            &received,
+            &|_o| progress_count.set(progress_count.get() + 1),
+            &mut outcomes,
+        );
+
+        // Exactly C::testC1 and C::testC2 synthesised; A::testA1 skipped.
+        let mut got: Vec<(String, String)> = outcomes
+            .iter()
+            .map(|o| (o.class.clone(), o.method.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("C".to_string(), "testC1".to_string()),
+                ("C".to_string(), "testC2".to_string()),
+            ]
+        );
+        assert!(outcomes.iter().all(|o| o.status == TestStatus::Error));
+        assert_eq!(progress_count.get(), 2, "on_progress fires once per synth");
+    }
+
+    /// A `<class>`-covered class must suppress synthesis even when the batch
+    /// listed explicit methods for it (the EOF/empty-methods path expands to
+    /// `<class>`, but a multi-method class fataling also routes through the
+    /// `<class>` coverage rule).
+    #[test]
+    fn synth_class_row_covers_all_methods_of_that_class() {
+        let plan = BatchPlan {
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![BatchClass {
+                file: PathBuf::from("/B.php"),
+                class: "B".to_string(),
+                methods: vec![
+                    "testB1".to_string(),
+                    "testB2".to_string(),
+                    "testB3".to_string(),
+                ],
+                row_filter: None,
+                required_files: vec![],
+                is_isolated: false,
+            }],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
+        };
+
+        let mut received = ReceivedOutcomes::default();
+        received.record(&TestOutcome {
+            class: "B".to_string(),
+            method: "<class>".to_string(),
+            dataset: None,
+            status: TestStatus::Error,
+            message: Some("php fatal".into()),
+            trace: None,
+            duration_ms: 0.0,
+        });
+
+        let mut outcomes: Vec<TestOutcome> = Vec::new();
+        synth_error_outcomes(&plan, "cause", &received, &|_o| {}, &mut outcomes);
+
+        assert!(
+            outcomes.is_empty(),
+            "a received `<class>` row must cover every method of that class; got: {outcomes:?}"
+        );
     }
 }
 
