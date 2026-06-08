@@ -1374,6 +1374,14 @@ fn insert_key(items: &mut Vec<(ArrayKey, Value)>, key: ArrayKey, val: Value) {
     }
 }
 
+/// Lift an [`ArrayKey`] back to a [`Value`] (for `array_search` / `array_keys`).
+fn array_key_to_value(k: &ArrayKey) -> Value {
+    match k {
+        ArrayKey::Int(i) => Value::Int(*i),
+        ArrayKey::Str(s) => Value::Str(s.clone()),
+    }
+}
+
 fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
     use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
     match call {
@@ -1475,12 +1483,24 @@ fn resolve_class_name(expr: &Expression) -> Result<Vec<u8>, BailReason> {
     }
 }
 
-/// A tiny pure-builtin whitelist (spec §9 — ≈6 fns). Each is exact PHP-8 byte
-/// semantics. `Ok(None)` = not a builtin (try the resolver next).
+/// A pure-builtin whitelist (spec §9). Each is exact PHP-8 byte semantics.
+/// `Ok(None)` = not a builtin (try the resolver next); `Err` = a builtin the
+/// reducer refuses to model (a cursor builtin, or a loose-comparison overload).
 fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
+    // CURSOR builtins have no observable cursor in our `Arr` model — a test mixing
+    // `reset()`/`end()` (which we model as pure first/last) with any of these would
+    // diverge, so they HARD-BAIL unconditionally (Task E, inc-2 frontier §7). This
+    // makes `reset`/`end` safe to model as pure first/last below.
+    if matches!(name, b"key" | b"next" | b"current" | b"prev" | b"each") {
+        return Err(BailReason::UnsupportedConstruct(format!(
+            "cursor builtin {}() — Arr has no observable internal pointer",
+            String::from_utf8_lossy(name)
+        )));
+    }
+
     let v = match (name, args) {
         (b"strlen", [Value::Str(s)]) => Value::Int(s.len() as i64),
-        (b"count", [Value::Arr(a)]) => Value::Int(a.len() as i64),
+        (b"count" | b"sizeof", [Value::Arr(a)]) => Value::Int(a.len() as i64),
         (b"abs", [Value::Int(i)]) => match i.checked_abs() {
             Some(v) => Value::Int(v),
             None => Value::Float((*i as f64).abs()), // abs(PHP_INT_MIN) → float
@@ -1493,6 +1513,82 @@ fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailR
         (b"is_bool", [v]) => Value::Bool(matches!(v, Value::Bool(_))),
         (b"is_null", [v]) => Value::Bool(matches!(v, Value::Null)),
         (b"is_float" | b"is_double", [v]) => Value::Bool(matches!(v, Value::Float(_))),
+
+        // ── strict array builtins (Task E) ──
+        // reset/end = pure first/last element; empty → false (cursor siblings bail
+        // above, so this can never observably diverge).
+        (b"reset", [Value::Arr(a)]) => a
+            .first()
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Bool(false)),
+        (b"end", [Value::Arr(a)]) => a
+            .last()
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Bool(false)),
+
+        // in_array(needle, haystack, true) — STRICT only. The loose 2-arg / `false`
+        // overload bails (PHP `==` juggling is a divergence risk).
+        (b"in_array", [needle, Value::Arr(hay), Value::Bool(true)]) => {
+            Value::Bool(hay.iter().any(|(_, v)| v.php_strict_eq(needle)))
+        }
+        (b"in_array", _) => {
+            return Err(BailReason::UnsupportedConstruct(
+                "in_array without strict=true (loose == not modelled)".into(),
+            ))
+        }
+        // array_search(needle, haystack, true) — STRICT: returns the KEY or false.
+        (b"array_search", [needle, Value::Arr(hay), Value::Bool(true)]) => hay
+            .iter()
+            .find(|(_, v)| v.php_strict_eq(needle))
+            .map(|(k, _)| array_key_to_value(k))
+            .unwrap_or(Value::Bool(false)),
+        (b"array_search", _) => {
+            return Err(BailReason::UnsupportedConstruct(
+                "array_search without strict=true (loose == not modelled)".into(),
+            ))
+        }
+        // array_key_exists(key, array): key presence (null value still counts).
+        (b"array_key_exists", [k, Value::Arr(a)]) => {
+            let key = k
+                .to_array_key()
+                .ok_or_else(|| BailReason::TypeError("array/object as array key".into()))?;
+            Value::Bool(a.iter().any(|(ak, _)| *ak == key))
+        }
+        // array_keys / array_values: reindex from 0.
+        (b"array_keys", [Value::Arr(a)]) => Value::Arr(
+            a.iter()
+                .enumerate()
+                .map(|(i, (k, _))| (ArrayKey::Int(i as i64), array_key_to_value(k)))
+                .collect(),
+        ),
+        (b"array_values", [Value::Arr(a)]) => Value::Arr(
+            a.iter()
+                .enumerate()
+                .map(|(i, (_, v))| (ArrayKey::Int(i as i64), v.clone()))
+                .collect(),
+        ),
+        // array_merge: int keys reindex sequentially; string keys overwrite.
+        (b"array_merge", merges) if !merges.is_empty() => {
+            let mut out: Vec<(ArrayKey, Value)> = Vec::new();
+            let mut next_int: i64 = 0;
+            for m in merges {
+                let Value::Arr(items) = m else {
+                    return Err(BailReason::TypeError("array_merge of a non-array".into()));
+                };
+                for (k, v) in items {
+                    match k {
+                        // String/explicit-int keys: int keys APPEND (reindexed),
+                        // string keys overwrite-in-place.
+                        ArrayKey::Int(_) => {
+                            insert_key(&mut out, ArrayKey::Int(next_int), v.clone());
+                            next_int += 1;
+                        }
+                        ArrayKey::Str(_) => insert_key(&mut out, k.clone(), v.clone()),
+                    }
+                }
+            }
+            Value::Arr(out)
+        }
         _ => return Ok(None),
     };
     Ok(Some(v))
@@ -1715,6 +1811,144 @@ mod tests {
             eval_one("(['k' => null]['k'] ?? 'D')").unwrap(),
             Value::Str(b"D".to_vec())
         );
+    }
+
+    // ── strict array builtins (Task E), gold vs `php -r` ──
+
+    #[test]
+    fn in_array_strict() {
+        // php -r 'var_export(in_array(1,[1],true));' → true; "1" vs 1 → false
+        assert_eq!(
+            eval_one("in_array(1, [1, 2], true)").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_one("in_array('1', [1, 2], true)").unwrap(),
+            Value::Bool(false)
+        );
+        // strict: 0 !== false
+        assert_eq!(
+            eval_one("in_array(0, [false], true)").unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_one("in_array(null, [1, null], true)").unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn array_search_strict_returns_key_or_false() {
+        // returns the KEY (int or string), or false when absent.
+        assert_eq!(
+            eval_one("array_search('b', [5 => 'a', 9 => 'b'], true)").unwrap(),
+            Value::Int(9)
+        );
+        assert_eq!(
+            eval_one("array_search('x', ['k' => 'a'], true)").unwrap(),
+            Value::Bool(false)
+        );
+        // string key is returned as a string.
+        assert_eq!(
+            eval_one("array_search(2, ['a' => 1, 'b' => 2], true)").unwrap(),
+            Value::Str(b"b".to_vec())
+        );
+        // strict: array_search(0, [false], true) === false (no match)
+        assert_eq!(
+            eval_one("array_search(0, [false], true)").unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn loose_in_array_and_search_bail() {
+        // The 2-arg (loose `==`) form is NOT modelled — bail rather than risk
+        // PHP's juggling surprises.
+        assert!(eval_one("in_array(1, [1])").is_err());
+        assert!(eval_one("array_search(1, [1])").is_err());
+        // Explicit loose flag (false) also bails.
+        assert!(eval_one("in_array(1, [1], false)").is_err());
+    }
+
+    #[test]
+    fn array_key_exists_keys_values_merge() {
+        // array_key_exists: true even when the value is null.
+        assert_eq!(
+            eval_one("array_key_exists('k', ['k' => null])").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_one("array_key_exists('x', ['k' => 1])").unwrap(),
+            Value::Bool(false)
+        );
+        // array_keys / array_values reindex from 0.
+        assert_eq!(
+            eval_one("array_keys([5 => 'a', 9 => 'b'])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Int(0), Value::Int(5)),
+                (ArrayKey::Int(1), Value::Int(9)),
+            ])
+        );
+        assert_eq!(
+            eval_one("array_values([5 => 'a', 9 => 'b'])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Int(0), Value::Str(b"a".to_vec())),
+                (ArrayKey::Int(1), Value::Str(b"b".to_vec())),
+            ])
+        );
+        // array_merge: int keys reindex, string keys overwrite.
+        assert_eq!(
+            eval_one("array_merge([1, 2], [3, 4])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Int(0), Value::Int(1)),
+                (ArrayKey::Int(1), Value::Int(2)),
+                (ArrayKey::Int(2), Value::Int(3)),
+                (ArrayKey::Int(3), Value::Int(4)),
+            ])
+        );
+        assert_eq!(
+            eval_one("array_merge(['a' => 1], ['a' => 2, 'b' => 3])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Str(b"a".to_vec()), Value::Int(2)),
+                (ArrayKey::Str(b"b".to_vec()), Value::Int(3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn reset_end_first_last_pure() {
+        // reset = first element, end = last element; empty → false.
+        assert_eq!(eval_one("reset([10, 20, 30])").unwrap(), Value::Int(10));
+        assert_eq!(eval_one("end([10, 20, 30])").unwrap(), Value::Int(30));
+        assert_eq!(eval_one("reset([])").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("end([])").unwrap(), Value::Bool(false));
+        // first/last over an associative array (value, not key).
+        assert_eq!(
+            eval_one("reset(['a' => 1, 'b' => 2])").unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            eval_one("end(['a' => 1, 'b' => 2])").unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn cursor_builtins_hard_bail() {
+        // Our Arr has no observable cursor; key/next/current/prev/each MUST bail
+        // (a test mixing reset()/end() with one of these would diverge — Task E).
+        for call in [
+            "key([1, 2])",
+            "next([1, 2])",
+            "current([1, 2])",
+            "prev([1, 2])",
+            "each([1, 2])",
+        ] {
+            assert!(
+                matches!(eval_one(call), Err(BailReason::UnsupportedConstruct(_))),
+                "{call} must hard-bail (no cursor model)"
+            );
+        }
     }
 
     #[test]
