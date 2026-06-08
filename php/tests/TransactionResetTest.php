@@ -56,6 +56,28 @@ final class _TxFixture extends TestCase
     }
 }
 
+/**
+ * Finding (5): a test that COMMITS inside the runner's transaction (explicit
+ * commit() or a DDL implicit commit) cannot be rolled back — its writes leak
+ * into the slot clone for later tests. Full re-clone is out of scope, so the
+ * documented mitigation is a loud STDERR breadcrumb. This fixture commits on
+ * purpose so we can assert the warning fires.
+ */
+final class _TxCommitLeakFixture extends TestCase
+{
+    public function testCommitsInsideTransaction(): void
+    {
+        $pdo = \PhpunitRust\TestExecutor::connection();
+        \PHPUnit\Framework\Assert::assertNotNull($pdo);
+        // Explicit commit ends the runner-opened transaction. The finally guard
+        // sees inTransaction()===false and must emit the leak breadcrumb.
+        if ($pdo->inTransaction()) {
+            $pdo->commit();
+        }
+        $this->assertTrue(true);
+    }
+}
+
 final class TransactionResetTest extends TestCase
 {
     private string $dbFile = '';
@@ -93,5 +115,41 @@ final class TransactionResetTest extends TestCase
         $this->assertSame('pass', $outcomes[1]['status'],
             "B must see a clean table; a fail here means the per-test rollback leaked: "
             . var_export($outcomes[1], true));
+    }
+
+    public function testCommittedWriteEmitsLeakBreadcrumbToStderr(): void
+    {
+        // Finding (5): when a test commits inside the runner transaction we can
+        // no longer roll it back. We must NOT silently swallow that — a loud
+        // STDERR breadcrumb makes the leak visible in forensics. STDERR is
+        // process-global and noisy to assert in-process, so drive the fixture
+        // in a child PHP process and capture its stderr.
+        $autoload = dirname(__DIR__) . '/vendor/autoload.php';
+        $php = <<<'PHP'
+            require %s;
+            putenv('PHPUNIT_RUST_DB_DSN=sqlite:' . %s);
+            putenv('PHPUNIT_RUST_SLOT=3');
+            \PhpunitRust\TestExecutor::runClass(
+                \PhpunitRust\Tests\_TxCommitLeakFixture::class,
+                ['testCommitsInsideTransaction']
+            );
+            PHP;
+        $script = sprintf($php, var_export($autoload, true), var_export($this->dbFile, true));
+
+        $descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $proc = proc_open(PHP_BINARY . ' -r ' . escapeshellarg($script), $descriptors, $pipes);
+        $this->assertIsResource($proc);
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($proc);
+
+        $this->assertStringContainsString('DB isolation LEAK', $stderr,
+            "committing inside the txn must emit a leak breadcrumb. stderr=[$stderr] stdout=[$stdout]");
+        $this->assertStringContainsString('_TxCommitLeakFixture::testCommitsInsideTransaction', $stderr,
+            'the breadcrumb must name the offending class::method');
+        $this->assertStringContainsString('slot=3', $stderr,
+            'the breadcrumb must name the slot for forensics');
     }
 }
