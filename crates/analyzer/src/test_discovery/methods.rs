@@ -52,41 +52,142 @@ pub fn find_test_methods(project: &MagoProject, test_classes: &[String]) -> Vec<
         let Some(class_refl) = class_index.get(&key) else {
             continue;
         };
-        let Some(file) = project.file_of_span(&class_refl.span) else {
+
+        // PHPUnit never INSTANTIATES an abstract test case — it runs its tests via
+        // the concrete subclass(es). So an abstract `*TestCase` contributes no rows
+        // of its own; its `test*` bodies are surfaced (below) to each CONCRETE
+        // descendant, bound to THAT subclass's `$this` (Inc-4 Task C). Skipping the
+        // abstract class here also avoids emitting a duplicate, always-bailing row
+        // (abstract `$this` cannot run an abstract method like `buildCollection`).
+        if class_refl.flags.is_abstract() {
+            continue;
+        }
+
+        // Walk the class itself + its ancestor chain (nearest-first). A method
+        // declared directly on `class_name` carries `declaring_class = None`; one
+        // declared on an ancestor carries `declaring_class = Some(ancestor FQCN)`.
+        // The FIRST class up the chain to declare a given method name wins (an
+        // override shadows the parent), matching PHP method resolution.
+        let mut seen_methods: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // The CONCRETE class's own file is where discovery BUCKETS every surfaced
+        // method (own + inherited): the user queries by the concrete test file, so
+        // an inherited method must report THAT file (its body lives elsewhere, found
+        // by the driver via `body_class()`). Resolve it once.
+        let Some(concrete_file) = project.file_of_span(&class_refl.span) else {
             continue;
         };
-        let logical_name = String::from_utf8_lossy(&file.name).into_owned();
-        let file_path: PathBuf = match &file.path {
+        let concrete_logical = String::from_utf8_lossy(&concrete_file.name).into_owned();
+        let concrete_file_path: PathBuf = match &concrete_file.path {
             Some(p) => p.clone(),
-            None => PathBuf::from(logical_name.clone()),
+            None => PathBuf::from(concrete_logical.clone()),
         };
 
-        let methods = project
-            .with_program(&logical_name, |program, file, names| {
-                let mut found = Vec::new();
-                collect_methods_in_statements(
-                    program.statements.iter(),
-                    class_name,
-                    file,
-                    &file_path,
-                    names,
-                    &mut found,
-                );
-                found
-            })
-            .unwrap_or_default();
+        // The chain: the concrete class, then each parent (closest first). mago's
+        // `all_parent_classes` is unordered, so we re-derive nearest-first by
+        // following `direct_parent_class` links through the index.
+        let chain = ancestor_chain(class_name, class_refl, &class_index);
 
-        out.extend(methods);
+        for (depth, ancestor_fqcn) in chain.iter().enumerate() {
+            let akey = ancestor_fqcn.trim_start_matches('\\').to_lowercase();
+            let Some(ancestor_refl) = class_index.get(&akey) else {
+                continue;
+            };
+            let Some(file) = project.file_of_span(&ancestor_refl.span) else {
+                continue;
+            };
+            let logical_name = String::from_utf8_lossy(&file.name).into_owned();
+            let file_path: PathBuf = match &file.path {
+                Some(p) => p.clone(),
+                None => PathBuf::from(logical_name.clone()),
+            };
+            // depth 0 = the concrete class itself → declaring_class None.
+            let declaring_class = if depth == 0 {
+                None
+            } else {
+                Some(ancestor_fqcn.clone())
+            };
+
+            let mut methods = project
+                .with_program(&logical_name, |program, file, names| {
+                    let mut found = Vec::new();
+                    collect_methods_in_statements(
+                        program.statements.iter(),
+                        ancestor_fqcn,
+                        class_name,
+                        declaring_class.clone(),
+                        file,
+                        &file_path,
+                        names,
+                        &mut found,
+                    );
+                    found
+                })
+                .unwrap_or_default();
+
+            for mut m in methods.drain(..) {
+                // First declaration up the chain wins (override shadows parent).
+                if seen_methods.insert(m.method.to_lowercase()) {
+                    // Inherited methods are bucketed under the CONCRETE file so a
+                    // query for the subclass's test file surfaces them.
+                    if depth > 0 {
+                        m.file = concrete_file_path.clone();
+                    }
+                    out.push(m);
+                }
+            }
+        }
     }
 
     out
 }
 
-/// Recursively walk a statement list (descending into namespaces) for the named
-/// class, and collect its test methods into `out`.
+/// Build the inheritance chain for `class_name` nearest-first: the class itself,
+/// then its direct parent, grandparent, … up to (but not including) the point
+/// where the chain leaves the loaded codebase. Stops at `PHPUnit\Framework\
+/// TestCase` and below (those declare no user `test*` methods worth surfacing,
+/// and walking into vendor is wasted work). Bounded to avoid cycles.
+fn ancestor_chain(
+    class_name: &str,
+    class_refl: &mago_codex::metadata::class_like::ClassLikeMetadata,
+    index: &std::collections::HashMap<String, &mago_codex::metadata::class_like::ClassLikeMetadata>,
+) -> Vec<String> {
+    const TESTCASE_FQCN_LOWER: &str = "phpunit\\framework\\testcase";
+    const MAX_DEPTH: usize = 50;
+
+    let mut chain = vec![class_name.to_string()];
+    let mut current = class_refl;
+    for _ in 0..MAX_DEPTH {
+        let Some(parent) = &current.direct_parent_class else {
+            break;
+        };
+        let parent_display = word_to_string(parent);
+        let parent_key = parent_display.trim_start_matches('\\').to_lowercase();
+        if parent_key == TESTCASE_FQCN_LOWER {
+            break;
+        }
+        let Some(parent_refl) = index.get(&parent_key) else {
+            break;
+        };
+        // Use the original-cased FQCN for display/lookup.
+        chain.push(word_to_string(&parent_refl.original_name));
+        current = parent_refl;
+    }
+    chain
+}
+
+/// Recursively walk a statement list (descending into namespaces) for the class
+/// whose FQCN is `declaring_fqcn`, and collect its test methods into `out`.
+///
+/// `attributed_class` is the CONCRETE class the discovered methods belong to
+/// (equal to `declaring_fqcn` for own methods; the subclass for inherited ones).
+/// `declaring_class` is `None` for own methods, `Some(parent)` for inherited ones.
+#[allow(clippy::too_many_arguments)]
 fn collect_methods_in_statements<'s, 'arena, I>(
     stmts: I,
-    class_name: &str,
+    declaring_fqcn: &str,
+    attributed_class: &str,
+    declaring_class: Option<String>,
     file: &mago_database::file::File,
     file_path: &std::path::Path,
     names: &mago_names::ResolvedNames,
@@ -95,21 +196,28 @@ fn collect_methods_in_statements<'s, 'arena, I>(
     'arena: 's,
     I: Iterator<Item = &'s Statement<'arena>>,
 {
-    let simple_class = simple_name(class_name);
+    let simple_class = simple_name(declaring_fqcn);
     for stmt in stmts {
         match stmt {
             Statement::Class(class) if name_eq_ignore_case(class.name.value, simple_class) => {
                 let source_text = String::from_utf8_lossy(&file.contents);
-                // mago lowercases reflection FQCNs; recover the original casing from
-                // the AST node by replacing the last `\`-segment of `class_name`.
-                let display_class = display_class_name(class_name, class.name.value);
+                // The methods are attributed to the CONCRETE class (`attributed_class`
+                // already carries source casing from `original_name`); for an
+                // inherited method, the AST/body lives in this `declaring_fqcn` file.
+                let display_class = attributed_class;
                 for member in class.members.iter() {
                     let ClassLikeMember::Method(method) = member else {
                         continue;
                     };
-                    if let Some(tm) =
-                        method_to_test(method, &display_class, file, file_path, names, &source_text)
-                    {
+                    if let Some(tm) = method_to_test(
+                        method,
+                        display_class,
+                        declaring_class.clone(),
+                        file,
+                        file_path,
+                        names,
+                        &source_text,
+                    ) {
                         out.push(tm);
                     }
                 }
@@ -119,7 +227,9 @@ fn collect_methods_in_statements<'s, 'arena, I>(
                 match &ns.body {
                     NamespaceBody::Implicit(b) => collect_methods_in_statements(
                         b.statements.iter(),
-                        class_name,
+                        declaring_fqcn,
+                        attributed_class,
+                        declaring_class.clone(),
                         file,
                         file_path,
                         names,
@@ -127,7 +237,9 @@ fn collect_methods_in_statements<'s, 'arena, I>(
                     ),
                     NamespaceBody::BraceDelimited(b) => collect_methods_in_statements(
                         b.statements.iter(),
-                        class_name,
+                        declaring_fqcn,
+                        attributed_class,
+                        declaring_class.clone(),
                         file,
                         file_path,
                         names,
@@ -141,9 +253,13 @@ fn collect_methods_in_statements<'s, 'arena, I>(
 }
 
 /// Classify an AST method node into a `TestMethod` if it qualifies.
+///
+/// `class_name` is the CONCRETE class the method is attributed to; an inherited
+/// method also carries `declaring_class = Some(parent FQCN)` (its body's class).
 fn method_to_test(
     method: &Method,
     class_name: &str,
+    declaring_class: Option<String>,
     file: &mago_database::file::File,
     file_path: &std::path::Path,
     names: &mago_names::ResolvedNames,
@@ -166,6 +282,7 @@ fn method_to_test(
     Some(TestMethod {
         class: class_name.to_string(),
         method: method_name,
+        declaring_class,
         file: file_path.to_path_buf(),
         line,
         has_data_provider,
@@ -234,16 +351,6 @@ fn extract_data_provider(method: &Method, names: &mago_names::ResolvedNames) -> 
 /// Strip a PHP namespace prefix: `My\\Ns\\ClassName` → `ClassName`.
 fn simple_name(fqcn: &str) -> &str {
     fqcn.rsplit('\\').next().unwrap_or(fqcn)
-}
-
-/// Build a display FQCN by replacing the last `\`-segment of `fqcn` (whose casing
-/// mago lowercased) with the original-cased `ast_simple` from the AST node.
-fn display_class_name(fqcn: &str, ast_simple: &[u8]) -> String {
-    let simple = String::from_utf8_lossy(ast_simple);
-    match fqcn.rfind('\\') {
-        Some(pos) => format!("{}\\{}", &fqcn[..pos], simple),
-        None => simple.into_owned(),
-    }
 }
 
 /// Case-insensitive compare an AST identifier's raw bytes against a `&str`.
@@ -384,6 +491,71 @@ mod tests {
             Some("provideData"),
             "expected DataProvider name 'provideData'; got: {:?}",
             test_foo.unwrap().has_data_provider
+        );
+    }
+
+    #[test]
+    fn surfaces_inherited_test_methods_to_concrete_subclass() {
+        // Inc-4 C: a test declared in an abstract `*TestCase` is surfaced to the
+        // CONCRETE subclass, attributed to the subclass with `declaring_class` set
+        // to the parent. The abstract class itself contributes NO rows.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("BaseTestCase.php"),
+            "<?php\nuse PHPUnit\\Framework\\TestCase;\nabstract class BaseTestCase extends TestCase {\n  public function testInherited(): void {}\n}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ConcreteTest.php"),
+            "<?php\nclass ConcreteTest extends BaseTestCase {\n  public function testOwn(): void {}\n}",
+        )
+        .unwrap();
+        let project = MagoProject::load(dir.path()).unwrap();
+
+        let methods = find_test_methods(
+            &project,
+            &["BaseTestCase".to_string(), "ConcreteTest".to_string()],
+        );
+
+        // The abstract class emits nothing of its own.
+        assert!(
+            !methods
+                .iter()
+                .any(|m| m.class.eq_ignore_ascii_case("BaseTestCase")),
+            "abstract class must not emit rows; got {methods:?}"
+        );
+        // The concrete subclass gets BOTH its own and the inherited method.
+        let own = methods
+            .iter()
+            .find(|m| m.method.eq_ignore_ascii_case("testOwn"))
+            .expect("testOwn surfaced");
+        assert!(own.class.eq_ignore_ascii_case("ConcreteTest"));
+        assert_eq!(
+            own.declaring_class, None,
+            "own method has no declaring_class"
+        );
+
+        let inherited = methods
+            .iter()
+            .find(|m| m.method.eq_ignore_ascii_case("testInherited"))
+            .expect("testInherited surfaced to ConcreteTest");
+        assert!(
+            inherited.class.eq_ignore_ascii_case("ConcreteTest"),
+            "inherited method must be attributed to the concrete class; got {inherited:?}"
+        );
+        assert!(
+            inherited
+                .declaring_class
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case("BaseTestCase")),
+            "inherited method must carry its declaring class; got {inherited:?}"
         );
     }
 

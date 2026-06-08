@@ -93,8 +93,11 @@ fn reduce_one_test(
     resolver: &BridgeResolver,
     test: &TestMethod,
 ) -> Vec<ReducedTest> {
-    // Resolve the declaring file's logical name (same path data_provider uses).
-    let Some(class_meta) = project.find_class(&test.class) else {
+    // Resolve the BODY class's declaring file (Inc-4 C: an inherited test method's
+    // body lives in its declaring `*TestCase`, not the concrete subclass — but the
+    // concrete subclass is what `$this` is bound to below).
+    let body_class = test.body_class();
+    let Some(class_meta) = project.find_class(body_class) else {
         return vec![bailed(test, None, "test class not in codebase")];
     };
     let Some(file) = project.file_of_span(&class_meta.span) else {
@@ -107,7 +110,7 @@ fn reduce_one_test(
     let rows = collect_rows(project, &logical, test);
 
     let reduced = project.with_program(&logical, |program, _file, names| {
-        let Some(method) = find_method(program, &test.class, &test.method) else {
+        let Some(method) = find_method(program, body_class, &test.method) else {
             return vec![bailed(test, None, "method body not found")];
         };
 
@@ -217,10 +220,10 @@ fn collect_rows(
             .collect();
     }
 
-    // #[TestWith([...])] rows from the raw method AST.
+    // #[TestWith([...])] rows from the raw method AST (in the body's class).
     let test_with = project
         .with_program(logical, |program, _file, _names| {
-            find_method(program, &test.class, &test.method).map(read_test_with_rows)
+            find_method(program, test.body_class(), &test.method).map(read_test_with_rows)
         })
         .flatten()
         .unwrap_or_default();
@@ -408,33 +411,29 @@ fn bailed(test: &TestMethod, data_set: Option<String>, reason: &str) -> ReducedT
 mod tests {
     use super::*;
 
-    /// Measurement harness (Inc-3 acceptance): run the reducer on a real
-    /// doctrine/collections accessor file and print the reduced fraction + bail
-    /// histogram. Ignored by default (needs a cloned + composer-installed checkout
-    /// at /tmp/doctrine-collections). Run with:
+    /// Measurement harness (Inc-4 acceptance): run the reducer on the real
+    /// doctrine/collections CONCRETE test file via the NORMAL `reduce_file` path
+    /// (no special harness) and print the reduced fraction + bail histogram.
+    /// Ignored by default (needs a cloned + composer-installed checkout at
+    /// /tmp/doctrine-collections). Run with:
     ///   cargo test -p analyzer --lib reduce::driver::tests::measure_doctrine_collections -- --ignored --nocapture
     #[test]
     #[ignore]
     fn measure_doctrine_collections() {
         use std::collections::BTreeMap;
         let root = Path::new("/tmp/doctrine-collections");
-        // The accessor tests are DECLARED in the abstract ArrayCollectionTestCase
-        // (the concrete ArrayCollectionTest only adds buildCollection + one test).
-        let test_file = root.join("tests/ArrayCollectionTestCase.php");
+        // Query the CONCRETE subclass file. Its accessor tests are INHERITED from
+        // the abstract ArrayCollectionTestCase; Inc-4 Task C surfaces them to this
+        // concrete class (bound to its `$this`, whose `buildCollection` returns a
+        // real ArrayCollection) through production discovery — so `reduce_file`
+        // reproduces the measurement with NO `reduce_as_concrete` harness.
+        let test_file = root.join("tests/ArrayCollectionTest.php");
         if !test_file.exists() {
             eprintln!("SKIP: {} not present", test_file.display());
             return;
         }
 
-        // FAITHFUL measurement: PHPUnit runs the inherited accessor tests as the
-        // CONCRETE subclass `ArrayCollectionTest`, whose `buildCollection` returns a
-        // real `ArrayCollection`. Discovery attributes inherited methods to their
-        // DECLARING class, so a plain `reduce_in_root` would bind `$this` to the
-        // abstract parent and bail every row on "abstract method dispatch". Here we
-        // reduce each declared test body against a `$this` bound to the concrete
-        // class so the inc-3 object model (A–E) is exercised against real code.
-        let concrete = "Doctrine\\Tests\\Common\\Collections\\ArrayCollectionTest";
-        let reduced = reduce_as_concrete(root, &test_file, concrete);
+        let reduced = reduce_in_root(root, &test_file).expect("reduce_file");
 
         let total = reduced.len();
         let mut pass = 0usize;
@@ -490,69 +489,67 @@ mod tests {
         }
     }
 
-    /// Reduce every test method DECLARED in `test_file`, but with `$this` bound to
-    /// the runtime `concrete_class` (modelling PHPUnit running an inherited test as
-    /// the concrete subclass). Used only by the doctrine measurement harness.
-    fn reduce_as_concrete(root: &Path, test_file: &Path, concrete_class: &str) -> Vec<ReducedTest> {
-        let project = MagoProject::load_excluding_vendor(root).expect("load");
-        let cache = CacheStore::open(root, MagoProject::version()).expect("cache");
-        let tests = discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover");
-        let resolver = BridgeResolver::new(&project);
-
-        let Some(class_meta) =
-            project.find_class(&tests.first().map(|t| t.class.clone()).unwrap_or_default())
-        else {
-            return vec![];
+    /// Second-suite breadth harness (Inc-4 acceptance): run the reducer via the
+    /// NORMAL `reduce_file` path on an arbitrary cloned suite file and print the
+    /// fraction + bail histogram. Path is taken from `REDUCE_MEASURE_FILE` so any
+    /// suite can be measured without editing code. Ignored by default.
+    ///   REDUCE_MEASURE_FILE=/tmp/x/tests/FooTest.php cargo test -p analyzer --lib \
+    ///     reduce::driver::tests::measure_arbitrary_suite -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_arbitrary_suite() {
+        use std::collections::BTreeMap;
+        let Ok(file) = std::env::var("REDUCE_MEASURE_FILE") else {
+            eprintln!("SKIP: set REDUCE_MEASURE_FILE=/abs/path/to/SomeTest.php");
+            return;
         };
-        let file = project.file_of_span(&class_meta.span).expect("file");
-        let logical = String::from_utf8_lossy(&file.name).into_owned();
-
-        // Build the concrete `$this` ONCE (setUp seeding is row-independent here).
-        let this_value = resolver.build_test_case_this(concrete_class).ok().flatten();
-
-        let mut out = Vec::new();
-        for test in &tests {
-            let rows = collect_rows(&project, &logical, test);
-            let reduced = project.with_program(&logical, |program, _f, names| {
-                let Some(method) = find_method(program, &test.class, &test.method) else {
-                    return vec![bailed(test, None, "method body not found")];
-                };
-                let MethodBody::Concrete(block) = &method.body else {
-                    return vec![bailed(test, None, "abstract/interface method")];
-                };
-                let param_names = match method_param_names(method) {
-                    Ok(n) => n,
-                    Err(reason) => {
-                        return rows
-                            .iter()
-                            .map(|(ds, _)| ReducedTest {
-                                class: concrete_class.to_string(),
-                                method: test.method.clone(),
-                                data_set: ds.clone(),
-                                outcome: Outcome::Bailed(reason.clone()),
-                            })
-                            .collect()
-                    }
-                };
-                rows.iter()
-                    .map(|(ds, args)| ReducedTest {
-                        class: concrete_class.to_string(),
-                        method: test.method.clone(),
-                        data_set: ds.clone(),
-                        outcome: reduce_row(
-                            block,
-                            &param_names,
-                            args,
-                            this_value.clone(),
-                            &resolver,
-                            names,
-                        ),
-                    })
-                    .collect()
-            });
-            out.extend(reduced.unwrap_or_default());
+        let test_file = Path::new(&file);
+        let root = test_file
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(Path::new("."));
+        if !test_file.exists() {
+            eprintln!("SKIP: {} not present", test_file.display());
+            return;
         }
-        out
+
+        let reduced = reduce_in_root(root, test_file).expect("reduce_file");
+        let total = reduced.len();
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        let mut bail = 0usize;
+        let mut hist: BTreeMap<String, usize> = BTreeMap::new();
+        for r in &reduced {
+            match &r.outcome {
+                Outcome::Pass => pass += 1,
+                Outcome::Fail(_) => fail += 1,
+                Outcome::Bailed(reason) => {
+                    bail += 1;
+                    let detail = match reason {
+                        BailReason::UnsupportedConstruct(m)
+                        | BailReason::UnknownCall(m)
+                        | BailReason::Other(m)
+                        | BailReason::TypeError(m)
+                        | BailReason::UnboundVariable(m) => format!("{}: {}", reason.tag(), m),
+                        other => other.tag().to_string(),
+                    };
+                    *hist.entry(detail).or_default() += 1;
+                }
+            }
+        }
+        println!("\n=== {} ===", test_file.display());
+        println!(
+            "rows={total}  PASS={pass}  FAIL={fail}  BAIL={bail}  reduced={:.1}%",
+            if total == 0 {
+                0.0
+            } else {
+                100.0 * (pass + fail) as f64 / total as f64
+            }
+        );
+        println!("--- bail histogram ---");
+        for (reason, n) in &hist {
+            println!("  {n:>3}  {reason}");
+        }
     }
 
     fn write_suite(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -592,6 +589,60 @@ mod tests {
             .iter()
             .map(|r| (r.method.as_str(), r.data_set.as_deref(), &r.outcome))
             .collect()
+    }
+
+    #[test]
+    fn inherited_test_method_reduces_via_normal_path() {
+        // Inc-4 C: an abstract *TestCase declares `testInherited`; the concrete
+        // subclass runs it with `$this->value()` returning a concrete int. The
+        // NORMAL `reduce_file` (querying the CONCRETE file) must surface the
+        // inherited test, bind `$this` to the concrete class, and reduce to Pass —
+        // no special harness.
+        let dir = write_suite(&[
+            (
+                "AbstractValueTestCase.php",
+                r#"<?php
+use PHPUnit\Framework\TestCase;
+abstract class AbstractValueTestCase extends TestCase {
+    abstract protected function value(): int;
+    public function testInherited(): void {
+        $this->assertSame(42, $this->value());
+    }
+}
+"#,
+            ),
+            (
+                "ConcreteValueTest.php",
+                r#"<?php
+class ConcreteValueTest extends AbstractValueTestCase {
+    protected function value(): int { return 42; }
+    public function testOwn(): void {
+        $this->assertSame(1, 1);
+    }
+}
+"#,
+            ),
+        ]);
+        let reduced = reduce_file(&dir.path().join("ConcreteValueTest.php")).unwrap();
+        let got = outcomes(&reduced);
+        // Both the inherited and the own test must be present AND pass.
+        assert!(
+            got.iter()
+                .any(|(m, _, o)| *m == "testInherited" && **o == Outcome::Pass),
+            "inherited test must reduce to Pass via the normal path; got {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|(m, _, o)| *m == "testOwn" && **o == Outcome::Pass),
+            "own test must still reduce; got {got:?}"
+        );
+        // The abstract parent must NOT contribute its own (duplicate) row.
+        assert!(
+            reduced
+                .iter()
+                .all(|r| r.class.eq_ignore_ascii_case("ConcreteValueTest")),
+            "all rows must be attributed to the concrete class; got {reduced:?}"
+        );
     }
 
     #[test]

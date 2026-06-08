@@ -6,12 +6,27 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TestMethod {
+    /// The CONCRETE runtime class PHPUnit instantiates and binds `$this` to.
     pub class: String,
     pub method: String,
+    /// `Some(fqcn)` when the method body is INHERITED — declared in an ancestor
+    /// `*TestCase` (`fqcn`) but run by the concrete `class`. `None` when the body
+    /// is declared in `class` itself. The reducer finds the body in
+    /// `declaring_class.unwrap_or(class)` but binds `$this` to `class` (Inc-4 C).
+    #[serde(default)]
+    pub declaring_class: Option<String>,
     pub file: PathBuf,
     pub line: u32,
     pub has_data_provider: Option<String>,
     pub lifecycle: LifecycleBinding,
+}
+
+impl TestMethod {
+    /// The class whose AST declares this method's body (the concrete class unless
+    /// the method is inherited from an ancestor `*TestCase`).
+    pub fn body_class(&self) -> &str {
+        self.declaring_class.as_deref().unwrap_or(&self.class)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

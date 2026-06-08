@@ -1843,6 +1843,52 @@ fn call_closure_builtin(
             }
             Ok(Some(acc))
         }
+        // PHP 8.4 array predicate/search builtins. Their callback takes (value,
+        // key) — value FIRST (RFC: "array_find"/"array_any"/"array_all"). Pure iff
+        // the closure is pure. Short-circuit on the first decisive element, exactly
+        // as PHP does.
+        // array_any(array, fn(value, key)): true iff fn is truthy for ANY element.
+        (b"array_any", [Value::Arr(items), Value::Closure(cl)]) => {
+            for (k, v) in items {
+                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
+                if hit.to_bool() {
+                    return Ok(Some(Value::Bool(true)));
+                }
+            }
+            Ok(Some(Value::Bool(false)))
+        }
+        // array_all(array, fn(value, key)): true iff fn is truthy for EVERY element.
+        (b"array_all", [Value::Arr(items), Value::Closure(cl)]) => {
+            for (k, v) in items {
+                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
+                if !hit.to_bool() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+            }
+            Ok(Some(Value::Bool(true)))
+        }
+        // array_find(array, fn(value, key)): the first VALUE where fn is truthy,
+        // else null.
+        (b"array_find", [Value::Arr(items), Value::Closure(cl)]) => {
+            for (k, v) in items {
+                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
+                if hit.to_bool() {
+                    return Ok(Some(v.clone()));
+                }
+            }
+            Ok(Some(Value::Null))
+        }
+        // array_find_key(array, fn(value, key)): the first KEY where fn is truthy,
+        // else null.
+        (b"array_find_key", [Value::Arr(items), Value::Closure(cl)]) => {
+            for (k, v) in items {
+                let hit = invoke_closure(cl, &[v.clone(), array_key_to_value(k)], scope)?;
+                if hit.to_bool() {
+                    return Ok(Some(array_key_to_value(k)));
+                }
+            }
+            Ok(Some(Value::Null))
+        }
         // usort & friends mutate by reference → bail (fail-closed): a by-value
         // model cannot write the sorted array back to the caller's variable.
         (b"usort" | b"uasort" | b"uksort", _) => Err(BailReason::UnsupportedConstruct(
@@ -2711,6 +2757,66 @@ mod tests {
         assert_eq!(
             run_body(
                 "$r = array_filter([1, 2, 3, 4], fn($x) => $x % 2 === 0); $this->assertSame([1 => 2, 3 => 4], $r);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn array_any_all_find_php84_predicates() {
+        // PHP 8.4 array_any/array_all/array_find. Callback is (value, key). The
+        // semantics are from the RFC (host PHP 8.1 has no these builtins, so the
+        // expectations are transcribed from the RFC spec, not php -r).
+        // array_any: true if ANY value is even.
+        assert_eq!(
+            run_body(
+                "$this->assertTrue(array_any([1, 3, 4], fn($v, $k) => $v % 2 === 0));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // array_all: false because not every value is even.
+        assert_eq!(
+            run_body(
+                "$this->assertFalse(array_all([2, 3, 4], fn($v, $k) => $v % 2 === 0));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // array_find: first value > 2 is 3.
+        assert_eq!(
+            run_body(
+                "$this->assertSame(3, array_find([1, 2, 3, 4], fn($v, $k) => $v > 2));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // array_find: no match → null.
+        assert_eq!(
+            run_body(
+                "$this->assertNull(array_find([1, 2], fn($v, $k) => $v > 9));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // The KEY is the SECOND arg (string-keyed array).
+        assert_eq!(
+            run_body(
+                "$this->assertTrue(array_any(['A' => 'a', 'B' => 'b'], fn($v, $k) => $k === 'A' && $v === 'a'));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_invoking_a_captured_closure() {
+        // A closure that captures and INVOKES another closure (the doctrine
+        // exists/array_any pattern: an arrow re-dispatches to a captured $p).
+        assert_eq!(
+            run_body(
+                "$p = fn($k, $e) => $k === 1 && $e === 20; $g = fn($v, $key) => (bool) $p($key, $v); $this->assertTrue(array_any([10, 20, 30], $g));",
                 vec![]
             ),
             Outcome::Pass

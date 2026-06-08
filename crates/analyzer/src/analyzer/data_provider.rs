@@ -54,7 +54,10 @@ pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
         return no_data();
     };
 
-    let Some(value) = compute_provider_return(project, &test.class, provider_name) else {
+    // The provider method lives where the test method's BODY lives: for an
+    // inherited test (Inc-4 C), that is the declaring `*TestCase`, not the concrete
+    // subclass. `body_class()` resolves to the right one.
+    let Some(value) = compute_provider_return(project, test.body_class(), provider_name) else {
         return no_data();
     };
 
