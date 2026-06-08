@@ -862,6 +862,64 @@ fn build_queue(
         // the only thing handling per-test isolation. OR both into a single
         // "must exit after this batch" bit.
         let must_force_exit = g.is_stateful || g.is_isolated;
+
+        // PHPUnit process isolation (@runInSeparateProcess /
+        // @runClassInSeparateProcess): vanilla runs EACH such test in its own
+        // pristine subprocess, so process-global state ($GLOBALS, statics,
+        // define(), ini) set by one isolated method must never be visible to the
+        // next. Our worker boundary is a fork, so give every isolated method its
+        // OWN single-method, force-exit plan: each runs in a fresh fork of the
+        // warm master and the child is recycled before the next method.
+        //
+        // This must short-circuit BEFORE the chain/bin/class-level grouping
+        // below — otherwise an isolated class with lifecycle overrides routes to
+        // the class-level path (all methods in one shared fork) and an isolated
+        // class with data providers gets LPT-binned with siblings, both leaking
+        // state across methods. Heavy provider methods keep their per-row-chunk
+        // split (each chunk is already its own fork — strictly finer isolation).
+        //
+        // NOTE: an internal #[Depends] chain inside an isolated class is split
+        // per method here; cross-fork dependency-return passing isn't modelled
+        // (it isn't for non-isolated classes either), and @depends combined with
+        // process isolation is rare and semantically fraught in vanilla itself.
+        if g.is_isolated {
+            for hm in &heavy_methods {
+                let rows = row_count_for(hm).unwrap_or(1);
+                let chunks = rows.min(MAX_ROW_CHUNKS);
+                for chunk_index in 0..chunks {
+                    let bc = BatchClass {
+                        file: g.file.clone(),
+                        class: g.class.clone(),
+                        methods: vec![hm.name.clone()],
+                        row_filter: Some(RowFilter {
+                            chunk_index,
+                            total_chunks: chunks,
+                        }),
+                        required_files: required_files_for(
+                            std::slice::from_ref(&hm.name),
+                            &g.methods,
+                        ),
+                        is_isolated: true,
+                    };
+                    queue.push_back(mk_plan(vec![bc], true));
+                }
+            }
+            for om in &other_methods {
+                let method_names = vec![om.name.clone()];
+                let req_files = required_files_for(&method_names, &g.methods);
+                let bc = BatchClass {
+                    file: g.file.clone(),
+                    class: g.class.clone(),
+                    methods: method_names,
+                    row_filter: None,
+                    required_files: req_files,
+                    is_isolated: true,
+                };
+                queue.push_back(mk_plan(vec![bc], true));
+            }
+            continue;
+        }
+
         for hm in &heavy_methods {
             let rows = row_count_for(hm).unwrap_or(1);
             let chunks = rows.min(MAX_ROW_CHUNKS);
@@ -1183,6 +1241,117 @@ mod tests {
             .contains(&"testSimple".to_string()));
     }
 
+    fn make_isolated_case(
+        class: &str,
+        method: &str,
+        lifecycle: bool,
+        dp: Option<&str>,
+    ) -> TestCase {
+        TestCase {
+            file: PathBuf::from("/f.php"),
+            class: class.to_string(),
+            method: method.to_string(),
+            data_provider: dp.map(|s| s.to_string()),
+            groups: vec![],
+            external_providers: vec![],
+            is_tautological: false,
+            has_lifecycle_overrides: lifecycle,
+            depends_on: vec![],
+            is_dispatch_safe: true,
+            fingerprint: std::collections::HashSet::new(),
+            is_stateful: false,
+            is_isolated: true,
+            needs_db: false,
+        }
+    }
+
+    #[test]
+    fn build_queue_isolated_class_forks_each_method_separately() {
+        // @runInSeparateProcess: vanilla runs each isolated test in its OWN
+        // pristine subprocess. The dispatcher must therefore emit ONE
+        // single-method, force-exit plan per method — even when the class has
+        // lifecycle overrides, which otherwise route to the class-level path
+        // that packs EVERY method into a single shared fork. Without per-method
+        // forking, process-global state ($GLOBALS / statics / define() / ini)
+        // set by one isolated method leaks into the next, diverging from vanilla.
+        let cases = vec![
+            make_isolated_case("Iso", "tA", true, None),
+            make_isolated_case("Iso", "tB", true, None),
+            make_isolated_case("Iso", "tC", true, None),
+        ];
+        let cfg = RunConfig {
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
+            class_file_index: HashMap::new(),
+            n_workers: 4,
+        };
+        let row_counts = RowCounts::new();
+
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
+
+        assert_eq!(q.len(), 3, "one plan per isolated method, got {}", q.len());
+        let mut methods: Vec<String> = Vec::new();
+        for p in &q {
+            assert_eq!(p.classes.len(), 1, "each isolated plan holds one class");
+            assert_eq!(
+                p.classes[0].methods.len(),
+                1,
+                "each isolated plan holds exactly one method"
+            );
+            assert!(
+                p.force_exit_after,
+                "each isolated plan must force-exit so its fork is recycled before the next method"
+            );
+            assert!(p.classes[0].is_isolated);
+            methods.push(p.classes[0].methods[0].clone());
+        }
+        methods.sort();
+        assert_eq!(
+            methods,
+            vec!["tA".to_string(), "tB".to_string(), "tC".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_queue_isolated_provider_method_still_forks_per_method() {
+        // An isolated class whose methods use data providers must NOT be binned
+        // with sibling methods into a shared fork. Each method gets its own
+        // force-exit plan (heavy providers keep their per-row-chunk split, which
+        // is strictly finer isolation; this fixture stays under the split
+        // threshold so each method yields exactly one plan).
+        let cases = vec![
+            make_isolated_case("IsoDp", "tX", false, Some("rows")),
+            make_isolated_case("IsoDp", "tY", false, Some("rows")),
+        ];
+        let cfg = RunConfig {
+            autoload: PathBuf::from("/autoload.php"),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: StopOn::default(),
+            worker_timeout: None,
+            class_file_index: HashMap::new(),
+            n_workers: 4,
+        };
+        let mut row_counts = RowCounts::new();
+        row_counts.insert(("IsoDp".to_string(), "rows".to_string()), Some(2));
+
+        let (queue, _synthetic) = build_queue(cases, &cfg, &row_counts);
+        let q: Vec<_> = queue.into_iter().collect();
+
+        assert_eq!(q.len(), 2, "one plan per isolated provider method");
+        for p in &q {
+            assert_eq!(p.classes.len(), 1);
+            assert_eq!(p.classes[0].methods.len(), 1);
+            assert!(p.force_exit_after);
+        }
+    }
+
     fn make_lifecycle_case(class: &str, method: &str) -> TestCase {
         TestCase {
             file: PathBuf::from("/f.php"),
@@ -1360,10 +1529,14 @@ mod tests {
     #[test]
     fn isolated_class_forces_exit_and_propagates_to_batchclass() {
         // A class marked is_isolated (e.g. via @runInSeparateProcess) must:
-        //   1. Have its BatchPlan flagged force_exit_after=true so the worker
-        //      child exits after this batch (mirroring stateful behaviour).
-        //   2. Have its BatchClass.is_isolated=true so the PHP executor can
-        //      clear runTestInSeparateProcess on each TestCase instance and
+        //   1. Be dispatched as ONE force-exit plan PER METHOD — vanilla runs
+        //      each isolated test in its own pristine subprocess, so the methods
+        //      must NOT share a fork (see
+        //      build_queue_isolated_class_forks_each_method_separately).
+        //   2. Have each BatchPlan flagged force_exit_after=true so the worker
+        //      child exits after running that single method.
+        //   3. Have each BatchClass.is_isolated=true so the PHP executor can
+        //      clear runTestInSeparateProcess on the TestCase instance and
         //      prevent PHPUnit from spawning a nested sub-process.
         let mut cases = vec![
             make_lifecycle_case("IsolatedClass", "testOne"),
@@ -1390,17 +1563,24 @@ mod tests {
             .collect();
         assert_eq!(
             plans.len(),
-            1,
-            "isolated class dispatched as a single batch"
+            2,
+            "isolated class dispatched one plan per method, not a shared batch"
         );
-        assert!(
-            plans[0].force_exit_after,
-            "isolated class must trigger force_exit_after on the BatchPlan"
-        );
-        assert!(
-            plans[0].classes[0].is_isolated,
-            "is_isolated must be stamped on the BatchClass for the PHP executor"
-        );
+        for p in &plans {
+            assert!(
+                p.force_exit_after,
+                "each isolated method's plan must trigger force_exit_after"
+            );
+            assert_eq!(
+                p.classes[0].methods.len(),
+                1,
+                "each isolated plan carries exactly one method"
+            );
+            assert!(
+                p.classes[0].is_isolated,
+                "is_isolated must be stamped on the BatchClass for the PHP executor"
+            );
+        }
     }
 
     /// Helper: safe case with a data provider (method_dispatch_safe=true).
