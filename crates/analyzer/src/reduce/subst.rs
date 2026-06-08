@@ -1248,4 +1248,43 @@ class PartialTest {
             Outcome::Bailed(_)
         ));
     }
+
+    // ── Increment 3: static-form assertions (doctrine uses `self::assertSame`) ──
+
+    #[test]
+    fn self_static_assertion_is_intercepted() {
+        // doctrine/collections asserts via `self::assertSame(...)`, not
+        // `$this->assertSame(...)`. The static form must be intercepted as an
+        // assertion (self/static/parent receiver) — never dispatched as a method
+        // call (which would bail on `self::`).
+        let src = r#"<?php
+class T {
+    public function testStatic(): void {
+        self::assertSame(4, 2 + 2);
+        static::assertTrue(1 === 1);
+        self::assertCount(3, [1, 2, 3]);
+        self::assertIsArray([1, 2]);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testStatic", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn self_static_assertion_fails_when_wrong() {
+        let src = r#"<?php
+class T {
+    public function testStatic(): void {
+        self::assertSame(5, 2 + 2);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testStatic", vec![]),
+            Outcome::Fail(_)
+        ));
+    }
 }

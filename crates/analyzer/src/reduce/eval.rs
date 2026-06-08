@@ -480,6 +480,23 @@ fn try_assertion(expr: &Expression, scope: &mut Scope) -> Result<Option<Outcome>
             Some(n) => (n, &fc.argument_list),
             None => return Ok(None),
         },
+        // `self::assertSame(...)` / `static::` / `parent::` — the static PHPUnit
+        // form (doctrine/collections uses this). Only a self/static/parent receiver
+        // is intercepted: inside a test method these unambiguously target the
+        // test case, so an assertion-named static call is a real assertion. A
+        // static call through a concrete `Foo::` class name is NOT intercepted
+        // (it could be a user static method) and falls through to dispatch.
+        Call::StaticMethod(sm) => {
+            let mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector::Identifier(id) =
+                &sm.method
+            else {
+                return Ok(None);
+            };
+            if !is_self_parent_static(sm.class) {
+                return Ok(None);
+            }
+            (id.value, &sm.argument_list)
+        }
         _ => return Ok(None),
     };
 
@@ -489,6 +506,30 @@ fn try_assertion(expr: &Expression, scope: &mut Scope) -> Result<Option<Outcome>
 
     let arg_values = eval_arguments(args, scope)?;
     Ok(Some(run_assertion(name, &arg_values)?))
+}
+
+/// True when a static-call class expression is `self`, `static`, or `parent` —
+/// the only receivers for which an assertion-named static call is unambiguously a
+/// PHPUnit assertion (inside a test method). A concrete class name is not matched.
+///
+/// mago parses these keywords as their own `Expression` variants (not an
+/// `Identifier`), but in some positions a bare `self` may also arrive as a local
+/// identifier — handle both shapes.
+fn is_self_parent_static(class: &Expression) -> bool {
+    if matches!(
+        class,
+        Expression::Self_(_) | Expression::Static(_) | Expression::Parent(_)
+    ) {
+        return true;
+    }
+    match identifier_name(class) {
+        Some(n) => {
+            n.eq_ignore_ascii_case(b"self")
+                || n.eq_ignore_ascii_case(b"static")
+                || n.eq_ignore_ascii_case(b"parent")
+        }
+        None => false,
+    }
 }
 
 fn is_assertion_name(name: &[u8]) -> bool {
@@ -502,6 +543,9 @@ fn is_assertion_name(name: &[u8]) -> bool {
             | b"assertFalse"
             | b"assertNull"
             | b"assertNotNull"
+            | b"assertCount"
+            | b"assertNotCount"
+            | b"assertIsArray"
     )
 }
 
@@ -558,6 +602,18 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
             let a = one_arg(args)?;
             pass(!matches!(a, Value::Null), "assertNotNull")
         }
+        b"assertCount" => {
+            let (expected, haystack) = two_args(args)?;
+            pass(count_matches(expected, haystack)?, "assertCount")
+        }
+        b"assertNotCount" => {
+            let (expected, haystack) = two_args(args)?;
+            pass(!count_matches(expected, haystack)?, "assertNotCount")
+        }
+        b"assertIsArray" => {
+            let a = one_arg(args)?;
+            pass(matches!(a, Value::Arr(_)), "assertIsArray")
+        }
         _ => {
             return Err(BailReason::UnknownCall(
                 String::from_utf8_lossy(name).into_owned(),
@@ -589,6 +645,24 @@ fn two_args(args: &[Value]) -> Result<(&Value, &Value), BailReason> {
             "assertion expects 2 arguments".into(),
         )),
     }
+}
+
+/// `assertCount($expected, $haystack)`: true iff `count($haystack) === $expected`.
+/// Only an array haystack is modelled — a `Countable` object's count depends on a
+/// user `count()` method (or an iterator), so an object/non-array haystack BAILS
+/// (fail-closed). The expected value must be an int (a non-int is a PHP TypeError).
+fn count_matches(expected: &Value, haystack: &Value) -> Result<bool, BailReason> {
+    let Value::Arr(items) = haystack else {
+        return Err(BailReason::UnsupportedConstruct(
+            "assertCount over a non-array (Countable/iterator) haystack".into(),
+        ));
+    };
+    let Value::Int(n) = expected else {
+        return Err(BailReason::TypeError(
+            "assertCount expected count is not an int".into(),
+        ));
+    };
+    Ok(items.len() as i64 == *n)
 }
 
 fn one_arg(args: &[Value]) -> Result<&Value, BailReason> {
