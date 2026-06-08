@@ -52,6 +52,48 @@ pub enum Value {
         class: Vec<u8>,
         props: Vec<(Vec<u8>, Value)>,
     },
+    /// A first-class closure / arrow function (Inc-4 Task A).
+    ///
+    /// Models `function (...) use (...) {...}` and `fn (...) => expr`, with the
+    /// `use(...)` / arrow auto-capture taken **by value** at creation time (a copy
+    /// of each captured variable's current `Value`). By-reference capture
+    /// (`use (&$x)`) and `$this`-rebinding (`Closure::bind`) are NOT representable
+    /// here — the gate/eval BAIL before ever producing such a closure (frontier:
+    /// impurity, fail-closed).
+    ///
+    /// `params` (bare parameter names) + `body` are **raw pointers into the
+    /// arena** that holds the closure's source AST. This is sound ONLY because a
+    /// closure is created and invoked inside the SAME `with_program` evaluation
+    /// scope (one arena, which outlives the whole `exec_statements` call). A
+    /// closure that escapes to a different file's arena is never invoked by us (it
+    /// reaches an unmodelled boundary and bails first). The pointers are read back
+    /// to typed AST refs only inside [`super::eval`] (`invoke_closure`).
+    Closure(ClosureRef),
+}
+
+/// The arena-pointer payload of a [`Value::Closure`]. Type-erased so [`value`]
+/// stays free of `mago_syntax` types; [`super::eval`] casts the pointers back.
+///
+/// `body` is `ClosureBodyPtr::Block` for `function(){...}`/`fn(){...}` (a
+/// statement body) and `ClosureBodyPtr::Expr` for `fn(...) => expr` (an arrow
+/// expression body). `captured` is the by-value capture environment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureRef {
+    /// `*const FunctionLikeParameterList` — the parameter list AST node.
+    pub params: *const (),
+    /// The body AST node (block or expression), tagged by kind.
+    pub body: ClosureBodyPtr,
+    /// Captured variables (name → value), by value at creation time.
+    pub captured: Vec<(Vec<u8>, Value)>,
+}
+
+/// Which AST node kind the closure body pointer refers to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClosureBodyPtr {
+    /// `*const Block` — a `{ ... }` statement body (`function`/`fn` block form).
+    Block(*const ()),
+    /// `*const Expression` — an arrow-function `=> expr` body.
+    Expr(*const ()),
 }
 
 /// A PHP array key — only `int` or (byte) `string`. Float/bool/null keys are
@@ -72,7 +114,8 @@ impl Value {
             Value::Float(_) => "float",
             Value::Str(_) => "string",
             Value::Arr(_) => "array",
-            Value::Object { .. } => "object",
+            // A Closure is an object (`gettype()` → "object", class "Closure").
+            Value::Object { .. } | Value::Closure(_) => "object",
         }
     }
 
@@ -112,8 +155,8 @@ impl Value {
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !(s.is_empty() || s.as_slice() == b"0"),
             Value::Arr(a) => !a.is_empty(),
-            // An object is always truthy in PHP.
-            Value::Object { .. } => true,
+            // An object (incl. a Closure) is always truthy in PHP.
+            Value::Object { .. } | Value::Closure(_) => true,
         }
     }
 
@@ -135,7 +178,7 @@ impl Value {
             // (int)$object is a PHP error/warning; the eval layer (arithmetic,
             // casts) bails on an object operand before reaching here. The `1`
             // sentinel is never observed — kept only to make the match total.
-            Value::Object { .. } => 1,
+            Value::Object { .. } | Value::Closure(_) => 1,
         }
     }
 
@@ -153,7 +196,7 @@ impl Value {
             Value::Str(s) => str_leading_numeric(s).map(|n| n.to_float()).unwrap_or(0.0),
             Value::Arr(a) => (!a.is_empty()) as i64 as f64,
             // (float)$object errors in PHP; arithmetic/cast bails first (see to_int).
-            Value::Object { .. } => 1.0,
+            Value::Object { .. } | Value::Closure(_) => 1.0,
         }
     }
 
@@ -175,8 +218,9 @@ impl Value {
             // PHP would emit "Array" + a notice; we bail rather than model that.
             Value::Arr(_) => return None,
             // Object→string needs `__toString` (frontier §6, not modelled in v2);
-            // bail by returning None so the caller (concat/cast) abstains.
-            Value::Object { .. } => return None,
+            // bail by returning None so the caller (concat/cast) abstains. A
+            // Closure→string is a PHP fatal — also None (caller bails).
+            Value::Object { .. } | Value::Closure(_) => return None,
         })
     }
 
@@ -198,8 +242,8 @@ impl Value {
                 None => ArrayKey::Str(s.clone()),
             },
             Value::Arr(_) => return None,
-            // An object cannot be an array key (PHP TypeError); caller bails.
-            Value::Object { .. } => return None,
+            // An object/closure cannot be an array key (PHP TypeError); caller bails.
+            Value::Object { .. } | Value::Closure(_) => return None,
         })
     }
 
@@ -578,6 +622,11 @@ impl Value {
             // Report a stable non-`Equal` direction (object > everything else).
             (Object { .. }, _) => Ordering::Greater,
             (_, Object { .. }) => Ordering::Less,
+            // A Closure is uncomparable; the eval layer bails on `<`/`>`/`<=>`/
+            // `===` with a closure operand, so this is never observed. Report a
+            // stable non-`Equal` direction.
+            (Closure(_), _) => Ordering::Greater,
+            (_, Closure(_)) => Ordering::Less,
             // scalar vs array → the array is greater.
             (Arr(_), _) => Ordering::Greater,
             (_, Arr(_)) => Ordering::Less,
@@ -624,8 +673,12 @@ impl Value {
                     .is_some_and(|(_, bv)| av.php_loose_eq(bv))
             });
         }
-        // An object vs a non-object is never loosely equal.
-        if matches!(self, Value::Object { .. }) || matches!(other, Value::Object { .. }) {
+        // An object/closure vs a non-matching value is never loosely equal here.
+        // (Closure `==` is reference identity; the eval layer bails on it, so a
+        // closure never reaches a true-producing path — false is the safe answer.)
+        if matches!(self, Value::Object { .. } | Value::Closure(_))
+            || matches!(other, Value::Object { .. } | Value::Closure(_))
+        {
             return false;
         }
         self.php_compare(other) == std::cmp::Ordering::Equal

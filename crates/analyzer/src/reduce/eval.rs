@@ -29,7 +29,7 @@ use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::ast::unary::UnaryPrefixOperator;
 use mago_syntax::ast::ast::variable::Variable;
 
-use super::value::{ArrayKey, Value};
+use super::value::{ArrayKey, ClosureBodyPtr, ClosureRef, Value};
 
 // ─── Outcome + bail taxonomy ──────────────────────────────────────────────────
 
@@ -783,7 +783,9 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
 /// reducer models structure, not heap identity, so it MUST abstain when either
 /// operand is an object (frontier §1). `assertEquals`/`==` stays modelable.
 fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
-    if matches!(a, Value::Object { .. }) || matches!(b, Value::Object { .. }) {
+    if matches!(a, Value::Object { .. } | Value::Closure(_))
+        || matches!(b, Value::Object { .. } | Value::Closure(_))
+    {
         return Err(BailReason::UnsupportedConstruct(
             "=== / assertSame on an object (reference identity, no heap model)".into(),
         ));
@@ -863,6 +865,9 @@ fn eval_expr(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> 
         // A BARE read of a missing key bails (PHP would warn) — only `?? default`
         // (handled in `eval_binary`'s NullCoalesce) tolerates a missing key.
         Expression::ArrayAccess(aa) => eval_array_access(aa, scope),
+        // A closure / arrow function literal → a `Value::Closure` (Task A).
+        Expression::Closure(c) => make_closure(c, scope),
+        Expression::ArrowFunction(a) => make_arrow(a, scope),
         other => Err(BailReason::UnsupportedConstruct(format!(
             "expression: {}",
             expr_kind(other)
@@ -1113,7 +1118,9 @@ fn php_negate(v: Value) -> Result<Value, BailReason> {
         Value::Float(f) => Ok(Value::Float(-f)),
         Value::Str(_) | Value::Bool(_) | Value::Null => php_negate(coerce_number(&v)),
         Value::Arr(_) => Err(BailReason::TypeError("negate array".into())),
-        Value::Object { .. } => Err(BailReason::TypeError("negate object".into())),
+        Value::Object { .. } | Value::Closure(_) => {
+            Err(BailReason::TypeError("negate object".into()))
+        }
     }
 }
 
@@ -1122,7 +1129,9 @@ fn php_unary_plus(v: Value) -> Result<Value, BailReason> {
         Value::Int(_) | Value::Float(_) => Ok(v),
         Value::Str(_) | Value::Bool(_) | Value::Null => Ok(coerce_number(&v)),
         Value::Arr(_) => Err(BailReason::TypeError("unary + on array".into())),
-        Value::Object { .. } => Err(BailReason::TypeError("unary + on object".into())),
+        Value::Object { .. } | Value::Closure(_) => {
+            Err(BailReason::TypeError("unary + on object".into()))
+        }
     }
 }
 
@@ -1156,12 +1165,17 @@ fn incdec_lvalue(
         ));
     };
     let key = var_name(v.name);
-    let cur = scope.vars.get(&key).cloned().ok_or_else(|| {
-        BailReason::UnboundVariable(String::from_utf8_lossy(&key).into_owned())
-    })?;
+    let cur =
+        scope.vars.get(&key).cloned().ok_or_else(|| {
+            BailReason::UnboundVariable(String::from_utf8_lossy(&key).into_owned())
+        })?;
     let new = match &cur {
         Value::Int(n) => {
-            let stepped = if inc { n.checked_add(1) } else { n.checked_sub(1) };
+            let stepped = if inc {
+                n.checked_add(1)
+            } else {
+                n.checked_sub(1)
+            };
             match stepped {
                 Some(r) => Value::Int(r),
                 // PHP_INT_MAX++ → float (overflow→float), like arithmetic.
@@ -1286,10 +1300,10 @@ fn coerce_number(v: &Value) -> Value {
             // PHP 8: a non-numeric string in arithmetic is a TypeError; we abstain.
             None => Value::Int(v.to_int()),
         },
-        // Arrays/objects never reach here: every arithmetic/unary path excludes
-        // them and bails first (`php_add`, `arithmetic_operand`,
+        // Arrays/objects/closures never reach here: every arithmetic/unary path
+        // excludes them and bails first (`php_add`, `arithmetic_operand`,
         // `php_negate`/`php_unary_plus`).
-        Value::Arr(_) | Value::Object { .. } => v.clone(),
+        Value::Arr(_) | Value::Object { .. } | Value::Closure(_) => v.clone(),
     }
 }
 
@@ -1306,9 +1320,11 @@ fn arithmetic_operand(v: &Value) -> Result<Value, BailReason> {
             )),
         },
         Value::Arr(_) => Err(BailReason::TypeError("array in arithmetic".into())),
-        // An object in arithmetic is a PHP TypeError (no __toString/numeric route
-        // in v2) — bail fail-closed (frontier §6).
-        Value::Object { .. } => Err(BailReason::TypeError("object in arithmetic".into())),
+        // An object/closure in arithmetic is a PHP TypeError (no __toString/numeric
+        // route in v2) — bail fail-closed (frontier §6).
+        Value::Object { .. } | Value::Closure(_) => {
+            Err(BailReason::TypeError("object in arithmetic".into()))
+        }
     }
 }
 
@@ -1605,16 +1621,261 @@ fn array_key_to_value(k: &ArrayKey) -> Value {
     }
 }
 
+// ─── Closures / arrow functions (Inc-4 Task A) ────────────────────────────────
+
+/// Build a `Value::Closure` from a `function (...) use (...) {...}` literal.
+/// Capture is BY VALUE from the explicit `use(...)` list (each named variable's
+/// current value is copied). `use (&$x)` by-reference capture is impurity → BAIL
+/// (frontier). A `static` closure (no `$this`) is fine — and any closure that
+/// reads `$this` will bail at the `$this` read anyway (it is not captured here).
+fn make_closure(
+    c: &mago_syntax::ast::ast::function_like::closure::Closure,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let mut captured: Vec<(Vec<u8>, Value)> = Vec::new();
+    if let Some(use_clause) = &c.use_clause {
+        for uv in use_clause.variables.iter() {
+            // By-reference capture (`use (&$x)`) cannot be modelled by value → bail.
+            if uv.ampersand.is_some() {
+                return Err(BailReason::UnsupportedConstruct(
+                    "by-reference closure capture (use (&$x))".into(),
+                ));
+            }
+            let name = var_name(uv.variable.name);
+            let value = scope.vars.get(&name).cloned().ok_or_else(|| {
+                BailReason::UnboundVariable(String::from_utf8_lossy(&name).into_owned())
+            })?;
+            captured.push((name, value));
+        }
+    }
+    let params: *const () = (&c.parameter_list as *const _) as *const ();
+    let body = ClosureBodyPtr::Block((&c.body as *const _) as *const ());
+    Ok(Value::Closure(ClosureRef {
+        params,
+        body,
+        captured,
+    }))
+}
+
+/// Build a `Value::Closure` from an `fn (...) => expr` arrow function. Arrow
+/// functions AUTO-CAPTURE the enclosing scope by value; we copy the WHOLE current
+/// variable scope (a sound superset — only the variables the body reads matter,
+/// and an unread capture is harmless). `$this` is intentionally NOT copied (an
+/// arrow fn that reads `$this` will bail at the read, fail-closed).
+fn make_arrow(
+    a: &mago_syntax::ast::ast::function_like::arrow_function::ArrowFunction,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let captured: Vec<(Vec<u8>, Value)> = scope
+        .vars
+        .iter()
+        .filter(|(k, _)| k.as_slice() != b"this")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let params: *const () = (&a.parameter_list as *const _) as *const ();
+    let body = ClosureBodyPtr::Expr((a.expression as *const _) as *const ());
+    Ok(Value::Closure(ClosureRef {
+        params,
+        body,
+        captured,
+    }))
+}
+
+/// Invoke a `Value::Closure` over concrete `args`, returning its result.
+///
+/// SAFETY: the `params`/`body` raw pointers are read back to typed AST refs. This
+/// is sound because a closure is only ever invoked inside the SAME `with_program`
+/// evaluation scope that created it (one arena, alive for the whole
+/// `exec_statements` call) — see [`Value::Closure`]. The bindings are the
+/// captured env (by value) overlaid with the bound parameters; the body runs in a
+/// FRESH scope (closures do not see the caller's other locals) carrying the same
+/// resolver + names + step budget.
+fn invoke_closure(
+    closure: &ClosureRef,
+    args: &[Value],
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::block::Block;
+    use mago_syntax::ast::ast::expression::Expression as Expr;
+    use mago_syntax::ast::ast::function_like::parameter::FunctionLikeParameterList;
+
+    // Recover the typed parameter list and bind params + captured env.
+    // SAFETY: see the doc comment — the arena outlives this call.
+    let param_list: &FunctionLikeParameterList =
+        unsafe { &*(closure.params as *const FunctionLikeParameterList) };
+
+    let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
+    // Captured env first; parameters then overlay (a param shadows a capture).
+    for (k, v) in &closure.captured {
+        bindings.insert(k.clone(), v.clone());
+    }
+
+    let params: Vec<_> = param_list.parameters.iter().collect();
+    if args.len() > params.len() {
+        return Err(BailReason::Other(
+            "more arguments than closure parameters (variadic call?)".into(),
+        ));
+    }
+    for (i, p) in params.iter().enumerate() {
+        if p.ellipsis.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "variadic closure parameter".into(),
+            ));
+        }
+        if p.ampersand.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "by-reference closure parameter".into(),
+            ));
+        }
+        let name = var_name(p.variable.name);
+        let value = match args.get(i) {
+            Some(a) => a.clone(),
+            None => match &p.default_value {
+                Some(d) => eval_expr(d.value, scope)?,
+                None => {
+                    return Err(BailReason::UnboundVariable(format!(
+                        "closure parameter ${}",
+                        String::from_utf8_lossy(&name)
+                    )))
+                }
+            },
+        };
+        bindings.insert(name, value);
+    }
+
+    // Run the body in a fresh scope sharing the resolver/names/budget, so the
+    // step budget is global (a closure called in a loop can still bail on runaway)
+    // and class-name resolution inside the body still works.
+    let mut inner = Scope::new(bindings, scope.resolver);
+    inner.names = scope.names;
+    inner.steps = scope.steps;
+    inner.max_steps = scope.max_steps;
+
+    let result = match closure.body {
+        // SAFETY: same arena-lifetime argument as above.
+        ClosureBodyPtr::Block(p) => {
+            let block: &Block = unsafe { &*(p as *const Block) };
+            match exec_statements(block.statements.iter(), &mut inner)? {
+                Flow::Returned(v) => v,
+                Flow::Normal => Value::Null,
+                Flow::Asserted(_) => {
+                    return Err(BailReason::UnsupportedConstruct(
+                        "assertion inside a closure body".into(),
+                    ))
+                }
+            }
+        }
+        ClosureBodyPtr::Expr(p) => {
+            let expr: &Expr = unsafe { &*(p as *const Expr) };
+            eval_expr(expr, &mut inner)?
+        }
+    };
+    // Propagate the consumed step budget back to the caller.
+    scope.steps = inner.steps;
+    Ok(result)
+}
+
+/// Higher-order builtins that take a closure callback. `Ok(None)` = not one of
+/// these (the caller falls through to the scalar builtin path / resolver).
+///
+/// Modelled, gold-tested vs `php -r` (8.1.33):
+/// - `array_map(fn, arr)` (single array): apply `fn($v)` to each value, PRESERVE
+///   keys + order. (The multi-array form, where keys are reindexed, is NOT
+///   modelled — it bails so we never guess its key handling.)
+/// - `array_filter(arr, fn)` (default mode): keep entries where `fn($v)` is
+///   truthy, PRESERVE original keys. The `ARRAY_FILTER_USE_KEY/BOTH` modes (a 3rd
+///   arg) bail. The no-callback form is the scalar builtin's concern (not here).
+/// - `array_reduce(arr, fn, initial?)`: left fold `fn($carry, $v)`; initial
+///   defaults to null.
+///
+/// `usort`/`uasort`/`uksort` are NOT modelled here: they sort the array BY
+/// REFERENCE (mutate the caller's variable), which the by-value scope cannot
+/// write back soundly → they bail (fail-closed) at the unknown-call boundary.
+fn call_closure_builtin(
+    name: &[u8],
+    args: &[Value],
+    scope: &mut Scope,
+) -> Result<Option<Value>, BailReason> {
+    match (name, args) {
+        // array_map(callback, array) — single-array form, keys preserved.
+        (b"array_map", [Value::Closure(cl), Value::Arr(items)]) => {
+            let mut out: Vec<(ArrayKey, Value)> = Vec::with_capacity(items.len());
+            for (k, v) in items {
+                let mapped = invoke_closure(cl, std::slice::from_ref(v), scope)?;
+                out.push((k.clone(), mapped));
+            }
+            Ok(Some(Value::Arr(out)))
+        }
+        // array_map(null, ...) or the multi-array form → bail (not modelled).
+        (b"array_map", [Value::Closure(_), _, _, ..]) => Err(BailReason::UnsupportedConstruct(
+            "array_map with multiple arrays (key reindexing not modelled)".into(),
+        )),
+        // array_filter(array, callback) — default mode (callback sees the VALUE),
+        // original keys preserved.
+        (b"array_filter", [Value::Arr(items), Value::Closure(cl)]) => {
+            let mut out: Vec<(ArrayKey, Value)> = Vec::new();
+            for (k, v) in items {
+                let keep = invoke_closure(cl, std::slice::from_ref(v), scope)?;
+                if keep.to_bool() {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+            Ok(Some(Value::Arr(out)))
+        }
+        // array_filter with a 3rd `mode` arg (USE_KEY / USE_BOTH) → bail.
+        (b"array_filter", [Value::Arr(_), Value::Closure(_), _, ..]) => {
+            Err(BailReason::UnsupportedConstruct(
+                "array_filter with ARRAY_FILTER_USE_KEY/BOTH mode".into(),
+            ))
+        }
+        // array_reduce(array, callback, initial?) — left fold.
+        (b"array_reduce", [Value::Arr(items), Value::Closure(cl)]) => {
+            let mut acc = Value::Null;
+            for (_, v) in items {
+                acc = invoke_closure(cl, &[acc, v.clone()], scope)?;
+            }
+            Ok(Some(acc))
+        }
+        (b"array_reduce", [Value::Arr(items), Value::Closure(cl), initial]) => {
+            let mut acc = initial.clone();
+            for (_, v) in items {
+                acc = invoke_closure(cl, &[acc, v.clone()], scope)?;
+            }
+            Ok(Some(acc))
+        }
+        // usort & friends mutate by reference → bail (fail-closed): a by-value
+        // model cannot write the sorted array back to the caller's variable.
+        (b"usort" | b"uasort" | b"uksort", _) => Err(BailReason::UnsupportedConstruct(
+            "usort/uasort/uksort (sorts an array by reference; not modelled)".into(),
+        )),
+        _ => Ok(None),
+    }
+}
+
 fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
     use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
     match call {
         Call::Function(fc) => {
+            // A non-identifier callee: a variable / expression holding a closure
+            // (`$f(args)`). Evaluate it; if it is a Closure, invoke it directly.
             let Some(name) = identifier_name(fc.function) else {
+                let callee = eval_expr(fc.function, scope)?;
+                if let Value::Closure(cl) = callee {
+                    let args = eval_arguments(&fc.argument_list, scope)?;
+                    return invoke_closure(&cl, &args, scope);
+                }
                 return Err(BailReason::UnsupportedConstruct(
-                    "dynamic function call".into(),
+                    "dynamic function call (non-closure callee)".into(),
                 ));
             };
             let args = eval_arguments(&fc.argument_list, scope)?;
+            // Higher-order builtins that take a closure (Task A): these need the
+            // scope to invoke the callback, so they are handled here, before the
+            // scope-free `call_pure_builtin`. They are pure IFF the closure is pure
+            // (a closure body that hits an impurity bails inside `invoke_closure`).
+            if let Some(v) = call_closure_builtin(name, &args, scope)? {
+                return Ok(v);
+            }
             // First try a pure builtin; then the substitution resolver.
             if let Some(v) = call_pure_builtin(name, &args)? {
                 return Ok(v);
@@ -2379,6 +2640,93 @@ mod tests {
             vec![],
         );
         assert_eq!(outcome, Outcome::Pass);
+    }
+
+    // ── closures (Inc-4 Task A) ──
+
+    #[test]
+    fn direct_arrow_closure_invocation() {
+        // $f = fn($x) => $x * 2;  $f(5) === 10
+        assert_eq!(
+            run_body(
+                "$f = fn($x) => $x * 2; $this->assertSame(10, $f(5));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn direct_closure_block_invocation() {
+        // $f = function ($x) { return $x + 1; };  $f(41) === 42
+        assert_eq!(
+            run_body(
+                "$f = function ($x) { return $x + 1; }; $this->assertSame(42, $f(41));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_use_captures_by_value() {
+        // use($n) copies $n at creation; a later reassignment of $n does NOT change
+        // the captured value (gold: php -r → 13, not 23).
+        assert_eq!(
+            run_body(
+                "$n = 3; $f = function ($x) use ($n) { return $x + $n; }; $n = 13; $this->assertSame(13, $f(10));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn arrow_auto_captures_by_value() {
+        // fn auto-captures $base by value.
+        assert_eq!(
+            run_body(
+                "$base = 100; $f = fn($x) => $x + $base; $this->assertSame(105, $f(5));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn array_map_with_closure_is_pure() {
+        // array_map(fn, arr): keys preserved, order preserved (gold vs php -r).
+        assert_eq!(
+            run_body(
+                "$r = array_map(fn($x) => $x * $x, [1, 2, 3]); $this->assertSame([1, 4, 9], $r);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn array_filter_with_closure_preserves_keys() {
+        // array_filter keeps ORIGINAL keys (gold: php -r → [1=>2, 3=>4]).
+        assert_eq!(
+            run_body(
+                "$r = array_filter([1, 2, 3, 4], fn($x) => $x % 2 === 0); $this->assertSame([1 => 2, 3 => 4], $r);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn by_reference_use_capture_bails() {
+        // use (&$x) by-ref capture is impurity → must bail (frontier).
+        assert!(matches!(
+            run_body(
+                "$n = 0; $f = function () use (&$n) { $n = 5; }; $f(); $this->assertSame(5, $n);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
     }
 
     #[test]
