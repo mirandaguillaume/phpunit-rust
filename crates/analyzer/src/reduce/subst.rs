@@ -306,6 +306,151 @@ impl BridgeResolver<'_> {
             }
         }
     }
+
+    /// Build the TEST-CASE `$this` record (Inc-3 Tasks A+B): a `Value::Object`
+    /// whose `class` is the test-case FQCN, seeded with the class chain's plain
+    /// literal property defaults, then run through `setUp()` (the seeding phase,
+    /// property writes permitted) if one is declared anywhere up the parent chain.
+    ///
+    /// Fail-closed: a `setUp` that hits any unmodelled/impure construct propagates
+    /// its bail (incomplete Givens → bail the whole test). `setUpBeforeClass` is
+    /// the DRIVER's concern (deferred → bail there); this only runs `setUp`.
+    ///
+    /// `Ok(None)` when the class is not in the codebase (the driver then bails).
+    pub fn build_test_case_this(&self, class: &str) -> Result<Option<Value>, BailReason> {
+        let codebase = self.project.codebase();
+        let class_key = class.to_lowercase();
+        let Some(class_meta) = codebase.get_class_like(class_key.as_bytes()) else {
+            return Ok(None);
+        };
+        let record_class = class_meta.original_name.as_bytes().to_vec();
+
+        // 1) Seed plain literal property defaults from the class AND every ancestor
+        //    (a test-case fixture property may be declared in a parent TestCase).
+        //    Each ancestor is seeded from its OWN class AST; a child default
+        //    overrides a parent's (so seed parents first, then the class itself).
+        let mut props: Vec<(Vec<u8>, Value)> = Vec::new();
+        let mut chain: Vec<Vec<u8>> = class_meta
+            .all_parent_classes
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        // Parents first, then the class itself (child wins on a duplicate prop).
+        chain.reverse();
+        chain.push(class_meta.name.as_bytes().to_vec());
+        for fqcn in &chain {
+            self.seed_class_property_defaults(fqcn, &mut props)?;
+        }
+
+        // 2) Run setUp() if it is declared anywhere up the chain (writes allowed).
+        let mut this = make_object(record_class, props);
+        if let Some(meta) = codebase.get_declaring_method(class_key.as_bytes(), b"setup") {
+            if meta.method_metadata.as_ref().is_some_and(|m| m.is_abstract) {
+                return Err(BailReason::UnsupportedConstruct("abstract setUp".into()));
+            }
+            let setup_class = codebase
+                .get_declaring_method_class(class_key.as_bytes(), b"setup")
+                .map(|w| w.as_bytes().to_vec())
+                .unwrap_or_else(|| class_meta.name.as_bytes().to_vec());
+            let file = self
+                .project
+                .file_of_span(&meta.span)
+                .ok_or_else(|| BailReason::Other("setUp declaring file not loaded".into()))?;
+            let logical = String::from_utf8_lossy(&file.name).into_owned();
+            let resolver = self;
+            this =
+                self.project
+                    .with_program(&logical, |program, _file, _names| {
+                        let m = find_class_method(program, &setup_class, b"setUp").ok_or_else(
+                            || BailReason::Other("setUp AST not found after re-parse".into()),
+                        )?;
+                        let MethodBody::Concrete(block) = &m.body else {
+                            return Err(BailReason::UnsupportedConstruct(
+                                "abstract/interface setUp body".into(),
+                            ));
+                        };
+                        // setUp takes no positional args; bind only `$this`.
+                        let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
+                        bindings.insert(b"this".to_vec(), this.clone());
+                        super::eval::run_ctor_body(block, bindings, resolver)
+                    })
+                    .unwrap_or_else(|| {
+                        Err(BailReason::Other("could not re-parse setUp file".into()))
+                    })?;
+        }
+        Ok(Some(this))
+    }
+
+    /// Seed one class's OWN plain literal property defaults into `props` (used by
+    /// the test-case `$this` builder to walk the ancestor chain). A class not on
+    /// disk is silently skipped (its props stay unseeded → a read bails later).
+    fn seed_class_property_defaults(
+        &self,
+        fqcn: &[u8],
+        props: &mut Vec<(Vec<u8>, Value)>,
+    ) -> Result<(), BailReason> {
+        let codebase = self.project.codebase();
+        let key = normalize_fqcn(fqcn);
+        let Some(class_meta) = codebase.get_class_like(&key.to_ascii_lowercase()) else {
+            return Ok(());
+        };
+        let Some(file) = self.project.file_of_span(&class_meta.span) else {
+            return Ok(());
+        };
+        let logical = String::from_utf8_lossy(&file.name).into_owned();
+        let class_fqcn = class_meta.name.as_bytes().to_vec();
+        self.project
+            .with_program(&logical, |program, _file, _names| {
+                let Some(class_node) = find_class(program, &class_fqcn) else {
+                    return Ok(());
+                };
+                seed_plain_property_defaults_tolerant(class_node, props)
+            })
+            .unwrap_or(Ok(()))
+    }
+}
+
+/// Seed plain literal property defaults for a TEST-CASE ancestor class, TOLERATING
+/// (skipping) static / hooked / non-literal-default properties instead of bailing.
+///
+/// Rationale (frontier, fail-closed-preserving): a base PHPUnit `TestCase` carries
+/// static props and the test-case chain may use property hooks the reducer cannot
+/// model — but those are not part of the modelled INSTANCE record. Skipping them
+/// here is still sound: a test that actually READS an unseeded instance property
+/// bails at the read site (`eval_access` → "read of unset property"). Only a plain,
+/// non-static property carrying a LITERAL default is seeded.
+fn seed_plain_property_defaults_tolerant(
+    class_node: &mago_syntax::ast::ast::class_like::Class,
+    props: &mut Vec<(Vec<u8>, Value)>,
+) -> Result<(), BailReason> {
+    use mago_syntax::ast::ast::class_like::property::{Property, PropertyItem};
+    use mago_syntax::ast::ast::modifier::Modifier;
+
+    for member in class_node.members.iter() {
+        let ClassLikeMember::Property(Property::Plain(plain)) = member else {
+            continue; // hooked properties / non-properties: skip (tolerant).
+        };
+        // Static properties are not part of an instance record → skip.
+        if plain
+            .modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Static(_)))
+        {
+            continue;
+        }
+        for item in plain.items.iter() {
+            let PropertyItem::Concrete(c) = item else {
+                continue; // no default → leave unset (read-before-init bails later).
+            };
+            // A non-literal default (call, new, …) is skipped here, not bailed: the
+            // prop stays unseeded and a later read bails fail-closed.
+            let mut scope = Scope::new(HashMap::new(), &NoResolver);
+            if let Ok(v) = super::eval::eval_default(c.value, &mut scope) {
+                set_prop(props, strip_dollar(c.variable.name), v);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Run a constructor AST over a fresh `$this` record: seed promoted params, bind

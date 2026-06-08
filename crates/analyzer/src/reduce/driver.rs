@@ -104,14 +104,42 @@ fn reduce_one_test(
             return vec![bailed(test, None, "method body not found")];
         };
 
-        // A shared fixture the reducer cannot model bails the whole method
-        // (spec §Q2): setUp / setUpBeforeClass present → abstain.
-        if test.lifecycle.set_up || test.lifecycle.set_up_before_class {
+        // Class-level fixtures are deferred (Inc-3 Task B): setUpBeforeClass seeds
+        // STATIC state we don't model → bail the whole method.
+        if test.lifecycle.set_up_before_class {
             return rows
                 .iter()
-                .map(|(ds, _)| bailed(test, ds.clone(), "shared fixture (setUp) not modelled"))
+                .map(|(ds, _)| {
+                    bailed(
+                        test,
+                        ds.clone(),
+                        "setUpBeforeClass (class fixture) not modelled",
+                    )
+                })
                 .collect();
         }
+
+        // Inc-3 Tasks A+B: bind `$this` to a Value::Object modelling the TEST-CASE
+        // instance, seeded by setUp() (walked up the parent chain via the resolver).
+        // A setUp that hits an unmodelled/impure construct bails the whole method
+        // (its Givens are incomplete) — fail-closed.
+        let this_value = match resolver.build_test_case_this(&test.class) {
+            Ok(Some(v)) => Some(v),
+            // Class not in the codebase → run with no `$this` (a `$this->...` read
+            // then bails). Preserves the inc-2 behaviour for non-TestCase classes.
+            Ok(None) => None,
+            Err(reason) => {
+                return rows
+                    .iter()
+                    .map(|(ds, _)| ReducedTest {
+                        class: test.class.clone(),
+                        method: test.method.clone(),
+                        data_set: ds.clone(),
+                        outcome: Outcome::Bailed(reason.clone()),
+                    })
+                    .collect()
+            }
+        };
 
         let MethodBody::Concrete(block) = &method.body else {
             return vec![bailed(test, None, "abstract/interface method")];
@@ -133,7 +161,7 @@ fn reduce_one_test(
 
         rows.iter()
             .map(|(data_set, args)| {
-                let outcome = reduce_row(block, &param_names, args, resolver);
+                let outcome = reduce_row(block, &param_names, args, this_value.clone(), resolver);
                 ReducedTest {
                     class: test.class.clone(),
                     method: test.method.clone(),
@@ -190,11 +218,13 @@ fn collect_rows(
     vec![(None, vec![])]
 }
 
-/// Reduce one row: bind args to the method's parameters and run the body.
+/// Reduce one row: bind args to the method's parameters (+ the test-case `$this`)
+/// and run the body.
 fn reduce_row(
     block: &Block,
     param_names: &[Vec<u8>],
     args: &[Value],
+    this_value: Option<Value>,
     resolver: &BridgeResolver,
 ) -> Outcome {
     // SURPLUS provider columns (more columns than parameters) are NOT an error in
@@ -204,6 +234,11 @@ fn reduce_row(
     // `param_names.len()` columns, matching PHPUnit — so we must NOT bail here
     // (Task G; was the "48 more provider columns than parameters" false bail).
     let mut givens: HashMap<Vec<u8>, Value> = HashMap::new();
+    // Bind the test-case `$this` (Inc-3 Task A) so `$this->prop` reads and
+    // `$this->helper()` calls resolve against the seeded test-case record.
+    if let Some(this) = this_value {
+        givens.insert(b"this".to_vec(), this);
+    }
     for (name, val) in param_names.iter().zip(args.iter()) {
         givens.insert(name.clone(), val.clone());
     }
@@ -550,6 +585,124 @@ class PointDriverTest extends TestCase {
         let reduced = reduce_file(&dir.path().join("PointDriverTest.php")).unwrap();
         assert_eq!(reduced.len(), 1, "got {reduced:?}");
         assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
+    }
+
+    #[test]
+    fn handwritten_test_case_object_reduces_setup_and_helper() {
+        // Inc-3 acceptance (Tasks A–C): a TestCase subclass whose setUp() seeds
+        // $this->items = [1,2,3], a pure helper sum(): int, and a test that asserts
+        // $this->assertSame(6, $this->sum()). Proves: $this bound to a Value::Object
+        // (A), setUp run as the seeding phase (B), and $this->helper() inlined (C).
+        let dir = write_suite(&[(
+            "SumTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class SumTest extends TestCase {
+    private array $items;
+
+    protected function setUp(): void {
+        $this->items = [1, 2, 3];
+    }
+
+    private function sum(): int {
+        $total = 0;
+        foreach ($this->items as $v) {
+            $total = $total + $v;
+        }
+        return $total;
+    }
+
+    public function testSum(): void {
+        $this->assertSame(6, $this->sum());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("SumTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "setUp-seeded $this + $this->sum() helper must reduce to Pass; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn body_mutator_on_this_prop_bails() {
+        // setUp is the ONLY sanctioned write phase. A test BODY that writes
+        // $this->prop is a mutator → bail (frontier §2), even with $this bound.
+        let dir = write_suite(&[(
+            "MutTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class MutTest extends TestCase {
+    private int $n;
+    protected function setUp(): void {
+        $this->n = 1;
+    }
+    public function testMutate(): void {
+        $this->n = 2;
+        $this->assertSame(2, $this->n);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("MutTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "a $this->prop write in the test body is a mutator → must bail; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn impure_setup_bails_the_whole_test() {
+        // A setUp that touches an unmodelled/impure construct (time()) has
+        // incomplete Givens → bail the whole test (B), never guess.
+        let dir = write_suite(&[(
+            "ImpureSetupTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class ImpureSetupTest extends TestCase {
+    private int $t;
+    protected function setUp(): void {
+        $this->t = time();
+    }
+    public function testT(): void {
+        $this->assertSame(0, $this->t);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("ImpureSetupTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "an impure setUp must bail the test (incomplete Givens); got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn set_up_before_class_still_bails() {
+        // Class-level setUpBeforeClass is deferred → bail (B).
+        let dir = write_suite(&[(
+            "ClassFixtureTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class ClassFixtureTest extends TestCase {
+    public static function setUpBeforeClass(): void {}
+    public function testX(): void {
+        $this->assertSame(1, 1);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("ClassFixtureTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "setUpBeforeClass is deferred → must bail; got {reduced:?}"
+        );
     }
 
     #[test]
