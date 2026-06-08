@@ -365,8 +365,11 @@ fn name_eq_ignore_case(bytes: &[u8], s: &str) -> bool {
 /// for `@test` not immediately followed by an alphanumeric character or `_`
 /// (so `@testWith` and `@testdox` are not matched).
 fn has_doc_test_annotation(source_text: &str, method_offset: usize) -> bool {
-    let end = method_offset.min(source_text.len());
-    let window_start = end.saturating_sub(300);
+    // The offset is a BYTE offset that may land mid-UTF-8-codepoint (real suites
+    // have accented chars in source); snap both ends to valid char boundaries
+    // before slicing, or `source_text[..]` panics.
+    let end = floor_char_boundary(source_text, method_offset.min(source_text.len()));
+    let window_start = floor_char_boundary(source_text, end.saturating_sub(300));
     let window = source_text[window_start..end].trim_end();
     if !window.ends_with("*/") {
         return false;
@@ -387,6 +390,18 @@ fn has_doc_test_annotation(source_text: &str, method_offset: usize) -> bool {
         pos = abs + 1;
     }
     false
+}
+
+/// The largest char boundary `<= index` (a stable-Rust stand-in for the unstable
+/// `str::floor_char_boundary`). A byte is a boundary unless it is a UTF-8
+/// continuation byte (`0b10xx_xxxx`).
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    let bytes = s.as_bytes();
+    while i > 0 && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
+        i -= 1;
+    }
+    i
 }
 
 /// Compare a resolved attribute name against an expected FQCN.
@@ -556,6 +571,27 @@ mod tests {
                 .as_deref()
                 .is_some_and(|d| d.eq_ignore_ascii_case("BaseTestCase")),
             "inherited method must carry its declaring class; got {inherited:?}"
+        );
+    }
+
+    #[test]
+    fn doc_annotation_scan_is_utf8_safe() {
+        // A method preceded by source containing multi-byte UTF-8 (accented chars)
+        // must not panic the docblock scanner (regression: byte-offset slice landed
+        // mid-codepoint on real suites like symfony/string).
+        let (_d, project) = project_with(concat!(
+            "<?php\n",
+            "use PHPUnit\\Framework\\TestCase;\n",
+            "class MyTest extends TestCase {\n",
+            "  // un café très élégant à côté — accents accents accents accents\n",
+            "  /** @test */\n",
+            "  public function itWorks(): void {}\n",
+            "}"
+        ));
+        let methods = find_test_methods(&project, &["MyTest".to_string()]);
+        assert!(
+            methods.iter().any(|m| m.method == "itWorks"),
+            "the @test method must be found without a UTF-8 panic; got {methods:?}"
         );
     }
 
