@@ -18,9 +18,10 @@ pub fn find_testcase_subclasses(project: &MagoProject) -> Vec<String> {
 
     let mut out = Vec::new();
     for refl in project.class_likes() {
-        let fqcn = word_to_string(&refl.name);
-        if ascends_to_testcase(&fqcn, &index) {
-            out.push(fqcn);
+        // Ascent uses the (lowercased) `name`; the returned FQCN uses
+        // `original_name` to preserve the source casing for display.
+        if ascends_to_testcase(&word_to_string(&refl.name), &index) {
+            out.push(word_to_string(&refl.original_name));
         }
     }
     out

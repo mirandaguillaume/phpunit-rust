@@ -60,13 +60,14 @@ pub fn find_test_methods(project: &MagoProject, test_classes: &[String]) -> Vec<
         };
 
         let methods = project
-            .with_program(&logical_name, |program, file, _names| {
+            .with_program(&logical_name, |program, file, names| {
                 let mut found = Vec::new();
                 collect_methods_in_statements(
                     program.statements.iter(),
                     class_name,
                     file,
                     &file_path,
+                    names,
                     &mut found,
                 );
                 found
@@ -86,6 +87,7 @@ fn collect_methods_in_statements<'s, 'arena, I>(
     class_name: &str,
     file: &mago_database::file::File,
     file_path: &std::path::Path,
+    names: &mago_names::ResolvedNames,
     out: &mut Vec<TestMethod>,
 ) where
     'arena: 's,
@@ -96,12 +98,15 @@ fn collect_methods_in_statements<'s, 'arena, I>(
         match stmt {
             Statement::Class(class) if name_eq_ignore_case(class.name.value, simple_class) => {
                 let source_text = String::from_utf8_lossy(&file.contents);
+                // mago lowercases reflection FQCNs; recover the original casing from
+                // the AST node by replacing the last `\`-segment of `class_name`.
+                let display_class = display_class_name(class_name, class.name.value);
                 for member in class.members.iter() {
                     let ClassLikeMember::Method(method) = member else {
                         continue;
                     };
                     if let Some(tm) =
-                        method_to_test(method, class_name, file, file_path, &source_text)
+                        method_to_test(method, &display_class, file, file_path, names, &source_text)
                     {
                         out.push(tm);
                     }
@@ -115,6 +120,7 @@ fn collect_methods_in_statements<'s, 'arena, I>(
                         class_name,
                         file,
                         file_path,
+                        names,
                         out,
                     ),
                     NamespaceBody::BraceDelimited(b) => collect_methods_in_statements(
@@ -122,6 +128,7 @@ fn collect_methods_in_statements<'s, 'arena, I>(
                         class_name,
                         file,
                         file_path,
+                        names,
                         out,
                     ),
                 };
@@ -137,11 +144,12 @@ fn method_to_test(
     class_name: &str,
     file: &mago_database::file::File,
     file_path: &std::path::Path,
+    names: &mago_names::ResolvedNames,
     source_text: &str,
 ) -> Option<TestMethod> {
     let method_name = String::from_utf8_lossy(method.name.value).into_owned();
 
-    let has_test_attr = has_attribute(method, ATTR_TEST);
+    let has_test_attr = has_attribute(method, names, ATTR_TEST);
     let method_offset = method.span().start.offset;
     let is_test = method_name.starts_with("test")
         || has_test_attr
@@ -150,7 +158,7 @@ fn method_to_test(
         return None;
     }
 
-    let has_data_provider = extract_data_provider(method);
+    let has_data_provider = extract_data_provider(method, names);
     let line = file.line_number(method_offset) + 1; // 0-based → 1-based
 
     Some(TestMethod {
@@ -163,12 +171,21 @@ fn method_to_test(
     })
 }
 
+/// Resolve an attribute's identifier to its fully-qualified name using the
+/// name-resolution table; falls back to the raw written name.
+fn resolved_attr_name(names: &mago_names::ResolvedNames, attr_name: &mago_syntax::ast::Identifier) -> String {
+    match names.resolve(attr_name) {
+        Some(fqcn) => String::from_utf8_lossy(fqcn).into_owned(),
+        None => String::from_utf8_lossy(attr_name.value()).into_owned(),
+    }
+}
+
 /// Returns `true` if the method carries the given attribute (by FQCN,
 /// case-insensitive, leading-backslash-insensitive).
-fn has_attribute(method: &Method, attr_fqcn: &str) -> bool {
+fn has_attribute(method: &Method, names: &mago_names::ResolvedNames, attr_fqcn: &str) -> bool {
     for attr_list in method.attribute_lists.iter() {
         for attr in attr_list.attributes.iter() {
-            let name = String::from_utf8_lossy(attr.name.value());
+            let name = resolved_attr_name(names, &attr.name);
             if names_match(&name, attr_fqcn) {
                 return true;
             }
@@ -179,14 +196,14 @@ fn has_attribute(method: &Method, attr_fqcn: &str) -> bool {
 
 /// Extract the DataProvider name from the first positional string argument of a
 /// `#[DataProvider("name")]` attribute, if present.
-fn extract_data_provider(method: &Method) -> Option<String> {
+fn extract_data_provider(method: &Method, names: &mago_names::ResolvedNames) -> Option<String> {
     use mago_syntax::ast::ast::argument::Argument;
     use mago_syntax::ast::ast::expression::Expression;
     use mago_syntax::ast::ast::literal::Literal;
 
     for attr_list in method.attribute_lists.iter() {
         for attr in attr_list.attributes.iter() {
-            let name = String::from_utf8_lossy(attr.name.value());
+            let name = resolved_attr_name(names, &attr.name);
             if !names_match(&name, ATTR_DATA_PROVIDER) {
                 continue;
             }
@@ -212,6 +229,16 @@ fn extract_data_provider(method: &Method) -> Option<String> {
 /// Strip a PHP namespace prefix: `My\\Ns\\ClassName` → `ClassName`.
 fn simple_name(fqcn: &str) -> &str {
     fqcn.rsplit('\\').next().unwrap_or(fqcn)
+}
+
+/// Build a display FQCN by replacing the last `\`-segment of `fqcn` (whose casing
+/// mago lowercased) with the original-cased `ast_simple` from the AST node.
+fn display_class_name(fqcn: &str, ast_simple: &[u8]) -> String {
+    let simple = String::from_utf8_lossy(ast_simple);
+    match fqcn.rfind('\\') {
+        Some(pos) => format!("{}\\{}", &fqcn[..pos], simple),
+        None => simple.into_owned(),
+    }
 }
 
 /// Case-insensitive compare an AST identifier's raw bytes against a `&str`.

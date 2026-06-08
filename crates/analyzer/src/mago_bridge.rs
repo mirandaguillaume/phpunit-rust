@@ -154,9 +154,12 @@ impl MagoProject {
     }
 
     /// Look up a class-like by FQCN (case-insensitive — mago lowercases keys).
+    ///
+    /// Uses `get_class_like` so interfaces, enums, and traits resolve too —
+    /// `get_class` only matches the `class` symbol kind.
     pub(crate) fn find_class(&self, name: &str) -> Option<&ClassLikeMetadata> {
         let key = name.trim_start_matches('\\').to_lowercase();
-        self.codebase.get_class(key.as_bytes())
+        self.codebase.get_class_like(key.as_bytes())
     }
 
     /// Iterate over all class-like metadata (classes, interfaces, enums, traits).

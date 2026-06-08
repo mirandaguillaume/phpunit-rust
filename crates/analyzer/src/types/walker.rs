@@ -1464,30 +1464,128 @@ pub(crate) mod tests {
     use mago_syntax::ast::class_like::method::MethodBody;
     use mago_syntax::ast::Statement;
 
-    /// Parse the first class's first method body from a PHP snippet.
-    /// Returns `(Program, enclosing_class_name)` so callers can walk it.
-    pub fn find_first_method_body(project: &MagoProject) -> (mago_syntax::ast::Program, String) {
-        let module = project
-            .inner()
-            .modules
-            .first()
-            .expect("at least one module");
-        let program = module.parse(project.interner());
-        // Find the first class statement.
-        let class = program
-            .statements
-            .iter()
-            .find_map(|s| {
+    /// Owns walk results so legacy `ctx.events` / `ctx.env` assertions keep working
+    /// after the helpers moved the walk inside a `with_program` closure.
+    struct EventsHolder {
+        events: Vec<CallSiteEvent>,
+    }
+
+    /// Owns a walked env for legacy `ctx.env.lookup(...)` assertions.
+    struct EnvHolder {
+        env: TypeEnv,
+    }
+
+    /// Logical name of the file declaring the given class (case-insensitive FQCN).
+    fn file_name_of_class(project: &MagoProject, class_lc: &str) -> String {
+        let refl = project
+            .class_likes()
+            .find(|r| word_to_string(&r.name).to_lowercase() == class_lc)
+            .expect("class not found in codebase");
+        let file = project
+            .file_of_span(&refl.span)
+            .expect("declaring file not found");
+        String::from_utf8_lossy(&file.name).into_owned()
+    }
+
+    /// Logical name of the first loaded file's declaring class. Tests write a
+    /// single class per snippet, so the first class is unambiguous.
+    fn first_class_file_name(project: &MagoProject) -> (String, String) {
+        let refl = project.class_likes().next().expect("at least one class");
+        let class_name = word_to_string(&refl.name);
+        let file = project
+            .file_of_span(&refl.span)
+            .expect("declaring file not found");
+        (String::from_utf8_lossy(&file.name).into_owned(), class_name)
+    }
+
+    /// Find the AST node of the named class in a program's statements,
+    /// descending into namespaces. Returns the matching `Class` node.
+    fn find_class_node<'p, 'arena>(
+        program: &'p mago_syntax::ast::Program<'arena>,
+        class_lc: &str,
+    ) -> Option<&'p mago_syntax::ast::Class<'arena>> {
+        for s in program.statements.iter() {
+            match s {
+                Statement::Class(c) if name_to_lower(c.name.value) == class_lc => return Some(c),
+                _ => {}
+            }
+        }
+        // Fall back to the first class statement when no name match is given.
+        if class_lc.is_empty() {
+            for s in program.statements.iter() {
                 if let Statement::Class(c) = s {
-                    Some(c)
-                } else {
-                    None
+                    return Some(c);
                 }
+            }
+        }
+        None
+    }
+
+    /// Find the concrete body block of a method on a class AST node.
+    fn method_block<'p, 'arena>(
+        class: &'p mago_syntax::ast::Class<'arena>,
+        method_lc: &str,
+    ) -> Option<&'p mago_syntax::ast::Block<'arena>> {
+        for m in class.members.iter() {
+            if let ClassLikeMember::Method(m) = m {
+                if name_to_lower(m.name.value) == method_lc {
+                    if let MethodBody::Concrete(b) = &m.body {
+                        return Some(b);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk every `Statement::Expression` in the named method's body and return
+    /// the resulting events + env. Mirrors the original inline test loops.
+    fn walk_method_expressions(
+        project: &MagoProject,
+        class_lc: &str,
+        method_lc: &str,
+    ) -> (Vec<CallSiteEvent>, TypeEnv) {
+        let logical = file_name_of_class(project, class_lc);
+        project
+            .with_program(&logical, |program, _file, names| {
+                let class = find_class_node(program, class_lc).expect("class node");
+                let class_name = String::from_utf8_lossy(class.name.value).into_owned();
+                let block = method_block(class, method_lc).expect("method block");
+                let env = TypeEnv::for_class(&class_name);
+                let mut ctx = WalkerCtx::new(env, project, names);
+                for stmt in block.statements.iter() {
+                    if let Statement::Expression(e) = stmt {
+                        walk_expression(&mut ctx, e.expression);
+                    }
+                }
+                (ctx.events, ctx.env)
             })
-            .expect("a class statement");
-        // The class name from the interner.
-        let class_name = project.interner().lookup(&class.name.value).to_string();
-        (program, class_name)
+            .expect("file parses")
+    }
+
+    /// Walk the full body of the named method via `walk_block` (statement-level
+    /// ctx walk), seeding `seeds` into the env first. Returns events + env.
+    fn walk_method_block_seeded(
+        project: &MagoProject,
+        class_lc: &str,
+        method_lc: &str,
+        seeds: &[(&str, Type)],
+    ) -> (Vec<CallSiteEvent>, TypeEnv) {
+        let logical = file_name_of_class(project, class_lc);
+        project
+            .with_program(&logical, |program, _file, names| {
+                let class = find_class_node(program, class_lc).expect("class node");
+                let class_name = String::from_utf8_lossy(class.name.value).into_owned();
+                let block = method_block(class, method_lc).expect("method block");
+                let mut env = TypeEnv::for_class(&class_name);
+                for (k, v) in seeds {
+                    env.set((*k).to_string(), v.clone());
+                }
+                let mut ctx = WalkerCtx::new(env, project, names);
+                walk_block(&mut ctx, block);
+                (ctx.events, ctx.env)
+            })
+            .expect("file parses")
     }
 
     /// Build a PHP snippet whose single method nests `n` `new A(...)` calls,
@@ -1511,44 +1609,32 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Test.php"), php).unwrap();
         let project = MagoProject::load(dir.path()).expect("load ok");
-        let interner = project.interner();
-        let module = project.inner().modules.first().expect("module");
-        let program = module.parse(interner);
-        let class = program
-            .statements
-            .iter()
-            .find_map(|s| {
-                if let Statement::Class(c) = s {
-                    Some(c)
-                } else {
-                    None
+        let project = &project;
+        let (logical, class_name) = first_class_file_name(project);
+        project
+            .with_program(&logical, |program, _file, names| {
+                let class = find_class_node(program, &class_name.to_lowercase()).expect("class");
+                let block = class
+                    .members
+                    .iter()
+                    .find_map(|m| {
+                        if let ClassLikeMember::Method(m) = m {
+                            if let MethodBody::Concrete(b) = &m.body {
+                                return Some(b);
+                            }
+                        }
+                        None
+                    })
+                    .expect("method");
+                let env = TypeEnv::for_class(&class_name);
+                let mut ctx = WalkerCtx::new(env, project, names);
+                ctx.max_depth = max_depth;
+                for stmt in block.statements.iter() {
+                    walk_statement_ctx(&mut ctx, stmt);
                 }
+                ctx.events.len()
             })
-            .expect("class");
-        let class_name = interner.lookup(&class.name.value).to_string();
-        let method = class
-            .members
-            .iter()
-            .find_map(|m| {
-                if let ClassLikeMember::Method(m) = m {
-                    Some(m)
-                } else {
-                    None
-                }
-            })
-            .expect("method");
-        let block = match &method.body {
-            MethodBody::Concrete(b) => b,
-            _ => panic!("expected concrete body"),
-        };
-        let env = TypeEnv::for_class(&class_name);
-        let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
-        let mut ctx = WalkerCtx::new(env, interner, &project, names);
-        ctx.max_depth = max_depth;
-        for stmt in block.statements.iter() {
-            walk_statement_ctx(&mut ctx, stmt);
-        }
-        ctx.events.len()
+            .expect("file parses")
     }
 
     /// H4: the walker must bound recursion depth on untrusted PHP. With a
@@ -1598,45 +1684,34 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Test.php"), php).unwrap();
         let project = MagoProject::load(dir.path()).expect("load ok");
+        let (logical, class_name) = first_class_file_name(&project);
 
-        let (program, class_name) = find_first_method_body(&project);
+        project
+            .with_program(&logical, |program, _file, _names| {
+                let class = find_class_node(program, &class_name.to_lowercase()).expect("class");
+                // Use the AST class name (original casing) so `SelfRef`/`StaticRef`
+                // preserve the source spelling, matching the 0.26 behaviour.
+                let ast_class_name = String::from_utf8_lossy(class.name.value).into_owned();
+                let block = class
+                    .members
+                    .iter()
+                    .find_map(|m| {
+                        if let ClassLikeMember::Method(m) = m {
+                            if let MethodBody::Concrete(b) = &m.body {
+                                return Some(b);
+                            }
+                        }
+                        None
+                    })
+                    .expect("method");
 
-        // Find the class node again from the program.
-        let class = program
-            .statements
-            .iter()
-            .find_map(|s| {
-                if let Statement::Class(c) = s {
-                    Some(c)
-                } else {
-                    None
+                let mut env = TypeEnv::for_class(&ast_class_name);
+                for stmt in block.statements.iter() {
+                    walk_statement(&mut env, stmt);
                 }
+                env.lookup(var_name)
             })
-            .expect("class");
-
-        // Find first concrete method.
-        let method = class
-            .members
-            .iter()
-            .find_map(|m| {
-                if let ClassLikeMember::Method(m) = m {
-                    Some(m)
-                } else {
-                    None
-                }
-            })
-            .expect("method");
-
-        let block = match &method.body {
-            MethodBody::Concrete(b) => b,
-            MethodBody::Abstract(_) => panic!("expected concrete method"),
-        };
-
-        let mut env = TypeEnv::for_class(&class_name);
-        for stmt in block.statements.iter() {
-            walk_statement(&mut env, project.interner(), stmt);
-        }
-        env.lookup(var_name)
+            .expect("file parses")
     }
 
     #[test]
@@ -1721,84 +1796,18 @@ class B {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
 
-        // Find class A and its `caller` method body.
-        let module = project.inner().modules.first().expect("module");
-        let program = module.parse(&interner);
+        let (events, _env) = walk_method_expressions(&project, "a", "caller");
 
-        let class_a = program
-            .statements
-            .iter()
-            .find_map(|s| {
-                if let Statement::Class(c) = s {
-                    let name = interner.lookup(&c.name.value).to_string();
-                    if name.to_lowercase() == "a" {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .expect("class A");
-
-        let caller_method = class_a
-            .members
-            .iter()
-            .find_map(|m| {
-                if let ClassLikeMember::Method(m) = m {
-                    let name = interner.lookup(&m.name.value).to_string();
-                    if name.to_lowercase() == "caller" {
-                        Some(m)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .expect("caller method");
-
-        let block = match &caller_method.body {
-            MethodBody::Concrete(b) => b,
-            _ => panic!("expected concrete body"),
-        };
-
-        let env = TypeEnv::for_class("A");
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        for stmt in block.statements.iter() {
-            if let Statement::Expression(e) = stmt {
-                walk_expression(&mut ctx, &e.expression);
-            }
-        }
-
-        // Also walk assignment statements ($b = new B()).
-        // Re-walk all statements properly.
-        let env2 = TypeEnv::for_class("A");
-        let names2 = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-        let mut ctx2 = WalkerCtx::new(env2, &interner, &project, names2);
-        for stmt in block.statements.iter() {
-            if let Statement::Expression(e) = stmt {
-                walk_expression(&mut ctx2, &e.expression);
-            }
-        }
-
-        let do_it_events: Vec<&CallSiteEvent> = ctx2
-            .events
-            .iter()
-            .filter(|e| e.method_name == "doIt")
-            .collect();
+        let do_it_events: Vec<&CallSiteEvent> =
+            events.iter().filter(|e| e.method_name == "doIt").collect();
 
         assert_eq!(
             do_it_events.len(),
             1,
             "expected 1 doIt call site event; got {} — all events: {:?}",
             do_it_events.len(),
-            ctx2.events
+            events
         );
 
         let ev = do_it_events[0];
@@ -1836,62 +1845,11 @@ class Client {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
 
-        let module = project.inner().modules.first().expect("module");
-        let program = module.parse(&interner);
-
-        let client = program
-            .statements
-            .iter()
-            .find_map(|s| {
-                if let Statement::Class(c) = s {
-                    let name = interner.lookup(&c.name.value).to_string();
-                    if name.to_lowercase() == "client" {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .expect("Client class");
-
-        let run_method = client
-            .members
-            .iter()
-            .find_map(|m| {
-                if let ClassLikeMember::Method(m) = m {
-                    let name = interner.lookup(&m.name.value).to_string();
-                    if name.to_lowercase() == "run" {
-                        Some(m)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .expect("run method");
-
-        let block = match &run_method.body {
-            MethodBody::Concrete(b) => b,
-            _ => panic!("expected concrete body"),
-        };
-
-        let env = TypeEnv::for_class("Client");
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        for stmt in block.statements.iter() {
-            if let Statement::Expression(e) = stmt {
-                walk_expression(&mut ctx, &e.expression);
-            }
-        }
+        let (_events, env) = walk_method_expressions(&project, "client", "run");
 
         // $result should have been assigned the return type of Builder::build() = Class("Result")
-        let result_type = ctx.env.lookup("$result");
+        let result_type = env.lookup("$result");
         assert_eq!(
             result_type,
             Type::Class("Result".into()),
@@ -1904,64 +1862,8 @@ class Client {
 
     /// Walk a named method body and return the env.
     fn walk_method_body(project: &MagoProject, class_lc: &str, method_lc: &str) -> TypeEnv {
-        let interner = project.interner();
-        let module = project.inner().modules.first().expect("module");
-        let program = module.parse(interner);
-
-        // Find the target class.
-        let class = program
-            .statements
-            .iter()
-            .find_map(|s| {
-                if let Statement::Class(c) = s {
-                    let n = interner.lookup(&c.name.value).to_lowercase();
-                    if n == class_lc {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| panic!("class {class_lc} not found"));
-
-        let class_name = interner.lookup(&class.name.value).to_string();
-
-        // Find the target method.
-        let method = class
-            .members
-            .iter()
-            .find_map(|m| {
-                if let ClassLikeMember::Method(m) = m {
-                    let n = interner.lookup(&m.name.value).to_lowercase();
-                    if n == method_lc {
-                        Some(m)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| panic!("method {method_lc} not found"));
-
-        let block = match &method.body {
-            MethodBody::Concrete(b) => b,
-            _ => panic!("expected concrete body"),
-        };
-
-        let env = TypeEnv::for_class(&class_name);
-        let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
-        let mut ctx = WalkerCtx::new(env, interner, project, names);
-
-        for stmt in block.statements.iter() {
-            if let Statement::Expression(e) = stmt {
-                walk_expression(&mut ctx, &e.expression);
-            }
-        }
-
-        ctx.env
+        let (_events, env) = walk_method_expressions(project, class_lc, method_lc);
+        env
     }
 
     #[test]
@@ -2114,50 +2016,8 @@ class Caller {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
-        let env = TypeEnv::for_class("Caller");
-
-        let caller_source = project
-            .class_likes()
-            .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source)
-            .unwrap();
-        let module = project
-            .inner()
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == caller_source)
-            .unwrap();
-        let program = module.parse(&interner);
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        // Walk Caller::go body
-        let mut found = false;
-        for stmt in program.statements.iter() {
-            if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
-                    continue;
-                }
-                for member in c.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
-                            continue;
-                        }
-                        if let MethodBody::Concrete(block) = &m.body {
-                            for s in block.statements.iter() {
-                                if let Statement::Expression(e) = s {
-                                    walk_expression(&mut ctx, &e.expression);
-                                }
-                            }
-                            found = true;
-                        }
-                    }
-                }
-            }
-        }
-        assert!(found, "didn't reach Caller::go body");
+        let (events, _env) = walk_method_expressions(&project, "caller", "go");
+        let ctx = EventsHolder { events };
 
         // We expect FOUR call site events: __construct (for new C()), returnsB(), returnsA(), done().
         // Their receivers should be C → C → B → A.
@@ -2213,52 +2073,20 @@ class Caller {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
-        let env = TypeEnv::for_class("Caller");
-
-        let caller_source = project
-            .class_likes()
-            .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source)
-            .unwrap();
-        let module = project
-            .inner()
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == caller_source)
-            .unwrap();
-        let program = module.parse(&interner);
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-        // Seed $animal as Base (its declared param type).
-        ctx.env.set("$animal".into(), Type::Class("Base".into()));
-
-        // Find Caller class and its go() method.
-        for stmt in program.statements.iter() {
-            if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
-                    continue;
-                }
-                for member in c.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
-                            continue;
-                        }
-                        if let MethodBody::Concrete(block) = &m.body {
-                            walk_block(&mut ctx, block);
-                        }
-                    }
-                }
-            }
-        }
+        // Seed $animal as Base (its declared param type), then walk the full body.
+        let (events, env) = walk_method_block_seeded(
+            &project,
+            "caller",
+            "go",
+            &[("$animal", Type::Class("Base".into()))],
+        );
 
         // The bark() call should have been emitted with receiver = Class(Dog).
-        let bark_event = ctx.events.iter().find(|e| e.method_name == "bark");
+        let bark_event = events.iter().find(|e| e.method_name == "bark");
         assert!(
             bark_event.is_some(),
             "expected bark() call site emitted; got events: {:?}",
-            ctx.events
+            events
         );
         assert_eq!(
             bark_event.unwrap().receiver,
@@ -2268,7 +2096,7 @@ class Caller {
 
         // After the if-body, $animal should be Base again.
         assert_eq!(
-            ctx.env.lookup("$animal"),
+            env.lookup("$animal"),
             Type::Class("Base".into()),
             "$animal should restore to Base after the if-body"
         );
@@ -2311,46 +2139,8 @@ class Caller {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
-        let env = TypeEnv::for_class("Caller");
-
-        let caller_source = project
-            .class_likes()
-            .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source)
-            .unwrap();
-        let module = project
-            .inner()
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == caller_source)
-            .unwrap();
-        let program = module.parse(&interner);
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        for stmt in program.statements.iter() {
-            if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
-                    continue;
-                }
-                for member in c.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
-                            continue;
-                        }
-                        if let MethodBody::Concrete(block) = &m.body {
-                            for s in block.statements.iter() {
-                                if let Statement::Expression(e) = s {
-                                    walk_expression(&mut ctx, &e.expression);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (_events, walk_env) = walk_method_expressions(&project, "caller", "go");
+        let ctx = EnvHolder { env: walk_env };
 
         // $x should now have Type::Union(Class(A), Class(B)) or Type::Union(Class(B), Class(A))
         let x_type = ctx.env.lookup("$x");
@@ -2398,46 +2188,8 @@ class Caller {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
-        let env = TypeEnv::for_class("Caller");
-
-        let caller_source = project
-            .class_likes()
-            .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source)
-            .unwrap();
-        let module = project
-            .inner()
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == caller_source)
-            .unwrap();
-        let program = module.parse(&interner);
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        for stmt in program.statements.iter() {
-            if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
-                    continue;
-                }
-                for member in c.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
-                            continue;
-                        }
-                        if let MethodBody::Concrete(block) = &m.body {
-                            for s in block.statements.iter() {
-                                if let Statement::Expression(e) = s {
-                                    walk_expression(&mut ctx, &e.expression);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (_events, walk_env) = walk_method_expressions(&project, "caller", "go");
+        let ctx = EnvHolder { env: walk_env };
 
         // $result should have Type::Nullable(Box::new(Type::Class("Foo")))
         let result_type = ctx.env.lookup("$result");
@@ -2475,46 +2227,8 @@ class Caller {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
-        let env = TypeEnv::for_class("Caller");
-
-        let caller_source = project
-            .class_likes()
-            .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source)
-            .unwrap();
-        let module = project
-            .inner()
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == caller_source)
-            .unwrap();
-        let program = module.parse(&interner);
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        for stmt in program.statements.iter() {
-            if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
-                    continue;
-                }
-                for member in c.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
-                            continue;
-                        }
-                        if let MethodBody::Concrete(block) = &m.body {
-                            for s in block.statements.iter() {
-                                if let Statement::Expression(e) = s {
-                                    walk_expression(&mut ctx, &e.expression);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (_events, walk_env) = walk_method_expressions(&project, "caller", "go");
+        let ctx = EnvHolder { env: walk_env };
 
         // $x should be Class("OnlyOne"), not Union or Mixed.
         let x_type = ctx.env.lookup("$x");
@@ -2549,46 +2263,8 @@ class Caller {
         .unwrap();
 
         let project = MagoProject::load(dir.path()).unwrap();
-        let interner = project.interner().clone();
-        let env = TypeEnv::for_class("Caller");
-
-        let caller_source = project
-            .class_likes()
-            .find(|(n, _)| project.class_name_str(n).to_lowercase() == "caller")
-            .map(|(_, r)| r.span.start.source)
-            .unwrap();
-        let module = project
-            .inner()
-            .modules
-            .iter()
-            .find(|m| m.source.identifier == caller_source)
-            .unwrap();
-        let program = module.parse(&interner);
-        let names = mago_names::resolver::NameResolver::new(&interner).resolve(&program);
-
-        let mut ctx = WalkerCtx::new(env, &interner, &project, names);
-
-        for stmt in program.statements.iter() {
-            if let Statement::Class(c) = stmt {
-                if interner.lookup(&c.name.value).to_lowercase() != "caller" {
-                    continue;
-                }
-                for member in c.members.iter() {
-                    if let ClassLikeMember::Method(m) = member {
-                        if interner.lookup(&m.name.value).to_lowercase() != "go" {
-                            continue;
-                        }
-                        if let MethodBody::Concrete(block) = &m.body {
-                            for s in block.statements.iter() {
-                                if let Statement::Expression(e) = s {
-                                    walk_expression(&mut ctx, &e.expression);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (_events, walk_env) = walk_method_expressions(&project, "caller", "go");
+        let ctx = EnvHolder { env: walk_env };
 
         // $x should be Type::Mixed (3+ non-null unions → Mixed in Phase 2).
         let x_type = ctx.env.lookup("$x");
@@ -2627,12 +2303,10 @@ class Caller {
         ).unwrap();
 
         let project = MagoProject::load(dir.path()).expect("load ok");
-        let interner = project.interner();
         let env = TypeEnv::for_class("Concrete");
 
         let result = lookup_return_type(
             &project,
-            interner,
             &Type::Class("Concrete".to_string()),
             "loaddriver",
             &env,
@@ -2670,12 +2344,10 @@ class Caller {
         ).unwrap();
 
         let project = MagoProject::load(dir.path()).expect("load ok");
-        let interner = project.interner();
         let env = TypeEnv::for_class("Concrete");
 
         let result = lookup_return_type(
             &project,
-            interner,
             &Type::Class("Concrete".to_string()),
             "loaddriver",
             &env,
@@ -2716,12 +2388,10 @@ class Caller {
         ).unwrap();
 
         let project = MagoProject::load(dir.path()).expect("load ok");
-        let interner = project.interner();
         let env = TypeEnv::for_class("App\\Tests\\ConcreteTest");
 
         let result = lookup_return_type(
             &project,
-            interner,
             &Type::Class("App\\Tests\\ConcreteTest".to_string()),
             "loaddriver",
             &env,
@@ -2746,57 +2416,23 @@ class Caller {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("M1.php"), php).unwrap();
         let project = MagoProject::load(dir.path()).expect("load ok");
-        let interner = project.interner();
-        let module = project.inner().modules.first().expect("module");
-        let program = module.parse(interner);
-
-        let class = program
-            .statements
-            .iter()
-            .find_map(|s| {
-                if let Statement::Class(c) = s {
-                    let n = interner.lookup(&c.name.value).to_lowercase();
-                    if n == class_lc {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+        let project = &project;
+        let logical = file_name_of_class(project, class_lc);
+        project
+            .with_program(&logical, |program, _file, names| {
+                let class = find_class_node(program, class_lc)
+                    .unwrap_or_else(|| panic!("class {class_lc} not found"));
+                let class_name = String::from_utf8_lossy(class.name.value).into_owned();
+                let block = method_block(class, method_lc)
+                    .unwrap_or_else(|| panic!("method {method_lc} not found"));
+                let env = TypeEnv::for_class(&class_name);
+                let mut ctx = WalkerCtx::new(env, project, names);
+                for stmt in block.statements.iter() {
+                    walk_statement_ctx(&mut ctx, stmt);
                 }
+                ctx.events
             })
-            .unwrap_or_else(|| panic!("class {class_lc} not found"));
-        let class_name = interner.lookup(&class.name.value).to_string();
-
-        let method = class
-            .members
-            .iter()
-            .find_map(|m| {
-                if let ClassLikeMember::Method(m) = m {
-                    let n = interner.lookup(&m.name.value).to_lowercase();
-                    if n == method_lc {
-                        Some(m)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| panic!("method {method_lc} not found"));
-
-        let block = match &method.body {
-            MethodBody::Concrete(b) => b,
-            _ => panic!("expected concrete body"),
-        };
-
-        let env = TypeEnv::for_class(&class_name);
-        let names = mago_names::resolver::NameResolver::new(interner).resolve(&program);
-        let mut ctx = WalkerCtx::new(env, interner, &project, names);
-        for stmt in block.statements.iter() {
-            walk_statement_ctx(&mut ctx, stmt);
-        }
-        ctx.events
+            .expect("file parses")
     }
 
     fn assert_helper_called(php: &str, helper: &str) {
