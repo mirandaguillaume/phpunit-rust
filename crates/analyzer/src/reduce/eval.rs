@@ -1226,11 +1226,16 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
             // object/non-object pair PHP CONVERTS (truthiness/int/__toString) →
             // bail rather than let php_loose_eq short-circuit to a false green.
             bail_if_object_mixed_loose(e, a)?;
+            // The assertEquals/assertNotEquals ORACLE is PHPUnit's comparator
+            // chain (sebastian/comparator), NOT PHP `==` — bail the pair
+            // classes where the two diverge (see `comparator_eq_divergent`).
+            bail_if_comparator_divergent(e, a)?;
             pass(assert_equals(e, a), "assertEquals")
         }
         b"assertNotEquals" => {
             let (e, a) = two_args(args)?;
             bail_if_object_mixed_loose(e, a)?;
+            bail_if_comparator_divergent(e, a)?;
             pass(!assert_equals(e, a), "assertNotEquals")
         }
         b"assertTrue" => {
@@ -1391,6 +1396,95 @@ fn bail_if_object_mixed_loose(a: &Value, b: &Value) -> Result<(), BailReason> {
     if loose_eq_pair_unmodelled(a, b) {
         return Err(BailReason::UnsupportedConstruct(
             "loose == between object and non-object (PHP converts) or on a closure (reference identity) — not modelled"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `assertEquals`/`assertNotEquals` verdicts come from PHPUnit's COMPARATOR
+/// CHAIN (sebastian/comparator), NOT from PHP `==` — this predicate walks both
+/// operands in parallel (the same aligned pairs `php_loose_eq` visits, like
+/// [`loose_eq_pair_unmodelled`]) and reports `true` on the pair classes where
+/// the chain's verdict diverges from `==`. GOLD-verified against real PHPUnit
+/// 10.5.63 AND 12.5.29 on php8.4 (identical verdicts on every probed pair):
+///
+/// DIVERGENT → bail (assertion sites ONLY — the `==`/`!=` OPERATOR stays
+/// PHP-exact and must NOT route through this):
+/// - (Arr, non-Arr) at any aligned depth: TypeComparator rejects BY TYPE
+///   ('false does not match expected type "array"') where `==` applies array
+///   truthiness — gold: assertEquals([], false) FAILS (`==` true, false green),
+///   assertNotEquals([], false) PASSES (`==` model said Fail, false red),
+///   assertEquals([[]], [false]) FAILS at depth, assertEquals([], null) FAILS.
+///   The whole family bails fail-closed, including `==`-aligned members like
+///   ([], 0) / ([], '') — the comparator's reason is the TYPE, not the value.
+/// - (Str, Str) byte-different but loose-equal: two strings are compared AS
+///   STRINGS by the chain — gold: assertEquals('1', '01'), ('10', '1e1'),
+///   ('1.0', '1'), ('0.5', '.5') ALL FAIL while PHP `==` says true
+///   (numeric-string comparison). Applies at depth: (['1'], ['01']) FAILS.
+///
+/// ALIGNED → keep computing (gold-verified, do not over-bail):
+/// - numeric cross-type: (1, '1'), ('01', 1), (10, '1e1'), (0.5, '0.5'),
+///   (1.0, 1), (0, '0'), ([1], ['1']) — all gold-PASS, `==` true.
+/// - null/bool cross-type: (null, false), (null, 0), ('', null), (true, 1),
+///   (false, '0'), ('', false), (true, 'a'), ([null], [false]), ([true], [1])
+///   — all gold-PASS, `==` true.
+/// - ('abc', 0) and (0, '') gold-FAIL, `==` false in PHP 8 — aligned.
+/// - float near-equality: (0.3, 0.1+0.2), (1.0, 1.0+1e-12), (NAN, NAN) all
+///   gold-FAIL — PHPUnit 10+/12 applies NO float epsilon — aligned with `==`.
+/// - (Object, Object): ObjectComparator is per-class + per-prop loose, aligned
+///   with the structural model; props are recursed so a divergent pair INSIDE
+///   a prop still bails. (Mixed object/non-object never reaches here —
+///   `bail_if_object_mixed_loose` already bailed it.)
+/// - (Arr, Arr) length/key mismatch: both the chain and `==` fail — aligned,
+///   no recursion needed into unvisited elements.
+fn comparator_eq_divergent(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Str(x), Str(y)) => x != y && a.php_loose_eq(b),
+        (Arr(x), Arr(y)) => {
+            if x.len() != y.len() {
+                return false;
+            }
+            x.iter()
+                .any(|(k, xv)| match y.iter().find(|(yk, _)| yk == k) {
+                    Some((_, yv)) => comparator_eq_divergent(xv, yv),
+                    None => false,
+                })
+        }
+        (
+            Object {
+                class: ca,
+                props: pa,
+                ..
+            },
+            Object {
+                class: cb,
+                props: pb,
+                ..
+            },
+        ) => {
+            if ca != cb || pa.len() != pb.len() {
+                return false;
+            }
+            pa.iter()
+                .any(|(k, av)| match pb.iter().find(|(bk, _)| bk == k) {
+                    Some((_, bv)) => comparator_eq_divergent(av, bv),
+                    None => false,
+                })
+        }
+        (Arr(_), _) | (_, Arr(_)) => true,
+        _ => false,
+    }
+}
+
+/// Assertion-mode guard for `assertEquals`/`assertNotEquals` ONLY (the `==`
+/// operator keeps PHP semantics): bail where the PHPUnit comparator chain
+/// diverges from `php_loose_eq` — see [`comparator_eq_divergent`].
+fn bail_if_comparator_divergent(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if comparator_eq_divergent(a, b) {
+        return Err(BailReason::UnsupportedConstruct(
+            "assertEquals oracle is PHPUnit's comparator chain, which diverges from PHP == on this pair (array vs non-array type-reject, or a numeric-string pair compared as strings)"
                 .into(),
         ));
     }
@@ -3739,6 +3833,127 @@ mod tests {
         );
         assert_eq!(
             run_body("$this->assertEquals(0, 'a');", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+    }
+
+    #[test]
+    fn assert_equals_array_vs_non_array_bails() {
+        // GOLD (php8.4, PHPUnit 10.5.63 AND 12.5.29 — identical verdicts):
+        // assertEquals([], false) FAILS ('false does not match expected type
+        // "array"', TypeComparator) while PHP `[] == false` is TRUE — computing
+        // php_loose_eq here was a FALSE GREEN. Bail.
+        assert!(matches!(
+            run_body("$this->assertEquals([], false);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // Mirror: gold assertNotEquals([], false) PASSES in real PHPUnit while
+        // the == model returned Fail (false red). Bail.
+        assert!(matches!(
+            run_body("$this->assertNotEquals([], false);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // Gold: assertEquals([], null) FAILS (== true); assertEquals(0, [])
+        // FAILS too (== false — aligned, but the whole (Arr, non-Arr) family is
+        // bailed fail-closed: the comparator rejects by TYPE, not by ==).
+        assert!(matches!(
+            run_body("$this->assertEquals([], null);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body("$this->assertEquals(0, []);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // At depth: gold assertEquals([[]], [false]) FAILS (ArrayComparator
+        // recurses, TypeComparator type-rejects [] vs false) while `==` is TRUE.
+        assert!(matches!(
+            run_body("$this->assertEquals([[]], [false]);", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn assert_equals_numeric_string_pair_bails() {
+        // GOLD (php8.4, PHPUnit 10.5.63 AND 12.5.29): assertEquals('1', '01'),
+        // ('10', '1e1'), ('1.0', '1'), ('0.5', '.5') ALL FAIL — two strings are
+        // compared AS STRINGS by the comparator chain — while PHP `==` says TRUE
+        // (numeric-string comparison). Bail byte-different-but-loose-equal
+        // string pairs.
+        assert!(matches!(
+            run_body("$this->assertEquals('1', '01');", vec![]),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body("$this->assertEquals('10', '1e1');", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // At depth: gold assertEquals(['1'], ['01']) FAILS too (ArrayComparator
+        // recurses into the string pair) while `==` is TRUE.
+        assert!(matches!(
+            run_body("$this->assertEquals(['1'], ['01']);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body("$this->assertNotEquals('1', '01');", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn assert_equals_comparator_aligned_pairs_still_compute() {
+        // NO-OVER-BAIL controls — every pair below was gold-verified ALIGNED
+        // between the PHPUnit comparator chain and php_loose_eq (php8.4,
+        // PHPUnit 10.5.63 AND 12.5.29), so the model must keep computing.
+        // Gold PASS, == true: numeric cross-type (NumericComparator).
+        assert_eq!(
+            run_body("$this->assertEquals('01', 1);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals(10, '1e1');", vec![]),
+            Outcome::Pass
+        );
+        // Gold PASS, == true: null/bool/empty cross-type.
+        assert_eq!(
+            run_body("$this->assertEquals(null, false);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals('', null);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals(true, 'a');", vec![]),
+            Outcome::Pass
+        );
+        // Gold PASS, == true: numeric / bool pairs INSIDE arrays.
+        assert_eq!(
+            run_body("$this->assertEquals([1], ['1']);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals([null], [false]);", vec![]),
+            Outcome::Pass
+        );
+        // Gold FAIL, == false (PHP 8): aligned failures keep computing.
+        assert_eq!(
+            run_body("$this->assertEquals(0, '');", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+        // Byte-identical strings: gold PASS, == true.
+        assert_eq!(
+            run_body("$this->assertEquals('abc', 'abc');", vec![]),
+            Outcome::Pass
+        );
+        // Byte-different non-numeric strings: gold FAIL, == false — aligned.
+        assert_eq!(
+            run_body("$this->assertEquals('a', 'b');", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+        // Float near-equality: gold assertEquals(0.3, 0.1 + 0.2) FAILS — the
+        // PHPUnit 10+/12 comparator applies NO epsilon — aligned with ==.
+        assert_eq!(
+            run_body("$this->assertEquals(0.3, 0.1 + 0.2);", vec![]),
             Outcome::Fail("assertEquals".into())
         );
     }

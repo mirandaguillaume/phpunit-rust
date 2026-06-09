@@ -791,7 +791,12 @@ pub fn assert_same(expected: &Value, actual: &Value) -> bool {
     expected.php_strict_eq(actual)
 }
 
-/// `assertEquals($expected, $actual)` ≈ `==` (no delta).
+/// `assertEquals($expected, $actual)` ≈ `==` (no delta) — ONLY on the pair
+/// classes where PHPUnit's comparator chain agrees with `==`. The real oracle
+/// is sebastian/comparator, which diverges from `==` on (Arr, non-Arr) pairs
+/// (TypeComparator rejects by type) and byte-different numeric-string pairs
+/// (compared as strings): the eval layer's `bail_if_comparator_divergent`
+/// guard BAILS those before this function is consulted.
 pub fn assert_equals(expected: &Value, actual: &Value) -> bool {
     expected.php_loose_eq(actual)
 }
