@@ -2627,6 +2627,30 @@ fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailR
         (b"is_null", [v]) => Value::Bool(matches!(v, Value::Null)),
         (b"is_float" | b"is_double", [v]) => Value::Bool(matches!(v, Value::Float(_))),
 
+        // ── Task 2: pure type/inspection + cast builtins (gold vs php8.4) ──
+        // is_scalar: int/float/string/bool → true; null/array/object → false.
+        (b"is_scalar", [v]) => Value::Bool(matches!(
+            v,
+            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
+        )),
+        // gettype: PHP's legacy spelling (NULL/boolean/integer/double/string/array/
+        // object), NOT Value::type_name() (which is lowercase int/float/etc.).
+        (b"gettype", [v]) => Value::Str(php_gettype(v).to_vec()),
+        // boolval/floatval mirror the gold-tested (bool)/(float) casts on Value.
+        // (intval is handled above.) strval mirrors the (string) cast; an array or
+        // object → PHP emits a notice / fatal → we BAIL (fail-closed), never "Array".
+        (b"boolval", [v]) => Value::Bool(v.to_bool()),
+        (b"floatval" | b"doubleval", [v]) => Value::Float(v.to_float()),
+        (b"strval", [v]) => match v.to_php_string() {
+            Some(bytes) => Value::Str(bytes),
+            None => {
+                return Err(BailReason::TypeError(format!(
+                    "strval of a {} (PHP notice/fatal)",
+                    v.type_name()
+                )))
+            }
+        },
+
         // ── strict array builtins (Task E) ──
         // reset/end = pure first/last element; empty → false (cursor siblings bail
         // above, so this can never observably diverge).
@@ -2705,6 +2729,22 @@ fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailR
         _ => return Ok(None),
     };
     Ok(Some(v))
+}
+
+/// PHP `gettype()` legacy type names (gold vs `php8.4 -r 'echo gettype($x);'`):
+/// `NULL`, `boolean`, `integer`, `double`, `string`, `array`, `object`. These
+/// differ from [`Value::type_name`] (lowercase `null`/`bool`/`int`/`float`), so
+/// `gettype` must NOT reuse it. A Closure is an object (`gettype` → "object").
+fn php_gettype(v: &Value) -> &'static [u8] {
+    match v {
+        Value::Null => b"NULL",
+        Value::Bool(_) => b"boolean",
+        Value::Int(_) => b"integer",
+        Value::Float(_) => b"double",
+        Value::Str(_) => b"string",
+        Value::Arr(_) => b"array",
+        Value::Object { .. } | Value::Closure(_) => b"object",
+    }
 }
 
 /// Evaluate a positional argument list to concrete values. Named/spread args bail.
@@ -3524,6 +3564,121 @@ mod tests {
             )
             .unwrap(),
             Value::Int(7)
+        );
+    }
+
+    // ── Task 2: pure type/inspection builtins (gold vs `php8.4 -r`) ──
+
+    #[test]
+    fn type_inspection_builtins_match_php() {
+        // is_scalar — php8.4: int/float/string/bool → true; null/array → false.
+        assert_eq!(eval_one("is_scalar(1)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar(1.5)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar('x')").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar(true)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar(null)").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("is_scalar([1])").unwrap(), Value::Bool(false));
+
+        // gettype — php8.4: NULL/boolean/integer/double/string/array (NOT type_name()).
+        assert_eq!(
+            eval_one("gettype(null)").unwrap(),
+            Value::Str(b"NULL".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype(true)").unwrap(),
+            Value::Str(b"boolean".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype(1)").unwrap(),
+            Value::Str(b"integer".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype(1.5)").unwrap(),
+            Value::Str(b"double".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype('x')").unwrap(),
+            Value::Str(b"string".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype([1])").unwrap(),
+            Value::Str(b"array".to_vec())
+        );
+
+        // count on an array (Value::Arr only).
+        assert_eq!(eval_one("count([1, 2, 3])").unwrap(), Value::Int(3));
+        assert_eq!(eval_one("sizeof([])").unwrap(), Value::Int(0));
+
+        // is_* already-present checks (regression-lock the listed set).
+        assert_eq!(eval_one("is_string(5)").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("is_array([1, 2])").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_null(null)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_float(1.5)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_bool(false)").unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn cast_builtins_match_php() {
+        // boolval — php8.4 gold: "0"→false, "0.0"→true, []→false, [0]→true.
+        assert_eq!(eval_one("boolval('0')").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("boolval('0.0')").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("boolval([])").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("boolval([0])").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("boolval(0)").unwrap(), Value::Bool(false));
+
+        // intval — php8.4 gold: "10abc"→10, "0x1A"→0, "1e2"→100, 1.9→1.
+        assert_eq!(eval_one("intval('10abc')").unwrap(), Value::Int(10));
+        assert_eq!(eval_one("intval('0x1A')").unwrap(), Value::Int(0));
+        assert_eq!(eval_one("intval('1e2')").unwrap(), Value::Int(100));
+        assert_eq!(eval_one("intval(1.9)").unwrap(), Value::Int(1));
+
+        // floatval — php8.4 gold: "10abc"→10.0, "1e2"→100.0, ".5"→0.5.
+        assert_eq!(eval_one("floatval('10abc')").unwrap(), Value::Float(10.0));
+        assert_eq!(eval_one("floatval('1e2')").unwrap(), Value::Float(100.0));
+        assert_eq!(eval_one("floatval('.5')").unwrap(), Value::Float(0.5));
+
+        // strval — php8.4 gold: null→"", true→"1", false→"", 1.0→"1", -0.0→"-0".
+        assert_eq!(eval_one("strval(null)").unwrap(), Value::Str(Vec::new()));
+        assert_eq!(eval_one("strval(true)").unwrap(), Value::Str(b"1".to_vec()));
+        assert_eq!(eval_one("strval(false)").unwrap(), Value::Str(Vec::new()));
+        assert_eq!(eval_one("strval(1.0)").unwrap(), Value::Str(b"1".to_vec()));
+        assert_eq!(
+            eval_one("strval(-0.0)").unwrap(),
+            Value::Str(b"-0".to_vec())
+        );
+
+        // strval of an array → PHP notice; we BAIL (fail-closed).
+        assert!(matches!(
+            eval_one("strval([1, 2])"),
+            Err(BailReason::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn tricky_numeric_string_inspection_bails() {
+        // The plan defers the tricky `is_numeric` numeric-string corner: it must
+        // BAIL (UnknownCall), never guess. `is_numeric("12abc")` is false in PHP,
+        // but we don't model the corner now → it must not resolve.
+        assert!(matches!(
+            eval_one("is_numeric('12abc')"),
+            Err(BailReason::UnknownCall(_))
+        ));
+    }
+
+    #[test]
+    fn type_builtins_in_assertions() {
+        // The end-to-end assertion form a real ctor/method body uses.
+        assert_eq!(
+            run_body("$this->assertTrue(is_array([1, 2]));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertFalse(is_string(5));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertSame(3, count([1, 2, 3]));", vec![]),
+            Outcome::Pass
         );
     }
 }
