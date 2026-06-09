@@ -348,35 +348,160 @@ pub fn eval_default(expr: &Expression, scope: &mut Scope) -> Result<Value, BailR
 /// coercion, so when a bare scalar return hint does not already match the returned
 /// value's type, BAIL (fail-closed) rather than return the un-coerced value — that
 /// was the symfony `LazyString::resolve(): string` false-FAIL. A non-scalar hint
-/// (class, union, nullable, void, mixed, …) needs no coercion and is left alone.
+/// (class, void, mixed, …) needs no coercion and is left alone; `?scalar` and
+/// `scalar|…` unions are unwrapped so the wrapped scalar member still bails.
 pub fn bail_if_scalar_return_coerces(
     hint: Option<&mago_syntax::ast::ast::function_like::r#return::FunctionLikeReturnTypeHint>,
     value: &Value,
 ) -> Result<(), BailReason> {
-    use mago_syntax::ast::ast::type_hint::Hint;
     let Some(rt) = hint else {
         return Ok(());
     };
-    let matches = match &rt.hint {
+    bail_if_scalar_hint_coerces(&rt.hint, value, "return")
+}
+
+/// Shared scalar-coercion guard for a declared type `hint` against a runtime
+/// `value`, used by both the inlined-return path and the parameter-binding path
+/// (`site` names which, for the bail message). PHP coerces a scalar value to a
+/// declared scalar type at these boundaries (weak mode) or throws `TypeError`
+/// (strict) — neither is modelled, so any mismatch BAILS (fail-closed, correct in
+/// both modes). The check unwraps `?scalar` (nullable) and descends `scalar|…`
+/// unions / `scalar&…` intersections so a wrapped scalar member is still enforced.
+pub fn bail_if_scalar_hint_coerces(
+    hint: &mago_syntax::ast::ast::type_hint::Hint,
+    value: &Value,
+    site: &str,
+) -> Result<(), BailReason> {
+    use mago_syntax::ast::ast::type_hint::Hint;
+
+    match hint {
+        // `?T`: a genuine null needs no coercion; otherwise apply the check to `T`.
+        Hint::Nullable(n) => {
+            if matches!(value, Value::Null) {
+                Ok(())
+            } else {
+                bail_if_scalar_hint_coerces(n.hint, value, site)
+            }
+        }
+        // A union / intersection coerces a SCALAR value unless it already matches a
+        // member exactly. PHP only scalar-coerces a scalar value, so a non-scalar
+        // value (object/array/closure) never undergoes scalar coercion here → Ok.
+        // For a scalar value: if ANY member is a bare scalar and the value matches
+        // NONE of the members exactly, PHP would coerce → BAIL. A value that already
+        // equals a member — a bare scalar (`int`), OR a literal type
+        // (`false`/`true`/`null`, e.g. `array_search(): int|string|false` returning
+        // `false`) — needs no coercion. If no member is a bare scalar, no scalar
+        // coercion is possible → leave alone.
+        Hint::Union(_) | Hint::Intersection(_) => {
+            if !is_scalar_value(value) {
+                return Ok(());
+            }
+            let mut saw_scalar_member = false;
+            let mut matched = false;
+            for_each_hint_leaf(hint, &mut |leaf| {
+                if bare_scalar_hint_matches(leaf, value) == Some(false) {
+                    saw_scalar_member = true;
+                }
+                if value_matches_hint_member(leaf, value) {
+                    matched = true;
+                }
+            });
+            if saw_scalar_member && !matched {
+                Err(BailReason::UnsupportedConstruct(format!(
+                    "scalar {site}-type coercion ({} on a {} value) not modelled",
+                    scalar_hint_name(hint),
+                    value.type_name(),
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        // A bare scalar hint: bail unless the value's type already matches exactly.
+        _ => match bare_scalar_hint_matches(hint, value) {
+            Some(true) | None => Ok(()),
+            Some(false) => Err(BailReason::UnsupportedConstruct(format!(
+                "scalar {site}-type coercion ({} on a {} value) not modelled",
+                scalar_hint_name(hint),
+                value.type_name(),
+            ))),
+        },
+    }
+}
+
+/// For a BARE scalar hint, `Some(true)` if it matches `value`'s type exactly,
+/// `Some(false)` if it is a bare scalar that does NOT match; `None` if `hint` is
+/// not a bare scalar (no scalar coercion is implied by it).
+fn bare_scalar_hint_matches(
+    hint: &mago_syntax::ast::ast::type_hint::Hint,
+    value: &Value,
+) -> Option<bool> {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    Some(match hint {
         Hint::String(_) => matches!(value, Value::Str(_)),
         Hint::Integer(_) => matches!(value, Value::Int(_)),
         Hint::Float(_) => matches!(value, Value::Float(_)),
         Hint::Bool(_) => matches!(value, Value::Bool(_)),
-        // Not a bare scalar hint → PHP performs no scalar coercion here.
-        _ => return Ok(()),
-    };
-    if matches {
-        Ok(())
-    } else {
-        Err(BailReason::UnsupportedConstruct(format!(
-            "scalar return-type coercion ({} return on a {} value) not modelled",
-            scalar_hint_name(&rt.hint),
-            value.type_name(),
-        )))
+        _ => return None,
+    })
+}
+
+/// Whether a SCALAR `value` ALREADY satisfies a single union/intersection member
+/// `leaf` with no coercion. Covers bare scalars (`int`→`Int`) and the literal types
+/// `true`/`false`/`null` (so `array_search(): int|string|false` returning `false`
+/// is a clean member match, not a coercion). `mixed` accepts anything. Any other
+/// member (class, array, callable, object, …) cannot be matched BY A SCALAR value,
+/// so it never counts as a match here — the caller only reaches this with a scalar
+/// value, and the bail decision still requires a non-matching bare-scalar member.
+fn value_matches_hint_member(leaf: &mago_syntax::ast::ast::type_hint::Hint, value: &Value) -> bool {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    match leaf {
+        Hint::String(_) | Hint::Integer(_) | Hint::Float(_) | Hint::Bool(_) => {
+            bare_scalar_hint_matches(leaf, value) == Some(true)
+        }
+        Hint::True(_) => matches!(value, Value::Bool(true)),
+        Hint::False(_) => matches!(value, Value::Bool(false)),
+        Hint::Null(_) => matches!(value, Value::Null),
+        // `mixed` accepts any value, including a scalar → a clean match, no coercion.
+        Hint::Mixed(_) => true,
+        // Any other member (class / array / callable / object / iterable / …) cannot
+        // be satisfied by a scalar value → not a match (fail-closed for the bail).
+        _ => false,
     }
 }
 
-/// Display name for a bare scalar return hint (for the bail message).
+/// Whether `value` is a PHP scalar (the only values PHP scalar-coerces). Object,
+/// closure and array values are never the subject of scalar coercion.
+fn is_scalar_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+    )
+}
+
+/// Visit every leaf hint of a (possibly nested) union / intersection tree, calling
+/// `f` on each non-composite leaf. Nullable wrappers are descended too.
+fn for_each_hint_leaf<'a>(
+    hint: &'a mago_syntax::ast::ast::type_hint::Hint,
+    f: &mut impl FnMut(&'a mago_syntax::ast::ast::type_hint::Hint),
+) {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    match hint {
+        Hint::Union(u) => {
+            for_each_hint_leaf(u.left, f);
+            for_each_hint_leaf(u.right, f);
+        }
+        Hint::Intersection(i) => {
+            for_each_hint_leaf(i.left, f);
+            for_each_hint_leaf(i.right, f);
+        }
+        Hint::Nullable(n) => for_each_hint_leaf(n.hint, f),
+        Hint::Parenthesized(p) => for_each_hint_leaf(p.hint, f),
+        leaf => f(leaf),
+    }
+}
+
+/// Display name for a scalar coercion bail message. For a composite hint it names
+/// the kind; for a bare scalar it names the scalar type.
 fn scalar_hint_name(hint: &mago_syntax::ast::ast::type_hint::Hint) -> &'static str {
     use mago_syntax::ast::ast::type_hint::Hint;
     match hint {
@@ -384,6 +509,9 @@ fn scalar_hint_name(hint: &mago_syntax::ast::ast::type_hint::Hint) -> &'static s
         Hint::Integer(_) => "int",
         Hint::Float(_) => "float",
         Hint::Bool(_) => "bool",
+        Hint::Nullable(_) => "nullable scalar",
+        Hint::Union(_) => "scalar union",
+        Hint::Intersection(_) => "scalar intersection",
         _ => "scalar",
     }
 }

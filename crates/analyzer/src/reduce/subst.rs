@@ -32,8 +32,9 @@ use mago_syntax::ast::ast::statement::Statement;
 use mago_syntax::ast::Program;
 
 use super::eval::{
-    bail_if_scalar_return_coerces, make_object, run_body_returning_with_names,
-    run_ctor_body_with_names, BailReason, CallResolver, NoResolver, Scope,
+    bail_if_scalar_hint_coerces, bail_if_scalar_return_coerces, make_object,
+    run_body_returning_with_names, run_ctor_body_with_names, BailReason, CallResolver, NoResolver,
+    Scope,
 };
 use super::value::Value;
 use crate::mago_bridge::MagoProject;
@@ -531,6 +532,7 @@ fn run_constructor(
                 }
             },
         };
+        bail_if_scalar_param_coerces(param, &value)?;
         // A promoted property seeds `$this->name` directly (PHP semantics).
         if param.is_promoted_property() {
             if has_readonly_modifier(param) {
@@ -661,6 +663,7 @@ fn bind_method_params(
                 }
             },
         };
+        bail_if_scalar_param_coerces(param, &value)?;
         bindings.insert(key, value);
     }
     Ok(bindings)
@@ -838,10 +841,25 @@ fn bind_params(
                 "parameter has no argument and no default".into(),
             ));
         };
+        bail_if_scalar_param_coerces(param, &value)?;
         bindings.insert(key, value);
     }
 
     Ok(bindings)
+}
+
+/// PHP coerces a scalar argument to a declared bare-scalar parameter type at the
+/// call boundary (weak mode) or throws `TypeError` (strict). Neither is modelled,
+/// so a mismatch BAILS (fail-closed). Routes through the shared scalar guard so
+/// `?scalar` / `scalar|…` parameter hints are enforced the same as returns.
+fn bail_if_scalar_param_coerces(
+    param: &FunctionLikeParameter,
+    value: &Value,
+) -> Result<(), BailReason> {
+    if let Some(hint) = &param.hint {
+        bail_if_scalar_hint_coerces(hint, value, "parameter")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1007,6 +1025,118 @@ class T {
             reduce_with_subst(src, "T", "testV", vec![]),
             Outcome::Bailed(_)
         ));
+    }
+
+    #[test]
+    fn scalar_param_coercion_bails() {
+        // PHP coerces `"5"` to int `5` at the `int $x` parameter boundary (weak
+        // mode) or throws TypeError (strict). Neither is modelled → BAIL rather
+        // than bind `Str("5")` raw and return it (which would diverge: the test
+        // would falsely PASS `assertSame(5, "5")` → Fail in real PHP). The `: mixed`
+        // return hint isolates the PARAMETER as the only scalar-coercion site (a
+        // scalar return hint would otherwise mask the param bug on the return path).
+        let src = r#"<?php
+function identity(int $x): mixed { return $x; }
+class T {
+    public function testCoerce(): void {
+        $this->assertSame(5, identity("5"));
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testCoerce", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn matching_scalar_param_does_not_bail() {
+        // An exactly-typed argument (Int → `int $x`) needs no coercion; the inline
+        // must still PASS so the param-coercion guard does not over-bail.
+        let src = r#"<?php
+function identity(int $x): mixed { return $x; }
+class T {
+    public function testExact(): void {
+        $this->assertSame(5, identity(5));
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testExact", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn nullable_scalar_return_coercion_bails() {
+        // `?string` with a `true` return coerces to `"1"` in PHP; unmodelled → BAIL.
+        // (The bonus fix only covered the BARE `: string` hint; `?string` slipped
+        // through the `_ => Ok(())` arm and returned `Bool(true)` → divergence.)
+        let src = r#"<?php
+function r(): ?string { return true; }
+class T {
+    public function testNullable(): void {
+        $this->assertSame("1", r());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testNullable", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn nullable_scalar_return_null_value_does_not_bail() {
+        // A genuine `null` return under `?string` is no coercion → must not bail.
+        let src = r#"<?php
+function r(): ?string { return null; }
+class T {
+    public function testNullOk(): void {
+        $this->assertNull(r());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testNullOk", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn union_scalar_return_coercion_bails() {
+        // `int|string` with a `true` return matches NEITHER member exactly and PHP
+        // coerces (to `1`/`"1"` depending on context) → BAIL.
+        let src = r#"<?php
+function u(): int|string { return true; }
+class T {
+    public function testUnion(): void {
+        $this->assertSame(1, u());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testUnion", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn union_scalar_return_matching_member_does_not_bail() {
+        // An `int` value already matches the `int` member of `int|string` → no
+        // coercion, must not over-bail.
+        let src = r#"<?php
+function u(): int|string { return 7; }
+class T {
+    public function testUnionOk(): void {
+        $this->assertSame(7, u());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testUnionOk", vec![]),
+            Outcome::Pass
+        );
     }
 
     // ── Increment 2: objects + methods (the Point fixture) ──
