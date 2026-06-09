@@ -2840,11 +2840,39 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
                     }
                 };
 
+            // Object-return aliasing (Inc-5): ANY method that returns a
+            // `Value::Object` may be forwarding the receiver back to the caller
+            // (canonically `return $this;`). PHP hands back the SAME handle, so the
+            // returned value aliases the receiver — and this holds REGARDLESS of
+            // whether the method mutates. Our by-value model otherwise hands back an
+            // unswept clone, so a later mutation of EITHER name diverges. Fail-closed:
+            // when the return is an object, mark the returned value aliased AND, if
+            // the receiver is a plain `$var` binding, mark that binding aliased too,
+            // so any subsequent mutation of either bails. This unifies the read-only
+            // (`None`) and mutator (`Some`) branches on the object-return axis.
+            if matches!(dispatch.ret, Value::Object { .. }) {
+                if let Expression::Variable(Variable::Direct(v)) = m.object {
+                    let key = var_name(v.name);
+                    if let Some(binding) = scope.vars.get_mut(&key) {
+                        binding.mark_aliased();
+                    }
+                }
+            }
+
             // Mutation handling (Inc-5 Task 3 — the soundness core).
             match dispatch.mutated_this {
-                // Read-only method: the by-value model is exact regardless of
-                // aliasing. Just use the return value.
-                None => Ok(dispatch.ret),
+                // Read-only method: the by-value model is exact for a NON-object
+                // return regardless of aliasing. For an OBJECT return it is NOT
+                // exact (the returned handle aliases the receiver in PHP) — the
+                // object-return marking above has already marked the receiver and
+                // we mark the returned value here so any later mutation bails.
+                None => {
+                    let mut ret = dispatch.ret;
+                    if matches!(ret, Value::Object { .. }) {
+                        ret.mark_aliased();
+                    }
+                    Ok(ret)
+                }
                 // Mutator: PHP would write through the shared handle. Our model
                 // can only stay sound if the object is UNIQUELY OWNED *and* we
                 // have a binding to write the mutation back to.
@@ -4085,30 +4113,41 @@ mod tests {
             method: &[u8],
             _args: &[Value],
         ) -> Result<Option<MethodDispatch>, BailReason> {
-            if method != b"inc" {
-                return Ok(None);
-            }
             let Value::Object { class, props, .. } = this else {
                 return Ok(None);
             };
             if class.as_slice() != b"Box" {
                 return Ok(None);
             }
-            // `$this->v++` — read the current `v`, write back the incremented record.
-            let cur = props
-                .iter()
-                .find(|(k, _)| k.as_slice() == b"v")
-                .map(|(_, v)| v.clone())
-                .unwrap_or(Value::Int(0));
-            let next = match cur {
-                Value::Int(n) => Value::Int(n + 1),
-                _ => return Err(BailReason::TypeError("Box::v is not an int".into())),
-            };
-            let mutated = make_object(b"Box".to_vec(), vec![(b"v".to_vec(), next)]);
-            Ok(Some(MethodDispatch {
-                ret: Value::Null,
-                mutated_this: Some(mutated),
-            }))
+            match method {
+                // `function inc(): void { $this->v++; }` — a MUTATOR returning void.
+                b"inc" => {
+                    // `$this->v++` — read the current `v`, write back the
+                    // incremented record.
+                    let cur = props
+                        .iter()
+                        .find(|(k, _)| k.as_slice() == b"v")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Int(0));
+                    let next = match cur {
+                        Value::Int(n) => Value::Int(n + 1),
+                        _ => return Err(BailReason::TypeError("Box::v is not an int".into())),
+                    };
+                    let mutated = make_object(b"Box".to_vec(), vec![(b"v".to_vec(), next)]);
+                    Ok(Some(MethodDispatch {
+                        ret: Value::Null,
+                        mutated_this: Some(mutated),
+                    }))
+                }
+                // `function self() { return $this; }` — a READ-ONLY method that
+                // fluently returns the receiver object (no mutation). PHP hands
+                // back the SAME handle, so the returned value aliases the receiver.
+                b"self" => Ok(Some(MethodDispatch {
+                    ret: this.clone(),
+                    mutated_this: None,
+                })),
+                _ => Ok(None),
+            }
         }
     }
 
@@ -4202,6 +4241,45 @@ mod tests {
                 Outcome::Bailed(_)
             ),
             "parenthesized null-coalesce-forwarded alias source must bail, not diverge"
+        );
+    }
+
+    #[test]
+    fn readonly_return_this_aliasing_bails() {
+        // `$b = $a->self()` — a READ-ONLY method (`function self() { return $this; }`,
+        // `mutated_this: None`) that fluently returns the receiver. PHP hands back the
+        // SAME handle, so `$a === $b`. Before the dispatch-return symmetry fix the
+        // read-only branch returned the object RAW (`None => Ok(dispatch.ret)`) and
+        // never marked the receiver `$a` aliased: a later `$a->inc()` wrote back only
+        // to `$a`, leaving `$b` a stale by-value clone (v == 0) → a false-green
+        // divergence (reducer reported Fail while real PHP — same handle — Passes with
+        // $b->v === 1). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = $a->self(); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "read-only object-returning method (return $this) must mark the receiver \
+             aliased and bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn readonly_return_this_chain_without_later_mutation_still_passes() {
+        // Control: `$a->self()->v` reads through the fluently-returned receiver but
+        // `$a` is NOT mutated again afterward, so marking `$a` aliased is harmless —
+        // the result stays feasible and must still reduce to PASS (no over-bail).
+        // (If a future tightening of the property-read path made this bail, that
+        // would be an ACCEPTABLE conservative over-bail, but today it passes.)
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $a->inc(); $this->assertSame(1, $a->self()->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
         );
     }
 
