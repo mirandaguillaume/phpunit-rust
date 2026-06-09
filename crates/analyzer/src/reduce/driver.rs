@@ -58,8 +58,31 @@ pub enum DriverError {
 /// Any row the reducer cannot model has `outcome = Outcome::Bailed(reason)` — it
 /// is the caller's job to run those for real (fail-closed).
 pub fn reduce_file(test_file: &Path) -> Result<Vec<ReducedTest>, DriverError> {
-    let root = test_file.parent().unwrap_or(Path::new("."));
-    reduce_in_root(root, test_file)
+    let root = project_root_of(test_file);
+    reduce_in_root(&root, test_file)
+}
+
+/// Resolve the scan root for `test_file` by walking UP to the nearest ancestor
+/// directory that contains a `composer.json` (the canonical PHP project-root
+/// marker). This widens the scan to include the project's own `src/` so a
+/// `new <ProjectClass>` resolves (the narrow parent-of-the-test root omitted
+/// `src/`, forcing a scoping-artifact bail — see Task 1). Vendor stays excluded
+/// downstream via [`MagoProject::load_excluding_vendor`], so the wider root costs
+/// only the project's own (small) source tree, never the 36x vendor scan.
+///
+/// Fallback (no composer.json found anywhere up the tree): the test file's own
+/// parent dir — the prior behavior, fully divergence-safe (a missing class still
+/// bails).
+pub fn project_root_of(test_file: &Path) -> std::path::PathBuf {
+    let start = test_file.parent().unwrap_or(Path::new("."));
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join("composer.json").is_file() {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent();
+    }
+    start.to_path_buf()
 }
 
 /// Like [`reduce_file`] but with an explicit codebase root (the suite dir whose
@@ -514,16 +537,24 @@ mod tests {
             return;
         };
         let test_file = Path::new(&file);
-        let root = test_file
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(Path::new("."));
+        // Default scan root: the composer.json PROJECT ROOT (same as production
+        // `reduce_file` via `project_root_of`) so the suite's own src/ resolves.
+        // An optional REDUCE_MEASURE_ROOT override pins an explicit root. Benign
+        // measurement knob.
+        let root_env = std::env::var("REDUCE_MEASURE_ROOT").ok();
+        let root = match &root_env {
+            Some(r) => Path::new(r).to_path_buf(),
+            None => project_root_of(test_file),
+        };
         if !test_file.exists() {
             eprintln!("SKIP: {} not present", test_file.display());
             return;
         }
+        eprintln!("SCAN_ROOT={}", root.display());
 
-        let reduced = reduce_in_root(root, test_file).expect("reduce_file");
+        let scan_t0 = std::time::Instant::now();
+        let reduced = reduce_in_root(&root, test_file).expect("reduce_file");
+        eprintln!("SCAN+REDUCE_MS={}", scan_t0.elapsed().as_millis());
         let total = reduced.len();
         let mut pass = 0usize;
         let mut fail = 0usize;
@@ -573,6 +604,98 @@ mod tests {
         println!("--- bail histogram ---");
         for (reason, n) in &hist {
             println!("  {n:>3}  {reason}");
+        }
+    }
+
+    /// Build a temp PHP PROJECT (composer.json + src/ + tests/) and return the dir.
+    /// Unlike `write_suite` (flat), this lays out a real project tree so the
+    /// project-root scan (Task 1) can resolve the library's own `src/` classes.
+    fn write_project(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("composer.json"), "{\n}\n").unwrap();
+        // Minimal PHPUnit stub under the project root so test classes resolve.
+        std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
+        )
+        .unwrap();
+        for (name, src) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        dir
+    }
+
+    const MONEY_SRC: &str = r#"<?php
+final class Money {
+    public function __construct(public int $cents) {}
+    public function cents(): int { return $this->cents; }
+}
+"#;
+    const MONEY_TEST_SRC: &str = r#"<?php
+use PHPUnit\Framework\TestCase;
+class MoneyTest extends TestCase {
+    public function testCents(): void {
+        $m = new Money(500);
+        $this->assertSame(500, $m->cents());
+    }
+}
+"#;
+
+    /// Task 1 RED: with the NARROW root (the test file's own directory `tests/`),
+    /// `src/Money.php` is not scanned, so `new Money` cannot resolve and the row
+    /// BAILS on `new Money` — proving the bail is a SCOPING artifact, not a real
+    /// modelling gap.
+    #[test]
+    fn narrow_root_bails_on_unscanned_project_class() {
+        let dir = write_project(&[
+            ("src/Money.php", MONEY_SRC),
+            ("tests/MoneyTest.php", MONEY_TEST_SRC),
+        ]);
+        let test_file = dir.path().join("tests/MoneyTest.php");
+        // The narrow root = the test file's parent dir (`tests/`), which excludes src/.
+        let narrow = test_file.parent().unwrap().to_path_buf();
+        let reduced = reduce_in_root(&narrow, &test_file).unwrap();
+        assert_eq!(reduced.len(), 1);
+        match &reduced[0].outcome {
+            Outcome::Bailed(BailReason::UnknownCall(m)) => {
+                assert!(
+                    m.contains("new Money") || m == "new Money",
+                    "expected a `new Money` bail under the narrow root; got {m:?}"
+                );
+            }
+            other => {
+                panic!("expected Bailed(UnknownCall new Money) under narrow root; got {other:?}")
+            }
+        }
+    }
+
+    /// Task 1 GREEN: `reduce_file` walks up to the composer.json project root, so
+    /// `src/Money.php` IS scanned and `new Money` RESOLVES — the bail is no longer
+    /// `new Money`. (The full Pass is unlocked once instance dispatch lands in
+    /// Task 3; here we assert only that `new Money` is no longer the wall.)
+    #[test]
+    fn project_root_scan_resolves_project_class() {
+        let dir = write_project(&[
+            ("src/Money.php", MONEY_SRC),
+            ("tests/MoneyTest.php", MONEY_TEST_SRC),
+        ]);
+        let test_file = dir.path().join("tests/MoneyTest.php");
+        // Sanity: project_root_of must find the composer.json dir, not `tests/`.
+        assert_eq!(project_root_of(&test_file), dir.path());
+        let reduced = reduce_file(&test_file).unwrap();
+        assert_eq!(reduced.len(), 1);
+        match &reduced[0].outcome {
+            Outcome::Bailed(BailReason::UnknownCall(m)) => assert!(
+                !m.contains("new Money"),
+                "`new Money` must resolve under the project root; still bailing on it: {m:?}"
+            ),
+            // Pass is also acceptable (Task 3 unlocks the getter); never a wrong Fail.
+            Outcome::Pass => {}
+            other => panic!("unexpected outcome: {other:?}"),
         }
     }
 
