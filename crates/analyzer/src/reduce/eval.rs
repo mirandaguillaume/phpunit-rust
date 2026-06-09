@@ -1269,15 +1269,42 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
     })
 }
 
+/// True iff `v` IS, or (transitively through array elements) CONTAINS, a value
+/// carrying PHP reference identity (an object or a closure). Strict (`===`)
+/// comparison recurses into arrays, so an identity-carrying value at ANY depth
+/// reaches `php_strict_eq`'s unmodelled (Object, Object)/(Closure, Closure)
+/// pairs — the equality-layer mirror of `mark_aliased`'s aggregate recursion.
+fn contains_identity_value(v: &Value) -> bool {
+    match v {
+        Value::Object { .. } | Value::Closure(_) => true,
+        Value::Arr(items) => items.iter().any(|(_, e)| contains_identity_value(e)),
+        _ => false,
+    }
+}
+
+/// True iff `v` IS, or (transitively through array elements / object props)
+/// CONTAINS, a closure. Loose (`==`) comparison recurses into both arrays and
+/// object property records, and closure `==` is reference identity — unmodelled.
+fn contains_closure(v: &Value) -> bool {
+    match v {
+        Value::Closure(_) => true,
+        Value::Arr(items) => items.iter().any(|(_, e)| contains_closure(e)),
+        Value::Object { props, .. } => props.iter().any(|(_, e)| contains_closure(e)),
+        _ => false,
+    }
+}
+
 /// `assertSame`/`assertNotSame`/`===` over objects is REFERENCE identity — the
 /// reducer models structure, not heap identity, so it MUST abstain when either
-/// operand is an object (frontier §1). `assertEquals`/`==` stays modelable.
+/// operand is — or is an array reachably HOLDING — an object/closure (frontier
+/// §1): `[$o] === [$o]` recurses to the unmodelled (Object, Object) pair, so a
+/// top-level-only check false-greens. Scalar/scalar-array strict compares stay
+/// exact. `assertEquals`/`==` stays modelable.
 fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
-    if matches!(a, Value::Object { .. } | Value::Closure(_))
-        || matches!(b, Value::Object { .. } | Value::Closure(_))
-    {
+    if contains_identity_value(a) || contains_identity_value(b) {
         return Err(BailReason::UnsupportedConstruct(
-            "=== / assertSame on an object (reference identity, no heap model)".into(),
+            "=== / assertSame on (an aggregate holding) an object (reference identity, no heap model)"
+                .into(),
         ));
     }
     Ok(())
@@ -1285,13 +1312,33 @@ fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
 
 /// `==`/`!=`/`assertEquals`/`assertNotEquals` on a `Value::Closure` is reference
 /// identity in PHP (two closures are `==` iff they are the SAME instance). The
-/// reducer models no heap identity, so it MUST abstain when either operand is a
-/// closure — otherwise `php_loose_eq` short-circuits to `false` and produces a
-/// false-green Pass (Inc-4 Task 4). Objects stay modelable (gate on Closure only).
+/// reducer models no heap identity, so it MUST abstain when either operand is —
+/// or reachably contains (array element / object prop, `php_loose_eq` recurses
+/// into both) — a closure; otherwise the nested compare short-circuits to
+/// `false` and produces a false-green Pass (Inc-4 Task 4). Plain closure-free
+/// objects stay modelable per-class + per-prop (gate on Closure only).
 fn bail_if_closure_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
-    if matches!(a, Value::Closure(_)) || matches!(b, Value::Closure(_)) {
+    if contains_closure(a) || contains_closure(b) {
         return Err(BailReason::UnsupportedConstruct(
-            "== / != / assertEquals on a closure (reference identity, no heap model)".into(),
+            "== / != / assertEquals on (an aggregate holding) a closure (reference identity, no heap model)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Strict `in_array`/`array_search` compare the needle against every haystack
+/// element with `===`. If the needle OR any (recursively reachable) element is
+/// an object/closure, that compare is reference identity — unmodelled → BAIL.
+/// Scalar/scalar-array strict searches stay exact (doctrine relies on them).
+fn bail_if_identity_in_strict_search(
+    needle: &Value,
+    hay: &[(ArrayKey, Value)],
+) -> Result<(), BailReason> {
+    if contains_identity_value(needle) || hay.iter().any(|(_, v)| contains_identity_value(v)) {
+        return Err(BailReason::UnsupportedConstruct(
+            "strict in_array/array_search over (an aggregate holding) an object (reference identity, no heap model)"
+                .into(),
         ));
     }
     Ok(())
@@ -3111,8 +3158,12 @@ fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailR
             .unwrap_or(Value::Bool(false)),
 
         // in_array(needle, haystack, true) — STRICT only. The loose 2-arg / `false`
-        // overload bails (PHP `==` juggling is a divergence risk).
+        // overload bails (PHP `==` juggling is a divergence risk). Strict `===`
+        // against an object/closure needle or element is REFERENCE identity
+        // (in_array($o, [$o], true) is TRUE in PHP, same instance) — the model
+        // has no heap, so any reachable identity value BAILS.
         (b"in_array", [needle, Value::Arr(hay), Value::Bool(true)]) => {
+            bail_if_identity_in_strict_search(needle, hay)?;
             Value::Bool(hay.iter().any(|(_, v)| v.php_strict_eq(needle)))
         }
         (b"in_array", _) => {
@@ -3121,11 +3172,15 @@ fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailR
             ))
         }
         // array_search(needle, haystack, true) — STRICT: returns the KEY or false.
-        (b"array_search", [needle, Value::Arr(hay), Value::Bool(true)]) => hay
-            .iter()
-            .find(|(_, v)| v.php_strict_eq(needle))
-            .map(|(k, _)| array_key_to_value(k))
-            .unwrap_or(Value::Bool(false)),
+        // Same identity guard as strict in_array (PHP returns the matching KEY
+        // for a same-instance object needle; the model would wrongly say false).
+        (b"array_search", [needle, Value::Arr(hay), Value::Bool(true)]) => {
+            bail_if_identity_in_strict_search(needle, hay)?;
+            hay.iter()
+                .find(|(_, v)| v.php_strict_eq(needle))
+                .map(|(k, _)| array_key_to_value(k))
+                .unwrap_or(Value::Bool(false))
+        }
         (b"array_search", _) => {
             return Err(BailReason::UnsupportedConstruct(
                 "array_search without strict=true (loose == not modelled)".into(),
@@ -4439,6 +4494,153 @@ mod tests {
             run_body_with(
                 "$a = new Box(); $f = function () use ($a) { return $a; }; \
                  $b = $f(); $this->assertSame(0, $b->v); $this->assertSame(0, $a->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    // ── strict identity leaking through AGGREGATES (objects/closures inside
+    //    arrays reaching php_strict_eq / php_loose_eq) ──
+
+    #[test]
+    fn strict_in_array_object_needle_bails() {
+        // PHP: in_array($o, [$o], true) is TRUE (same instance) → assertFalse
+        // FAILS. The model's php_strict_eq has no Object arm → false → a
+        // false-green Pass. Reference identity is unmodelled → must BAIL.
+        let o = run_body_with(
+            "$o = new Box(); $arr = [$o]; $this->assertFalse(in_array($o, $arr, true));",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "strict in_array with an object needle must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn strict_array_search_object_needle_bails() {
+        // PHP: array_search($o, [$o], true) returns key 0 → assertFalse(0) FAILS.
+        // The model returns false → assertFalse(false) → false-green Pass → BAIL.
+        let o = run_body_with(
+            "$o = new Box(); $arr = [$o]; $this->assertFalse(array_search($o, $arr, true));",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "strict array_search with an object needle must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn assert_not_same_on_arrays_holding_objects_bails() {
+        // PHP: [$o] === [$o] is TRUE (same element instance) → assertNotSame
+        // FAILS. The model's Arr arm recurses to (Object, Object) → false → a
+        // false-green Pass. Both operands are top-level Arrs, so the old
+        // top-level-only guard let them through → must BAIL.
+        let o = run_body_with(
+            "$o = new Box(); $this->assertNotSame([$o], [$o]);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "assertNotSame on arrays holding objects must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn assert_same_on_arrays_holding_objects_bails() {
+        // PHP: [$o] === [$o] is TRUE → assertSame PASSES. The model computes
+        // false → a wrong Fail. Must BAIL instead of diverging either way.
+        let o = run_body_with(
+            "$o = new Box(); $this->assertSame([$o], [$o]);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "assertSame on arrays holding objects must bail, not wrong-Fail (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn assert_not_equals_on_arrays_holding_closures_bails() {
+        // PHP: [$f] == [$f] is TRUE (same closure instance element) →
+        // assertNotEquals FAILS. php_loose_eq's Arr recursion hits
+        // (Closure, Closure) → false → a false-green Pass. The old closure
+        // guard checked only TOP-LEVEL operands → must BAIL.
+        let o = run_body(
+            "$f = fn() => 1; $this->assertNotEquals([$f], [$f]);",
+            vec![],
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "assertNotEquals on arrays holding closures must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn strict_eq_operator_on_arrays_holding_objects_bails() {
+        // The `===` operator path (not just the assertion helpers) shares the
+        // same guard — arrays holding objects must bail there too.
+        let o = run_body_with(
+            "$o = new Box(); $r = ([$o] === [$o]); $this->assertTrue($r);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "`===` on arrays holding objects must bail (got {o:?})"
+        );
+    }
+
+    // ── no-over-bail controls: scalar strict compares and plain-object loose
+    //    equality stay EXACT ──
+
+    #[test]
+    fn assert_same_scalar_arrays_still_exact() {
+        assert_eq!(
+            run_body("$this->assertSame([1, 'a'], [1, 'a']);", vec![]),
+            Outcome::Pass
+        );
+        assert!(matches!(
+            run_body("$this->assertSame([1, 'a'], [1, 'b']);", vec![]),
+            Outcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn strict_in_array_scalars_still_exact() {
+        assert_eq!(
+            run_body("$this->assertTrue(in_array(2, [1, 2], true));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertFalse(in_array(3, [1, 2], true));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body(
+                "$this->assertSame(1, array_search(2, [1, 2], true));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn loose_eq_on_plain_objects_still_computes() {
+        // `assertEquals` on two plain (closure-free) objects is STRUCTURAL in
+        // PHP (same class + per-prop ==) — the model computes it exactly and
+        // must NOT bail (only closures are unmodelable under loose eq).
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $this->assertEquals($a, $b);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $b->inc(); $this->assertNotEquals($a, $b);",
                 &BoxResolver
             ),
             Outcome::Pass

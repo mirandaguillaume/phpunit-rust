@@ -768,7 +768,14 @@ impl Value {
                         .zip(b.iter())
                         .all(|((ak, av), (bk, bv))| ak == bk && av.php_strict_eq(bv))
             }
-            _ => false, // different types are never strictly equal
+            // Different types are never strictly equal. NOTE: (Object, Object)
+            // and (Closure, Closure) also land here, but `===` on those is
+            // REFERENCE identity (unmodelled — no heap): the eval layer's
+            // guards (`bail_if_object_operand`, the strict in_array/array_search
+            // guard) BAIL before any operand that IS or reachably CONTAINS an
+            // object/closure gets here, so the `false` they would see is never
+            // observable. Do not rely on this arm for identity semantics.
+            _ => false,
         }
     }
 }
