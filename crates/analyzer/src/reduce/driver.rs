@@ -1343,6 +1343,108 @@ class TraitMatchTest extends TestCase {
     }
 
     #[test]
+    fn array_map_object_element_mutation_in_callback_bails() {
+        // Inc-5 RED (closure PARAM binding aliasing): array_map builds an array of
+        // objects, a second array_map's callback MUTATES each element. php8.4
+        // prints v=2 (the callback mutates the caller's object through the shared
+        // handle), but the by-value model used to bind the element to `$o` raw —
+        // the element was UNMARKED (array_map output pushes skipped store-time
+        // marking, and the closure builtins bypass eval_arguments' caller-side
+        // marking) — so `$o->inc()` succeeded on a closure-local clone, the
+        // caller's array kept v=1, and the model produced a DIVERGENT Fail.
+        // Marking object args at the closure param-binding site makes this BAIL.
+        let dir = write_suite(&[(
+            "MapMutateTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class Foo {
+    public int $v;
+    public function __construct(int $v) { $this->v = $v; }
+    public function inc() { $this->v = $this->v + 1; }
+}
+class MapMutateTest extends TestCase {
+    public function testMapMutate(): void {
+        $objs = array_map(fn($i) => new Foo($i), [1]);
+        array_map(function($o) { $o->inc(); return true; }, $objs);
+        $this->assertSame(2, $objs[0]->v);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("MapMutateTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "a callback mutating an object element bound to a closure parameter \
+             must BAIL (php8.4 mutates through the shared handle → v=2), not \
+             produce a divergent Fail; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn array_map_object_elements_pure_callback_still_passes() {
+        // Inc-5 over-bail guard: the same array_map-of-objects shape with a PURE
+        // callback (a read-only getter) must still resolve — marking the bound
+        // object aliased only forbids MUTATION, never reads.
+        let dir = write_suite(&[(
+            "MapPureTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class Fooo {
+    public int $v;
+    public function __construct(int $v) { $this->v = $v; }
+    public function v(): int { return $this->v; }
+}
+class MapPureTest extends TestCase {
+    public function testMapPure(): void {
+        $objs = [new Fooo(1), new Fooo(2)];
+        $vals = array_map(fn($o) => $o->v(), $objs);
+        $this->assertSame([1, 2], $vals);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("MapPureTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "a pure callback over object elements must NOT over-bail; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn array_map_produced_object_pure_read_still_passes() {
+        // Inc-5 over-bail guard for the builtin-output marking (defense-in-depth):
+        // objects synthesized BY the array_map callback are marked as they enter
+        // the output array; a later pure property READ through the array must
+        // still resolve to Pass (reads of aliased objects are exact).
+        let dir = write_suite(&[(
+            "MapReadTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class Foor {
+    public int $v;
+    public function __construct(int $v) { $this->v = $v; }
+}
+class MapReadTest extends TestCase {
+    public function testMapRead(): void {
+        $objs = array_map(fn($i) => new Foor($i), [1]);
+        $this->assertSame(1, $objs[0]->v);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("MapReadTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "a pure read of an array_map-produced object must NOT over-bail; got {reduced:?}"
+        );
+    }
+
+    #[test]
     fn trait_untyped_property_write_does_not_over_bail() {
         // Round 5 guard (b): the trait-declared property is UNTYPED, so there is no
         // scalar hint and no coercion contract. Writing a string into it must NOT

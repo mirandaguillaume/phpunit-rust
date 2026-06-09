@@ -1589,11 +1589,14 @@ fn array_access_lookup(
                 // Aliasing defense-in-depth (Inc-5): reading a `Value::Object`
                 // element out of an array yields a SECOND reference to that object
                 // — the array still holds it. Store-time marking (every object
-                // entering a `Value::Arr` is marked at insertion) already covers
-                // this today; mark the returned clone too so the read is LOCALLY
-                // fail-closed, symmetric with `eval_property_read`. Only objects
-                // are marked — never arrays-of-scalars (no over-bail on the
-                // common scalar-array read path).
+                // entering a `Value::Arr` is marked at insertion: literal /
+                // assignment stores, and — since the closure-builtin fix — the
+                // `array_map` output push) covers the store side; this
+                // clone-then-mark covers the read side, so the pair makes the
+                // invariant LOCALLY true regardless of which store produced the
+                // array. Symmetric with `eval_property_read`. Only objects are
+                // marked — never arrays-of-scalars (no over-bail on the common
+                // scalar-array read path).
                 let mut out = v.clone();
                 if matches!(out, Value::Object { .. }) {
                     out.mark_aliased();
@@ -2573,7 +2576,7 @@ fn invoke_parsed_closure(
             ));
         }
         let name = var_name(p.variable.name);
-        let value = match args.get(i) {
+        let mut value = match args.get(i) {
             Some(a) => a.clone(),
             None => match &p.default_value {
                 Some(d) => eval_expr(d.value, scope)?,
@@ -2589,6 +2592,19 @@ fn invoke_parsed_closure(
         // is a coercion boundary just like a named-function parameter — fail-closed.
         if let Some(hint) = &p.hint {
             bail_if_scalar_hint_coerces(hint, &value, "closure parameter")?;
+        }
+        // Aliasing (Inc-5): binding an OBJECT argument to a closure parameter
+        // shares the handle in PHP — the callback can mutate it and the caller
+        // sees the change; our by-value clone would diverge. Marking here, at the
+        // BINDING SITE, closes every invocation path at once: direct `$f($a)`
+        // calls (where `eval_arguments` already marked the caller side) AND the
+        // higher-order builtins (array_map/filter/reduce/any/all/find…), which
+        // pass array ELEMENTS to the callback without going through
+        // `eval_arguments`. Object-only — scalars and arrays-of-scalars bind raw,
+        // so the scalar closure-builtin fast path never over-bails. Conservative
+        // over-approximation: a marked object only forbids MUTATION, never reads.
+        if matches!(value, Value::Object { .. }) {
+            value.mark_aliased();
         }
         bindings.insert(name, value);
     }
@@ -2680,13 +2696,26 @@ fn call_closure_builtin(
             with_parsed_closure(&cl.src, |kind, snip| {
                 let mut out: Vec<(ArrayKey, Value)> = Vec::with_capacity(items.len());
                 for (k, v) in items {
-                    let mapped = invoke_parsed_closure(
+                    let mut mapped = invoke_parsed_closure(
                         kind,
                         snip,
                         &cl.captured,
                         std::slice::from_ref(v),
                         scope,
                     )?;
+                    // Store-time invariant (Inc-5): every object entering a
+                    // `Value::Arr` is marked at insertion. The callback may
+                    // synthesize objects (`fn($i) => new Foo($i)`) the enclosing
+                    // assignment never sees individually (the rhs is an Arr, not
+                    // an Object) — mark them here so a later element read /
+                    // closure-param binding finds them already aliased. No-op for
+                    // scalars; `mark_aliased` recurses into aggregates.
+                    // (array_filter/array_find re-emit ORIGINAL input elements,
+                    // which were marked when they entered the INPUT array — only
+                    // array_map synthesizes new element values.)
+                    if matches!(mapped, Value::Object { .. } | Value::Arr(_)) {
+                        mapped.mark_aliased();
+                    }
                     out.push((k.clone(), mapped));
                 }
                 Ok(Some(Value::Arr(out)))
