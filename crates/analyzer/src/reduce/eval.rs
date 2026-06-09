@@ -171,6 +171,13 @@ pub struct Scope<'r> {
     /// in any non-constructor body is a MUTATOR — fail-closed BAIL (frontier §2),
     /// because the by-value scope model would get aliasing wrong.
     allow_this_write: bool,
+    /// The receiver class's declared SCALAR property hints (round 3, Task A),
+    /// keyed by bare property name. Built once from the class AST inside
+    /// `with_program` (where the `&Hint` is live) and carried OWNED here, so a
+    /// typed `$this->prop = rhs` write can re-check scalar coercion at the lazy
+    /// write site after the AST has dropped. A property absent from this map is
+    /// untyped (or non-scalar-typed) → stored verbatim, no coercion (no bail).
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
 }
 
 impl<'r> Scope<'r> {
@@ -185,7 +192,16 @@ impl<'r> Scope<'r> {
             names: None,
             source: None,
             allow_this_write: false,
+            prop_hints: HashMap::new(),
         }
+    }
+
+    /// Attach the receiver class's declared scalar property hints (round 3 Task A),
+    /// so a typed `$this->prop = …` write can re-check scalar coercion at the lazy
+    /// write site. Only properties with a coercion-relevant scalar hint appear.
+    pub fn with_prop_hints(mut self, hints: HashMap<Vec<u8>, OwnedScalarHint>) -> Self {
+        self.prop_hints = hints;
+        self
     }
 
     /// Attach the resolved-names table for the body about to be evaluated, so
@@ -361,12 +377,38 @@ pub fn bail_if_scalar_return_coerces(
 }
 
 /// Shared scalar-coercion guard for a declared type `hint` against a runtime
-/// `value`, used by both the inlined-return path and the parameter-binding path
-/// (`site` names which, for the bail message). PHP coerces a scalar value to a
-/// declared scalar type at these boundaries (weak mode) or throws `TypeError`
-/// (strict) — neither is modelled, so any mismatch BAILS (fail-closed, correct in
-/// both modes). The check unwraps `?scalar` (nullable) and descends `scalar|…`
-/// unions / `scalar&…` intersections so a wrapped scalar member is still enforced.
+/// `value` (`site` names the boundary, for the bail message). PHP coerces a scalar
+/// value to a declared scalar type at these boundaries (weak mode) or throws
+/// `TypeError` (strict) — neither is modelled, so any mismatch BAILS (fail-closed,
+/// correct in both modes). The check unwraps `?scalar` (nullable) and descends
+/// `scalar|…` unions / `scalar&…` intersections so a wrapped scalar member is still
+/// enforced.
+///
+/// # The enumerated SCALAR-coercion sink set (round 3 completeness invariant)
+///
+/// EVERY value that crosses a typed scalar boundary MUST pass through this guard
+/// (or its [`OwnedScalarHint`] mirror) before being stored/used. Adding a new typed
+/// scalar boundary REQUIRES adding it to this list AND a bails+no-over-bail test
+/// pair in `subst::tests` (module-level `Round 3: scalar-coercion sink matrix`):
+///
+/// 1. **Named-function / method PARAM** — `subst::bail_if_scalar_param_coerces`
+///    (`bind_params`, `bind_method_params`, constructor param bind).
+/// 2. **Named-function / method RETURN** — [`bail_if_scalar_return_coerces`]
+///    (`inline_function`, `inline_method`).
+/// 3. **Typed PROPERTY WRITE** `$this->prop = rhs` — [`eval_property_assignment`]
+///    via the [`OwnedScalarHint`] carried in [`Scope::prop_hints`] (round 3 Task A).
+/// 4. **Typed PROPERTY DEFAULT** `public float $x = 5;` —
+///    `subst::seed_plain_property_defaults` (+ the tolerant test-case variant).
+/// 5. **Promoted CONSTRUCTOR PARAM** — covered by sink #1 (the promoted param IS
+///    the property; `run_constructor` also records its hint for later body writes).
+/// 6. **CLOSURE / ARROW PARAM** (incl. the default-value branch) —
+///    [`invoke_parsed_closure`] (round 3 Task C).
+/// 7. **CLOSURE / ARROW RETURN** — [`invoke_parsed_closure`] (round 3 Task C).
+///
+/// Fail-closed sinks that are UNREACHABLE today (no guard needed — the construct
+/// bails before any scalar crosses): typed class CONSTANTS (`const int X = …` are
+/// not evaluated — a class-const read bails), STATIC typed properties (bail in the
+/// seeding path), and property HOOKS (bail). See Task D notes at those sites.
 pub fn bail_if_scalar_hint_coerces(
     hint: &mago_syntax::ast::ast::type_hint::Hint,
     value: &Value,
@@ -516,6 +558,151 @@ fn scalar_hint_name(hint: &mago_syntax::ast::ast::type_hint::Hint) -> &'static s
     }
 }
 
+/// One leaf of a type hint, classified for scalar-coercion purposes only. Mirrors
+/// the cases `value_matches_hint_member` / `bare_scalar_hint_matches` test, in an
+/// OWNED form so a property's declared hint can be carried out of the arena-scoped
+/// AST (`with_program`) into the by-value [`Scope`] and re-checked at the lazy
+/// `$this->prop = …` write site — see [`OwnedScalarHint`] and Task A (round 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarLeaf {
+    Int,
+    Float,
+    Bool,
+    Str,
+    /// A literal member (`true`/`false`/`null`) — matches one value, never coerces.
+    LitTrue,
+    LitFalse,
+    LitNull,
+    /// `mixed` — matches anything, so it suppresses any coercion bail.
+    Mixed,
+    /// Any non-scalar, non-mixed member (class / array / callable / …) — a scalar
+    /// value can never match it, and it is not itself a coercing bare scalar.
+    Other,
+}
+
+impl ScalarLeaf {
+    /// The bare-scalar classification mirror of [`bare_scalar_hint_matches`]:
+    /// `Some(true)` exact-match, `Some(false)` non-matching bare scalar, `None`
+    /// not a bare scalar.
+    fn bare_scalar_matches(self, value: &Value) -> Option<bool> {
+        Some(match self {
+            ScalarLeaf::Str => matches!(value, Value::Str(_)),
+            ScalarLeaf::Int => matches!(value, Value::Int(_)),
+            ScalarLeaf::Float => matches!(value, Value::Float(_)),
+            ScalarLeaf::Bool => matches!(value, Value::Bool(_)),
+            _ => return None,
+        })
+    }
+
+    /// The member-match mirror of [`value_matches_hint_member`].
+    fn matches_member(self, value: &Value) -> bool {
+        match self {
+            ScalarLeaf::Int | ScalarLeaf::Float | ScalarLeaf::Bool | ScalarLeaf::Str => {
+                self.bare_scalar_matches(value) == Some(true)
+            }
+            ScalarLeaf::LitTrue => matches!(value, Value::Bool(true)),
+            ScalarLeaf::LitFalse => matches!(value, Value::Bool(false)),
+            ScalarLeaf::LitNull => matches!(value, Value::Null),
+            ScalarLeaf::Mixed => true,
+            ScalarLeaf::Other => false,
+        }
+    }
+
+    fn of_hint(hint: &mago_syntax::ast::ast::type_hint::Hint) -> Self {
+        use mago_syntax::ast::ast::type_hint::Hint;
+        match hint {
+            Hint::Integer(_) => ScalarLeaf::Int,
+            Hint::Float(_) => ScalarLeaf::Float,
+            Hint::Bool(_) => ScalarLeaf::Bool,
+            Hint::String(_) => ScalarLeaf::Str,
+            Hint::True(_) => ScalarLeaf::LitTrue,
+            Hint::False(_) => ScalarLeaf::LitFalse,
+            Hint::Null(_) => ScalarLeaf::LitNull,
+            Hint::Mixed(_) => ScalarLeaf::Mixed,
+            _ => ScalarLeaf::Other,
+        }
+    }
+}
+
+/// An OWNED classification of a declared type hint's scalar-coercion behaviour,
+/// built once from a `&Hint` (inside the arena via [`scalar_hint_of`]) so it can be
+/// stored in the by-value [`Scope`] and re-checked when a typed `$this->prop = …`
+/// write executes after the AST has dropped. `leaves` is the flattened set of
+/// union/intersection members (a bare scalar hint is a single leaf); `nullable` is
+/// set for a `?T` wrapper (a genuine `null` value then needs no coercion). The
+/// runtime decision in [`OwnedScalarHint::bail_if_coerces`] applies EXACTLY the
+/// same predicate as [`bail_if_scalar_hint_coerces`].
+#[derive(Debug, Clone)]
+pub struct OwnedScalarHint {
+    leaves: Vec<ScalarLeaf>,
+    nullable: bool,
+    name: &'static str,
+}
+
+/// Classify a declared `&Hint` into an [`OwnedScalarHint`], returning `None` when
+/// the hint implies NO scalar coercion at all (no bare-scalar leaf anywhere) — e.g.
+/// untyped, a pure class/array/callable hint, `void`, `object`. Callers store
+/// `None` as "store verbatim, never bail" (matching the untyped-property contract).
+pub fn scalar_hint_of(hint: &mago_syntax::ast::ast::type_hint::Hint) -> Option<OwnedScalarHint> {
+    let mut leaves = Vec::new();
+    let mut nullable = matches!(hint, mago_syntax::ast::ast::type_hint::Hint::Nullable(_));
+    for_each_hint_leaf(hint, &mut |leaf| {
+        // `for_each_hint_leaf` descends Nullable, so a `?int` shows up as the
+        // `int` leaf; remember the nullable wrapper so a `null` value is exempt.
+        if matches!(leaf, mago_syntax::ast::ast::type_hint::Hint::Null(_)) {
+            nullable = true;
+        }
+        leaves.push(ScalarLeaf::of_hint(leaf));
+    });
+    // No bare-scalar leaf anywhere → this hint can never scalar-coerce a value.
+    let coerces = leaves.iter().any(|l| {
+        matches!(
+            l,
+            ScalarLeaf::Int | ScalarLeaf::Float | ScalarLeaf::Bool | ScalarLeaf::Str
+        )
+    });
+    if !coerces {
+        return None;
+    }
+    Some(OwnedScalarHint {
+        leaves,
+        nullable,
+        name: scalar_hint_name(hint),
+    })
+}
+
+impl OwnedScalarHint {
+    /// Re-apply the scalar-coercion guard at a lazy sink (the typed-property write).
+    /// Same policy as [`bail_if_scalar_hint_coerces`]: a non-scalar value never
+    /// scalar-coerces; a `null` under a nullable hint is exempt; otherwise a scalar
+    /// value that matches NO member exactly while a bare-scalar member exists is a
+    /// coercion → BAIL (fail-closed). `site` names the boundary in the message.
+    pub fn bail_if_coerces(&self, value: &Value, site: &str) -> Result<(), BailReason> {
+        if !is_scalar_value(value) {
+            return Ok(());
+        }
+        if self.nullable && matches!(value, Value::Null) {
+            return Ok(());
+        }
+        // Exactly the union/bare predicate of `bail_if_scalar_hint_coerces`: a
+        // bare-scalar member exists, AND the value matches NO member → coercion.
+        let saw_scalar_member = self
+            .leaves
+            .iter()
+            .any(|l| l.bare_scalar_matches(value) == Some(false));
+        let matched = self.leaves.iter().any(|l| l.matches_member(value));
+        if saw_scalar_member && !matched {
+            Err(BailReason::UnsupportedConstruct(format!(
+                "scalar {site}-type coercion ({} on a {} value) not modelled",
+                self.name,
+                value.type_name(),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Inline a **constructor** body to seed a fresh `$this` record (Task B). The
 /// `bindings` carry `this` (the partially-seeded object: promoted params + plain
 /// literal defaults already filled) plus the constructor's parameters. Property
@@ -527,21 +714,30 @@ pub fn run_ctor_body(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
-    run_ctor_body_inner(block, bindings, resolver, None, None)
+    run_ctor_body_inner(block, bindings, resolver, None, None, HashMap::new())
 }
 
 /// Like [`run_ctor_body`] but with the body file's resolved-names table attached
 /// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN) plus
 /// the body file's source (so a closure literal stored into `$this` here owns its
-/// bytes — Inc-4 Task 1).
+/// bytes — Inc-4 Task 1) and the receiver class's declared scalar property hints
+/// (round 3 Task A — so a typed `$this->prop = …` write re-checks scalar coercion).
 pub fn run_ctor_body_with_names(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: &mago_names::ResolvedNames,
     source: &[u8],
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
 ) -> Result<Value, BailReason> {
-    run_ctor_body_inner(block, bindings, resolver, Some(names), Some(source))
+    run_ctor_body_inner(
+        block,
+        bindings,
+        resolver,
+        Some(names),
+        Some(source),
+        prop_hints,
+    )
 }
 
 fn run_ctor_body_inner(
@@ -550,8 +746,9 @@ fn run_ctor_body_inner(
     resolver: &dyn CallResolver,
     names: Option<&mago_names::ResolvedNames>,
     source: Option<&[u8]>,
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
 ) -> Result<Value, BailReason> {
-    let mut scope = Scope::new(bindings, resolver);
+    let mut scope = Scope::new(bindings, resolver).with_prop_hints(prop_hints);
     if let Some(n) = names {
         scope = scope.with_names(n);
     }
@@ -1167,9 +1364,15 @@ fn eval_access(
         Access::NullSafeProperty(_) => Err(BailReason::UnsupportedConstruct(
             "null-safe property access (?->)".into(),
         )),
+        // Round 3 Task D: a STATIC typed property (`public static int $x`) is never
+        // read here (bail) and its declaration bails in the seeding path → no scalar
+        // ever crosses it. Unreachable sink, already fail-closed (no guard needed).
         Access::StaticProperty(_) => Err(BailReason::UnsupportedConstruct(
             "static property access".into(),
         )),
+        // Round 3 Task D: a typed class CONSTANT (`const int X = …`, PHP 8.3) is
+        // never evaluated — its read bails here → no scalar crosses it. Unreachable
+        // sink, already fail-closed (no guard needed).
         Access::ClassConstant(_) => Err(BailReason::UnsupportedConstruct(
             "class constant access".into(),
         )),
@@ -1750,6 +1953,17 @@ fn eval_property_assignment(
     };
     let rhs = eval_expr(a.rhs, scope)?;
 
+    // A typed SCALAR property coerces the written value in PHP (`int $n` stores
+    // `int(10)` for `$this->n = "10"`); the by-value model would store the raw
+    // `Str("10")` and diverge. Re-check the declared scalar hint (carried OWNED in
+    // the scope from the class AST) at this lazy write site — fail-closed (round 3
+    // Task A). An untyped / non-scalar-typed property is absent from the map →
+    // stored verbatim, no bail.
+    let prop_name = prop_id.value.to_vec();
+    if let Some(hint) = scope.prop_hints.get(prop_name.as_slice()) {
+        hint.bail_if_coerces(&rhs, "property")?;
+    }
+
     // Functional update of the `$this` record in scope.
     let this = scope.vars.get_mut(b"this".as_slice()).ok_or_else(|| {
         BailReason::UnsupportedConstruct("property write with no bound \\$this".into())
@@ -1759,7 +1973,6 @@ fn eval_property_assignment(
             "property write on a non-object \\$this".into(),
         ));
     };
-    let prop_name = prop_id.value.to_vec();
     match props.iter_mut().find(|(k, _)| *k == prop_name) {
         Some(slot) => slot.1 = rhs.clone(),
         None => props.push((prop_name, rhs.clone())),
@@ -2031,6 +2244,11 @@ fn invoke_parsed_closure(
                 }
             },
         };
+        // A typed scalar closure parameter (incl. the default-value branch above)
+        // is a coercion boundary just like a named-function parameter — fail-closed.
+        if let Some(hint) = &p.hint {
+            bail_if_scalar_hint_coerces(hint, &value, "closure parameter")?;
+        }
         bindings.insert(name, value);
     }
 
@@ -2057,6 +2275,13 @@ fn invoke_parsed_closure(
         }
         ParsedClosureKind::Arrow(a) => eval_expr(a.expression, &mut inner)?,
     };
+    // A typed scalar closure/arrow RETURN coerces the produced value in PHP just
+    // like a named-function return — fail-closed on a mismatch.
+    let return_hint = match kind {
+        ParsedClosureKind::Closure(c) => c.return_type_hint.as_ref(),
+        ParsedClosureKind::Arrow(a) => a.return_type_hint.as_ref(),
+    };
+    bail_if_scalar_return_coerces(return_hint, &result)?;
     // Propagate the consumed step budget back to the caller.
     scope.steps = inner.steps;
     Ok(result)

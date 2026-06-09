@@ -33,11 +33,18 @@ use mago_syntax::ast::Program;
 
 use super::eval::{
     bail_if_scalar_hint_coerces, bail_if_scalar_return_coerces, make_object,
-    run_body_returning_with_names, run_ctor_body_with_names, BailReason, CallResolver, NoResolver,
-    Scope,
+    run_body_returning_with_names, run_ctor_body_with_names, scalar_hint_of, BailReason,
+    CallResolver, NoResolver, OwnedScalarHint, Scope,
 };
 use super::value::Value;
 use crate::mago_bridge::MagoProject;
+
+/// The receiver class's declared SCALAR property hints, keyed by bare property
+/// name, carried OWNED from the arena-scoped class AST into the constructor/setUp
+/// scope so a typed `$this->prop = …` write re-checks scalar coercion at the lazy
+/// write site (round 3 Task A). A property absent here is untyped or non-scalar →
+/// stored verbatim (no coercion, no bail).
+type PropHints = HashMap<Vec<u8>, OwnedScalarHint>;
 
 /// A [`CallResolver`] that inlines user functions resolved through a loaded
 /// [`MagoProject`]. Holds a recursion-depth guard so a (mutually) recursive user
@@ -261,11 +268,13 @@ impl BridgeResolver<'_> {
         let class_logical = String::from_utf8_lossy(&class_file.name).into_owned();
         let class_fqcn = class_meta.name.as_bytes().to_vec();
 
-        // 1) Seed plain (non-promoted) property declarations with literal defaults.
+        // 1) Seed plain (non-promoted) property declarations with literal defaults,
+        //    and collect the class's declared SCALAR property hints (round 3 Task A)
+        //    so a typed `$this->prop = …` write in the ctor body re-checks coercion.
         //    (Read off THIS class's own AST. Inherited-property defaults are not
         //    modelled in v2 — a read of an unseeded prop bails, fail-closed.)
         let resolver = self;
-        let mut props: Vec<(Vec<u8>, Value)> = self
+        let (mut props, prop_hints): (Vec<(Vec<u8>, Value)>, PropHints) = self
             .project
             .with_program(&class_logical, |program, _file, _names| {
                 let Some(class_node) = find_class(program, &class_fqcn) else {
@@ -275,7 +284,8 @@ impl BridgeResolver<'_> {
                 };
                 let mut p: Vec<(Vec<u8>, Value)> = Vec::new();
                 seed_plain_property_defaults(class_node, &mut p, resolver)?;
-                Ok(p)
+                let hints = collect_scalar_property_hints(class_node);
+                Ok((p, hints))
             })
             .unwrap_or_else(|| Err(BailReason::Other("could not re-parse class file".into())))?;
 
@@ -307,7 +317,15 @@ impl BridgeResolver<'_> {
                             .ok_or_else(|| {
                                 BailReason::Other("constructor AST not found after re-parse".into())
                             })?;
-                        run_constructor(resolver, ctor, this.clone(), args, names, &file.contents)
+                        run_constructor(
+                            resolver,
+                            ctor,
+                            this.clone(),
+                            args,
+                            names,
+                            &file.contents,
+                            prop_hints.clone(),
+                        )
                     })
                     .unwrap_or_else(|| {
                         Err(BailReason::Other(
@@ -359,8 +377,12 @@ impl BridgeResolver<'_> {
         // Parents first, then the class itself (child wins on a duplicate prop).
         chain.reverse();
         chain.push(class_meta.name.as_bytes().to_vec());
+        // Collect the chain's declared scalar property hints too (round 3 Task A),
+        // so a typed `$this->prop = …` write inside setUp re-checks coercion.
+        let mut prop_hints = PropHints::new();
         for fqcn in &chain {
             self.seed_class_property_defaults(fqcn, &mut props)?;
+            self.collect_class_scalar_property_hints(fqcn, &mut prop_hints);
         }
 
         // 2) Run setUp() if it is declared anywhere up the chain (writes allowed).
@@ -400,6 +422,7 @@ impl BridgeResolver<'_> {
                             resolver,
                             names,
                             &file.contents,
+                            prop_hints.clone(),
                         )
                     })
                     .unwrap_or_else(|| {
@@ -435,6 +458,31 @@ impl BridgeResolver<'_> {
                 seed_plain_property_defaults_tolerant(class_node, props)
             })
             .unwrap_or(Ok(()))
+    }
+
+    /// Collect one class's OWN declared scalar property hints into `hints` (round 3
+    /// Task A; used by the test-case `$this` builder to walk the ancestor chain so a
+    /// typed `$this->prop = …` write in setUp re-checks coercion). A child class's
+    /// hint overrides a parent's on a duplicate name (the chain is walked
+    /// parents-first). A class not on disk is silently skipped.
+    fn collect_class_scalar_property_hints(&self, fqcn: &[u8], hints: &mut PropHints) {
+        let codebase = self.project.codebase();
+        let key = normalize_fqcn(fqcn);
+        let Some(class_meta) = codebase.get_class_like(&key.to_ascii_lowercase()) else {
+            return;
+        };
+        let Some(file) = self.project.file_of_span(&class_meta.span) else {
+            return;
+        };
+        let logical = String::from_utf8_lossy(&file.name).into_owned();
+        let class_fqcn = class_meta.name.as_bytes().to_vec();
+        let _ = self
+            .project
+            .with_program(&logical, |program, _file, _names| {
+                if let Some(class_node) = find_class(program, &class_fqcn) {
+                    hints.extend(collect_scalar_property_hints(class_node));
+                }
+            });
     }
 }
 
@@ -474,6 +522,14 @@ fn seed_plain_property_defaults_tolerant(
             // prop stays unseeded and a later read bails fail-closed.
             let mut scope = Scope::new(HashMap::new(), &NoResolver);
             if let Ok(v) = super::eval::eval_default(c.value, &mut scope) {
+                // A typed scalar property would coerce its default in PHP; storing
+                // the un-coerced value diverges. Tolerant fail-closed: SKIP seeding
+                // (leave unset → a later read bails) rather than store a wrong value.
+                if let Some(hint) = &plain.hint {
+                    if bail_if_scalar_hint_coerces(hint, &v, "property default").is_err() {
+                        continue;
+                    }
+                }
                 set_prop(props, strip_dollar(c.variable.name), v);
             }
         }
@@ -491,6 +547,7 @@ fn run_constructor(
     args: &[Value],
     names: &mago_names::ResolvedNames,
     source: &[u8],
+    mut prop_hints: PropHints,
 ) -> Result<Value, BailReason> {
     let Value::Object { class, mut props } = this else {
         return Err(BailReason::Other(
@@ -533,12 +590,20 @@ fn run_constructor(
             },
         };
         bail_if_scalar_param_coerces(param, &value)?;
-        // A promoted property seeds `$this->name` directly (PHP semantics).
+        // A promoted property seeds `$this->name` directly (PHP semantics). Its
+        // scalar coercion is already enforced by `bail_if_scalar_param_coerces`
+        // above (the promoted-param IS the property), but record its hint too so a
+        // LATER `$this->name = …` write in the body is re-checked (round 3 Task A).
         if param.is_promoted_property() {
             if has_readonly_modifier(param) {
                 // readonly is fine for a write-once seed at construction time, so
                 // we allow it here; any LATER mutation of the prop bails because
                 // mutator methods bail. (No special handling needed.)
+            }
+            if let Some(hint) = &param.hint {
+                if let Some(sh) = super::eval::scalar_hint_of(hint) {
+                    prop_hints.insert(bare.clone(), sh);
+                }
             }
             set_prop(&mut props, bare.clone(), value.clone());
         }
@@ -551,7 +616,46 @@ fn run_constructor(
             "abstract constructor body".into(),
         ));
     };
-    run_ctor_body_with_names(block, bindings, resolver, names, source)
+    run_ctor_body_with_names(block, bindings, resolver, names, source, prop_hints)
+}
+
+/// Collect a class's declared SCALAR property hints (round 3 Task A), keyed by
+/// bare property name. Reads plain (non-promoted) property declarations off THIS
+/// class's AST; promoted-constructor-param hints are merged in `run_constructor`.
+/// Only coercion-relevant scalar hints are recorded (`scalar_hint_of` returns
+/// `None` for untyped / non-scalar hints — those are stored verbatim, never bail).
+/// Static/hooked properties are skipped (the seeding path bails on them anyway).
+fn collect_scalar_property_hints(
+    class_node: &mago_syntax::ast::ast::class_like::Class,
+) -> PropHints {
+    use mago_syntax::ast::ast::class_like::property::Property;
+    use mago_syntax::ast::ast::modifier::Modifier;
+
+    let mut hints = PropHints::new();
+    for member in class_node.members.iter() {
+        let ClassLikeMember::Property(Property::Plain(plain)) = member else {
+            continue;
+        };
+        if plain
+            .modifiers
+            .iter()
+            .any(|m| matches!(m, Modifier::Static(_)))
+        {
+            continue;
+        }
+        let Some(hint) = &plain.hint else {
+            continue; // untyped property → stored verbatim, no coercion.
+        };
+        let Some(sh) = scalar_hint_of(hint) else {
+            continue; // non-scalar typed property → no scalar coercion.
+        };
+        // One hint applies to every item in `int $a, $b;`.
+        for item in plain.items.iter() {
+            let name = strip_dollar(item.variable().name);
+            hints.insert(name, sh.clone());
+        }
+    }
+    hints
 }
 
 /// Seed plain (non-promoted) property declarations carrying a literal default,
@@ -587,6 +691,12 @@ fn seed_plain_property_defaults(
                             // A non-literal default (function call, new, etc.) bails.
                             let mut scope = Scope::new(HashMap::new(), &NoResolver);
                             let v = super::eval::eval_default(c.value, &mut scope)?;
+                            // A typed scalar property coerces its default in PHP
+                            // (`public float $x = 5;` stores `float(5.0)`); the
+                            // reducer keeps `Int(5)` → fail-closed BAIL on mismatch.
+                            if let Some(hint) = &plain.hint {
+                                bail_if_scalar_hint_coerces(hint, &v, "property default")?;
+                            }
                             let name = strip_dollar(c.variable.name);
                             set_prop(props, name, v);
                         }
@@ -1474,6 +1584,217 @@ class T {
         assert!(matches!(
             reduce_with_subst(src, "T", "testStatic", vec![]),
             Outcome::Fail(_)
+        ));
+    }
+
+    // ── Round 3: scalar-coercion sink matrix (the completeness lock) ──
+    //
+    // EVERY typed scalar boundary the reducer can reach must route a crossing
+    // value through `bail_if_scalar_hint_coerces` BEFORE storing/using it, so a
+    // weak-mode coercion (PHP silently converts) or strict-mode TypeError (PHP
+    // throws) — neither modelled — fails CLOSED (BAIL) rather than diverging.
+    // For each sink there is a *bails* test (mismatch → Bailed) and a
+    // *no-over-bail* test (matching type → Pass). The enumerated sink set is
+    // documented at `bail_if_scalar_hint_coerces`.
+
+    // Sink: typed PROPERTY WRITE (`$this->n = $rhs` in a constructor body).
+    #[test]
+    fn property_write_scalar_coercion_bails() {
+        // PHP coerces the `"10"` string to `int(10)` at the `int $n` property
+        // boundary → `$p->n === int(10)`, assertSame PASSES. The reducer stores
+        // `Str("10")` verbatim and would model `Int(10) === Str("10")` → false →
+        // FAIL = divergence. Fail-closed: BAIL.
+        let src = r#"<?php
+class P {
+    public int $n;
+    public function __construct() { $v = "10"; $this->n = $v; }
+}
+class T {
+    public function testPropWrite(): void {
+        $p = new P();
+        $this->assertSame(10, $p->n);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testPropWrite", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn property_write_matching_type_does_not_bail() {
+        // A matching `int` write needs no coercion → must still PASS (no over-bail).
+        let src = r#"<?php
+class P {
+    public int $n;
+    public function __construct() { $this->n = 10; }
+}
+class T {
+    public function testPropWriteOk(): void {
+        $p = new P();
+        $this->assertSame(10, $p->n);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testPropWriteOk", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn untyped_property_write_does_not_bail() {
+        // An UNtyped property carries no coercion → the value is stored verbatim,
+        // no bail (guards against over-bailing untyped writes).
+        let src = r#"<?php
+class P {
+    public $n;
+    public function __construct() { $v = "10"; $this->n = $v; }
+}
+class T {
+    public function testUntyped(): void {
+        $p = new P();
+        $this->assertSame("10", $p->n);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testUntyped", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    // Sink: typed PROPERTY DEFAULT (`public float $x = 5;`).
+    #[test]
+    fn property_default_scalar_coercion_bails() {
+        // PHP stores `float(5.0)` for `public float $x = 5;`; assertSame(5.0,…)
+        // PASSES. The reducer evaluates `5` → `Int(5)` and would model
+        // `Float(5.0) === Int(5)` → FAIL = divergence. Fail-closed: BAIL.
+        let src = r#"<?php
+class D { public float $x = 5; }
+class T {
+    public function testDefault(): void {
+        $d = new D();
+        $this->assertSame(5.0, $d->x);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testDefault", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn property_default_matching_type_does_not_bail() {
+        // A matching `int` default needs no coercion → must still PASS.
+        let src = r#"<?php
+class D { public int $x = 5; }
+class T {
+    public function testDefaultOk(): void {
+        $d = new D();
+        $this->assertSame(5, $d->x);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testDefaultOk", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    // Sink: CLOSURE / ARROW typed PARAM.
+    #[test]
+    fn closure_param_scalar_coercion_bails() {
+        // `fn(int $x) => $x` coerces `"5"` to `int(5)` at the param boundary; PHP
+        // returns `int(5)`, assertSame(5,…) PASSES. The reducer binds `Str("5")`
+        // verbatim and would model `Int(5) === Str("5")` → FAIL. Fail-closed: BAIL.
+        let src = r#"<?php
+class T {
+    public function testClosureParam(): void {
+        $f = fn(int $x) => $x;
+        $this->assertSame(5, $f("5"));
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testClosureParam", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn closure_param_matching_type_does_not_bail() {
+        // A matching `int` argument needs no coercion → must still PASS.
+        let src = r#"<?php
+class T {
+    public function testClosureParamOk(): void {
+        $f = fn(int $x) => $x;
+        $this->assertSame(5, $f(5));
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testClosureParamOk", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    // Sink: CLOSURE / ARROW typed RETURN.
+    #[test]
+    fn closure_return_scalar_coercion_bails() {
+        // A `function (): string { return true; }` closure coerces the `true`
+        // return to `"1"` in PHP; assertSame("1",…) PASSES. The reducer returns
+        // `Bool(true)` verbatim → models `Str("1") === Bool(true)` → FAIL.
+        // Fail-closed: BAIL.
+        let src = r#"<?php
+class T {
+    public function testClosureReturn(): void {
+        $f = function (): string { return true; };
+        $this->assertSame("1", $f());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testClosureReturn", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn closure_return_matching_type_does_not_bail() {
+        // A matching `string` return needs no coercion → must still PASS.
+        let src = r#"<?php
+class T {
+    public function testClosureReturnOk(): void {
+        $f = function (): string { return "x"; };
+        $this->assertSame("x", $f());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "T", "testClosureReturnOk", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_default_param_scalar_coercion_bails() {
+        // The default branch of the closure param bind is also a typed boundary:
+        // `fn(int $x = 5)` called with no args binds the default. A *coercing*
+        // default value (string literal "5") would coerce to int → BAIL.
+        let src = r#"<?php
+class T {
+    public function testClosureDefault(): void {
+        $f = fn(int $x = "5") => $x;
+        $this->assertSame(5, $f());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "T", "testClosureDefault", vec![]),
+            Outcome::Bailed(_)
         ));
     }
 }
