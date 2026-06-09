@@ -1467,15 +1467,30 @@ fn eval_access(
 }
 
 /// `Class::CONST` / `Class::class` read (Inc-5 Task 4). `Class::class` folds to the
-/// FQCN string literal. `Class::CONST` resolves the FQCN then asks the resolver to
-/// fold the const's literal initializer (computed/enum → bail). `self`/`static`/
-/// `parent` resolve to the enclosing `$this`'s runtime class (late static binding;
-/// exact for `static::`, and for `self::`/`parent::` on a non-overridden const).
+/// FQCN string literal; `Class::CONST` resolves the FQCN then asks the resolver to
+/// fold the const's literal initializer (computed/enum → bail). Only an EXPLICIT
+/// named class is resolved — `self::`/`parent::`/`static::` BAIL.
+///
+/// Round 6 soundness fix: `self::`/`parent::` bind to the LEXICAL defining class of
+/// the method, and `static::` to the late-static-bound class. The [`Scope`] carries
+/// no lexical-defining-class context — only the bound `$this`'s RUNTIME class. For a
+/// const (or `::class`) read in a method DECLARED in a parent but CALLED on a child,
+/// folding from the runtime class gives the WRONG class → a false fail (divergence).
+/// With no sound recovery, every self/parent/static-qualified form BAILS (fail-
+/// closed). An explicit `Foo::CONST` / `Foo::class` is unambiguous and still folds.
 fn eval_class_constant(
     cc: &mago_syntax::ast::ast::access::ClassConstantAccess,
     scope: &mut Scope,
 ) -> Result<Value, BailReason> {
     use mago_syntax::ast::ast::class_like::member::ClassLikeConstantSelector;
+
+    // self/parent/static-qualified access (incl. `self::class`) has no lexical
+    // defining-class context in the Scope → BAIL before any runtime-class fold.
+    if is_self_parent_static(cc.class) {
+        return Err(BailReason::UnsupportedConstruct(
+            "self/parent/static-qualified class-constant access (no lexical class context)".into(),
+        ));
+    }
 
     // The constant selector must be a static identifier (dynamic `C::{$x}` bails).
     let ClassLikeConstantSelector::Identifier(const_id) = &cc.constant else {
@@ -1485,8 +1500,7 @@ fn eval_class_constant(
     };
     let const_name = const_id.value;
 
-    // Resolve the class FQCN. self/static/parent → the enclosing class, taken from
-    // the bound `$this` (no other lexical-class context exists in the Scope).
+    // Resolve the EXPLICIT named class FQCN (self/parent/static already bailed).
     let class = resolve_const_class(cc.class, scope)?;
 
     // The `::class` magic constant → the FQCN as a string (no const lookup).
@@ -1504,28 +1518,19 @@ fn eval_class_constant(
     }
 }
 
-/// Resolve the class side of a `Class::CONST` access to an FQCN. Unlike
-/// [`resolve_class_name_in_scope`] (which bails on self/static/parent), this binds
-/// self/static/parent to the enclosing `$this`'s runtime class so an in-method
-/// `self::CONST` / `static::CONST` resolves (Inc-5 Task 4). A `parent::` without a
-/// modelled parent link still resolves to `$this`'s class chain in the resolver.
+/// Resolve the EXPLICIT named class side of a `Class::CONST` access to an FQCN.
+/// `self`/`parent`/`static` are bailed by the caller ([`eval_class_constant`]) —
+/// they bind to the LEXICAL/late-static class, which the [`Scope`] does not carry,
+/// so folding from the runtime `$this` class would diverge (Round 6). This path
+/// therefore only sees an explicit class name; a self/static/parent leak here is
+/// still fail-closed (defensive bail). A dynamic/unresolvable class name bails.
 fn resolve_const_class(expr: &Expression, scope: &Scope) -> Result<Vec<u8>, BailReason> {
-    let is_self_static_parent = matches!(
-        expr,
-        Expression::Self_(_) | Expression::Static(_) | Expression::Parent(_)
-    ) || identifier_name(expr).is_some_and(|n| {
-        n.eq_ignore_ascii_case(b"self")
-            || n.eq_ignore_ascii_case(b"static")
-            || n.eq_ignore_ascii_case(b"parent")
-    });
-    if is_self_static_parent {
-        // The enclosing class = the bound `$this`'s runtime class.
-        return match scope.vars.get(b"this".as_slice()) {
-            Some(Value::Object { class, .. }) => Ok(class.clone()),
-            _ => Err(BailReason::UnsupportedConstruct(
-                "self/static/parent class constant with no enclosing $this".into(),
-            )),
-        };
+    // Defensive: the caller already bails self/parent/static, but never fold one
+    // here from the runtime class (it would be unsound) — fail-closed instead.
+    if is_self_parent_static(expr) {
+        return Err(BailReason::UnsupportedConstruct(
+            "self/parent/static-qualified class-constant access (no lexical class context)".into(),
+        ));
     }
     if let Some(name) = identifier_name(expr) {
         if let Some(fqcn) = scope.resolve_name_at(expr) {

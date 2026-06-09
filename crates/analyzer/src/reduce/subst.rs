@@ -2011,8 +2011,14 @@ class CTest {
     }
 
     #[test]
-    fn self_class_constant_resolves_to_enclosing_class() {
-        // `self::LIMIT` inside a method resolves to the enclosing class's const.
+    fn self_class_constant_bails_no_lexical_context() {
+        // Round 6: `self::CAP` inside a method binds to the LEXICAL defining class,
+        // which the Scope does not carry (only the runtime `$this` class). Even when
+        // it would resolve correctly here (Box is final, const not inherited), the
+        // reducer cannot prove the lexical == runtime class in general → BAIL
+        // (fail-closed; over-bail is safe, the runtime-class fold is unsound). The
+        // explicit-class path (`Foo::CAP`) still resolves — see
+        // `explicit_class_constant_still_resolves`.
         let src = r#"<?php
 final class Box {
     const int CAP = 7;
@@ -2026,8 +2032,61 @@ class BoxTest {
     }
 }
 "#;
-        assert_eq!(
+        assert!(matches!(
             reduce_with_subst(src, "BoxTest", "testSelf", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn self_class_constant_in_inherited_method_bails() {
+        // Round 6 finding: `self::`/`parent::`/`static::` bind to the LEXICAL
+        // defining class of the method, NOT the runtime class. `Base::tag()` returns
+        // `self::class`; called on a `Child extends Base`, PHP yields 'Base' (the
+        // lexical class where `tag` is declared) → assertSame('Base', 'Base') Pass.
+        // The reducer has no lexical-defining-class context — it folds `self::class`
+        // from the runtime `$this` class 'Child' → assertSame('Base', 'Child') Fail
+        // = DIVERGENCE. With no sound way to recover the lexical class, this MUST
+        // BAIL.
+        let src = r#"<?php
+class Base {
+    const TAG = 'base';
+    public function tag(): mixed { return self::class; }
+}
+class Child extends Base {}
+class TagTest {
+    public function testTag(): void {
+        $c = new Child();
+        $this->assertSame('Base', $c->tag());
+    }
+}
+"#;
+        let outcome = reduce_with_subst(src, "TagTest", "testTag", vec![]);
+        assert!(
+            matches!(outcome, Outcome::Bailed(_)),
+            "self::class in an inherited method has no lexical-class context → must bail, never diverge; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_class_constant_still_resolves() {
+        // No-over-bail control for the self/parent/static bail: an EXPLICIT named
+        // class `Foo::CONST` / `Foo::class` is unambiguous (the class is named, not
+        // self/parent/static) → it stays resolved (that is sound). Only the
+        // self/parent/static-qualified forms bail.
+        let src = r#"<?php
+class Foo {
+    const int LIMIT = 42;
+}
+class FooTest {
+    public function testFoo(): void {
+        $this->assertSame(42, Foo::LIMIT);
+        $this->assertSame('Foo', Foo::class);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "FooTest", "testFoo", vec![]),
             Outcome::Pass
         );
     }
