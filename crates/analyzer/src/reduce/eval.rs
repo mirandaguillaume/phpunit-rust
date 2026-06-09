@@ -147,6 +147,20 @@ pub trait CallResolver {
     fn construct(&self, _class: &[u8], _args: &[Value]) -> Result<Option<Value>, BailReason> {
         Ok(None)
     }
+
+    /// Resolve a class CONSTANT read `Class::CONST` (Inc-5 Task 4) by folding the
+    /// const's initializer from the class AST. `class` is the resolved FQCN; the
+    /// constant is looked up on the class + its ancestor chain. `Ok(None)` → the
+    /// class is not in the codebase (caller bails); `Err` → a non-foldable
+    /// initializer (computed/unresolved) or an enum (deferred). Only literal /
+    /// already-modelled constant expressions fold; everything else BAILS.
+    fn resolve_class_constant(
+        &self,
+        _class: &[u8],
+        _const_name: &[u8],
+    ) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
 }
 
 /// A resolver that resolves nothing (all user calls bail). Used by the pure-eval
@@ -1429,13 +1443,83 @@ fn eval_access(
         Access::StaticProperty(_) => Err(BailReason::UnsupportedConstruct(
             "static property access".into(),
         )),
-        // Round 3 Task D: a typed class CONSTANT (`const int X = …`, PHP 8.3) is
-        // never evaluated — its read bails here → no scalar crosses it. Unreachable
-        // sink, already fail-closed (no guard needed).
-        Access::ClassConstant(_) => Err(BailReason::UnsupportedConstruct(
-            "class constant access".into(),
-        )),
+        // Inc-5 Task 4: a class constant `Class::CONST` or the `Class::class`
+        // magic constant. Resolved via the names table (+ self/static/parent →
+        // the enclosing `$this`'s class). A computed/enum const bails.
+        Access::ClassConstant(cc) => eval_class_constant(cc, scope),
     }
+}
+
+/// `Class::CONST` / `Class::class` read (Inc-5 Task 4). `Class::class` folds to the
+/// FQCN string literal. `Class::CONST` resolves the FQCN then asks the resolver to
+/// fold the const's literal initializer (computed/enum → bail). `self`/`static`/
+/// `parent` resolve to the enclosing `$this`'s runtime class (late static binding;
+/// exact for `static::`, and for `self::`/`parent::` on a non-overridden const).
+fn eval_class_constant(
+    cc: &mago_syntax::ast::ast::access::ClassConstantAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::class_like::member::ClassLikeConstantSelector;
+
+    // The constant selector must be a static identifier (dynamic `C::{$x}` bails).
+    let ClassLikeConstantSelector::Identifier(const_id) = &cc.constant else {
+        return Err(BailReason::UnsupportedConstruct(
+            "dynamic class-constant selector".into(),
+        ));
+    };
+    let const_name = const_id.value;
+
+    // Resolve the class FQCN. self/static/parent → the enclosing class, taken from
+    // the bound `$this` (no other lexical-class context exists in the Scope).
+    let class = resolve_const_class(cc.class, scope)?;
+
+    // The `::class` magic constant → the FQCN as a string (no const lookup).
+    if const_name.eq_ignore_ascii_case(b"class") {
+        return Ok(Value::Str(class));
+    }
+
+    match scope.resolver.resolve_class_constant(&class, const_name)? {
+        Some(v) => Ok(v),
+        None => Err(BailReason::UnknownCall(format!(
+            "{}::{}",
+            String::from_utf8_lossy(&class),
+            String::from_utf8_lossy(const_name)
+        ))),
+    }
+}
+
+/// Resolve the class side of a `Class::CONST` access to an FQCN. Unlike
+/// [`resolve_class_name_in_scope`] (which bails on self/static/parent), this binds
+/// self/static/parent to the enclosing `$this`'s runtime class so an in-method
+/// `self::CONST` / `static::CONST` resolves (Inc-5 Task 4). A `parent::` without a
+/// modelled parent link still resolves to `$this`'s class chain in the resolver.
+fn resolve_const_class(expr: &Expression, scope: &Scope) -> Result<Vec<u8>, BailReason> {
+    let is_self_static_parent = matches!(
+        expr,
+        Expression::Self_(_) | Expression::Static(_) | Expression::Parent(_)
+    ) || identifier_name(expr).is_some_and(|n| {
+        n.eq_ignore_ascii_case(b"self")
+            || n.eq_ignore_ascii_case(b"static")
+            || n.eq_ignore_ascii_case(b"parent")
+    });
+    if is_self_static_parent {
+        // The enclosing class = the bound `$this`'s runtime class.
+        return match scope.vars.get(b"this".as_slice()) {
+            Some(Value::Object { class, .. }) => Ok(class.clone()),
+            _ => Err(BailReason::UnsupportedConstruct(
+                "self/static/parent class constant with no enclosing $this".into(),
+            )),
+        };
+    }
+    if let Some(name) = identifier_name(expr) {
+        if let Some(fqcn) = scope.resolve_name_at(expr) {
+            return Ok(fqcn);
+        }
+        return Ok(name.to_vec());
+    }
+    Err(BailReason::UnsupportedConstruct(
+        "dynamic/unresolvable class name in class-constant access".into(),
+    ))
 }
 
 /// `$arr[$key]` read (Task D) over ANY expression evaluating to an array. A bare

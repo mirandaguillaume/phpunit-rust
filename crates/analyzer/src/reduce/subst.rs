@@ -110,6 +110,14 @@ impl CallResolver for BridgeResolver<'_> {
     fn construct(&self, class: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
         self.with_depth(|s| s.construct_object(class, args))
     }
+
+    fn resolve_class_constant(
+        &self,
+        class: &[u8],
+        const_name: &[u8],
+    ) -> Result<Option<Value>, BailReason> {
+        self.fold_class_constant(class, const_name)
+    }
 }
 
 impl BridgeResolver<'_> {
@@ -367,6 +375,85 @@ impl BridgeResolver<'_> {
             self.collect_class_scalar_property_hints(fqcn, &mut prop_hints);
         }
         prop_hints
+    }
+
+    /// Fold a class constant `Class::CONST` (Inc-5 Task 4) to a literal [`Value`].
+    /// Looks the constant up on the class then its parent classes/interfaces
+    /// (most-derived first, matching PHP const resolution), re-parses the declaring
+    /// class AST, finds the `const CONST = <init>` item, and evaluates its
+    /// initializer with [`NoResolver`] (LITERAL / already-modelled expressions only;
+    /// a computed/call/`new`/unresolved initializer BAILS via `eval_default`). An
+    /// enum bails (enum cases are deferred). `Ok(None)` → class not in the codebase
+    /// OR constant not found (caller bails with an UnknownCall).
+    fn fold_class_constant(
+        &self,
+        class: &[u8],
+        const_name: &[u8],
+    ) -> Result<Option<Value>, BailReason> {
+        let codebase = self.project.codebase();
+        let class = normalize_fqcn(class);
+        let class = class.as_slice();
+        let Some(class_meta) = codebase.get_class_like(class) else {
+            return Ok(None);
+        };
+        // Enum constant/case access is deferred (frontier) — fail-closed.
+        if class_meta.kind.is_enum() {
+            return Err(BailReason::UnsupportedConstruct(
+                "enum constant/case access (deferred)".into(),
+            ));
+        }
+
+        // Lookup chain: the class itself, then its parent classes, then parent
+        // interfaces (interface consts are inherited). Most-derived first.
+        let mut chain: Vec<Vec<u8>> = vec![class_meta.name.as_bytes().to_vec()];
+        chain.extend(
+            class_meta
+                .all_parent_classes
+                .iter()
+                .map(|w| w.as_bytes().to_vec()),
+        );
+        chain.extend(
+            class_meta
+                .all_parent_interfaces
+                .iter()
+                .map(|w| w.as_bytes().to_vec()),
+        );
+
+        for fqcn in &chain {
+            // The enum check above only covered the entry class; a parent enum is
+            // impossible (you cannot extend an enum), so no re-check is needed.
+            if let Some(value) = self.fold_constant_in_class(fqcn, const_name)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Look up `const_name` in the single class `fqcn`'s OWN AST and fold its
+    /// literal initializer. `Ok(None)` → the class declares no such constant (try
+    /// the next in the chain). A typed constant re-checks scalar coercion.
+    fn fold_constant_in_class(
+        &self,
+        fqcn: &[u8],
+        const_name: &[u8],
+    ) -> Result<Option<Value>, BailReason> {
+        let codebase = self.project.codebase();
+        let Some(meta) = codebase.get_class_like(fqcn) else {
+            return Ok(None);
+        };
+        let Some(file) = self.project.file_of_span(&meta.span) else {
+            return Ok(None);
+        };
+        let logical = String::from_utf8_lossy(&file.name).into_owned();
+        let class_fqcn = meta.name.as_bytes().to_vec();
+        self.project
+            .with_program(&logical, |program, _file, _names| {
+                let Some(class_node) = find_class(program, &class_fqcn) else {
+                    return Ok(None);
+                };
+                find_class_constant_value(class_node, const_name)
+            })
+            .unwrap_or(Ok(None))
     }
 
     /// Construct `new class(args)` (Task B): seed props from plain literal property
@@ -915,6 +1002,37 @@ fn seed_plain_property_defaults(
         }
     }
     Ok(())
+}
+
+/// Find a class constant `const NAME = <init>` in `class_node`'s OWN members and
+/// fold its initializer to a literal [`Value`] (Inc-5 Task 4). `Ok(None)` → no such
+/// constant declared here. A non-literal initializer bails via `eval_default`; a
+/// typed constant (`const int X = 10`) re-checks scalar coercion (fail-closed).
+fn find_class_constant_value(
+    class_node: &mago_syntax::ast::ast::class_like::Class,
+    const_name: &[u8],
+) -> Result<Option<Value>, BailReason> {
+    for member in class_node.members.iter() {
+        let ClassLikeMember::Constant(konst) = member else {
+            continue;
+        };
+        for item in konst.items.iter() {
+            if item.name.value != const_name {
+                continue;
+            }
+            // Literal-only fold (computed/call/new/unresolved → bail).
+            let mut scope = Scope::new(HashMap::new(), &NoResolver);
+            let v = super::eval::eval_default(item.value, &mut scope)?;
+            // A typed scalar constant coerces its value in PHP (`const float X = 5;`
+            // stores `5.0`); the reducer keeps `Int(5)` → fail-closed BAIL on a
+            // mismatch (symmetric with `seed_plain_property_defaults`).
+            if let Some(hint) = &konst.hint {
+                bail_if_scalar_hint_coerces(hint, &v, "class constant")?;
+            }
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 /// Whether a parameter carries the `readonly` modifier.
@@ -1817,6 +1935,93 @@ $this->assertSame(1, $a->value()); $this->assertSame(11, $b->value());",
             Outcome::Pass,
             "two independently-owned objects must each mutate soundly (no over-bail)"
         );
+    }
+
+    // ── Inc-5 Task 4: class-constant access (literal const table + ::class) ──
+
+    #[test]
+    fn class_constant_and_class_magic_resolve() {
+        // `C::LIMIT` reads a literal const; `C::class` folds to the FQCN string.
+        let src = r#"<?php
+class C {
+    const int LIMIT = 10;
+    const NAME = 'widget';
+}
+class CTest {
+    public function testConst(): void {
+        $this->assertSame(10, C::LIMIT);
+        $this->assertSame('widget', C::NAME);
+        $this->assertSame('C', C::class);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "CTest", "testConst", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn self_class_constant_resolves_to_enclosing_class() {
+        // `self::LIMIT` inside a method resolves to the enclosing class's const.
+        let src = r#"<?php
+final class Box {
+    const int CAP = 7;
+    public function __construct(public int $v) {}
+    public function capped(): int { return self::CAP; }
+}
+class BoxTest {
+    public function testSelf(): void {
+        $b = new Box(0);
+        $this->assertSame(7, $b->capped());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "BoxTest", "testSelf", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn computed_class_constant_bails() {
+        // A const whose initializer is a runtime call (non-literal/non-modelled) is
+        // not foldable → must BAIL, never guess.
+        let src = r#"<?php
+class C {
+    const VAL = STR_PAD_LEFT;
+    public static function compute(): int { return random_int(1, 9); }
+}
+class CTest {
+    public function testComputed(): void {
+        $this->assertSame(5, C::computed());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "CTest", "testComputed", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn enum_case_access_bails() {
+        // Enum cases (`Suit::Hearts`) are deferred — must BAIL (never fold to a guess).
+        let src = r#"<?php
+enum Suit: string {
+    case Hearts = 'H';
+    case Spades = 'S';
+}
+class SuitTest {
+    public function testEnum(): void {
+        $this->assertSame('H', Suit::Hearts->value);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "SuitTest", "testEnum", vec![]),
+            Outcome::Bailed(_)
+        ));
     }
 
     #[test]
