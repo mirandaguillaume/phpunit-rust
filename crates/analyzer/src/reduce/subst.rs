@@ -302,6 +302,11 @@ impl BridgeResolver<'_> {
         hint_chain.push(class_meta.name.as_bytes().to_vec());
         let mut prop_hints = PropHints::new();
         for fqcn in &hint_chain {
+            // A class's used traits BEFORE its own hints (round 5: trait-declared
+            // typed scalar props are a SEPARATE set, never in all_parent_classes),
+            // so a class-level redeclare wins over a trait's hint.
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            self.collect_trait_scalar_property_hints(fqcn, &mut prop_hints, &mut seen);
             self.collect_class_scalar_property_hints(fqcn, &mut prop_hints);
         }
 
@@ -398,6 +403,11 @@ impl BridgeResolver<'_> {
         let mut prop_hints = PropHints::new();
         for fqcn in &chain {
             self.seed_class_property_defaults(fqcn, &mut props)?;
+            // A class's used traits BEFORE its own hints (round 5: trait-declared
+            // typed scalar props are a SEPARATE set, never in all_parent_classes),
+            // so a class-level redeclare wins over a trait's hint.
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            self.collect_trait_scalar_property_hints(fqcn, &mut prop_hints, &mut seen);
             self.collect_class_scalar_property_hints(fqcn, &mut prop_hints);
         }
 
@@ -495,10 +505,58 @@ impl BridgeResolver<'_> {
         let _ = self
             .project
             .with_program(&logical, |program, _file, _names| {
+                // A class-like is either a `class` or a `trait` AST node; both carry
+                // the same `members` shape, so the same `&Hint` collection applies.
                 if let Some(class_node) = find_class(program, &class_fqcn) {
-                    hints.extend(collect_scalar_property_hints(class_node));
+                    hints.extend(collect_scalar_property_hints(class_node.members.iter()));
+                } else if let Some(trait_node) = find_trait(program, &class_fqcn) {
+                    hints.extend(collect_scalar_property_hints(trait_node.members.iter()));
                 }
             });
+    }
+
+    /// Collect a class's USED-TRAIT scalar property hints into `hints` (round 5),
+    /// recursing into traits a trait itself `use`s, so a `$this->prop = …` write to
+    /// a TRAIT-declared typed scalar property re-checks coercion. Traits are a
+    /// SEPARATE set in mago (`used_traits`, never an `all_parent_classes` member),
+    /// so the ancestor-chain walk alone missed them — a coercing write to a
+    /// trait-declared typed scalar property escaped the guard and was stored
+    /// verbatim (a 0-divergence break). Each trait's OWN hints are collected via the
+    /// same AST `&Hint` path as a class, so the verified coercion predicate is
+    /// reused byte-for-byte. A used trait is collected BEFORE the using class's own
+    /// hints by the caller, so a class-level redeclare wins over a trait's hint.
+    /// `seen` guards against a (malformed) trait-use cycle. A trait not on disk is
+    /// silently skipped (its props stay unhinted → stored verbatim, fail-closed).
+    fn collect_trait_scalar_property_hints(
+        &self,
+        fqcn: &[u8],
+        hints: &mut PropHints,
+        seen: &mut Vec<Vec<u8>>,
+    ) {
+        let codebase = self.project.codebase();
+        let key = normalize_fqcn(fqcn);
+        let lower = key.to_ascii_lowercase();
+        if seen.iter().any(|s| s == &lower) {
+            return;
+        }
+        seen.push(lower.clone());
+        let Some(class_meta) = codebase.get_class_like(&lower) else {
+            return;
+        };
+        // Snapshot the used-trait FQCNs (the borrow of `class_meta` ends here so the
+        // recursive call can re-borrow the codebase).
+        let traits: Vec<Vec<u8>> = class_meta
+            .used_traits
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        for trait_fqcn in &traits {
+            // A trait can `use` another trait: recurse first (nested traits before
+            // the using trait), then collect the trait's own declared hints so a
+            // trait that redeclares a nested-trait prop wins.
+            self.collect_trait_scalar_property_hints(trait_fqcn, hints, seen);
+            self.collect_class_scalar_property_hints(trait_fqcn, hints);
+        }
     }
 }
 
@@ -641,14 +699,18 @@ fn run_constructor(
 /// Only coercion-relevant scalar hints are recorded (`scalar_hint_of` returns
 /// `None` for untyped / non-scalar hints — those are stored verbatim, never bail).
 /// Static/hooked properties are skipped (the seeding path bails on them anyway).
-fn collect_scalar_property_hints(
-    class_node: &mago_syntax::ast::ast::class_like::Class,
+/// Collect the declared scalar property hints from a class-like's MEMBERS. Taking
+/// the member sequence (not a `&Class`) lets the SAME `&Hint`-based collection serve
+/// both a `class`/`trait` AST node (round 5: a trait's typed scalar props need the
+/// identical verified coercion classification as a class's).
+fn collect_scalar_property_hints<'a>(
+    members: impl Iterator<Item = &'a ClassLikeMember<'a>>,
 ) -> PropHints {
     use mago_syntax::ast::ast::class_like::property::Property;
     use mago_syntax::ast::ast::modifier::Modifier;
 
     let mut hints = PropHints::new();
-    for member in class_node.members.iter() {
+    for member in members {
         let ClassLikeMember::Property(Property::Plain(plain)) = member else {
             continue;
         };
@@ -839,6 +901,56 @@ where
                     }
                     NamespaceBody::BraceDelimited(b) => {
                         find_class_in(b.statements.iter(), &inner, target)
+                    }
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// FQN-aware lookup of a `trait` AST node (mirror of [`find_class`] for
+/// `Statement::Trait`). Used by round-5 trait-hint collection: a trait is a
+/// distinct AST node from a class, but carries the same `members` shape.
+fn find_trait<'a>(
+    program: &'a Program<'a>,
+    fqcn: &[u8],
+) -> Option<&'a mago_syntax::ast::ast::class_like::Trait<'a>> {
+    let target = normalize_fqcn(fqcn);
+    find_trait_in(program.statements.iter(), &[], &target)
+}
+
+fn find_trait_in<'a, 's>(
+    stmts: impl Iterator<Item = &'s Statement<'s>>,
+    ns: &[u8],
+    target: &[u8],
+) -> Option<&'s mago_syntax::ast::ast::class_like::Trait<'s>>
+where
+    's: 'a,
+{
+    use mago_syntax::ast::ast::namespace::NamespaceBody;
+    for stmt in stmts {
+        match stmt {
+            Statement::Trait(t) => {
+                if qualified_name(ns, t.name.value).eq_ignore_ascii_case(target) {
+                    return Some(t);
+                }
+            }
+            Statement::Namespace(nsd) => {
+                let inner = match nsd.name {
+                    Some(n) => qualified_name(ns, n.value()),
+                    None => ns.to_vec(),
+                };
+                let found = match &nsd.body {
+                    NamespaceBody::Implicit(b) => {
+                        find_trait_in(b.statements.iter(), &inner, target)
+                    }
+                    NamespaceBody::BraceDelimited(b) => {
+                        find_trait_in(b.statements.iter(), &inner, target)
                     }
                 };
                 if found.is_some() {

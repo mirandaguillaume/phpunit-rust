@@ -1147,4 +1147,108 @@ class InheritedUntypedTest extends TestCase {
         );
         assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
     }
+
+    #[test]
+    fn trait_typed_property_write_coercion_bails() {
+        // Round 5 RED: a ctor writes a scalar value into a typed property declared
+        // in a USED TRAIT (not the leaf class, not a parent). PHP coerces "10" →
+        // int(10) at the typed trait-property write, so assertSame(10, …) PASSES.
+        // The reducer must collect the trait's scalar hint (`int $n`) so the
+        // typed-write coercion guard fires and BAILS — before round 5 the trait
+        // hint was missed (used_traits is a separate set, never an
+        // all_parent_classes member), the value was stored Str("10") verbatim, and
+        // the test produced a divergent definitive FAIL. `: mixed` getter keeps the
+        // return-coercion guard from masking the property-write site under test.
+        let dir = write_suite(&[(
+            "TraitWriteTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+trait HasN { public int $n; }
+class P {
+    use HasN;
+    public function __construct(string $s) { $this->n = $s; }
+    public function n(): mixed { return $this->n; }
+}
+class TraitWriteTest extends TestCase {
+    public function testTrait(): void {
+        $p = new P("10");
+        $this->assertSame(10, $p->n());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("TraitWriteTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "a scalar write into a TRAIT-declared typed property must BAIL on \
+             coercion, not produce a divergent Fail; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn trait_typed_property_matching_write_does_not_over_bail() {
+        // Round 5 guard (a): a ctor writes a value of the MATCHING type (int 10)
+        // into a trait-declared typed property `int $n`. No coercion happens, so
+        // the guard must NOT bail — the test resolves to Pass.
+        let dir = write_suite(&[(
+            "TraitMatchTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+trait HasNm { public int $n; }
+class Pm {
+    use HasNm;
+    public function __construct(int $v) { $this->n = $v; }
+    public function n(): mixed { return $this->n; }
+}
+class TraitMatchTest extends TestCase {
+    public function testMatch(): void {
+        $p = new Pm(10);
+        $this->assertSame(10, $p->n());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("TraitMatchTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            !matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "a matching-type write into a trait-declared typed property must NOT \
+             over-bail; got {reduced:?}"
+        );
+        assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
+    }
+
+    #[test]
+    fn trait_untyped_property_write_does_not_over_bail() {
+        // Round 5 guard (b): the trait-declared property is UNTYPED, so there is no
+        // scalar hint and no coercion contract. Writing a string into it must NOT
+        // trip the coercion guard — the reducer resolves it verbatim (Pass).
+        let dir = write_suite(&[(
+            "TraitUntypedTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+trait HasNu { public $n; }
+class Pu {
+    use HasNu;
+    public function __construct(string $s) { $this->n = $s; }
+    public function n(): mixed { return $this->n; }
+}
+class TraitUntypedTest extends TestCase {
+    public function testUntyped(): void {
+        $p = new Pu("10");
+        $this->assertSame("10", $p->n());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("TraitUntypedTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            !matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "an untyped trait property has no scalar hint → the coercion guard must \
+             NOT fire; got {reduced:?}"
+        );
+        assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
+    }
 }
