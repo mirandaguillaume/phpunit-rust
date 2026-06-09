@@ -268,13 +268,12 @@ impl BridgeResolver<'_> {
         let class_logical = String::from_utf8_lossy(&class_file.name).into_owned();
         let class_fqcn = class_meta.name.as_bytes().to_vec();
 
-        // 1) Seed plain (non-promoted) property declarations with literal defaults,
-        //    and collect the class's declared SCALAR property hints (round 3 Task A)
-        //    so a typed `$this->prop = …` write in the ctor body re-checks coercion.
-        //    (Read off THIS class's own AST. Inherited-property defaults are not
-        //    modelled in v2 — a read of an unseeded prop bails, fail-closed.)
+        // 1) Seed plain (non-promoted) property declarations with literal defaults
+        //    from THIS class's own AST. Inherited-property defaults are intentionally
+        //    NOT seeded (seed_plain_property_defaults is leaf-only) — a read of an
+        //    unseeded inherited prop bails, fail-closed (no divergence).
         let resolver = self;
-        let (mut props, prop_hints): (Vec<(Vec<u8>, Value)>, PropHints) = self
+        let mut props: Vec<(Vec<u8>, Value)> = self
             .project
             .with_program(&class_logical, |program, _file, _names| {
                 let Some(class_node) = find_class(program, &class_fqcn) else {
@@ -284,10 +283,27 @@ impl BridgeResolver<'_> {
                 };
                 let mut p: Vec<(Vec<u8>, Value)> = Vec::new();
                 seed_plain_property_defaults(class_node, &mut p, resolver)?;
-                let hints = collect_scalar_property_hints(class_node);
-                Ok((p, hints))
+                Ok(p)
             })
             .unwrap_or_else(|| Err(BailReason::Other("could not re-parse class file".into())))?;
+
+        // Collect the declared SCALAR property hints (round 3 Task A) across the
+        // FULL ancestor chain — symmetric with build_test_case_this — so a typed
+        // `$this->prop = …` write in the ctor body re-checks coercion even when the
+        // property is DECLARED IN A PARENT. (Leaf-only collection missed inherited
+        // hints, letting an un-coerced value through → a divergent Pass/Fail.)
+        // Walk parents-first so a child override wins over a parent on a dup name.
+        let mut hint_chain: Vec<Vec<u8>> = class_meta
+            .all_parent_classes
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        hint_chain.reverse();
+        hint_chain.push(class_meta.name.as_bytes().to_vec());
+        let mut prop_hints = PropHints::new();
+        for fqcn in &hint_chain {
+            self.collect_class_scalar_property_hints(fqcn, &mut prop_hints);
+        }
 
         // 2) Run the constructor (promoted-param seeding + body). Resolved through
         //    the DECLARING class so an inherited constructor inlines correctly.

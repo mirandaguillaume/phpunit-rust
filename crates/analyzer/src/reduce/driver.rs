@@ -1048,4 +1048,103 @@ class CoerceTest extends TestCase {
             "scalar return-type coercion must BAIL, not produce a divergent Fail; got {reduced:?}"
         );
     }
+
+    #[test]
+    fn inherited_typed_property_write_coercion_bails() {
+        // A CHILD ctor writes a scalar value into a typed property DECLARED IN A
+        // PARENT. PHP coerces "42" → int(42) at the typed parent-property write,
+        // so assertSame(42, …) PASSES. The reducer must collect the inherited
+        // scalar hint (parent's `int $n`) so the typed-write coercion guard fires
+        // and BAILS — storing Str("42") verbatim produced a divergent FAIL.
+        // The `: mixed` getter keeps the return-coercion guard from masking the
+        // property-write site under test.
+        let dir = write_suite(&[(
+            "InheritedWriteTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class Base { public int $n; }
+class Child extends Base {
+    public function __construct(string $s) { $this->n = $s; }
+    public function n(): mixed { return $this->n; }
+}
+class InheritedWriteTest extends TestCase {
+    public function testInherited(): void {
+        $c = new Child("42");
+        $this->assertSame(42, $c->n());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("InheritedWriteTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "a scalar write into an inherited typed property must BAIL on coercion, \
+             not produce a divergent Fail; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_typed_property_matching_write_does_not_over_bail() {
+        // Guard (a): a CHILD ctor writes a value of the MATCHING type (int 42)
+        // into the inherited typed property `int $n`. No coercion happens, so the
+        // guard must NOT bail — the test resolves to Pass.
+        let dir = write_suite(&[(
+            "InheritedMatchTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class BaseM { public int $n; }
+class ChildM extends BaseM {
+    public function __construct(int $v) { $this->n = $v; }
+    public function n(): mixed { return $this->n; }
+}
+class InheritedMatchTest extends TestCase {
+    public function testMatch(): void {
+        $c = new ChildM(42);
+        $this->assertSame(42, $c->n());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("InheritedMatchTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            !matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "a matching-type write into an inherited typed property must NOT over-bail; \
+             got {reduced:?}"
+        );
+        assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
+    }
+
+    #[test]
+    fn inherited_untyped_property_write_does_not_over_bail() {
+        // Guard (b): the inherited property is UNTYPED, so there is no scalar hint
+        // and no coercion contract. Writing a string into it must NOT trip the
+        // coercion guard — the reducer resolves it verbatim (Pass), not a bail.
+        let dir = write_suite(&[(
+            "InheritedUntypedTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class BaseU { public $n; }
+class ChildU extends BaseU {
+    public function __construct(string $s) { $this->n = $s; }
+    public function n(): mixed { return $this->n; }
+}
+class InheritedUntypedTest extends TestCase {
+    public function testUntyped(): void {
+        $c = new ChildU("42");
+        $this->assertSame("42", $c->n());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("InheritedUntypedTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            !matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "an untyped inherited property has no scalar hint → the coercion guard \
+             must NOT fire; got {reduced:?}"
+        );
+        assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
+    }
 }
