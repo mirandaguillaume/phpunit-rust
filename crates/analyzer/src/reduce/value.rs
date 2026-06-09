@@ -34,7 +34,11 @@ use crate::concrete::PhpValue;
 /// strings, positional arrays) and exists ONLY for test assertions and for the
 /// `PartialEq` on [`super::eval::Outcome`]. It is deliberately NOT used anywhere
 /// for PHP value semantics — those go through the `php_*` methods above.
-#[derive(Debug, Clone, PartialEq)]
+/// `PartialEq` is HAND-WRITTEN below (not derived) so the [`Value::Object`]
+/// `aliased` bookkeeping flag is EXCLUDED from equality — it is reducer metadata
+/// (ownership tracking), never a PHP-observable difference. Two structurally
+/// identical objects compare equal whether or not either is marked aliased.
+#[derive(Debug, Clone)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -45,12 +49,23 @@ pub enum Value {
     Arr(Vec<(ArrayKey, Value)>),
     /// An object value: a record of fields (spec §13). `class` is the runtime
     /// FQCN (byte-exact, from the construction site); `props` is the
-    /// insertion-ordered field list. Increment 2 models only immutable value
-    /// objects — a method that writes `$this->prop` (a mutator) or any by-ref
-    /// aliasing bails before an `Object` is ever shared (driver/eval frontier).
+    /// insertion-ordered field list.
+    ///
+    /// `aliased` (Inc-5 Task 3, the soundness core): PHP objects have HANDLE
+    /// semantics — `$b = $a` makes both names refer to the SAME object, so a
+    /// mutation via one is visible via the other. Our `Value::Object` is by-VALUE
+    /// (clone-on-assign), which would diverge on a mutator after an alias. So we
+    /// over-approximate ownership: `aliased` is set the MOMENT a second reference
+    /// to this object could exist (assigned to another var, passed as a call/method
+    /// arg, stored into an array/property, …). A MUTATING method dispatched on an
+    /// `aliased` object BAILS (fail-closed). A fresh `new` object starts
+    /// `aliased = false` (uniquely owned). Over-marking only over-bails (safe),
+    /// never diverges.
     Object {
         class: Vec<u8>,
         props: Vec<(Vec<u8>, Value)>,
+        /// Whether a second reference to this object could exist (see above).
+        aliased: bool,
     },
     /// A first-class closure / arrow function (Inc-4 Task A).
     ///
@@ -69,6 +84,38 @@ pub enum Value {
     /// returned from an inlined helper or stored into `$this` (whose creating arena
     /// has since dropped) is invoked soundly — no use-after-free.
     Closure(ClosureRef),
+}
+
+/// Hand-written structural equality. Identical to a `#[derive(PartialEq)]` EXCEPT
+/// that the [`Value::Object`] `aliased` flag is ignored — it is ownership
+/// bookkeeping, not a value. (Used only by test assertions and the `PartialEq` on
+/// [`super::eval::Outcome`]; PHP value semantics go through the `php_*` methods.)
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Null, Null) => true,
+            (Bool(a), Bool(b)) => a == b,
+            (Int(a), Int(b)) => a == b,
+            (Float(a), Float(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Arr(a), Arr(b)) => a == b,
+            (
+                Object {
+                    class: ca,
+                    props: pa,
+                    aliased: _,
+                },
+                Object {
+                    class: cb,
+                    props: pb,
+                    aliased: _,
+                },
+            ) => ca == cb && pa == pb,
+            (Closure(a), Closure(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// The owned payload of a [`Value::Closure`] (Inc-4 Task 1 remediation).
@@ -105,6 +152,33 @@ impl Value {
             Value::Arr(_) => "array",
             // A Closure is an object (`gettype()` → "object", class "Closure").
             Value::Object { .. } | Value::Closure(_) => "object",
+        }
+    }
+
+    /// Whether this value is an object that may have a second live reference
+    /// (Inc-5 Task 3). Non-objects are never aliased. See [`Value::Object`].
+    pub fn is_aliased(&self) -> bool {
+        matches!(self, Value::Object { aliased: true, .. })
+    }
+
+    /// Mark this value (if it is an object) as possibly-aliased — a second
+    /// reference to it could now exist. No-op on non-objects. Recurses into
+    /// nested object props/array elements so an object reachable THROUGH an
+    /// aliased aggregate is itself treated as aliased (fail-closed over-approx).
+    pub fn mark_aliased(&mut self) {
+        match self {
+            Value::Object { aliased, props, .. } => {
+                *aliased = true;
+                for (_, v) in props.iter_mut() {
+                    v.mark_aliased();
+                }
+            }
+            Value::Arr(items) => {
+                for (_, v) in items.iter_mut() {
+                    v.mark_aliased();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -578,10 +652,12 @@ impl Value {
                 Object {
                     class: ca,
                     props: pa,
+                    ..
                 },
                 Object {
                     class: cb,
                     props: pb,
+                    ..
                 },
             ) => {
                 if ca != cb || pa.len() != pb.len() {
@@ -646,10 +722,12 @@ impl Value {
             Value::Object {
                 class: ca,
                 props: pa,
+                ..
             },
             Value::Object {
                 class: cb,
                 props: pb,
+                ..
             },
         ) = (self, other)
         {
@@ -1011,6 +1089,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.as_bytes().to_vec(), v))
                 .collect(),
+            aliased: false,
         }
     }
 

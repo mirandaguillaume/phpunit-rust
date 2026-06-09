@@ -33,8 +33,8 @@ use mago_syntax::ast::Program;
 
 use super::eval::{
     bail_if_scalar_hint_coerces, bail_if_scalar_return_coerces, make_object,
-    run_body_returning_with_names, run_ctor_body_with_names, scalar_hint_of, BailReason,
-    CallResolver, NoResolver, OwnedScalarHint, Scope,
+    run_body_returning_with_names, run_ctor_body_with_names, run_method_with_this_writes,
+    scalar_hint_of, BailReason, CallResolver, MethodDispatch, NoResolver, OwnedScalarHint, Scope,
 };
 use super::value::Value;
 use crate::mago_bridge::MagoProject;
@@ -90,12 +90,12 @@ impl CallResolver for BridgeResolver<'_> {
         this: &Value,
         method: &[u8],
         args: &[Value],
-    ) -> Result<Option<Value>, BailReason> {
+    ) -> Result<Option<MethodDispatch>, BailReason> {
         // The class comes from the RUNTIME receiver record (never a static type).
         let Value::Object { class, .. } = this else {
             return Ok(None);
         };
-        self.with_depth(|s| s.inline_method(class, method, Some(this.clone()), args))
+        self.with_depth(|s| s.inline_instance_method(class, method, this.clone(), args))
     }
 
     fn resolve_static_method(
@@ -159,10 +159,12 @@ impl BridgeResolver<'_> {
     }
 
     /// Run `f` under the recursion-depth guard (shared by every inlining entry).
-    fn with_depth(
+    /// Generic over the success type so it serves both the value-returning inlines
+    /// (`Option<Value>`) and the instance-dispatch inline (`Option<MethodDispatch>`).
+    fn with_depth<R>(
         &self,
-        f: impl FnOnce(&Self) -> Result<Option<Value>, BailReason>,
-    ) -> Result<Option<Value>, BailReason> {
+        f: impl FnOnce(&Self) -> Result<Option<R>, BailReason>,
+    ) -> Result<Option<R>, BailReason> {
         let d = self.depth.get();
         if d >= self.max_depth {
             return Err(BailReason::Other("recursion depth cap".into()));
@@ -243,6 +245,128 @@ impl BridgeResolver<'_> {
                 Ok(Some(ret))
             });
         outcome.unwrap_or_else(|| Err(BailReason::Other("could not re-parse method file".into())))
+    }
+
+    /// Inline an INSTANCE method `$this->m(args)` (Inc-5 Task 3), allowing
+    /// `$this->prop = …` writes, and report BOTH the return value and whether the
+    /// body mutated `$this` (so the eval-layer dispatch can write the mutation back
+    /// to a uniquely-owned `$var` receiver, or BAIL on an aliased/non-assignable
+    /// one). Resolution mirrors [`BridgeResolver::inline_method`] (FQN-aware via
+    /// `get_declaring_method_class`); abstract/interface bodies bail.
+    fn inline_instance_method(
+        &self,
+        class: &[u8],
+        method: &[u8],
+        this: Value,
+        args: &[Value],
+    ) -> Result<Option<MethodDispatch>, BailReason> {
+        let codebase = self.project.codebase();
+        let class = normalize_fqcn(class);
+        let class = class.as_slice();
+        let Some(meta) = codebase.get_declaring_method(class, method) else {
+            return Ok(None);
+        };
+        if meta.method_metadata.as_ref().is_some_and(|m| m.is_abstract) {
+            return Err(BailReason::UnsupportedConstruct(
+                "abstract method dispatch".into(),
+            ));
+        }
+        let declaring_fqcn = codebase
+            .get_declaring_method_class(class, method)
+            .map(|w| w.as_bytes().to_vec())
+            .unwrap_or_else(|| class.to_vec());
+
+        // The receiver class's declared scalar property hints, across its full
+        // ancestor chain + traits — so a typed `$this->prop = …` write in the body
+        // re-checks scalar coercion (round 3 Task A); symmetric with construct.
+        let prop_hints = self.collect_instance_prop_hints(class);
+
+        // The pre-body `$this` props, to diff against after the body runs (mutation
+        // detection). The class is invariant, so comparing props suffices.
+        let pre_props = match &this {
+            Value::Object { props, .. } => props.clone(),
+            _ => {
+                return Err(BailReason::Other(
+                    "instance dispatch receiver is not an object".into(),
+                ))
+            }
+        };
+
+        let file = self
+            .project
+            .file_of_span(&meta.span)
+            .ok_or_else(|| BailReason::Other("method's declaring file not loaded".into()))?;
+        let logical_name = String::from_utf8_lossy(&file.name).into_owned();
+
+        let outcome = self
+            .project
+            .with_program(&logical_name, |program, file, names| {
+                let m = find_class_method(program, &declaring_fqcn, method).ok_or_else(|| {
+                    BailReason::UnknownCall(format!(
+                        "{}::{}",
+                        String::from_utf8_lossy(&declaring_fqcn),
+                        String::from_utf8_lossy(method)
+                    ))
+                })?;
+                let MethodBody::Concrete(block) = &m.body else {
+                    return Err(BailReason::UnsupportedConstruct(
+                        "abstract/interface method body".into(),
+                    ));
+                };
+                let mut bindings = bind_method_params(&m.parameter_list, args)?;
+                bindings.insert(b"this".to_vec(), this.clone());
+                let (ret, final_this) = run_method_with_this_writes(
+                    block,
+                    bindings,
+                    self,
+                    names,
+                    &file.contents,
+                    prop_hints.clone(),
+                )?;
+                bail_if_scalar_return_coerces(m.return_type_hint.as_ref(), &ret)?;
+
+                // Did the body write to `$this`? Compare the post-body props to the
+                // pre-body props (class is invariant; `Value`'s PartialEq ignores the
+                // aliasing flag, so only real value changes count as a mutation).
+                let mutated = match &final_this {
+                    Value::Object { props, .. } => props != &pre_props,
+                    _ => {
+                        return Err(BailReason::Other(
+                            "instance method lost its object \\$this".into(),
+                        ))
+                    }
+                };
+                Ok(Some(MethodDispatch {
+                    ret,
+                    mutated_this: if mutated { Some(final_this) } else { None },
+                }))
+            });
+        outcome.unwrap_or_else(|| Err(BailReason::Other("could not re-parse method file".into())))
+    }
+
+    /// Collect the receiver class's declared SCALAR property hints across its full
+    /// parent chain + used traits (parents-first so a child override wins), keyed by
+    /// bare property name. Mirrors the hint-collection in [`BridgeResolver::construct_object`]
+    /// so a typed `$this->prop = …` write in an instance method re-checks coercion.
+    fn collect_instance_prop_hints(&self, class: &[u8]) -> PropHints {
+        let codebase = self.project.codebase();
+        let Some(class_meta) = codebase.get_class_like(class) else {
+            return PropHints::new();
+        };
+        let mut hint_chain: Vec<Vec<u8>> = class_meta
+            .all_parent_classes
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        hint_chain.reverse();
+        hint_chain.push(class_meta.name.as_bytes().to_vec());
+        let mut prop_hints = PropHints::new();
+        for fqcn in &hint_chain {
+            let mut seen: Vec<Vec<u8>> = Vec::new();
+            self.collect_trait_scalar_property_hints(fqcn, &mut prop_hints, &mut seen);
+            self.collect_class_scalar_property_hints(fqcn, &mut prop_hints);
+        }
+        prop_hints
     }
 
     /// Construct `new class(args)` (Task B): seed props from plain literal property
@@ -623,7 +747,10 @@ fn run_constructor(
     source: &[u8],
     mut prop_hints: PropHints,
 ) -> Result<Value, BailReason> {
-    let Value::Object { class, mut props } = this else {
+    let Value::Object {
+        class, mut props, ..
+    } = this
+    else {
         return Err(BailReason::Other(
             "constructor $this is not an object".into(),
         ));
@@ -1464,8 +1591,11 @@ class BoxTest {
 
     #[test]
     fn mutator_method_bails() {
-        // A method that writes $this->prop is a mutator — the by-value model gets
-        // aliasing wrong, so inlining it must BAIL (frontier §2).
+        // A mutator dispatched on a NON-assignable receiver (a `(new …)` temporary)
+        // BAILS: there is no binding to write the mutated `$this` back to, so we
+        // cannot guarantee soundness (Inc-5 Task 3 — mutation needs a writeback
+        // target). A mutator on a uniquely-owned `$var` receiver is sound (see
+        // `mutator_on_unique_owner_reduces`).
         let src = r#"<?php
 final class Counter {
     public function __construct(public int $n) {}
@@ -1481,6 +1611,212 @@ class CounterTest {
             reduce_with_subst(src, "CounterTest", "testBump", vec![]),
             Outcome::Bailed(_)
         ));
+    }
+
+    // ── Inc-5 Task 3: instance dispatch + $this-mutation (aliasing-fail-closed) ──
+
+    #[test]
+    fn readonly_getter_on_variable_receiver_reduces() {
+        // Construct + read-only dispatch on a `$var` receiver — no mutation, no
+        // aliasing. Must Pass (the whole vertical slice for a plain value object).
+        let src = r#"<?php
+final class Money {
+    public function __construct(public int $cents) {}
+    public function cents(): int { return $this->cents; }
+}
+class MoneyTest {
+    public function testCents(): void {
+        $m = new Money(500);
+        $this->assertSame(500, $m->cents());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "MoneyTest", "testCents", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn mutator_on_unique_owner_reduces() {
+        // A mutator (`$this->n = …`) called on a FRESHLY-constructed, NON-aliased
+        // `$var` receiver: the object is uniquely owned, so we mutate it and write
+        // the result back to `$c`. A subsequent read sees the mutation. Must Pass.
+        let src = r#"<?php
+final class Counter {
+    public function __construct(public int $n) {}
+    public function inc(): void { $this->n = $this->n + 1; }
+    public function value(): int { return $this->n; }
+}
+class CounterTest {
+    public function testInc(): void {
+        $c = new Counter(0);
+        $c->inc();
+        $this->assertSame(1, $c->value());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "CounterTest", "testInc", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn mutation_of_aliased_object_bails() {
+        // THE divergence-prevention test. `$b = $a` makes `$b` and `$a` the SAME
+        // object in PHP, so `$a->inc()` is visible via `$b`. Our by-value model
+        // would update only `$a` → `$b->value()` would still read 0 → a WRONG Pass
+        // (PHP: assertSame(1, 1) Pass; reducer-by-value: assertSame(1, 0) Fail).
+        // The aliasing guard must catch this and BAIL on the mutating `$a->inc()`
+        // because `$a` is aliased — NEVER a wrong Pass, NEVER a Fail.
+        let src = r#"<?php
+final class Counter {
+    public function __construct(public int $n) {}
+    public function inc(): void { $this->n = $this->n + 1; }
+    public function value(): int { return $this->n; }
+}
+class CounterTest {
+    public function testAlias(): void {
+        $a = new Counter(0);
+        $b = $a;
+        $a->inc();
+        $this->assertSame(1, $b->value());
+    }
+}
+"#;
+        let outcome = reduce_with_subst(src, "CounterTest", "testAlias", vec![]);
+        match outcome {
+            Outcome::Bailed(super::super::eval::BailReason::UnsupportedConstruct(ref m)) => {
+                assert!(
+                    m.contains("aliased"),
+                    "must bail specifically on the aliasing guard; got {m:?}"
+                );
+            }
+            other => panic!("mutation of an aliased object MUST bail on the aliasing guard, never diverge; got {other:?}"),
+        }
+    }
+
+    // ── Adversarial aliasing battery: every escape route a mutation could leak
+    //    through MUST bail (never a wrong Pass/Fail). PHP shares the handle in all
+    //    of these; our by-value model would diverge, so the guard must fire. ──
+
+    const COUNTER_SRC: &str = r#"<?php
+final class Counter {
+    public function __construct(public int $n) {}
+    public function inc(): void { $this->n = $this->n + 1; }
+    public function value(): int { return $this->n; }
+}
+"#;
+
+    fn counter_test(body: &str) -> String {
+        format!("{COUNTER_SRC}class CounterTest {{ public function testX(): void {{ {body} }} }}\n")
+    }
+
+    #[test]
+    fn mutation_via_helper_that_received_object_bails() {
+        // Object passed to a helper that mutates it: PHP mutates the SHARED handle,
+        // visible back in the caller. Passing as an arg marks `$c` aliased, so the
+        // mutation inside the helper bails (and the caller's later read can't diverge).
+        let src = format!(
+            "{COUNTER_SRC}\
+function bump(Counter $x): void {{ $x->inc(); }}\n\
+class CounterTest {{ public function testX(): void {{ \
+$c = new Counter(0); bump($c); $this->assertSame(1, $c->value()); }} }}\n"
+        );
+        assert!(
+            matches!(
+                reduce_with_subst(&src, "CounterTest", "testX", vec![]),
+                Outcome::Bailed(_)
+            ),
+            "mutation of an arg-passed (aliased) object must bail"
+        );
+    }
+
+    #[test]
+    fn mutation_of_object_stored_in_array_bails() {
+        // Object stored into an array then mutated through the array element.
+        let src = counter_test(
+            "$c = new Counter(0); $arr = [$c]; $arr[0]->inc(); $this->assertSame(1, $c->value());",
+        );
+        assert!(
+            matches!(
+                reduce_with_subst(&src, "CounterTest", "testX", vec![]),
+                Outcome::Bailed(_)
+            ),
+            "mutation through an array element (non-assignable receiver / aliased) must bail"
+        );
+    }
+
+    #[test]
+    fn mutation_after_array_store_then_var_mutate_bails() {
+        // Store the object into an array (aliasing it), THEN mutate the original
+        // `$var` — PHP sees the change in the array too; our writeback to `$c`
+        // would leave the array stale → must bail because `$c` is now aliased.
+        let src = counter_test(
+            "$c = new Counter(0); $arr = [$c]; $c->inc(); $this->assertSame(0, $arr[0]->value());",
+        );
+        assert!(
+            matches!(
+                reduce_with_subst(&src, "CounterTest", "testX", vec![]),
+                Outcome::Bailed(_)
+            ),
+            "mutating a $var after it was stored into an array (aliased) must bail"
+        );
+    }
+
+    #[test]
+    fn mutation_of_returned_alias_bails() {
+        // A helper returns its argument (a shared handle); mutating the returned
+        // object then reading the original would diverge → must bail.
+        let src = format!(
+            "{COUNTER_SRC}\
+function passthru(Counter $x): Counter {{ return $x; }}\n\
+class CounterTest {{ public function testX(): void {{ \
+$c = new Counter(0); $d = passthru($c); $d->inc(); $this->assertSame(1, $c->value()); }} }}\n"
+        );
+        assert!(
+            matches!(
+                reduce_with_subst(&src, "CounterTest", "testX", vec![]),
+                Outcome::Bailed(_)
+            ),
+            "mutation of a returned (aliased) object must bail"
+        );
+    }
+
+    #[test]
+    fn mutation_via_indirect_this_copy_bails() {
+        // A method copies `$this` to a local then mutates the copy. PHP: the copy is
+        // the SAME object → `$this` changes too. `$x = $this` marks both aliased, so
+        // `$x->inc()` inside the body bails.
+        let src = format!(
+            "{COUNTER_SRC}\
+final class Tricky extends Counter {{ public function sneaky(): void {{ $x = $this; $x->inc(); }} }}\n\
+class CounterTest {{ public function testX(): void {{ \
+$t = new Tricky(0); $t->sneaky(); $this->assertSame(1, $t->value()); }} }}\n"
+        );
+        assert!(
+            matches!(
+                reduce_with_subst(&src, "CounterTest", "testX", vec![]),
+                Outcome::Bailed(_)
+            ),
+            "mutation via an indirect $this copy must bail"
+        );
+    }
+
+    #[test]
+    fn two_independent_objects_each_mutate_soundly() {
+        // No aliasing: two distinct `$var` receivers, each mutated in place. Both
+        // are uniquely owned → both writebacks are sound → Pass (no over-bail).
+        let src = counter_test(
+            "$a = new Counter(0); $b = new Counter(10); $a->inc(); $b->inc(); \
+$this->assertSame(1, $a->value()); $this->assertSame(11, $b->value());",
+        );
+        assert_eq!(
+            reduce_with_subst(&src, "CounterTest", "testX", vec![]),
+            Outcome::Pass,
+            "two independently-owned objects must each mutate soundly (no over-bail)"
+        );
     }
 
     #[test]

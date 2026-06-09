@@ -89,6 +89,20 @@ impl BailReason {
 
 // ─── A resolver hook for user-function substitution (filled in Task 5) ────────
 
+/// The result of dispatching an instance method `$obj->m(args)` (Inc-5 Task 3).
+///
+/// `ret` is the method's return value. `mutated_this` is `Some(obj)` IFF the
+/// inlined body wrote to `$this` (the post-body `$this` record differs from the
+/// pre-body one) — i.e. the method is a MUTATOR. The eval-layer dispatch site uses
+/// `mutated_this` to decide writeback vs the aliasing bail: a read-only method
+/// (`mutated_this == None`) is always sound; a mutator is sound ONLY on a
+/// uniquely-owned `$var` receiver (writeback target), and BAILS otherwise.
+#[derive(Debug)]
+pub struct MethodDispatch {
+    pub ret: Value,
+    pub mutated_this: Option<Value>,
+}
+
 /// Resolves a user function/method call to a concrete [`Value`] by inlining its
 /// body (substitution; spec §12.3). Task 5 supplies a real implementation backed
 /// by the mago bridge; Task 4 uses [`NoResolver`] (every user call bails).
@@ -101,7 +115,9 @@ pub trait CallResolver {
     /// Attempt to inline an **instance method** call `$obj->method(args)`. The
     /// receiver `this` is the concrete runtime [`Value::Object`] (its `class` gives
     /// the exact type — never a static type, spec §13). `Ok(None)` → not a method
-    /// the resolver can inline (caller bails); `Err` propagates a bail.
+    /// the resolver can inline (caller bails); `Err` propagates a bail. On success
+    /// returns the return value AND (for a mutator) the mutated `$this` so the
+    /// caller can write it back — see [`MethodDispatch`] (Inc-5 Task 3).
     ///
     /// Increment-2 default: no instance-method inlining (the [`NoResolver`] path).
     fn resolve_instance_method(
@@ -109,7 +125,7 @@ pub trait CallResolver {
         _this: &Value,
         _method: &[u8],
         _args: &[Value],
-    ) -> Result<Option<Value>, BailReason> {
+    ) -> Result<Option<MethodDispatch>, BailReason> {
         Ok(None)
     }
 
@@ -740,6 +756,42 @@ pub fn run_ctor_body_with_names(
     )
 }
 
+/// Run an INSTANCE method body (Inc-5 Task 3) over its bound params + `$this`,
+/// with `$this->prop = …` writes PERMITTED, returning BOTH the method's return
+/// value (PHP returns null when the body falls off the end) AND the final `$this`
+/// record (which the caller diffs against the input to detect mutation). The
+/// receiver class's scalar property hints re-check coercion at a typed `$this->prop`
+/// write (round 3 Task A). An assertion inside a non-test method body bails.
+#[allow(clippy::too_many_arguments)]
+pub fn run_method_with_this_writes(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+    source: &[u8],
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+) -> Result<(Value, Value), BailReason> {
+    let mut scope = Scope::new(bindings, resolver)
+        .with_prop_hints(prop_hints)
+        .with_names(names)
+        .with_source(source);
+    scope.allow_this_writes();
+    let ret = match exec_statements(block.statements.iter(), &mut scope)? {
+        Flow::Returned(v) => v,
+        Flow::Normal => Value::Null,
+        Flow::Asserted(_) => {
+            return Err(BailReason::UnsupportedConstruct(
+                "assertion inside an inlined method body".into(),
+            ))
+        }
+    };
+    let final_this = scope
+        .vars
+        .remove(b"this".as_slice())
+        .ok_or_else(|| BailReason::Other("instance method lost its \\$this".into()))?;
+    Ok((ret, final_this))
+}
+
 fn run_ctor_body_inner(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
@@ -773,7 +825,14 @@ fn run_ctor_body_inner(
 /// used when a class has promoted params + an empty constructor body, or no
 /// constructor at all.
 pub fn make_object(class: Vec<u8>, props: Vec<(Vec<u8>, Value)>) -> Value {
-    Value::Object { class, props }
+    // A freshly constructed object is uniquely owned (not yet aliased) — Inc-5
+    // Task 3. The alias flag is set later, the moment a second reference to it
+    // could arise (assignment copy, argument passing, array/property storage).
+    Value::Object {
+        class,
+        props,
+        aliased: false,
+    }
 }
 
 // ─── Statement execution ──────────────────────────────────────────────────────
@@ -1908,8 +1967,43 @@ fn eval_assignment(
         }
     };
 
+    // Aliasing (Inc-5 Task 3): `$x = <obj>` may create a SECOND reference to an
+    // existing object. PHP object assignment copies the HANDLE, not the object —
+    // both names then alias the same instance. The ONLY rhs that yields a freshly
+    // and uniquely owned object is a `new` expression (its result is the caller's
+    // alone); every other object-valued rhs (a variable copy `$b = $a`, a property
+    // read, an array element, a method/function return) may already be referenced
+    // elsewhere. Mark such a stored object aliased, and — when the rhs is a direct
+    // variable — mark the SOURCE binding aliased too, so a later mutating method on
+    // EITHER name bails (fail-closed). Over-marking only over-bails.
+    let mut new_val = new_val;
+    if matches!(new_val, Value::Object { .. }) && !is_fresh_instantiation(a.rhs) {
+        new_val.mark_aliased();
+        if let Expression::Variable(Variable::Direct(src)) = unwrap_parens(a.rhs) {
+            let src_key = var_name(src.name);
+            if let Some(src_val) = scope.vars.get_mut(&src_key) {
+                src_val.mark_aliased();
+            }
+        }
+    }
+
     scope.vars.insert(key, new_val.clone());
     Ok(new_val)
+}
+
+/// Strip `(…)` parentheses to reach the inner expression (for alias-source and
+/// fresh-`new` detection in `eval_assignment`).
+fn unwrap_parens<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    match expr {
+        Expression::Parenthesized(p) => unwrap_parens(p.expression),
+        other => other,
+    }
+}
+
+/// Whether `expr` is a fresh `new C(...)` instantiation (its object is uniquely
+/// owned by the caller, so an assignment from it creates no alias) — Inc-5 Task 3.
+fn is_fresh_instantiation(expr: &Expression) -> bool {
+    matches!(unwrap_parens(expr), Expression::Instantiation(_))
 }
 
 /// `$this->prop = rhs` — a property write (constructor seeding only). Frontier §2:
@@ -2013,6 +2107,24 @@ fn eval_legacy_array(arr: &LegacyArray, scope: &mut Scope) -> Result<Value, Bail
     build_array(arr.elements.as_slice(), scope)
 }
 
+/// Evaluate an array ELEMENT value, marking aliasing (Inc-5 Task 3): an object
+/// stored into an array element gains a second reference path (the array now holds
+/// it), so a later mutation through any reference would diverge — mark the stored
+/// object aliased, and the source `$var` (if direct) too. Fail-closed over-approx.
+fn eval_object_element(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
+    let mut v = eval_expr(expr, scope)?;
+    if matches!(v, Value::Object { .. }) {
+        v.mark_aliased();
+        if let Expression::Variable(Variable::Direct(src)) = unwrap_parens(expr) {
+            let src_key = var_name(src.name);
+            if let Some(src_val) = scope.vars.get_mut(&src_key) {
+                src_val.mark_aliased();
+            }
+        }
+    }
+    Ok(v)
+}
+
 fn build_array(elements: &[ArrayElement], scope: &mut Scope) -> Result<Value, BailReason> {
     let mut items: Vec<(ArrayKey, Value)> = Vec::new();
     let mut next_int: i64 = 0;
@@ -2021,7 +2133,7 @@ fn build_array(elements: &[ArrayElement], scope: &mut Scope) -> Result<Value, Ba
         match element {
             ArrayElement::KeyValue(kv) => {
                 let k = eval_expr(kv.key, scope)?;
-                let v = eval_expr(kv.value, scope)?;
+                let v = eval_object_element(kv.value, scope)?;
                 let key = k
                     .to_array_key()
                     .ok_or_else(|| BailReason::TypeError("array used as array key".into()))?;
@@ -2033,7 +2145,7 @@ fn build_array(elements: &[ArrayElement], scope: &mut Scope) -> Result<Value, Ba
                 insert_key(&mut items, key, v);
             }
             ArrayElement::Value(ve) => {
-                let v = eval_expr(ve.value, scope)?;
+                let v = eval_object_element(ve.value, scope)?;
                 insert_key(&mut items, ArrayKey::Int(next_int), v);
                 next_int += 1;
             }
@@ -2520,16 +2632,52 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
                     receiver.type_name()
                 )));
             }
+            let receiver_aliased = receiver.is_aliased();
             let args = eval_arguments(&m.argument_list, scope)?;
-            match scope
-                .resolver
-                .resolve_instance_method(&receiver, method_id.value, &args)?
-            {
-                Some(v) => Ok(v),
-                None => Err(BailReason::UnknownCall(format!(
-                    "->{}",
-                    String::from_utf8_lossy(method_id.value)
-                ))),
+            let dispatch =
+                match scope
+                    .resolver
+                    .resolve_instance_method(&receiver, method_id.value, &args)?
+                {
+                    Some(d) => d,
+                    None => {
+                        return Err(BailReason::UnknownCall(format!(
+                            "->{}",
+                            String::from_utf8_lossy(method_id.value)
+                        )))
+                    }
+                };
+
+            // Mutation handling (Inc-5 Task 3 — the soundness core).
+            match dispatch.mutated_this {
+                // Read-only method: the by-value model is exact regardless of
+                // aliasing. Just use the return value.
+                None => Ok(dispatch.ret),
+                // Mutator: PHP would write through the shared handle. Our model
+                // can only stay sound if the object is UNIQUELY OWNED *and* we
+                // have a binding to write the mutation back to.
+                Some(new_this) => {
+                    if receiver_aliased {
+                        // A second reference may exist → writing back to one
+                        // binding would diverge from PHP (which mutates both).
+                        return Err(BailReason::UnsupportedConstruct(
+                            "mutation of a possibly-aliased object".into(),
+                        ));
+                    }
+                    // Writeback is only possible (and sound) when the receiver is a
+                    // plain `$var` lvalue. A temporary / property / chain receiver
+                    // has no safe writeback target → bail (fail-closed).
+                    if let Expression::Variable(Variable::Direct(v)) = m.object {
+                        let key = var_name(v.name);
+                        scope.vars.insert(key, new_this);
+                        Ok(dispatch.ret)
+                    } else {
+                        Err(BailReason::UnsupportedConstruct(
+                            "mutating method on a non-assignable receiver (no writeback target)"
+                                .into(),
+                        ))
+                    }
+                }
             }
         }
         // `Class::method(args)` (Task E). self/parent/static → bail (no enclosing
@@ -2760,7 +2908,23 @@ fn eval_arguments(
                 if p.ellipsis.is_some() {
                     return Err(BailReason::UnsupportedConstruct("argument spread".into()));
                 }
-                out.push(eval_expr(p.value, scope)?);
+                let mut value = eval_expr(p.value, scope)?;
+                // Aliasing (Inc-5 Task 3): passing an object as an argument shares
+                // the HANDLE in PHP — the callee can mutate it and the caller sees
+                // the change. Our by-value clone would diverge. Mark the passed
+                // value aliased (so a mutation inside the callee bails) and, when
+                // the argument is a direct `$var`, mark the caller's binding aliased
+                // too (a later mutation back in the caller bails). Fail-closed.
+                if matches!(value, Value::Object { .. }) {
+                    value.mark_aliased();
+                    if let Expression::Variable(Variable::Direct(src)) = unwrap_parens(p.value) {
+                        let src_key = var_name(src.name);
+                        if let Some(src_val) = scope.vars.get_mut(&src_key) {
+                            src_val.mark_aliased();
+                        }
+                    }
+                }
+                out.push(value);
             }
             Argument::Named(_) => {
                 return Err(BailReason::UnsupportedConstruct("named argument".into()))
