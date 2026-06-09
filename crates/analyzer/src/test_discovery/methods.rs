@@ -267,13 +267,15 @@ fn method_to_test(
 ) -> Option<TestMethod> {
     let method_name = String::from_utf8_lossy(method.name.value).into_owned();
 
-    // PHPUnit collects ONLY public, non-static, non-abstract methods as tests. A
-    // protected/private/static/abstract `test*` (or `#[Test]`) method is never run
-    // as a test — surfacing it as a phantom row is a divergence, amplified by inc-4's
+    // PHPUnit collects every PUBLIC, non-abstract method as a test — its
+    // isTestMethod rule (Util/Test.php, gold-tested 10.5.63) rejects solely on
+    // `!isPublic()`; a `public static function testFoo()` (or static `#[Test]`) IS
+    // run and counted. A protected/private/abstract `test*` (or `#[Test]`) method is
+    // never run — surfacing it as a phantom row is a divergence, amplified by inc-4's
     // parent-chain surfacing onto every concrete descendant. A method with NO
     // visibility modifier is implicitly public (so we reject only an EXPLICIT
-    // protected/private read-visibility modifier).
-    if method.is_static() || method.is_abstract() {
+    // protected/private read-visibility modifier); static is allowed.
+    if method.is_abstract() {
         return None;
     }
     let is_non_public = method.modifiers.iter().any(|m| {
@@ -639,19 +641,23 @@ mod tests {
     }
 
     #[test]
-    fn only_public_non_static_methods_are_tests() {
-        // PHPUnit collects only PUBLIC, NON-STATIC, non-abstract `test*` methods.
-        // protected/private/static `test*` methods are NOT tests; emitting them as
-        // phantom rows (amplified by inc-4's parent-chain surfacing) is a divergence.
+    fn only_public_methods_are_tests() {
+        // PHPUnit (gold-tested 10.5.63) collects every PUBLIC, non-abstract `test*`
+        // method, INCLUDING `public static` ones — its isTestMethod rule rejects
+        // solely on `!isPublic()`. protected/private `test*` methods are NOT tests;
+        // emitting them as phantom rows (amplified by inc-4's parent-chain surfacing)
+        // is a divergence, but a public static one is RUN and COUNTED, so dropping it
+        // would be an under-count divergence.
         let (_d, project) = project_with(
-            "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass VisTest extends TestCase {\n  public function testPublic(): void {}\n  protected function testProtected(): void {}\n  private function testPrivate(): void {}\n  public static function testStatic(): void {}\n}",
+            "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass VisTest extends TestCase {\n  public function testPublic(): void {}\n  public static function testStaticPrefixed(): void {}\n  protected function testProtected(): void {}\n  private function testPrivate(): void {}\n}",
         );
         let methods = find_test_methods(&project, &["VisTest".to_string()]);
         let names: Vec<String> = methods.iter().map(|m| m.method.clone()).collect();
         assert_eq!(
             names,
-            vec!["testPublic".to_string()],
-            "only the public non-static test method must be collected; got {names:?}"
+            vec!["testPublic".to_string(), "testStaticPrefixed".to_string()],
+            "every PUBLIC test method (static included) must be collected, \
+             protected/private excluded; got {names:?}"
         );
     }
 }
