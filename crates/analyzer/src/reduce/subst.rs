@@ -471,6 +471,10 @@ impl BridgeResolver<'_> {
             Some(m) => m,
             None => return Ok(None),
         };
+        // Fail-closed: a declared ancestor outside the scanned codebase carries
+        // ext-internal state the record cannot model — never construct an empty
+        // shell (it would compare as `{}` and diverge from PHPUnit, false green).
+        self.bail_unresolvable_declared_ancestry(class, false)?;
         let record_class = class_meta.original_name.as_bytes().to_vec();
         let class_file = self
             .project
@@ -594,6 +598,10 @@ impl BridgeResolver<'_> {
         let Some(class_meta) = codebase.get_class_like(class_key.as_bytes()) else {
             return Ok(None);
         };
+        // Fail-closed on a declared ancestor missing from the scan, EXCEPT the
+        // PHPUnit `TestCase` base (never scanned project-only; its internal
+        // state is never part of a compared record).
+        self.bail_unresolvable_declared_ancestry(class_key.as_bytes(), true)?;
         let record_class = class_meta.original_name.as_bytes().to_vec();
 
         // 1) Seed plain literal property defaults from the class AND every ancestor
@@ -724,6 +732,61 @@ impl BridgeResolver<'_> {
                     hints.extend(collect_scalar_property_hints(trait_node.members.iter()));
                 }
             });
+    }
+
+    /// Walk the DECLARED `extends` chain of `start_key` and BAIL (fail-closed)
+    /// when any ancestor class is absent from the scanned codebase.
+    ///
+    /// Each hop is the AST extends name the scanner recorded
+    /// (`direct_parent_class`, present even when the parent never resolved —
+    /// mago's `all_parent_classes` may OMIT unknown parents, so it cannot be
+    /// trusted for this check). An absent ancestor means ext-internal state the
+    /// record cannot carry (\DateTime's wall-clock instant, \Exception's
+    /// file/line/trace): constructing it as an empty shell made
+    /// `assertEquals(new MyDate(), new MyDate())` compare `{} == {}` → a FALSE
+    /// GREEN against PHPUnit's comparator chain. Interfaces carry no state, so
+    /// only the extends chain matters.
+    ///
+    /// `exempt_phpunit_test_case`: the test-case `$this` builder runs with the
+    /// PHPUnit `TestCase` base exempt — a project-only (vendor-excluded) scan
+    /// never carries it, and the `$this` record's TestCase-internal state is
+    /// never compared (assertions on `$this` itself bail elsewhere). The walk
+    /// stops there: nothing above an absent class is reachable anyway.
+    fn bail_unresolvable_declared_ancestry(
+        &self,
+        start_key: &[u8],
+        exempt_phpunit_test_case: bool,
+    ) -> Result<(), BailReason> {
+        const TESTCASE_FQCN_LOWER: &[u8] = b"phpunit\\framework\\testcase";
+        let codebase = self.project.codebase();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut current = normalize_fqcn(start_key).to_ascii_lowercase();
+        loop {
+            if seen.contains(&current) {
+                // Declared-extends cycle (malformed source): every hop so far
+                // resolved, nothing new to verify.
+                return Ok(());
+            }
+            let Some(meta) = codebase.get_class_like(&current) else {
+                // The caller verified `start_key` resolves; defensive only.
+                return Ok(());
+            };
+            let Some(parent) = &meta.direct_parent_class else {
+                return Ok(()); // reached a root class: the whole chain resolved.
+            };
+            let parent_key = normalize_fqcn(parent.as_bytes()).to_ascii_lowercase();
+            if codebase.get_class_like(&parent_key).is_none() {
+                if exempt_phpunit_test_case && parent_key == TESTCASE_FQCN_LOWER {
+                    return Ok(());
+                }
+                return Err(BailReason::UnsupportedConstruct(format!(
+                    "class extends `{}`, a class not in the codebase (ext-internal state unmodelled)",
+                    String::from_utf8_lossy(parent.as_bytes()),
+                )));
+            }
+            seen.push(current);
+            current = parent_key;
+        }
     }
 
     /// Collect a class's USED-TRAIT scalar property hints into `hints` (round 5),
@@ -977,8 +1040,18 @@ fn seed_plain_property_defaults(
                 }
                 for item in plain.items.iter() {
                     match item {
-                        // No default → leave unset (read-before-init bails later).
-                        PropertyItem::Abstract(_) => {}
+                        // No default: an UNTYPED `public $x;` is initialized to
+                        // NULL by PHP (exact semantics) — leaving it unset made
+                        // `{x:null}` vs `{}` a prop-count mismatch (false red).
+                        // A TYPED defaultless prop stays UNSET: it is
+                        // uninitialized in PHP and absent from both `==` and the
+                        // comparator chain (gold-verified) — seeding it NULL
+                        // would diverge; a read of it bails later, fail-closed.
+                        PropertyItem::Abstract(a) => {
+                            if plain.hint.is_none() {
+                                set_prop(props, strip_dollar(a.variable.name), Value::Null);
+                            }
+                        }
                         PropertyItem::Concrete(c) => {
                             // A non-literal default (function call, new, etc.) bails.
                             let mut scope = Scope::new(HashMap::new(), &NoResolver);
@@ -1390,6 +1463,47 @@ mod tests {
                 )
             })
             .expect("with_program")
+    }
+
+    /// Defense-in-depth for the `$this` builder: a (would-be) test class whose
+    /// DECLARED ancestry leaves the scanned codebase through a NON-TestCase
+    /// ancestor must bail — its parent's state is unmodelled.
+    #[test]
+    fn build_this_bails_on_unresolvable_non_testcase_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Code.php"),
+            "<?php class WeirdBase extends \\Some\\Vendor\\Base {}\nclass MyTest extends WeirdBase {}",
+        )
+        .unwrap();
+        let project = MagoProject::load(dir.path()).unwrap();
+        let resolver = BridgeResolver::new(&project);
+        let res = resolver.build_test_case_this("MyTest");
+        assert!(
+            matches!(res, Err(BailReason::UnsupportedConstruct(_))),
+            "an unresolvable non-TestCase ancestor must bail the $this build; got {res:?}"
+        );
+    }
+
+    /// The PHPUnit `TestCase` base is EXEMPT from the unresolvable-ancestry
+    /// bail in the `$this` builder: a project-only scan never carries it, and
+    /// the `$this` record's TestCase-internal state is never compared
+    /// (assertions on `$this` itself bail elsewhere).
+    #[test]
+    fn build_this_exempts_absent_phpunit_testcase_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Code.php"),
+            "<?php class MyTest extends \\PHPUnit\\Framework\\TestCase { public $n = 1; }",
+        )
+        .unwrap();
+        let project = MagoProject::load(dir.path()).unwrap();
+        let resolver = BridgeResolver::new(&project);
+        let res = resolver.build_test_case_this("MyTest");
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "the absent PHPUnit TestCase ancestor is exempt — $this must build; got {res:?}"
+        );
     }
 
     fn find_method_block<'a>(

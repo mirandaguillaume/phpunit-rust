@@ -1476,4 +1476,159 @@ class TraitUntypedTest extends TestCase {
         );
         assert_eq!(reduced[0].outcome, Outcome::Pass, "got {reduced:?}");
     }
+
+    #[test]
+    fn ext_ancestor_construction_bails_not_false_green() {
+        // FALSE GREEN (gold-verified): `class MyDate extends \DateTime {}` — the
+        // parent is NOT in a project-only scan (no PHP stubs), so its internal
+        // state (the wall-clock instant) is unmodelled and a no-arg `new MyDate()`
+        // built an EMPTY record. `assertEquals(new MyDate(), new MyDate())` then
+        // compared {} == {} → Pass, while real PHPUnit routes the pair through
+        // DateTimeComparator (compares the two instants). Construction must BAIL.
+        let dir = write_suite(&[(
+            "ExtDateTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class MyDate extends \DateTime {}
+class ExtDateTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new MyDate(), new MyDate());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("ExtDateTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        match &reduced[0].outcome {
+            Outcome::Bailed(BailReason::UnsupportedConstruct(m)) => assert!(
+                m.contains("not in the codebase"),
+                "the bail must name the unresolvable ancestor; got {m:?}"
+            ),
+            other => panic!(
+                "constructing a subclass of an unscanned ext class must BAIL \
+                 (ext-internal state unmodelled), never a false green; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn ext_ancestor_loose_eq_bails_not_false_green() {
+        // FALSE GREEN, `==` operator path: `class MyEx extends \Exception {}` —
+        // two fresh instances are NOT loosely equal in PHP (file/line/trace
+        // differ), but two empty records compared {} == {} → true → a false
+        // green on assertTrue. Construction must BAIL before `==` is reached.
+        let dir = write_suite(&[(
+            "ExtExTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class MyEx extends \Exception {}
+class ExtExTest extends TestCase {
+    public function testLooseEq(): void {
+        $a = new MyEx();
+        $b = new MyEx();
+        $this->assertTrue($a == $b);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("ExtExTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Bailed(_)),
+            "an ext-subclass instance must never reach `==` as an empty record; \
+             got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn ext_ancestor_two_hops_up_still_bails() {
+        // The unresolvable ancestor is the GRANDPARENT — the DECLARED extends
+        // chain must be walked transitively (mago's `all_parent_classes` may
+        // omit unknown parents, so each hop's declared name is checked).
+        let dir = write_suite(&[(
+            "ExtDeepTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class Mid extends \ArrayObject {}
+class Leaf extends Mid {}
+class ExtDeepTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new Leaf(), new Leaf());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("ExtDeepTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(
+                reduced[0].outcome,
+                Outcome::Bailed(BailReason::UnsupportedConstruct(_))
+            ),
+            "the unresolvable GRANDPARENT must bail construction too; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn untyped_defaultless_prop_seeds_null_not_false_red() {
+        // FALSE RED (gold-verified): PHP initializes an UNTYPED defaultless
+        // `public $x;` to NULL. Leaving it unseeded made {x:null} vs {} a
+        // prop-count mismatch → reducer Fail while real PHPUnit PASSES.
+        // Seeding NULL is exact PHP semantics → Pass (EXACT, not a bail).
+        let dir = write_suite(&[(
+            "UntypedPropTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class Holder {
+    public $x;
+    public function __construct(int $w) { if ($w) { $this->x = null; } }
+}
+class UntypedPropTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new Holder(1), new Holder(0));
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("UntypedPropTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "an untyped defaultless property defaults to NULL in PHP — both \
+             records are {{x:null}}; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn typed_defaultless_prop_control_keeps_failing() {
+        // Control (gold-aligned): a TYPED defaultless `public ?int $x;` is
+        // UNINITIALIZED in PHP — absent from `==` and from the comparator
+        // chain's property set on BOTH sides. It must NOT be seeded NULL:
+        // {x:null} vs {} is a real FAIL in PHPUnit too (ObjectComparator's
+        // toArray omits the uninitialized side). Current behavior is correct
+        // and must stay byte-identical after the untyped-prop fix.
+        let dir = write_suite(&[(
+            "TypedPropTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class THolder {
+    public ?int $x;
+    public function __construct(int $w) { if ($w) { $this->x = null; } }
+}
+class TypedPropTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new THolder(1), new THolder(0));
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("TypedPropTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Fail(_)),
+            "a typed defaultless property stays UNSET (gold-aligned Fail); \
+             got {reduced:?}"
+        );
+    }
 }
