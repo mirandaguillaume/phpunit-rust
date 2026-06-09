@@ -2084,35 +2084,78 @@ fn eval_assignment(
     let mut new_val = new_val;
     if matches!(new_val, Value::Object { .. }) && !is_fresh_instantiation(a.rhs) {
         new_val.mark_aliased();
-        match unwrap_parens(a.rhs) {
-            // `$x = $src` — both names now alias the same object: mark the SOURCE
-            // binding aliased too, so a later mutating method on EITHER bails.
-            Expression::Variable(Variable::Direct(src)) => {
-                let src_key = var_name(src.name);
-                if let Some(src_val) = scope.vars.get_mut(&src_key) {
-                    src_val.mark_aliased();
-                }
-            }
-            // CHAINED assignment `$a = $b = <obj>` (Round 6 finding 1): the inner
-            // `$b = <obj>` already bound `$b`, but its result is now ALSO bound to
-            // `$a` (this enclosing assignment), so `$b` and `$a` alias the same
-            // object even when the inner rhs was a fresh `new`. Mark the inner
-            // just-bound var aliased so a later mutation on it bails (fail-closed).
-            Expression::Assignment(inner) => {
-                if let Expression::Variable(Variable::Direct(inner_var)) = unwrap_parens(inner.lhs)
-                {
-                    let inner_key = var_name(inner_var.name);
-                    if let Some(inner_val) = scope.vars.get_mut(&inner_key) {
-                        inner_val.mark_aliased();
-                    }
-                }
-            }
-            _ => {}
-        }
+        // Symmetric with the unconditional `new_val.mark_aliased()` above: the
+        // stored copy is marked for ANY non-fresh-`new` object rhs, so the SOURCE
+        // side must be EQUALLY exhaustive over every value-forwarding form — else a
+        // forwarded source binding stays unmarked and a later mutating method on it
+        // writes back only to it, leaving the stored copy a stale by-value clone (a
+        // 0-divergence wrong Pass/Fail). Recurse all forwarding shapes (ternary/
+        // elvis/parens/chained-assignment), marking each reachable direct source.
+        mark_alias_sources(a.rhs, scope);
     }
 
     scope.vars.insert(key, new_val.clone());
     Ok(new_val)
+}
+
+/// Mark every direct-variable SOURCE binding reachable through the value-forwarding
+/// expression `expr` as possibly-aliased (Inc-5 Task 3, source side). Called when
+/// an object-valued rhs that is NOT a fresh `new` is assigned: such an rhs may hand
+/// the SAME object handle to the new binding, so every source it could forward must
+/// alias too (a later mutating method on EITHER then bails — fail-closed). This is
+/// the exhaustive counterpart to the unconditional `new_val.mark_aliased()`; over-
+/// marking only over-bails, never diverges. The forms that can forward an existing
+/// object value are: a direct variable copy `$src` (the base case); parentheses
+/// `($e)` (unwrap and recurse); a chained inner assignment `$a = $e` (the inner
+/// just-bound var AND whatever the inner rhs forwarded both alias); a ternary
+/// `$c ? $t : $e` (BOTH branches may be selected at runtime — recurse both); and the
+/// elvis operator `$c ?: $e` (the truthy result is `$c` itself, `then == None`, so
+/// recurse the condition AND the else branch). `match` cannot reach here (it bails
+/// in `eval_expr`); its arms are recursed defensively in case that ever changes.
+fn mark_alias_sources(expr: &Expression, scope: &mut Scope) {
+    match expr {
+        // `$src` — the base case: both names now alias the same object.
+        Expression::Variable(Variable::Direct(src)) => {
+            let src_key = var_name(src.name);
+            if let Some(src_val) = scope.vars.get_mut(&src_key) {
+                src_val.mark_aliased();
+            }
+        }
+        // `($e)` — strip parentheses and recurse.
+        Expression::Parenthesized(p) => mark_alias_sources(p.expression, scope),
+        // CHAINED assignment `$a = $b = <obj>` (Round 6 finding 1): the inner
+        // `$b = <obj>` already bound `$b`, but its result is now ALSO bound to this
+        // enclosing target, so `$b` aliases too — mark the inner just-bound var, and
+        // recurse the inner rhs (it may itself forward further sources).
+        Expression::Assignment(inner) => {
+            mark_alias_sources(inner.lhs, scope);
+            mark_alias_sources(inner.rhs, scope);
+        }
+        // `$c ? $t : $e` / `$c ?: $e`: we cannot know statically which branch is
+        // selected, so EVERY branch that could be forwarded must alias. For the
+        // elvis form (`then == None`) the truthy result is the CONDITION itself, so
+        // recurse the condition too.
+        Expression::Conditional(c) => {
+            match c.then {
+                Some(then_expr) => mark_alias_sources(then_expr, scope),
+                None => mark_alias_sources(c.condition, scope),
+            }
+            mark_alias_sources(c.r#else, scope);
+        }
+        // `match (…) { … }` — bails in `eval_expr` before reaching an assignment,
+        // but recurse its arm bodies defensively (fail-closed) in case that changes.
+        Expression::Match(m) => {
+            use mago_syntax::ast::ast::MatchArm;
+            for arm in m.arms.iter() {
+                match arm {
+                    MatchArm::Expression(e) => mark_alias_sources(e.expression, scope),
+                    MatchArm::Default(d) => mark_alias_sources(d.expression, scope),
+                }
+            }
+        }
+        // Any other rhs cannot forward an existing direct-variable binding.
+        _ => {}
+    }
 }
 
 /// Strip `(…)` parentheses to reach the inner expression (for alias-source and
@@ -3979,6 +4022,147 @@ mod tests {
         );
         assert_eq!(
             run_body("$this->assertSame(3, count([1, 2, 3]));", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    // ── object-aliasing source-marking (recurse value-forwarding exprs) ──
+    //
+    // Models a minimal `class Box { public int $v = 0; function inc(): void {
+    // $this->v++; } }`: `new Box()` yields `{v: 0}`, and `inc()` is a MUTATOR that
+    // returns void and writes back `{v: $v + 1}`. This lets the unit layer exercise
+    // the mutating-method dispatch path (NoResolver would bail on any `->inc()`).
+    struct BoxResolver;
+
+    impl CallResolver for BoxResolver {
+        fn resolve_function(
+            &self,
+            _name: &[u8],
+            _args: &[Value],
+        ) -> Result<Option<Value>, BailReason> {
+            Ok(None)
+        }
+
+        fn construct(&self, class: &[u8], _args: &[Value]) -> Result<Option<Value>, BailReason> {
+            if class == b"Box" {
+                Ok(Some(make_object(
+                    b"Box".to_vec(),
+                    vec![(b"v".to_vec(), Value::Int(0))],
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn resolve_instance_method(
+            &self,
+            this: &Value,
+            method: &[u8],
+            _args: &[Value],
+        ) -> Result<Option<MethodDispatch>, BailReason> {
+            if method != b"inc" {
+                return Ok(None);
+            }
+            let Value::Object { class, props, .. } = this else {
+                return Ok(None);
+            };
+            if class.as_slice() != b"Box" {
+                return Ok(None);
+            }
+            // `$this->v++` — read the current `v`, write back the incremented record.
+            let cur = props
+                .iter()
+                .find(|(k, _)| k.as_slice() == b"v")
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Int(0));
+            let next = match cur {
+                Value::Int(n) => Value::Int(n + 1),
+                _ => return Err(BailReason::TypeError("Box::v is not an int".into())),
+            };
+            let mutated = make_object(b"Box".to_vec(), vec![(b"v".to_vec(), next)]);
+            Ok(Some(MethodDispatch {
+                ret: Value::Null,
+                mutated_this: Some(mutated),
+            }))
+        }
+    }
+
+    /// Like [`run_body`] but with a pluggable resolver (so a body can call
+    /// `new Box()` / `$x->inc()`).
+    fn run_body_with(body: &str, resolver: &dyn CallResolver) -> Outcome {
+        let full = format!("<?php function __t() {{ {} }}", body);
+        let arena = Bump::new();
+        let file = File::ephemeral(
+            std::borrow::Cow::Borrowed(b"eval.php".as_slice()),
+            std::borrow::Cow::Owned(full.into_bytes()),
+        );
+        let program = parse_file(&arena, &file);
+        let block = first_function_block(program).expect("function block");
+        run_method_body_inner(block, HashMap::new(), resolver, None, Some(&file.contents))
+    }
+
+    #[test]
+    fn ternary_aliasing_source_marking_bails() {
+        // `$b = true ? $a : $a` forwards the existing object `$a` into `$b` — both
+        // names now alias the SAME handle. The rhs is a `Conditional`, not a direct
+        // variable, so before the recursive source-marking fix the SOURCE `$a` was
+        // left unmarked: a later `$a->inc()` wrote back only to `$a`, leaving `$b` a
+        // stale by-value clone (v == 0) → a false-green divergence (reducer reported
+        // Fail while real PHP — same handle — Passes with $b->v === 1). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = true ? $a : $a; $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "ternary-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn elvis_aliasing_source_marking_bails() {
+        // `$b = $a ?: new Box()` — the elvis lhs (`$a`, truthy) is forwarded into
+        // `$b`, aliasing the same handle. The lhs lives in `Conditional.condition`
+        // (with `then == None`); before the fix it was never source-marked, so a
+        // later `$a->inc()` left `$b` stale → wrong Fail. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = $a ?: new Box(); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "elvis-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn unique_owner_mutation_still_passes() {
+        // No aliasing: `$o` is the sole reference to its `Box`. A mutating method on
+        // a uniquely-owned object is exact under the by-value model → must PASS (the
+        // recursive source-marking must not over-bail this control).
+        assert_eq!(
+            run_body_with(
+                "$o = new Box(); $o->inc(); $this->assertSame(1, $o->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn two_independent_boxes_each_mutated_still_passes() {
+        // Two distinct, uniquely-owned boxes, each mutated independently — no alias
+        // between them → both mutations are exact → must PASS (no over-bail).
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $a->inc(); $b->inc(); $b->inc(); \
+                 $this->assertSame(1, $a->v); $this->assertSame(2, $b->v);",
+                &BoxResolver
+            ),
             Outcome::Pass
         );
     }
