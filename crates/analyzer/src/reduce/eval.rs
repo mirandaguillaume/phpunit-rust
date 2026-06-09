@@ -2104,14 +2104,28 @@ fn eval_assignment(
 /// the SAME object handle to the new binding, so every source it could forward must
 /// alias too (a later mutating method on EITHER then bails — fail-closed). This is
 /// the exhaustive counterpart to the unconditional `new_val.mark_aliased()`; over-
-/// marking only over-bails, never diverges. The forms that can forward an existing
-/// object value are: a direct variable copy `$src` (the base case); parentheses
-/// `($e)` (unwrap and recurse); a chained inner assignment `$a = $e` (the inner
-/// just-bound var AND whatever the inner rhs forwarded both alias); a ternary
-/// `$c ? $t : $e` (BOTH branches may be selected at runtime — recurse both); and the
-/// elvis operator `$c ?: $e` (the truthy result is `$c` itself, `then == None`, so
-/// recurse the condition AND the else branch). `match` cannot reach here (it bails
-/// in `eval_expr`); its arms are recursed defensively in case that ever changes.
+/// marking only over-bails, never diverges.
+///
+/// COMPLETE set of value-forwarding forms this must cover (an object handle reaches
+/// the new binding unchanged through each):
+///   - `$src` — a direct variable copy (the base case);
+///   - `($e)` — parentheses (unwrap and recurse);
+///   - `$a = $e` — a chained inner assignment (the inner just-bound var AND whatever
+///     the inner rhs forwarded both alias);
+///   - `$c ? $t : $e` — a ternary (BOTH branches may be selected at runtime — recurse
+///     both) and the elvis `$c ?: $e` (the truthy result is `$c` itself,
+///     `then == None`, so recurse the condition AND the else branch);
+///   - `$l ?? $r` — null-coalesce (when `$l` is a non-null object PHP forwards `$l`;
+///     when `$l` is null it forwards the default `$r` — recurse BOTH operands). The
+///     parenthesized `($l ?? $r)` is covered via the `Parenthesized` arm above.
+///
+/// Every OTHER object-producing form is handled elsewhere, so this set is exhaustive
+/// for SOURCE aliasing: `match` / `clone` / casts / static-property reads either bail
+/// (in `eval_expr`) or cannot forward an existing direct binding; a fresh `new C(...)`
+/// is uniquely owned (no source to mark); method/function calls are covered by arg-
+/// pass marking and fluent-return marking; property reads are clone-marked in
+/// `eval_property_read`. `match` cannot reach here (it bails in `eval_expr`); its arms
+/// are recursed defensively in case that ever changes.
 fn mark_alias_sources(expr: &Expression, scope: &mut Scope) {
     match expr {
         // `$src` — the base case: both names now alias the same object.
@@ -2141,6 +2155,17 @@ fn mark_alias_sources(expr: &Expression, scope: &mut Scope) {
                 None => mark_alias_sources(c.condition, scope),
             }
             mark_alias_sources(c.r#else, scope);
+        }
+        // `$l ?? $r` — null-coalesce. PHP forwards `$l` when it is a non-null object
+        // and the default `$r` when `$l` is null; we cannot know statically which, so
+        // recurse BOTH operands (fail-closed). This is `Expression::Binary` with
+        // `BinaryOperator::NullCoalesce` — a DIFFERENT AST node than `Conditional`, so
+        // without this arm `$b = $a ?? $d` hit the `_ => {}` no-op and left the source
+        // `$a` unmarked → a later `$a->inc()` diverged. The parenthesized form
+        // `($l ?? $r)` is reached through the `Parenthesized` arm above.
+        Expression::Binary(b) if matches!(b.operator, BinaryOperator::NullCoalesce(_)) => {
+            mark_alias_sources(b.lhs, scope);
+            mark_alias_sources(b.rhs, scope);
         }
         // `match (…) { … }` — bails in `eval_expr` before reaching an assignment,
         // but recurse its arm bodies defensively (fail-closed) in case that changes.
@@ -4136,6 +4161,47 @@ mod tests {
                 Outcome::Bailed(_)
             ),
             "elvis-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn null_coalesce_aliasing_source_marking_bails() {
+        // `$b = $a ?? new Box()` — `$a` is a non-null object, so PHP short-circuits
+        // the `??` and forwards the SAME handle into `$b` (`$a === $b`). The rhs is
+        // an `Expression::Binary` with `BinaryOperator::NullCoalesce`, a DIFFERENT
+        // AST node than `Conditional`; before the null-coalesce source-marking fix it
+        // hit the `_ => {}` no-op arm, leaving the source `$a` unmarked. A later
+        // `$a->inc()` then wrote back only to `$a`, leaving `$b` a stale by-value
+        // clone (v == 0) → a false-green divergence (reducer reported Fail while real
+        // PHP — same handle — Passes with $b->v === 1). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = $a ?? new Box(); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "null-coalesce-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn parenthesized_null_coalesce_aliasing_source_marking_bails() {
+        // `$b = ($a ?? new Box())` — the parenthesized variant: `Parenthesized`
+        // unwraps into the same `Binary`/`NullCoalesce` node, so the fix covers it
+        // too. The non-null object `$a` is forwarded into `$b` (same handle); the
+        // source `$a` must be marked or a later `$a->inc()` leaves `$b` stale → wrong
+        // Fail. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = ($a ?? new Box()); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "parenthesized null-coalesce-forwarded alias source must bail, not diverge"
         );
     }
 
