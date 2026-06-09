@@ -1937,6 +1937,55 @@ $this->assertSame(1, $a->value()); $this->assertSame(11, $b->value());",
         );
     }
 
+    #[test]
+    fn mutation_of_chained_assignment_alias_bails() {
+        // Round 6 finding 1: chained assignment `$a = $b = new Counter(0)`. The
+        // inner `$b = new Counter(0)` is a fresh instantiation → `$b` non-aliased;
+        // the outer `$a = $b` aliases the SAME object. PHP: `$b->inc()` is visible
+        // via `$a` (assertSame(1, 1) Pass). Our by-value model would mutate only
+        // `$b`'s binding while `$a` stays at 0 → assertSame(1, 0) Fail = DIVERGENCE.
+        // The whitelist guard must mark the inner just-bound `$b` aliased (its value
+        // is reused by the enclosing assignment) so `$b->inc()` BAILS.
+        let src =
+            counter_test("$a = $b = new Counter(0); $b->inc(); $this->assertSame(1, $a->value());");
+        let outcome = reduce_with_subst(&src, "CounterTest", "testX", vec![]);
+        assert!(
+            matches!(outcome, Outcome::Bailed(_)),
+            "mutation through a chained-assignment alias must bail, never diverge; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn mutation_after_fluent_self_return_bails() {
+        // Round 6 finding 2: fluent `$d = $c->bump()` where `bump()` mutates `$this`
+        // and `return $this`. PHP: `$d` and `$c` are the SAME object; the second
+        // `$c->bump()` is visible via `$d` (assertSame(2, 2) Pass). Our by-value
+        // model writes the mutation back to `$c` but `$d` is an unswept copy → the
+        // second mutation lands only on `$c`, `$d->value()` reads 1 → assertSame(2, 1)
+        // Fail = DIVERGENCE. A mutating dispatch that returns a Value::Object must
+        // mark BOTH the written-back receiver and the returned value aliased so the
+        // second `$c->bump()` BAILS.
+        let src = format!(
+            "{COUNTER_SRC_FLUENT}class CounterTest {{ public function testX(): void {{ \
+$c = new Counter(0); $d = $c->bump(); $c->bump(); $this->assertSame(2, $d->value()); }} }}\n"
+        );
+        let outcome = reduce_with_subst(&src, "CounterTest", "testX", vec![]);
+        assert!(
+            matches!(outcome, Outcome::Bailed(_)),
+            "mutation after a fluent self-return alias must bail, never diverge; got {outcome:?}"
+        );
+    }
+
+    // Counter with a fluent mutator `bump(): static { ...; return $this; }`.
+    const COUNTER_SRC_FLUENT: &str = r#"<?php
+final class Counter {
+    public function __construct(public int $n) {}
+    public function inc(): void { $this->n = $this->n + 1; }
+    public function bump(): static { $this->n = $this->n + 1; return $this; }
+    public function value(): int { return $this->n; }
+}
+"#;
+
     // ── Inc-5 Task 4: class-constant access (literal const table + ::class) ──
 
     #[test]

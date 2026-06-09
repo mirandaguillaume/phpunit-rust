@@ -1044,6 +1044,13 @@ fn exec_foreach(
 
     for (key, val) in items {
         scope.tick()?;
+        // Aliasing defense-in-depth (Round 6): a non-reference foreach binds a COPY
+        // of each element, but for an OBJECT element PHP copies the HANDLE — the
+        // array still holds the same instance, so the loop variable aliases it.
+        // Mark each bound object aliased so a mutating method in the loop body bails
+        // (a `foreach (&$v)` by-ref target would already bail upstream). Fail-closed.
+        let mut val = val;
+        val.mark_aliased();
         match &f.target {
             ForeachTarget::Value(t) => {
                 bind_lvalue(t.value, val, scope)?;
@@ -1414,7 +1421,16 @@ fn eval_property_read(
         )));
     };
     match props.iter().find(|(k, _)| k.as_slice() == prop_id.value) {
-        Some((_, v)) => Ok(v.clone()),
+        Some((_, v)) => {
+            // Aliasing defense-in-depth (Round 6 finding 3): reading a nested
+            // `Value::Object` property yields a SECOND reference to that object —
+            // the parent record still holds it. Our by-value clone of the read
+            // would let a later mutation of the read-out object silently diverge
+            // from the parent's copy. Mark the returned clone aliased (fail-closed).
+            let mut out = v.clone();
+            out.mark_aliased();
+            Ok(out)
+        }
         // PHP would warn + return null for an undefined property; we bail
         // (an unseeded prop usually means a default/hook we did not model).
         None => Err(BailReason::UnsupportedConstruct(format!(
@@ -2063,11 +2079,30 @@ fn eval_assignment(
     let mut new_val = new_val;
     if matches!(new_val, Value::Object { .. }) && !is_fresh_instantiation(a.rhs) {
         new_val.mark_aliased();
-        if let Expression::Variable(Variable::Direct(src)) = unwrap_parens(a.rhs) {
-            let src_key = var_name(src.name);
-            if let Some(src_val) = scope.vars.get_mut(&src_key) {
-                src_val.mark_aliased();
+        match unwrap_parens(a.rhs) {
+            // `$x = $src` — both names now alias the same object: mark the SOURCE
+            // binding aliased too, so a later mutating method on EITHER bails.
+            Expression::Variable(Variable::Direct(src)) => {
+                let src_key = var_name(src.name);
+                if let Some(src_val) = scope.vars.get_mut(&src_key) {
+                    src_val.mark_aliased();
+                }
             }
+            // CHAINED assignment `$a = $b = <obj>` (Round 6 finding 1): the inner
+            // `$b = <obj>` already bound `$b`, but its result is now ALSO bound to
+            // `$a` (this enclosing assignment), so `$b` and `$a` alias the same
+            // object even when the inner rhs was a fresh `new`. Mark the inner
+            // just-bound var aliased so a later mutation on it bails (fail-closed).
+            Expression::Assignment(inner) => {
+                if let Expression::Variable(Variable::Direct(inner_var)) = unwrap_parens(inner.lhs)
+                {
+                    let inner_key = var_name(inner_var.name);
+                    if let Some(inner_val) = scope.vars.get_mut(&inner_key) {
+                        inner_val.mark_aliased();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2753,8 +2788,21 @@ fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
                     // has no safe writeback target → bail (fail-closed).
                     if let Expression::Variable(Variable::Direct(v)) = m.object {
                         let key = var_name(v.name);
+                        // Fluent self-return (Round 6 finding 2): when a MUTATING
+                        // method returns a `Value::Object` (typically `return $this`),
+                        // the returned value and the written-back receiver are the
+                        // SAME object in PHP. Our by-value model hands back an
+                        // unswept clone, so a subsequent mutation of EITHER would
+                        // diverge. Mark BOTH the written-back receiver binding AND
+                        // the returned value aliased so any later mutation bails.
+                        let mut new_this = new_this;
+                        let mut ret = dispatch.ret;
+                        if matches!(ret, Value::Object { .. }) {
+                            new_this.mark_aliased();
+                            ret.mark_aliased();
+                        }
                         scope.vars.insert(key, new_this);
-                        Ok(dispatch.ret)
+                        Ok(ret)
                     } else {
                         Err(BailReason::UnsupportedConstruct(
                             "mutating method on a non-assignable receiver (no writeback target)"
