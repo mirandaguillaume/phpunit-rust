@@ -1222,14 +1222,15 @@ fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
         }
         b"assertEquals" => {
             let (e, a) = two_args(args)?;
-            // assertEquals on a closure is reference identity (no heap model) → bail
-            // rather than let php_loose_eq short-circuit to a false-green result.
-            bail_if_closure_operand(e, a)?;
+            // assertEquals on a closure is reference identity, and on a mixed
+            // object/non-object pair PHP CONVERTS (truthiness/int/__toString) →
+            // bail rather than let php_loose_eq short-circuit to a false green.
+            bail_if_object_mixed_loose(e, a)?;
             pass(assert_equals(e, a), "assertEquals")
         }
         b"assertNotEquals" => {
             let (e, a) = two_args(args)?;
-            bail_if_closure_operand(e, a)?;
+            bail_if_object_mixed_loose(e, a)?;
             pass(!assert_equals(e, a), "assertNotEquals")
         }
         b"assertTrue" => {
@@ -1310,17 +1311,86 @@ fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
     Ok(())
 }
 
-/// `==`/`!=`/`assertEquals`/`assertNotEquals` on a `Value::Closure` is reference
-/// identity in PHP (two closures are `==` iff they are the SAME instance). The
-/// reducer models no heap identity, so it MUST abstain when either operand is —
-/// or reachably contains (array element / object prop, `php_loose_eq` recurses
-/// into both) — a closure; otherwise the nested compare short-circuits to
-/// `false` and produces a false-green Pass (Inc-4 Task 4). Plain closure-free
-/// objects stay modelable per-class + per-prop (gate on Closure only).
-fn bail_if_closure_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
-    if contains_closure(a) || contains_closure(b) {
+/// Walks both loose-equality operands IN PARALLEL, the same way
+/// [`Value::php_loose_eq`] recurses, and reports `true` when the comparison
+/// reaches a pair the model cannot soundly compute:
+///
+/// - (Closure, anything) at any aligned position → unmodelled (closure `==` is
+///   reference identity; was `bail_if_closure_operand`, subsumed here).
+/// - (Object, non-Object) at any aligned position → unmodelled: PHP CONVERTS
+///   under loose `==` — `$o == true` is object TRUTHINESS (true), `$o == 1`
+///   casts the object to int 1 (+ Notice), `$o == "s"` invokes `__toString`.
+///   Computing `false` here was a false green (`assertFalse($o == true)`
+///   Passed in the reducer while PHPUnit Fails).
+/// - (Object, Object) stays MODELED (structural: per-class + per-prop) — only
+///   the aligned prop pairs `php_loose_eq` actually visits are walked.
+/// - (Arr, Arr) recurses over the key-aligned element pairs `php_loose_eq`
+///   visits. Where `php_loose_eq` short-circuits to `false` WITHOUT comparing
+///   (length or class/prop-set mismatch, missing key), that `false` is the
+///   real PHP answer, so only an unvisited closure forces a bail (preserving
+///   the old closure guard's conservatism).
+/// - (Arr, non-Arr) holding an object/closure anywhere → unmodelled: PHP
+///   array==non-array is false EXCEPT vs bool, where ARRAY TRUTHINESS applies
+///   (`[new C] == true` is TRUE) — bail the whole family rather than guess.
+fn loose_eq_pair_unmodelled(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Closure(_), _) | (_, Closure(_)) => true,
+        (
+            Object {
+                class: ca,
+                props: pa,
+                ..
+            },
+            Object {
+                class: cb,
+                props: pb,
+                ..
+            },
+        ) => {
+            if ca != cb || pa.len() != pb.len() {
+                // php_loose_eq returns false without visiting props — sound
+                // (different classes are never ==) unless a closure hides inside.
+                return contains_closure(a) || contains_closure(b);
+            }
+            pa.iter().any(|(k, av)| {
+                match pb.iter().find(|(bk, _)| bk == k) {
+                    Some((_, bv)) => loose_eq_pair_unmodelled(av, bv),
+                    // Missing prop key: php_loose_eq returns false without
+                    // comparing `av` — sound unless `av` holds a closure.
+                    None => contains_closure(av),
+                }
+            })
+        }
+        (Arr(x), Arr(y)) => {
+            if x.len() != y.len() {
+                return contains_closure(a) || contains_closure(b);
+            }
+            x.iter()
+                .any(|(k, xv)| match y.iter().find(|(yk, _)| yk == k) {
+                    Some((_, yv)) => loose_eq_pair_unmodelled(xv, yv),
+                    None => contains_closure(xv),
+                })
+        }
+        // Mixed pair: object on exactly one side → PHP converts → unmodelled.
+        (Object { .. }, _) | (_, Object { .. }) => true,
+        // Arr vs non-Arr: false in PHP EXCEPT vs bool (array truthiness). If
+        // an object/closure lives anywhere inside the array side, abstain.
+        (Arr(_), _) | (_, Arr(_)) => contains_identity_value(a) || contains_identity_value(b),
+        _ => false,
+    }
+}
+
+/// `==`/`!=`/`assertEquals`/`assertNotEquals` MUST abstain when the comparison
+/// reaches — at ANY depth — a closure (reference identity, Inc-4 Task 4) or a
+/// mixed object/non-object pair (PHP converts: truthiness vs bool, int cast +
+/// Notice, `__toString` vs string; `[new C(1)] == [true]` is TRUE in php8.4).
+/// Pure Object↔Object stays modeled per-class + per-prop, and scalar /
+/// scalar-array loose equality keeps computing exactly.
+fn bail_if_object_mixed_loose(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if loose_eq_pair_unmodelled(a, b) {
         return Err(BailReason::UnsupportedConstruct(
-            "== / != / assertEquals on (an aggregate holding) a closure (reference identity, no heap model)"
+            "loose == between object and non-object (PHP converts) or on a closure (reference identity) — not modelled"
                 .into(),
         ));
     }
@@ -1897,12 +1967,13 @@ fn eval_binary(
         BinaryOperator::Exponentiation(_) => php_pow(&l, &r),
         BinaryOperator::StringConcat(_) => php_concat(&l, &r),
         BinaryOperator::Equal(_) => {
-            // `==` on a closure is reference identity (no heap model) → bail.
-            bail_if_closure_operand(&l, &r)?;
+            // `==` on a closure is reference identity, and on a mixed
+            // object/non-object pair PHP converts (no model for either) → bail.
+            bail_if_object_mixed_loose(&l, &r)?;
             Ok(Value::Bool(l.php_loose_eq(&r)))
         }
         BinaryOperator::NotEqual(_) | BinaryOperator::AngledNotEqual(_) => {
-            bail_if_closure_operand(&l, &r)?;
+            bail_if_object_mixed_loose(&l, &r)?;
             Ok(Value::Bool(!l.php_loose_eq(&r)))
         }
         // `===`/`!==` over objects is reference identity (frontier §1) → bail.
@@ -4643,6 +4714,116 @@ mod tests {
                 "$a = new Box(); $b = new Box(); $b->inc(); $this->assertNotEquals($a, $b);",
                 &BoxResolver
             ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn loose_eq_object_vs_bool_bails() {
+        // php8.4: `new stdClass() == true` is TRUE (PHP converts: object
+        // truthiness). The model computed `false`, so `assertFalse($o == true)`
+        // was a false-green Pass (reducer Pass, PHPUnit Fail). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$o = new Box(); $this->assertFalse($o == true);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "`$o == true` (object truthiness) must bail, not compute false"
+        );
+    }
+
+    #[test]
+    fn assert_not_equals_object_vs_bool_bails() {
+        // php8.4: `true == $o` is TRUE → assertNotEquals(true, $o) FAILS in
+        // PHPUnit; the model said not-equal → false-green Pass. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$o = new Box(); $this->assertNotEquals(true, $o);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "assertNotEquals(true, $object) must bail, not pass"
+        );
+    }
+
+    #[test]
+    fn nested_array_object_vs_bool_bails() {
+        // php8.4: `[$o] == [true]` is TRUE — array `==` compares element-wise,
+        // so the mixed (Object, Bool) pair appears at depth 1 and defeats any
+        // top-level check. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$o = new Box(); $this->assertFalse([$o] == [true]);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "nested `[$o] == [true]` must bail, not compute false"
+        );
+    }
+
+    #[test]
+    fn loose_eq_object_vs_other_scalars_bails() {
+        // php8.4: `$o == 1` → Notice + TRUE (int cast); `$o == "s"` may invoke
+        // __toString; `$o == null` / `$o == []` are false in PHP but sit on the
+        // same converting mixed arm — bail the whole family, never guess.
+        for body in [
+            "$o = new Box(); $this->assertFalse($o == 1);",
+            "$o = new Box(); $this->assertTrue($o != 's');",
+            "$o = new Box(); $this->assertFalse($o == null);",
+            "$o = new Box(); $this->assertFalse($o == []);",
+            "$o = new Box(); $this->assertNotEquals([], $o);",
+        ] {
+            assert!(
+                matches!(run_body_with(body, &BoxResolver), Outcome::Bailed(_)),
+                "object-vs-non-object loose eq must bail: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn loose_eq_aligned_objects_in_arrays_still_compute() {
+        // Object↔Object stays modeled (per-class + per-prop), including when the
+        // pair is structurally aligned INSIDE arrays — no over-bail.
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $this->assertTrue([$a] == [$b]);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $b->inc(); $this->assertNotEquals([1, $a], [1, $b]);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn loose_eq_scalar_controls_still_compute() {
+        // Scalar / scalar-array loose equality keeps computing exactly.
+        assert_eq!(
+            run_body("$this->assertEquals([1, 2], [1, 2]);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertTrue(1 == '1');", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertFalse(0 == 'a');", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertNotEquals([1], [2]);", vec![]),
             Outcome::Pass
         );
     }

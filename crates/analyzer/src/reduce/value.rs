@@ -740,9 +740,15 @@ impl Value {
                     .is_some_and(|(_, bv)| av.php_loose_eq(bv))
             });
         }
-        // An object/closure vs a non-matching value is never loosely equal here.
-        // (Closure `==` is reference identity; the eval layer bails on it, so a
-        // closure never reaches a true-producing path — false is the safe answer.)
+        // Object/closure vs anything else: this `false` is NOT PHP's answer —
+        // PHP CONVERTS under loose `==` (object==bool is truthiness, so
+        // `$o == true` is TRUE; object==int casts to int 1 + Notice;
+        // object==string invokes __toString; closure `==` is reference
+        // identity). It is only sound because the eval layer's
+        // `bail_if_object_mixed_loose` guard walks both operands in parallel
+        // and BAILS before any mixed object/non-object or closure pair — at
+        // any depth — can reach this arm. Do not rely on this arm for the
+        // converting semantics.
         if matches!(self, Value::Object { .. } | Value::Closure(_))
             || matches!(other, Value::Object { .. } | Value::Closure(_))
         {
