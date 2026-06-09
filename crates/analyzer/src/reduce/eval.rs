@@ -1586,7 +1586,19 @@ fn array_access_lookup(
             if coalesce && matches!(v, Value::Null) {
                 Ok(None)
             } else {
-                Ok(Some(v.clone()))
+                // Aliasing defense-in-depth (Inc-5): reading a `Value::Object`
+                // element out of an array yields a SECOND reference to that object
+                // — the array still holds it. Store-time marking (every object
+                // entering a `Value::Arr` is marked at insertion) already covers
+                // this today; mark the returned clone too so the read is LOCALLY
+                // fail-closed, symmetric with `eval_property_read`. Only objects
+                // are marked — never arrays-of-scalars (no over-bail on the
+                // common scalar-array read path).
+                let mut out = v.clone();
+                if matches!(out, Value::Object { .. }) {
+                    out.mark_aliased();
+                }
+                Ok(Some(out))
             }
         }
         None => Ok(None),
@@ -2391,9 +2403,24 @@ fn make_closure(
                 ));
             }
             let name = var_name(uv.variable.name);
-            let value = scope.vars.get(&name).cloned().ok_or_else(|| {
-                BailReason::UnboundVariable(String::from_utf8_lossy(&name).into_owned())
-            })?;
+            // Aliasing (Inc-5, capture site): `use ($a)` copies the HANDLE of an
+            // object, not the object — the captured copy and the source binding
+            // then alias the SAME instance. Mark the SOURCE binding aliased, then
+            // clone (the clone carries the mark), so a later mutating method on
+            // EITHER side bails fail-closed instead of diverging on a stale
+            // by-value copy. `mark_aliased` recurses into aggregates and is a
+            // no-op on scalars — over-marking only over-bails.
+            let value = match scope.vars.get_mut(&name) {
+                Some(src) => {
+                    src.mark_aliased();
+                    src.clone()
+                }
+                None => {
+                    return Err(BailReason::UnboundVariable(
+                        String::from_utf8_lossy(&name).into_owned(),
+                    ))
+                }
+            };
             captured.push((name, value));
         }
     }
@@ -2425,11 +2452,21 @@ fn make_arrow(
     a: &mago_syntax::ast::ast::function_like::arrow_function::ArrowFunction,
     scope: &mut Scope,
 ) -> Result<Value, BailReason> {
+    // Aliasing (Inc-5, capture site): auto-capture copies the HANDLE of every
+    // object in scope — the captured copy and the source binding alias the SAME
+    // instance. Mark each SOURCE binding aliased, then clone (the clone carries
+    // the mark). Auto-capture is already a conservative superset of what the body
+    // reads, so marking every captured object source is correct: `mark_aliased`
+    // recurses into aggregates, is a no-op on scalars, and over-marking only
+    // over-bails (never diverges).
     let captured: Vec<(Vec<u8>, Value)> = scope
         .vars
-        .iter()
+        .iter_mut()
         .filter(|(k, _)| k.as_slice() != b"this")
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| {
+            v.mark_aliased();
+            (k.clone(), v.clone())
+        })
         .collect();
     let src = closure_source(a.span(), scope)?;
     Ok(Value::Closure(ClosureRef { src, captured }))
@@ -4305,6 +4342,74 @@ mod tests {
             run_body_with(
                 "$a = new Box(); $b = new Box(); $a->inc(); $b->inc(); $b->inc(); \
                  $this->assertSame(1, $a->v); $this->assertSame(2, $b->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_use_capture_aliasing_bails() {
+        // `function () use ($a) { return $a; }` — PHP `use ($a)` copies the HANDLE
+        // of an object, not the object: the closure's captured `$a` and the outer
+        // `$a` are the SAME instance. Before the capture-site marking fix neither
+        // the source binding nor the captured copy was marked aliased, so a later
+        // `$a->inc()` wrote back only to the outer `$a`, leaving `$b` (returned
+        // from the closure) a stale by-value clone (v == 0) → a false divergence
+        // (reducer reported Fail while real PHP — same handle — Passes with
+        // $b->v === 1). It must BAIL.
+        let o = run_body_with(
+            "$a = new Box(); $f = function () use ($a) { return $a; }; \
+             $b = $f(); $a->inc(); $this->assertSame(1, $b->v);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "closure use($a) object capture must mark both the source binding and \
+             the captured copy aliased and bail, not diverge to a wrong Fail (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn arrow_auto_capture_aliasing_bails() {
+        // `fn () => $a` — arrow functions auto-capture by value, which for an
+        // object copies the HANDLE (same instance inside and outside). Same
+        // divergence shape as the `use ($a)` variant above: must BAIL.
+        let o = run_body_with(
+            "$a = new Box(); $f = fn () => $a; \
+             $b = $f(); $a->inc(); $this->assertSame(1, $b->v);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "arrow-function object auto-capture must mark both the source binding \
+             and the captured copy aliased and bail, not diverge to a wrong Fail (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn closure_capturing_scalar_still_passes() {
+        // Control: a closure over a SCALAR has no object handle to alias — the
+        // capture-site marking is a no-op on non-objects → must still PASS.
+        assert_eq!(
+            run_body_with(
+                "$n = 5; $f = fn () => $n + 1; $this->assertSame(6, $f());",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_capturing_object_without_later_mutation_still_passes() {
+        // Control: the closure captures an object that is NEVER mutated afterward.
+        // The conservative capture mark flags both sides aliased, but the alias
+        // flag only gates MUTATING method dispatch — pure reads through either
+        // name stay exact → must still PASS (no over-bail on read-only use).
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $f = function () use ($a) { return $a; }; \
+                 $b = $f(); $this->assertSame(0, $b->v); $this->assertSame(0, $a->v);",
                 &BoxResolver
             ),
             Outcome::Pass
