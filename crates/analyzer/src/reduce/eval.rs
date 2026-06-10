@@ -161,6 +161,24 @@ pub trait CallResolver {
     ) -> Result<Option<Value>, BailReason> {
         Ok(None)
     }
+
+    /// Enforce PHP property-READ visibility (round 18) for a `$obj->prop` read:
+    /// `receiver_class` is the runtime record's class, `reading_class` the class
+    /// declaring the body performing the read (`None` = a free function / closure
+    /// / unit-test scope — no class context). The default allows everything (the
+    /// [`NoResolver`] unit-test path builds records by hand, with no declared
+    /// visibility to consult); the [`super::subst::BridgeResolver`] resolves the
+    /// declared visibility from the scanned codebase and BAILS (fail-closed) on a
+    /// read PHP would deny (Error) or resolve to a DIFFERENT slot
+    /// (parent-private read from a child method → undefined-property null).
+    fn bail_inaccessible_prop_read(
+        &self,
+        _receiver_class: &[u8],
+        _prop: &[u8],
+        _reading_class: Option<&[u8]>,
+    ) -> Result<(), BailReason> {
+        Ok(())
+    }
 }
 
 /// A resolver that resolves nothing (all user calls bail). Used by the pure-eval
@@ -214,6 +232,12 @@ pub struct Scope<'r> {
     /// readonly property" Error — the write-once seed happens at promoted-param
     /// binding, NEVER through the body — so the write site bails (fail-closed).
     readonly_props: HashSet<Vec<u8>>,
+    /// The FQCN of the class DECLARING the body this scope evaluates (round 18):
+    /// the test-case body class, an inlined method/ctor/setUp's declaring class.
+    /// `None` for a free function, a closure body, or a unit-test scope. Property
+    /// reads pass this to [`CallResolver::bail_inaccessible_prop_read`] so PHP
+    /// visibility (private/protected) is enforced at the read site.
+    current_class: Option<Vec<u8>>,
 }
 
 impl<'r> Scope<'r> {
@@ -230,6 +254,7 @@ impl<'r> Scope<'r> {
             allow_this_write: false,
             prop_hints: HashMap::new(),
             readonly_props: HashSet::new(),
+            current_class: None,
         }
     }
 
@@ -247,6 +272,15 @@ impl<'r> Scope<'r> {
     /// seed, which never flows through `eval_property_assignment`).
     pub fn with_readonly_props(mut self, readonly: HashSet<Vec<u8>>) -> Self {
         self.readonly_props = readonly;
+        self
+    }
+
+    /// Attach the FQCN of the class declaring the body about to be evaluated
+    /// (round 18), so a property read can enforce PHP visibility — a private
+    /// prop is only readable from its declaring class, a protected one only
+    /// from the receiver's own chain.
+    pub fn with_current_class(mut self, class: Vec<u8>) -> Self {
+        self.current_class = Some(class);
         self
     }
 
@@ -310,19 +344,29 @@ pub fn run_method_body(
     givens: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Outcome {
-    run_method_body_inner(block, givens, resolver, None, None)
+    run_method_body_inner(block, givens, resolver, None, None, None)
 }
 
 /// Like [`run_method_body`] but with the body file's resolved-names table attached
-/// so `new ClassName` / `ClassName::m()` resolve to a FQCN (Inc-3).
+/// so `new ClassName` / `ClassName::m()` resolve to a FQCN (Inc-3), plus the FQCN
+/// of the class declaring the test-method body (round 18) so property reads in the
+/// body enforce PHP visibility from the right scope.
 pub fn run_method_body_with_names(
     block: &Block,
     givens: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: &mago_names::ResolvedNames,
     source: &[u8],
+    current_class: Option<&[u8]>,
 ) -> Outcome {
-    run_method_body_inner(block, givens, resolver, Some(names), Some(source))
+    run_method_body_inner(
+        block,
+        givens,
+        resolver,
+        Some(names),
+        Some(source),
+        current_class,
+    )
 }
 
 fn run_method_body_inner(
@@ -331,6 +375,7 @@ fn run_method_body_inner(
     resolver: &dyn CallResolver,
     names: Option<&mago_names::ResolvedNames>,
     source: Option<&[u8]>,
+    current_class: Option<&[u8]>,
 ) -> Outcome {
     let mut scope = Scope::new(givens, resolver);
     if let Some(n) = names {
@@ -338,6 +383,9 @@ fn run_method_body_inner(
     }
     if let Some(s) = source {
         scope = scope.with_source(s);
+    }
+    if let Some(c) = current_class {
+        scope = scope.with_current_class(c.to_vec());
     }
     match exec_statements(block.statements.iter(), &mut scope) {
         Ok(Flow::Asserted(outcome)) => outcome,
@@ -357,20 +405,30 @@ pub fn run_body_returning(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
-    run_body_returning_inner(block, bindings, resolver, None, None)
+    run_body_returning_inner(block, bindings, resolver, None, None, None)
 }
 
 /// Like [`run_body_returning`] but with the body file's resolved-names table
 /// attached (Inc-3 class-name resolution inside an inlined body) plus the body
-/// file's source (so a closure literal RETURNED from this body owns its bytes).
+/// file's source (so a closure literal RETURNED from this body owns its bytes)
+/// and the body's declaring class, if any (round 18 — `None` for a free
+/// function), so property reads enforce PHP visibility from the right scope.
 pub fn run_body_returning_with_names(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
     names: &mago_names::ResolvedNames,
     source: &[u8],
+    current_class: Option<&[u8]>,
 ) -> Result<Value, BailReason> {
-    run_body_returning_inner(block, bindings, resolver, Some(names), Some(source))
+    run_body_returning_inner(
+        block,
+        bindings,
+        resolver,
+        Some(names),
+        Some(source),
+        current_class,
+    )
 }
 
 fn run_body_returning_inner(
@@ -379,6 +437,7 @@ fn run_body_returning_inner(
     resolver: &dyn CallResolver,
     names: Option<&mago_names::ResolvedNames>,
     source: Option<&[u8]>,
+    current_class: Option<&[u8]>,
 ) -> Result<Value, BailReason> {
     let mut scope = Scope::new(bindings, resolver);
     if let Some(n) = names {
@@ -386,6 +445,9 @@ fn run_body_returning_inner(
     }
     if let Some(s) = source {
         scope = scope.with_source(s);
+    }
+    if let Some(c) = current_class {
+        scope = scope.with_current_class(c.to_vec());
     }
     match exec_statements(block.statements.iter(), &mut scope)? {
         Flow::Returned(v) => Ok(v),
@@ -768,6 +830,7 @@ pub fn run_ctor_body(
         None,
         HashMap::new(),
         HashSet::new(),
+        None,
     )
 }
 
@@ -775,8 +838,11 @@ pub fn run_ctor_body(
 /// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN) plus
 /// the body file's source (so a closure literal stored into `$this` here owns its
 /// bytes — Inc-4 Task 1), the receiver class's declared scalar property hints
-/// (round 3 Task A — so a typed `$this->prop = …` write re-checks scalar coercion)
-/// and its `readonly` property names (round 17 fix 4 — a body write to one bails).
+/// (round 3 Task A — so a typed `$this->prop = …` write re-checks scalar coercion),
+/// its `readonly` property names (round 17 fix 4 — a body write to one bails) and
+/// the ctor/setUp's DECLARING class (round 18 — property reads in the body enforce
+/// PHP visibility from that scope).
+#[allow(clippy::too_many_arguments)]
 pub fn run_ctor_body_with_names(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
@@ -785,6 +851,7 @@ pub fn run_ctor_body_with_names(
     source: &[u8],
     prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
     readonly_props: HashSet<Vec<u8>>,
+    declaring_class: &[u8],
 ) -> Result<Value, BailReason> {
     run_ctor_body_inner(
         block,
@@ -794,6 +861,7 @@ pub fn run_ctor_body_with_names(
         Some(source),
         prop_hints,
         readonly_props,
+        Some(declaring_class),
     )
 }
 
@@ -802,7 +870,11 @@ pub fn run_ctor_body_with_names(
 /// value (PHP returns null when the body falls off the end) AND the final `$this`
 /// record (which the caller diffs against the input to detect mutation). The
 /// receiver class's scalar property hints re-check coercion at a typed `$this->prop`
-/// write (round 3 Task A). An assertion inside a non-test method body bails.
+/// write (round 3 Task A), its `readonly` names bail a body write (round 18 — a
+/// method write to a readonly prop is PHP's "Cannot modify readonly property"
+/// Error; the ctor/setUp paths already bailed, the dispatch path did not), and the
+/// method's DECLARING class scopes property-read visibility (round 18). An
+/// assertion inside a non-test method body bails.
 #[allow(clippy::too_many_arguments)]
 pub fn run_method_with_this_writes(
     block: &Block,
@@ -811,9 +883,13 @@ pub fn run_method_with_this_writes(
     names: &mago_names::ResolvedNames,
     source: &[u8],
     prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    readonly_props: HashSet<Vec<u8>>,
+    declaring_class: &[u8],
 ) -> Result<(Value, Value), BailReason> {
     let mut scope = Scope::new(bindings, resolver)
         .with_prop_hints(prop_hints)
+        .with_readonly_props(readonly_props)
+        .with_current_class(declaring_class.to_vec())
         .with_names(names)
         .with_source(source);
     scope.allow_this_writes();
@@ -842,6 +918,7 @@ fn run_ctor_body_inner(
     source: Option<&[u8]>,
     prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
     readonly_props: HashSet<Vec<u8>>,
+    declaring_class: Option<&[u8]>,
 ) -> Result<Value, BailReason> {
     let mut scope = Scope::new(bindings, resolver)
         .with_prop_hints(prop_hints)
@@ -851,6 +928,9 @@ fn run_ctor_body_inner(
     }
     if let Some(s) = source {
         scope = scope.with_source(s);
+    }
+    if let Some(c) = declaring_class {
+        scope = scope.with_current_class(c.to_vec());
     }
     scope.allow_this_writes();
     match exec_statements(block.statements.iter(), &mut scope)? {
@@ -1656,12 +1736,23 @@ fn eval_property_read(
         ));
     };
     let receiver = eval_expr(pa.object, scope)?;
-    let Value::Object { props, .. } = &receiver else {
+    let Value::Object { class, props, .. } = &receiver else {
         return Err(BailReason::TypeError(format!(
             "property read on non-object ({})",
             receiver.type_name()
         )));
     };
+    // PHP visibility at the READ site (round 18): the record model is
+    // scope-blind, but a private/protected prop read from the wrong class is a
+    // PHP Error (external) or an undefined-property null (parent-private from a
+    // child method) — never the slot's value. The resolver consults the
+    // declared visibility and bails fail-closed; public (the overwhelmingly
+    // common case) and dynamic props pass through untouched.
+    scope.resolver.bail_inaccessible_prop_read(
+        class,
+        prop_id.value,
+        scope.current_class.as_deref(),
+    )?;
     match props.iter().find(|(k, _)| k.as_slice() == prop_id.value) {
         Some((_, v)) => {
             // Aliasing defense-in-depth (Round 6 finding 3): reading a nested
@@ -2504,17 +2595,20 @@ fn eval_property_assignment(
     // Task A). An untyped / non-scalar-typed property is absent from the map →
     // stored verbatim, no bail.
     let prop_name = prop_id.value.to_vec();
-    // A ctor/setUp BODY write to a `readonly` property (round 17 fix 4): for a
-    // PROMOTED readonly param the param binding already performed the write-once
-    // seed, so this body write is PHP's "Cannot modify readonly property" Error —
-    // the record model would silently overwrite (false green). BAIL. This also
-    // over-bails the legal FIRST init of a plain (non-promoted) readonly prop in
-    // a ctor body — accepted: modelling per-prop write-once state risks getting
-    // it wrong, and a bail only costs coverage, never truth.
+    // A BODY write to a `readonly` property (round 17 fix 4 for ctor/setUp;
+    // round 18 extends the same set to the instance-method dispatch path): for
+    // a PROMOTED readonly param the param binding already performed the
+    // write-once seed, so this body write is PHP's "Cannot modify readonly
+    // property" Error — the record model would silently overwrite (false
+    // green). BAIL unconditionally on a readonly name. This over-bails the
+    // legal FIRST init of a plain (non-promoted) readonly prop in a ctor body
+    // AND the legal first-init of one in a single method — accepted (consistent
+    // with the ctor-path philosophy): modelling per-prop write-once state risks
+    // getting it wrong, and a bail only costs coverage, never truth.
     if scope.readonly_props.contains(prop_name.as_slice()) {
         return Err(BailReason::UnsupportedConstruct(format!(
-            "write to readonly property ${} in a constructor/setUp body (PHP \
-             \"Cannot modify readonly property\" Error unmodelled)",
+            "write to readonly property ${} in a method/constructor/setUp body \
+             (PHP \"Cannot modify readonly property\" Error unmodelled)",
             String::from_utf8_lossy(&prop_name)
         )));
     }
@@ -3536,7 +3630,8 @@ mod tests {
             .map(|(k, v)| (k.as_bytes().to_vec(), v))
             .collect();
         // Attach the file source so a closure literal in `body` owns its bytes.
-        run_method_body_inner(block, givens, &NoResolver, None, Some(&file.contents))
+        // No enclosing class in this pure-eval test path → no visibility scope.
+        run_method_body_inner(block, givens, &NoResolver, None, Some(&file.contents), None)
     }
 
     fn first_function_block<'a>(
@@ -4614,7 +4709,14 @@ mod tests {
         );
         let program = parse_file(&arena, &file);
         let block = first_function_block(program).expect("function block");
-        run_method_body_inner(block, HashMap::new(), resolver, None, Some(&file.contents))
+        run_method_body_inner(
+            block,
+            HashMap::new(),
+            resolver,
+            None,
+            Some(&file.contents),
+            None,
+        )
     }
 
     #[test]

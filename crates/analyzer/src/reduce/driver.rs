@@ -203,6 +203,7 @@ fn reduce_one_test(
                     resolver,
                     names,
                     source,
+                    body_class,
                 );
                 ReducedTest {
                     class: test.class.clone(),
@@ -267,7 +268,10 @@ fn collect_rows(
 }
 
 /// Reduce one row: bind args to the method's parameters (+ the test-case `$this`)
-/// and run the body.
+/// and run the body. `body_class` is the FQCN of the class DECLARING the test
+/// method body (round 18) — property reads in the body enforce PHP visibility
+/// from that scope (the doctrine fixture pattern: a test method reading its own
+/// class's private fixture prop stays readable; a foreign private prop bails).
 #[allow(clippy::too_many_arguments)]
 fn reduce_row(
     block: &Block,
@@ -277,6 +281,7 @@ fn reduce_row(
     resolver: &BridgeResolver,
     names: &mago_names::ResolvedNames,
     source: &[u8],
+    body_class: &str,
 ) -> Outcome {
     // SURPLUS provider columns (more columns than parameters) are NOT an error in
     // PHP/PHPUnit: data-provider rows are bound positionally via
@@ -295,7 +300,14 @@ fn reduce_row(
     }
     // Parameters past the provided args are unbound; if the body reads one it
     // bails (UnboundVariable) — fail-closed, no defaults invented here.
-    run_method_body_with_names(block, givens, resolver, names, source)
+    run_method_body_with_names(
+        block,
+        givens,
+        resolver,
+        names,
+        source,
+        Some(body_class.as_bytes()),
+    )
 }
 
 // ─── AST helpers ──────────────────────────────────────────────────────────────

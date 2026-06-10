@@ -118,6 +118,92 @@ impl CallResolver for BridgeResolver<'_> {
     ) -> Result<Option<Value>, BailReason> {
         self.fold_class_constant(class, const_name)
     }
+
+    /// PHP property-READ visibility (round 18). The record model is scope-blind:
+    /// it stored ONE slot per name and returned it to any reader, while PHP
+    /// denies an out-of-scope read (Error → PHPUnit test Error for an external
+    /// read; undefined-property Warning + NULL for a parent-private read from a
+    /// child method) — both were definitive false verdicts.
+    ///
+    /// Resolution walks the receiver's chain MOST-DERIVED FIRST and stops at the
+    /// first class-like whose codex metadata declares the prop (own + flattened
+    /// trait props; the slot tracker already bailed shadowed-private chains, so
+    /// the first declaration found IS the single modelled slot):
+    /// * `public` → allow (the overwhelmingly common case);
+    /// * `private` → allow only when the reading body's declaring class IS the
+    ///   declaring class;
+    /// * `protected` → allow only when the reading class is somewhere in the
+    ///   receiver's own chain (PHP allows the declaring class, descendants AND
+    ///   ancestors — all linearly related inside one chain).
+    ///
+    /// A prop declared NOWHERE in the chain is dynamic (PHP reads it publicly) →
+    /// allow; an unknown receiver class is a defensive allow (every
+    /// record-producing path verified its class resolves — and an unseeded slot
+    /// still bails at the read). `reading_class = None` (free function / closure
+    /// scope) has no class context → any non-public read bails (PHP denies it
+    /// from global scope too).
+    fn bail_inaccessible_prop_read(
+        &self,
+        receiver_class: &[u8],
+        prop: &[u8],
+        reading_class: Option<&[u8]>,
+    ) -> Result<(), BailReason> {
+        use mago_codex::visibility::Visibility;
+        let codebase = self.project.codebase();
+        let leaf_key = normalize_fqcn(receiver_class).to_ascii_lowercase();
+        let Some(class_meta) = codebase.get_class_like(&leaf_key) else {
+            return Ok(());
+        };
+        let mut chain: Vec<Vec<u8>> = vec![class_meta.name.as_bytes().to_vec()];
+        chain.extend(
+            class_meta
+                .all_parent_classes
+                .iter()
+                .map(|w| w.as_bytes().to_vec()),
+        );
+        let reading_key = reading_class.map(|c| normalize_fqcn(c).to_ascii_lowercase());
+        // codex keys properties WITH the leading `$`.
+        let mut prop_key = Vec::with_capacity(prop.len() + 1);
+        prop_key.push(b'$');
+        prop_key.extend_from_slice(prop);
+        for hop in &chain {
+            let Some(pm) = codebase.get_property(hop, &prop_key) else {
+                continue;
+            };
+            let declaring = normalize_fqcn(hop).to_ascii_lowercase();
+            match pm.read_visibility {
+                Visibility::Public => return Ok(()),
+                Visibility::Private => {
+                    if reading_key.as_deref() == Some(declaring.as_slice()) {
+                        return Ok(());
+                    }
+                    return Err(BailReason::UnsupportedConstruct(format!(
+                        "read of private property ${} outside its declaring class `{}` \
+                         (PHP visibility Error / undefined-property divergence unmodelled)",
+                        String::from_utf8_lossy(prop),
+                        String::from_utf8_lossy(&declaring),
+                    )));
+                }
+                Visibility::Protected => {
+                    if let Some(rk) = &reading_key {
+                        if chain
+                            .iter()
+                            .any(|h| normalize_fqcn(h).to_ascii_lowercase() == *rk)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    return Err(BailReason::UnsupportedConstruct(format!(
+                        "read of protected property ${} from outside the receiver's \
+                         class chain (PHP visibility Error unmodelled)",
+                        String::from_utf8_lossy(prop),
+                    )));
+                }
+            }
+        }
+        // Declared nowhere in the chain → a dynamic prop; PHP reads it publicly.
+        Ok(())
+    }
 }
 
 impl BridgeResolver<'_> {
@@ -145,12 +231,16 @@ impl BridgeResolver<'_> {
                 // Recurse through THIS resolver so nested user calls inline too;
                 // names = the callee file's table (FQCN resolution for `new C`).
                 // source = the callee file (so a closure RETURNED here owns its bytes).
+                // current_class = None: a free function has no class scope, so
+                // any non-public property read in its body bails (PHP denies
+                // those from global scope too — round 18).
                 let ret = run_body_returning_with_names(
                     &func.body,
                     bindings,
                     self,
                     names,
                     &file.contents,
+                    None,
                 )?;
                 // PHP coerces the return to a declared scalar type; we don't model
                 // that, so a mismatch bails (fail-closed) rather than returning the
@@ -246,8 +336,16 @@ impl BridgeResolver<'_> {
                 // writes, so the assignment handler rejects it (frontier §2).
                 // names = the declaring file's table (resolves `new C` in the body).
                 // source = the declaring file (so a closure returned here owns its bytes).
-                let ret =
-                    run_body_returning_with_names(block, bindings, self, names, &file.contents)?;
+                // current_class = the DECLARING class (round 18) so property reads
+                // in the body enforce PHP visibility from the right scope.
+                let ret = run_body_returning_with_names(
+                    block,
+                    bindings,
+                    self,
+                    names,
+                    &file.contents,
+                    Some(&declaring_fqcn),
+                )?;
                 // PHP coerces the return to a declared scalar type; a mismatch bails.
                 bail_if_scalar_return_coerces(m.return_type_hint.as_ref(), &ret)?;
                 Ok(Some(ret))
@@ -286,8 +384,10 @@ impl BridgeResolver<'_> {
 
         // The receiver class's declared scalar property hints, across its full
         // ancestor chain + traits — so a typed `$this->prop = …` write in the body
-        // re-checks scalar coercion (round 3 Task A); symmetric with construct.
-        let prop_hints = self.collect_instance_prop_hints(class);
+        // re-checks scalar coercion (round 3 Task A); symmetric with construct —
+        // plus the chain's readonly names (round 18) so a method-body write to a
+        // readonly prop bails instead of silently mutating the record.
+        let (prop_hints, readonly_props) = self.collect_instance_prop_hints(class);
 
         // The pre-body `$this` props, to diff against after the body runs (mutation
         // detection). The class is invariant, so comparing props suffices.
@@ -330,6 +430,8 @@ impl BridgeResolver<'_> {
                     names,
                     &file.contents,
                     prop_hints.clone(),
+                    readonly_props.clone(),
+                    &declaring_fqcn,
                 )?;
                 bail_if_scalar_return_coerces(m.return_type_hint.as_ref(), &ret)?;
 
@@ -354,12 +456,18 @@ impl BridgeResolver<'_> {
 
     /// Collect the receiver class's declared SCALAR property hints across its full
     /// parent chain + used traits (parents-first so a child override wins), keyed by
-    /// bare property name. Mirrors the hint-collection in [`BridgeResolver::construct_object`]
-    /// so a typed `$this->prop = …` write in an instance method re-checks coercion.
-    fn collect_instance_prop_hints(&self, class: &[u8]) -> PropHints {
+    /// bare property name, AND the chain's `readonly` property names (round 18) —
+    /// plain declarations via the shared collectors plus PROMOTED readonly ctor
+    /// params (structurally invisible to the plain-only walkers). Mirrors the
+    /// hint-collection in [`BridgeResolver::construct_object`] so a typed
+    /// `$this->prop = …` write in an instance method re-checks coercion, and an
+    /// instance-method write to a readonly prop bails at the write site (a
+    /// dispatch-path mutation of one is PHP's "Cannot modify readonly property"
+    /// Error — the record silently mutated, a definitive false Pass).
+    fn collect_instance_prop_hints(&self, class: &[u8]) -> (PropHints, HashSet<Vec<u8>>) {
         let codebase = self.project.codebase();
         let Some(class_meta) = codebase.get_class_like(class) else {
-            return PropHints::new();
+            return (PropHints::new(), HashSet::new());
         };
         let mut hint_chain: Vec<Vec<u8>> = class_meta
             .all_parent_classes
@@ -369,10 +477,6 @@ impl BridgeResolver<'_> {
         hint_chain.reverse();
         hint_chain.push(class_meta.name.as_bytes().to_vec());
         let mut prop_hints = PropHints::new();
-        // Readonly names are collected but UNUSED on this path: a non-ctor body
-        // write to an ALREADY-initialized readonly prop is PHP's modify Error,
-        // but a method body may also legally first-init a plain readonly prop —
-        // the ctor/setUp bail (round 17 fix 4) does not extend here.
         let mut readonly_props: HashSet<Vec<u8>> = HashSet::new();
         for fqcn in &hint_chain {
             let mut seen: Vec<Vec<u8>> = Vec::new();
@@ -383,8 +487,15 @@ impl BridgeResolver<'_> {
                 &mut readonly_props,
             );
             self.collect_class_scalar_property_hints(fqcn, &mut prop_hints, &mut readonly_props);
+            // Promoted readonly ctor params are real readonly properties of the
+            // hop (round 18) — the plain-only collectors above missed them.
+            for p in self.promoted_ctor_params_of(fqcn) {
+                if p.is_readonly {
+                    readonly_props.insert(p.name);
+                }
+            }
         }
-        prop_hints
+        (prop_hints, readonly_props)
     }
 
     /// Fold a class constant `Class::CONST` (Inc-5 Task 4) to a literal [`Value`].
@@ -502,7 +613,11 @@ impl BridgeResolver<'_> {
         // A `__set` anywhere in the chain routes ctor-body writes to UNDECLARED
         // props through arbitrary user code — the record model would store the
         // write verbatim (false green). Bail on its PRESENCE (round 17 fix 2).
-        self.bail_magic_set_in_chain(class)?;
+        // `__get` is the read-side twin (round 18): an inaccessible/undeclared
+        // prop read routes through it legally in PHP, while the record returned
+        // the raw slot (false red) — bail on its PRESENCE too.
+        self.bail_magic_method_in_chain(class, b"__set", "magic property-write routing")?;
+        self.bail_magic_method_in_chain(class, b"__get", "magic property-read routing")?;
         let record_class = class_meta.original_name.as_bytes().to_vec();
         let class_fqcn = class_meta.name.as_bytes().to_vec();
 
@@ -537,6 +652,14 @@ impl BridgeResolver<'_> {
                 &mut slots,
             )?;
             self.seed_class_like_property_defaults(fqcn, &mut props, false, &mut slots)?;
+            // Promotion declares a REAL property on the hop (round 18): the
+            // plain-only seeders above never see it, so a promoted param
+            // redeclaring an ancestor's private (or shadowed by a later hop's
+            // redeclare) escaped the slot tracker — declare it here. Never
+            // seed() it: the value only exists once the ctor actually runs.
+            for p in self.promoted_ctor_params_of(fqcn) {
+                slots.declare(&p.name, p.is_private)?;
+            }
             slots.end_hop();
         }
 
@@ -601,6 +724,7 @@ impl BridgeResolver<'_> {
                             &file.contents,
                             prop_hints.clone(),
                             readonly_props.clone(),
+                            &ctor_class,
                         )
                     })
                     .unwrap_or_else(|| {
@@ -649,8 +773,18 @@ impl BridgeResolver<'_> {
         self.bail_unresolvable_used_traits(class_key.as_bytes())?;
         // A `__set` anywhere in the resolvable chain routes setUp writes to
         // UNDECLARED fixture props through arbitrary user code — bail on its
-        // PRESENCE (round 17 fix 2; symmetric with `construct_object`).
-        self.bail_magic_set_in_chain(class_key.as_bytes())?;
+        // PRESENCE (round 17 fix 2; symmetric with `construct_object`), and
+        // `__get` likewise on the read side (round 18).
+        self.bail_magic_method_in_chain(
+            class_key.as_bytes(),
+            b"__set",
+            "magic property-write routing",
+        )?;
+        self.bail_magic_method_in_chain(
+            class_key.as_bytes(),
+            b"__get",
+            "magic property-read routing",
+        )?;
         let record_class = class_meta.original_name.as_bytes().to_vec();
 
         // 1) Seed plain literal property defaults from the class AND every ancestor
@@ -686,6 +820,12 @@ impl BridgeResolver<'_> {
                 &mut slots,
             )?;
             self.seed_class_like_property_defaults(fqcn, &mut props, true, &mut slots)?;
+            // Promoted ctor params declare real properties on the hop (round
+            // 18) — declare (never seed) them so the slot tracker sees the
+            // same shadowed-private pairs as on the `new` path.
+            for p in self.promoted_ctor_params_of(fqcn) {
+                slots.declare(&p.name, p.is_private)?;
+            }
             slots.end_hop();
             // A class's used traits BEFORE its own hints (round 5: trait-declared
             // typed scalar props are a SEPARATE set, never in all_parent_classes),
@@ -739,6 +879,7 @@ impl BridgeResolver<'_> {
                             &file.contents,
                             prop_hints.clone(),
                             readonly_props.clone(),
+                            &setup_class,
                         )
                     })
                     .unwrap_or_else(|| {
@@ -1025,19 +1166,26 @@ impl BridgeResolver<'_> {
     }
 
     /// BAIL (fail-closed) when ANY class-like in the resolvable chain (the leaf,
-    /// each ancestor, every used trait at any depth) declares the `__set` magic
-    /// method (round 17 fix 2).
+    /// each ancestor, every used trait at any depth) declares the named magic
+    /// property method (round 17 fix 2 for `__set`; round 18 adds `__get`).
     ///
     /// PHP routes a write to an UNDECLARED (or inaccessible) property through
     /// `__set` — arbitrary user code that may drop, rename, or validate the
     /// write — while the record model stores `$this->foo = …` verbatim
     /// (`assertSame(5, $c->foo)` was a FALSE GREEN against a `__set` that drops
-    /// the write). The PRESENCE of `__set` anywhere in the chain bails; plain
-    /// dynamic-prop writes WITHOUT `__set` match PHP (gold-verified) and stay
-    /// modelled. The ancestry/trait resolvability bails run first, so the chain
-    /// walk here is total (an exempt unresolved PHPUnit `TestCase` declares no
-    /// `__set`).
-    fn bail_magic_set_in_chain(&self, start_key: &[u8]) -> Result<(), BailReason> {
+    /// the write). `__get` is the read twin: an inaccessible/undeclared read
+    /// returns `__get`'s result legally, while the record returned the raw slot
+    /// (a false red). The PRESENCE of the method anywhere in the chain bails;
+    /// plain dynamic-prop access WITHOUT it matches PHP (gold-verified) and
+    /// stays modelled. The ancestry/trait resolvability bails run first, so the
+    /// chain walk here is total (an exempt unresolved PHPUnit `TestCase`
+    /// declares neither).
+    fn bail_magic_method_in_chain(
+        &self,
+        start_key: &[u8],
+        magic: &[u8],
+        what: &str,
+    ) -> Result<(), BailReason> {
         let codebase = self.project.codebase();
         let leaf_key = normalize_fqcn(start_key).to_ascii_lowercase();
         let Some(class_meta) = codebase.get_class_like(&leaf_key) else {
@@ -1051,25 +1199,33 @@ impl BridgeResolver<'_> {
         chain.push(leaf_key);
         let mut seen: Vec<Vec<u8>> = Vec::new();
         for fqcn in &chain {
-            self.bail_magic_set_of(fqcn, &mut seen)?;
+            self.bail_magic_method_of(fqcn, magic, what, &mut seen)?;
         }
         Ok(())
     }
 
-    /// One hop of [`Self::bail_magic_set_in_chain`]: check `fqcn`'s own declared
-    /// `__set`, then recurse into each used trait (a trait's `__set` is flattened
-    /// into the using class). `seen` guards a (malformed) trait-use cycle.
-    fn bail_magic_set_of(&self, fqcn: &[u8], seen: &mut Vec<Vec<u8>>) -> Result<(), BailReason> {
+    /// One hop of [`Self::bail_magic_method_in_chain`]: check `fqcn`'s own declared
+    /// magic method, then recurse into each used trait (a trait's magic method is
+    /// flattened into the using class). `seen` guards a (malformed) trait-use cycle.
+    fn bail_magic_method_of(
+        &self,
+        fqcn: &[u8],
+        magic: &[u8],
+        what: &str,
+        seen: &mut Vec<Vec<u8>>,
+    ) -> Result<(), BailReason> {
         let codebase = self.project.codebase();
         let lower = normalize_fqcn(fqcn).to_ascii_lowercase();
         if seen.contains(&lower) {
             return Ok(());
         }
         seen.push(lower.clone());
-        if codebase.get_declaring_method(&lower, b"__set").is_some() {
+        if codebase.get_declaring_method(&lower, magic).is_some() {
             return Err(BailReason::UnsupportedConstruct(format!(
-                "`{}` declares __set (magic property-write routing unmodelled)",
-                String::from_utf8_lossy(fqcn)
+                "`{}` declares {} ({} unmodelled)",
+                String::from_utf8_lossy(fqcn),
+                String::from_utf8_lossy(magic),
+                what
             )));
         }
         let Some(meta) = codebase.get_class_like(&lower) else {
@@ -1081,7 +1237,7 @@ impl BridgeResolver<'_> {
             .map(|w| w.as_bytes().to_vec())
             .collect();
         for trait_fqcn in &traits {
-            self.bail_magic_set_of(trait_fqcn, seen)?;
+            self.bail_magic_method_of(trait_fqcn, magic, what, seen)?;
         }
         Ok(())
     }
@@ -1135,6 +1291,73 @@ impl BridgeResolver<'_> {
             self.collect_class_scalar_property_hints(trait_fqcn, hints, readonly);
         }
     }
+
+    /// The PROMOTED constructor params declared by `fqcn`'s OWN `__construct`
+    /// AST (round 18). Promotion declares a REAL property on the declaring
+    /// class — exactly what the round-17 slot tracker models — but the
+    /// plain-declaration walkers never see it: the chain walks use this to
+    /// `declare()` the slot (no `seed()` — a promoted prop has no value until
+    /// the ctor runs) and the dispatch-path collector to pick up promoted
+    /// `readonly` names. A class without its own `__construct` (inherited or
+    /// none, checked cheaply on the codex metadata first) or one whose AST
+    /// cannot be re-located returns the empty set — the seeding/dispatch paths
+    /// already bail on a chain member that genuinely fails to resolve.
+    fn promoted_ctor_params_of(&self, fqcn: &[u8]) -> Vec<PromotedCtorParam> {
+        let codebase = self.project.codebase();
+        let key = normalize_fqcn(fqcn).to_ascii_lowercase();
+        // Cheap metadata pre-check: only re-parse a hop that declares its OWN
+        // __construct (an inherited ctor's promoted props belong to the
+        // declaring ancestor — itself a hop in every chain walk).
+        if !codebase.method_is_declared_in_class(&key, b"__construct") {
+            return Vec::new();
+        }
+        let Some(class_meta) = codebase.get_class_like(&key) else {
+            return Vec::new();
+        };
+        let Some(file) = self.project.file_of_span(&class_meta.span) else {
+            return Vec::new();
+        };
+        let logical = String::from_utf8_lossy(&file.name).into_owned();
+        let class_fqcn = class_meta.name.as_bytes().to_vec();
+        self.project
+            .with_program(&logical, |program, _file, _names| {
+                let Some(ctor) = find_class_method(program, &class_fqcn, b"__construct") else {
+                    return Vec::new();
+                };
+                ctor.parameter_list
+                    .parameters
+                    .iter()
+                    .filter(|p| p.is_promoted_property())
+                    .map(|p| PromotedCtorParam {
+                        name: strip_dollar(p.variable.name),
+                        is_private: param_has_private_modifier(p),
+                        is_readonly: has_readonly_modifier(p),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// One promoted constructor parameter of a class's own `__construct` (round 18):
+/// the bare property name it declares, whether its visibility modifier is the
+/// classic `private` (a separate PHP slot across hops — the slot tracker's
+/// concern) and whether it is `readonly` (a body write to it bails).
+struct PromotedCtorParam {
+    name: Vec<u8>,
+    is_private: bool,
+    is_readonly: bool,
+}
+
+/// Whether a constructor parameter carries the classic `private` promotion
+/// modifier (round 18; symmetric with [`has_private_modifier`] for plain
+/// declarations — asymmetric `private(set)` is NOT a separate-slot redeclare).
+fn param_has_private_modifier(param: &FunctionLikeParameter) -> bool {
+    use mago_syntax::ast::ast::modifier::Modifier;
+    param
+        .modifiers
+        .iter()
+        .any(|m| matches!(m, Modifier::Private(_)))
 }
 
 /// Per-chain-walk property-SLOT bookkeeping (round 17, fixes 1+3). One hop =
@@ -1290,6 +1513,7 @@ fn run_constructor(
     source: &[u8],
     mut prop_hints: PropHints,
     mut readonly_props: HashSet<Vec<u8>>,
+    declaring_class: &[u8],
 ) -> Result<Value, BailReason> {
     let Value::Object {
         class, mut props, ..
@@ -1373,6 +1597,7 @@ fn run_constructor(
         source,
         prop_hints,
         readonly_props,
+        declaring_class,
     )
 }
 
@@ -1886,6 +2111,9 @@ mod tests {
                     &resolver,
                     names,
                     &file.contents,
+                    // The test-method body's declaring class (round 18) —
+                    // mirrors the driver threading `body_class`.
+                    Some(class_name.as_bytes()),
                 )
             })
             .expect("with_program")
@@ -3434,6 +3662,264 @@ class RoPlainTest {
         assert!(
             matches!(res, Err(BailReason::UnsupportedConstruct(_))),
             "a shadowed private fixture prop must bail the $this build; got {res:?}"
+        );
+    }
+
+    // ── Round 18: promoted slots + readonly on dispatch + read visibility ──
+
+    #[test]
+    fn promoted_param_redeclaring_ancestor_private_bails() {
+        // Gold (php8.4, runs clean): P keeps its own private $x slot — px()
+        // reads P's slot (= 1) even on a C instance whose promoted $x is 2.
+        // The name-keyed record collapsed both into {x:2} → px() = 2 → a FALSE
+        // GREEN on assertSame(2, ...). Promotion declares a REAL property on C,
+        // so the slot tracker must see it and bail the shadowed-private pair.
+        let src = r#"<?php
+class P { private $x = 1; public function px() { return $this->x; } }
+class C extends P { public function __construct(private $x = 2) {} }
+class PromShadowTest {
+    public function testPx(): void {
+        $c = new C();
+        $this->assertSame(2, $c->px());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "PromShadowTest", "testPx", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn child_plain_redeclare_over_ancestor_promoted_private_bails() {
+        // Mirror: the ANCESTOR's ctor promotes a private $x; the child's plain
+        // public $x = 9 is a second PHP slot. The record kept one slot (the
+        // inherited ctor's set_prop wrote 5 last) → the external read of the
+        // PUBLIC slot returned 5 instead of PHP's 9 (a false red).
+        let src = r#"<?php
+class PBase { public function __construct(private $x = 5) {} public function px() { return $this->x; } }
+class PChild extends PBase { public $x = 9; }
+class PromMirrorTest {
+    public function testX(): void {
+        $c = new PChild();
+        $this->assertSame(9, $c->x);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "PromMirrorTest", "testX", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn promoted_public_over_public_redeclare_still_reduces() {
+        // NO-OVER-BAIL control: a promoted PUBLIC param redeclaring a parent's
+        // PUBLIC prop is PHP's legal single-slot override — must keep reducing.
+        let src = r#"<?php
+class PubBase { public $x = 1; }
+class PubChild extends PubBase { public function __construct(public $x = 2) {} }
+class PromPublicTest {
+    public function testX(): void {
+        $this->assertSame(2, (new PubChild())->x);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "PromPublicTest", "testX", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn readonly_promoted_write_in_instance_method_bails() {
+        // Gold (php8.4): $c->setX(5) is PHP's "Cannot modify readonly property"
+        // Error → the test ERRORS in PHPUnit. The dispatch path never threaded
+        // the readonly set (and the plain-only collector missed promoted names
+        // structurally), so the record mutated → a definitive FALSE Pass.
+        let src = r#"<?php
+class RoDisp {
+    public function __construct(public readonly int $x = 1) {}
+    public function setX(int $v): void { $this->x = $v; }
+}
+class RoDispatchTest {
+    public function testSetX(): void {
+        $c = new RoDisp();
+        $c->setX(5);
+        $this->assertSame(5, $c->x);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "RoDispatchTest", "testSetX", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn readonly_class_non_mutating_method_still_inlines() {
+        // NO-OVER-BAIL control: carrying the readonly set into the dispatch
+        // scope must not affect a method that only READS the readonly prop.
+        let src = r#"<?php
+class RoRead {
+    public function __construct(public readonly int $x = 3) {}
+    public function double(): int { return $this->x * 2; }
+}
+class RoReadTest {
+    public function testDouble(): void {
+        $c = new RoRead();
+        $this->assertSame(6, $c->double());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "RoReadTest", "testDouble", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn child_method_reading_parent_private_bails() {
+        // Gold (php8.4, runs clean): $this->x inside VC is UNDEFINED (VP's slot
+        // is private to VP) → Warning + null → the assert FAILS in PHPUnit. The
+        // scope-blind record read returned the parent's 1 → a false green.
+        let src = r#"<?php
+class VP { private $x = 1; }
+class VC extends VP { public function cx() { return $this->x; } }
+class VisChildTest {
+    public function testCx(): void {
+        $c = new VC();
+        $this->assertSame(1, $c->cx());
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "VisChildTest", "testCx", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn external_read_of_private_prop_bails() {
+        // Gold (php8.4): a test-body read of a private prop is PHP's "Cannot
+        // access private property" Error → the test ERRORS in PHPUnit. The
+        // record read returned 5 → a definitive verdict where PHPUnit errors.
+        let src = r#"<?php
+class VS { private $secret = 5; }
+class VisExternalTest {
+    public function testRead(): void {
+        $s = new VS();
+        $this->assertSame(5, $s->secret);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "VisExternalTest", "testRead", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn external_read_of_protected_prop_bails() {
+        // Same as the private flavor: an external protected read is a PHP
+        // Error (PHPUnit test Error) — never a value.
+        let src = r#"<?php
+class VPr { protected $p = 7; }
+class VisProtExternalTest {
+    public function testRead(): void {
+        $o = new VPr();
+        $this->assertSame(7, $o->p);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "VisProtExternalTest", "testRead", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn private_prop_behind_magic_get_bails() {
+        // Gold (php8.4): the inaccessible read routes through __get → 42 → the
+        // test PASSES legally. The record returned the raw slot (1) → a false
+        // red. __get's PRESENCE anywhere in the chain bails the construction
+        // (symmetric with the round-17 __set bail).
+        let src = r#"<?php
+class VG {
+    private $data = 1;
+    public function __get($name) { return 42; }
+}
+class VisMagicGetTest {
+    public function testRead(): void {
+        $g = new VG();
+        $this->assertSame(42, $g->data);
+    }
+}
+"#;
+        assert!(matches!(
+            reduce_with_subst(src, "VisMagicGetTest", "testRead", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn external_public_prop_read_still_reduces() {
+        // NO-OVER-BAIL control: public props are the overwhelmingly common
+        // case (commonmark HtmlElement) — external reads must keep reducing.
+        let src = r#"<?php
+class VPub { public $v = 3; }
+class VisPublicTest {
+    public function testRead(): void {
+        $p = new VPub();
+        $this->assertSame(3, $p->v);
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "VisPublicTest", "testRead", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn self_read_of_own_private_prop_still_reduces() {
+        // NO-OVER-BAIL control: a method reading ITS OWN class's private prop
+        // is PHP-legal (the doctrine fixture pattern) — must keep reducing.
+        let src = r#"<?php
+class VOwn {
+    private $w = 4;
+    public function getW() { return $this->w; }
+}
+class VisOwnTest {
+    public function testRead(): void {
+        $o = new VOwn();
+        $this->assertSame(4, $o->getW());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "VisOwnTest", "testRead", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn child_method_reading_parent_protected_still_reduces() {
+        // NO-OVER-BAIL control: protected reads from anywhere in the
+        // receiver's own chain are PHP-legal — must keep reducing.
+        let src = r#"<?php
+class ProtBase { protected $p = 6; }
+class ProtChild extends ProtBase { public function getP() { return $this->p; } }
+class VisProtChainTest {
+    public function testRead(): void {
+        $c = new ProtChild();
+        $this->assertSame(6, $c->getP());
+    }
+}
+"#;
+        assert_eq!(
+            reduce_with_subst(src, "VisProtChainTest", "testRead", vec![]),
+            Outcome::Pass
         );
     }
 }
