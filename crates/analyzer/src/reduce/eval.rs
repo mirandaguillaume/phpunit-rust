@@ -17,7 +17,7 @@
 //! Task 5 via a resolver hook; this module evaluates a single body with the
 //! resolver pluggable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mago_syntax::ast::ast::array::{Array, ArrayElement, LegacyArray};
 use mago_syntax::ast::ast::binary::BinaryOperator;
@@ -208,6 +208,12 @@ pub struct Scope<'r> {
     /// write site after the AST has dropped. A property absent from this map is
     /// untyped (or non-scalar-typed) → stored verbatim, no coercion (no bail).
     prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    /// Bare names of the receiver class's `readonly` properties (round 17 fix 4):
+    /// promoted `readonly` ctor params + plain `readonly` declarations across the
+    /// chain. A ctor/setUp BODY write to one is (at best) PHP's "Cannot modify
+    /// readonly property" Error — the write-once seed happens at promoted-param
+    /// binding, NEVER through the body — so the write site bails (fail-closed).
+    readonly_props: HashSet<Vec<u8>>,
 }
 
 impl<'r> Scope<'r> {
@@ -223,6 +229,7 @@ impl<'r> Scope<'r> {
             source: None,
             allow_this_write: false,
             prop_hints: HashMap::new(),
+            readonly_props: HashSet::new(),
         }
     }
 
@@ -231,6 +238,15 @@ impl<'r> Scope<'r> {
     /// write site. Only properties with a coercion-relevant scalar hint appear.
     pub fn with_prop_hints(mut self, hints: HashMap<Vec<u8>, OwnedScalarHint>) -> Self {
         self.prop_hints = hints;
+        self
+    }
+
+    /// Attach the receiver class's `readonly` property names (round 17 fix 4), so
+    /// a ctor/setUp BODY write to one bails at the write site (PHP: "Cannot
+    /// modify readonly property" Error; the legal write-once is the promoted-param
+    /// seed, which never flows through `eval_property_assignment`).
+    pub fn with_readonly_props(mut self, readonly: HashSet<Vec<u8>>) -> Self {
+        self.readonly_props = readonly;
         self
     }
 
@@ -744,14 +760,23 @@ pub fn run_ctor_body(
     bindings: HashMap<Vec<u8>, Value>,
     resolver: &dyn CallResolver,
 ) -> Result<Value, BailReason> {
-    run_ctor_body_inner(block, bindings, resolver, None, None, HashMap::new())
+    run_ctor_body_inner(
+        block,
+        bindings,
+        resolver,
+        None,
+        None,
+        HashMap::new(),
+        HashSet::new(),
+    )
 }
 
 /// Like [`run_ctor_body`] but with the body file's resolved-names table attached
 /// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN) plus
 /// the body file's source (so a closure literal stored into `$this` here owns its
-/// bytes — Inc-4 Task 1) and the receiver class's declared scalar property hints
-/// (round 3 Task A — so a typed `$this->prop = …` write re-checks scalar coercion).
+/// bytes — Inc-4 Task 1), the receiver class's declared scalar property hints
+/// (round 3 Task A — so a typed `$this->prop = …` write re-checks scalar coercion)
+/// and its `readonly` property names (round 17 fix 4 — a body write to one bails).
 pub fn run_ctor_body_with_names(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
@@ -759,6 +784,7 @@ pub fn run_ctor_body_with_names(
     names: &mago_names::ResolvedNames,
     source: &[u8],
     prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    readonly_props: HashSet<Vec<u8>>,
 ) -> Result<Value, BailReason> {
     run_ctor_body_inner(
         block,
@@ -767,6 +793,7 @@ pub fn run_ctor_body_with_names(
         Some(names),
         Some(source),
         prop_hints,
+        readonly_props,
     )
 }
 
@@ -806,6 +833,7 @@ pub fn run_method_with_this_writes(
     Ok((ret, final_this))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ctor_body_inner(
     block: &Block,
     bindings: HashMap<Vec<u8>, Value>,
@@ -813,8 +841,11 @@ fn run_ctor_body_inner(
     names: Option<&mago_names::ResolvedNames>,
     source: Option<&[u8]>,
     prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    readonly_props: HashSet<Vec<u8>>,
 ) -> Result<Value, BailReason> {
-    let mut scope = Scope::new(bindings, resolver).with_prop_hints(prop_hints);
+    let mut scope = Scope::new(bindings, resolver)
+        .with_prop_hints(prop_hints)
+        .with_readonly_props(readonly_props);
     if let Some(n) = names {
         scope = scope.with_names(n);
     }
@@ -2473,6 +2504,20 @@ fn eval_property_assignment(
     // Task A). An untyped / non-scalar-typed property is absent from the map →
     // stored verbatim, no bail.
     let prop_name = prop_id.value.to_vec();
+    // A ctor/setUp BODY write to a `readonly` property (round 17 fix 4): for a
+    // PROMOTED readonly param the param binding already performed the write-once
+    // seed, so this body write is PHP's "Cannot modify readonly property" Error —
+    // the record model would silently overwrite (false green). BAIL. This also
+    // over-bails the legal FIRST init of a plain (non-promoted) readonly prop in
+    // a ctor body — accepted: modelling per-prop write-once state risks getting
+    // it wrong, and a bail only costs coverage, never truth.
+    if scope.readonly_props.contains(prop_name.as_slice()) {
+        return Err(BailReason::UnsupportedConstruct(format!(
+            "write to readonly property ${} in a constructor/setUp body (PHP \
+             \"Cannot modify readonly property\" Error unmodelled)",
+            String::from_utf8_lossy(&prop_name)
+        )));
+    }
     if let Some(hint) = scope.prop_hints.get(prop_name.as_slice()) {
         hint.bail_if_coerces(&rhs, "property")?;
     }
