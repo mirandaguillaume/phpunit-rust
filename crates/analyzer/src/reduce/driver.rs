@@ -711,6 +711,66 @@ class MoneyTest extends TestCase {
         }
     }
 
+    #[test]
+    fn static_prop_shadowing_ancestor_private_bails() {
+        // Round 19 (Fix C). Gold (php8.4, runs clean): StaticShadowTest's
+        // `public static $x` shadows StaticShadowBase's `private $x`. Reading
+        // $this->x is an undefined-INSTANCE-property access (a static is not
+        // served through `->`) → null → assertSame(1, null) FAILS in PHPUnit.
+        // The tolerant test-case seeder skipped the static BEFORE declaring it,
+        // fusing with the parent private slot → a definitive false green.
+        // Declaring the static now triggers the shadowed-private slot bail.
+        let dir = write_suite(&[(
+            "StaticShadowTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+abstract class StaticShadowBase extends TestCase { private $x = 1; }
+final class StaticShadowTest extends StaticShadowBase {
+    public static $x = 2;
+    public function testRead(): void {
+        $this->assertSame(1, $this->x);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("StaticShadowTest.php")).unwrap();
+        let got = outcomes(&reduced);
+        assert!(
+            got.iter()
+                .any(|(m, _, o)| *m == "testRead" && matches!(o, Outcome::Bailed(_))),
+            "static-shadow test must BAIL (not a definitive verdict); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn property_hook_in_test_case_chain_bails() {
+        // Round 19 (Fix D). Gold (php8.4, runs clean): HookShadowTest's virtual
+        // hooked $h routes $this->h through the `get` hook → 99 → assertSame(99,
+        // 99) PASSES. The tolerant seeder skipped the hooked prop, reading the
+        // parent private slot 1 → a definitive false FAIL. A property hook
+        // anywhere in the test-case chain now bails the $this build.
+        let dir = write_suite(&[(
+            "HookShadowTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+abstract class HookBase extends TestCase { private $h = 1; }
+final class HookShadowTest extends HookBase {
+    public int $h { get => 99; set(int $v) {} }
+    public function testRead(): void {
+        $this->assertSame(99, $this->h);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("HookShadowTest.php")).unwrap();
+        let got = outcomes(&reduced);
+        assert!(
+            got.iter()
+                .any(|(m, _, o)| *m == "testRead" && matches!(o, Outcome::Bailed(_))),
+            "hooked-prop test must BAIL; got {got:?}"
+        );
+    }
+
     fn write_suite(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         // Minimal PHPUnit stubs so the test classes resolve as TestCase subclasses.

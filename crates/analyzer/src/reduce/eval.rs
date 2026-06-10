@@ -179,6 +179,24 @@ pub trait CallResolver {
     ) -> Result<(), BailReason> {
         Ok(())
     }
+
+    /// Enforce PHP property-WRITE visibility (round 19; the symmetric twin of
+    /// [`Self::bail_inaccessible_prop_read`]). A `$this->prop = …` write from a
+    /// scope that cannot WRITE the property diverges: a child writing a
+    /// parent-`private` prop does NOT touch the parent slot (PHP forks a separate
+    /// dynamic property), and a write to an asymmetric `private(set)` /
+    /// `protected(set)` prop from outside the set-scope is a PHP Error. The
+    /// default allows everything (the [`NoResolver`] hand-built records carry no
+    /// declared visibility); the [`super::subst::BridgeResolver`] consults the
+    /// declared `write_visibility` and BAILS (fail-closed).
+    fn bail_inaccessible_prop_write(
+        &self,
+        _receiver_class: &[u8],
+        _prop: &[u8],
+        _writing_class: Option<&[u8]>,
+    ) -> Result<(), BailReason> {
+        Ok(())
+    }
 }
 
 /// A resolver that resolves nothing (all user calls bail). Used by the pure-eval
@@ -2595,6 +2613,24 @@ fn eval_property_assignment(
     // Task A). An untyped / non-scalar-typed property is absent from the map →
     // stored verbatim, no bail.
     let prop_name = prop_id.value.to_vec();
+    // PHP property-WRITE visibility (round 19): a write the current scope cannot
+    // perform either forks a separate dynamic property (a child writing a
+    // parent-`private` prop leaves the parent slot intact) or Errors (an
+    // asymmetric `private(set)` written from outside its set-scope). The by-value
+    // record would overwrite the modelled slot → a definitive false verdict. Read
+    // the receiver class off the bound `$this` and bail (fail-closed) before any
+    // mutation, the write-side twin of the round-18 read guard.
+    if let Some(Value::Object {
+        class: recv_class, ..
+    }) = scope.vars.get(b"this".as_slice())
+    {
+        let recv_class = recv_class.clone();
+        scope.resolver.bail_inaccessible_prop_write(
+            &recv_class,
+            prop_name.as_slice(),
+            scope.current_class.as_deref(),
+        )?;
+    }
     // A BODY write to a `readonly` property (round 17 fix 4 for ctor/setUp;
     // round 18 extends the same set to the instance-method dispatch path): for
     // a PROMOTED readonly param the param binding already performed the
