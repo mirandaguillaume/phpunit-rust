@@ -1631,4 +1631,289 @@ class TypedPropTest extends TestCase {
              got {reduced:?}"
         );
     }
+
+    const INHERITED_DEFAULT_SRC: &str = r#"<?php
+class P { public $z = 7; }
+class C extends P {
+    public function __construct($v = null) { if ($v !== null) { $this->z = $v; } }
+}
+"#;
+
+    #[test]
+    fn inherited_default_assert_equals_now_exact() {
+        // FALSE RED (gold-verified): `new C(7)` and `new C()` BOTH carry z=7 in
+        // PHP (the default lives in parent P). Leaf-only seeding recorded
+        // {z:7} vs {} → a structural prop-count mismatch → reducer Fail while
+        // real PHPUnit PASSES. Chain seeding makes both records {z:7} → Pass
+        // (EXACT, not a bail).
+        let dir = write_suite(&[(
+            "InheritedDefaultEqTest.php",
+            &format!(
+                r#"{INHERITED_DEFAULT_SRC}
+use PHPUnit\Framework\TestCase;
+class InheritedDefaultEqTest extends TestCase {{
+    public function testEquals(): void {{
+        $this->assertEquals(new C(7), new C());
+    }}
+}}
+"#
+            ),
+        )]);
+        let reduced = reduce_file(&dir.path().join("InheritedDefaultEqTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "an inherited class-property default must be seeded — both records \
+             are {{z:7}} (real PHPUnit passes); got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_default_assert_not_equals_matches_phpunit_fail() {
+        // FALSE GREEN (gold-verified, masks a real failure): real PHPUnit FAILS
+        // assertNotEquals(new C(7), new C()) — both objects have z=7. The
+        // unseeded {z:7} vs {} mismatch made the reducer report Pass. After
+        // chain seeding both records are {z:7} → the reducer must Fail, which
+        // MATCHES PHPUnit's Fail (a true red, 0 divergence).
+        let dir = write_suite(&[(
+            "InheritedDefaultNeqTest.php",
+            &format!(
+                r#"{INHERITED_DEFAULT_SRC}
+use PHPUnit\Framework\TestCase;
+class InheritedDefaultNeqTest extends TestCase {{
+    public function testNotEquals(): void {{
+        $this->assertNotEquals(new C(7), new C());
+    }}
+}}
+"#
+            ),
+        )]);
+        let reduced = reduce_file(&dir.path().join("InheritedDefaultNeqTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Fail(_)),
+            "assertNotEquals on two z=7 records FAILS in real PHPUnit — the \
+             reducer must match (never a false green); got {reduced:?}"
+        );
+    }
+
+    const TRAIT_DEFAULT_SRC: &str = r#"<?php
+trait HasX { public $x = 5; }
+class A1 {
+    use HasX;
+    public function __construct($v = null) { if ($v !== null) { $this->x = $v; } }
+}
+"#;
+
+    #[test]
+    fn trait_default_assert_equals_now_exact() {
+        // FALSE RED (gold-verified): a trait property is flattened into the
+        // using class — `new A1(5)` and `new A1()` BOTH carry x=5 in PHP.
+        // used_traits was consulted only for coercion HINTS, never for
+        // seeding → {x:5} vs {} → reducer Fail while real PHPUnit PASSES.
+        let dir = write_suite(&[(
+            "TraitDefaultEqTest.php",
+            &format!(
+                r#"{TRAIT_DEFAULT_SRC}
+use PHPUnit\Framework\TestCase;
+class TraitDefaultEqTest extends TestCase {{
+    public function testEquals(): void {{
+        $this->assertEquals(new A1(5), new A1());
+    }}
+}}
+"#
+            ),
+        )]);
+        let reduced = reduce_file(&dir.path().join("TraitDefaultEqTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "a trait-declared property default must be seeded — both records \
+             are {{x:5}} (real PHPUnit passes); got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn trait_default_assert_not_equals_matches_phpunit_fail() {
+        // FALSE GREEN twin: real PHPUnit FAILS assertNotEquals(new A1(5),
+        // new A1()) — both have x=5. The reducer's Fail after seeding MATCHES
+        // PHPUnit's Fail (true red, 0 divergence).
+        let dir = write_suite(&[(
+            "TraitDefaultNeqTest.php",
+            &format!(
+                r#"{TRAIT_DEFAULT_SRC}
+use PHPUnit\Framework\TestCase;
+class TraitDefaultNeqTest extends TestCase {{
+    public function testNotEquals(): void {{
+        $this->assertNotEquals(new A1(5), new A1());
+    }}
+}}
+"#
+            ),
+        )]);
+        let reduced = reduce_file(&dir.path().join("TraitDefaultNeqTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(reduced[0].outcome, Outcome::Fail(_)),
+            "assertNotEquals on two x=5 records FAILS in real PHPUnit — the \
+             reducer must match (never a false green); got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn ancestor_used_trait_default_seeded() {
+        // The trait is used by an ANCESTOR, not the leaf: PHP flattens it into
+        // B1 and D1 inherits it — `new D1(5)` and `new D1()` both carry x=5.
+        let dir = write_suite(&[(
+            "AncestorTraitTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+trait HasY { public $x = 5; }
+class B1 { use HasY; }
+class D1 extends B1 {
+    public function __construct($v = null) { if ($v !== null) { $this->x = $v; } }
+}
+class AncestorTraitTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new D1(5), new D1());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("AncestorTraitTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "an ancestor-used trait's property default must be seeded; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn trait_untyped_defaultless_prop_seeds_null() {
+        // Round-15's untyped-defaultless-NULL semantics must hold for a
+        // TRAIT-declared property too: PHP initializes `public $u;` to NULL
+        // wherever it is flattened from.
+        let dir = write_suite(&[(
+            "TraitNullTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+trait HasU { public $u; }
+class HU {
+    use HasU;
+    public function __construct(int $w) { if ($w) { $this->u = null; } }
+}
+class TraitNullTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new HU(1), new HU(0));
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("TraitNullTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert_eq!(
+            reduced[0].outcome,
+            Outcome::Pass,
+            "an untyped defaultless TRAIT property defaults to NULL in PHP — \
+             both records are {{u:null}}; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn absent_used_trait_construction_bails() {
+        // The trait sibling of the ext-ancestor bail: a used trait absent from
+        // the scanned codebase carries unmodelled state (its property set is
+        // unknown) — construction must BAIL, never build a partial record.
+        // (PHP itself fatals "Trait not found" at class-declaration time.)
+        let dir = write_suite(&[(
+            "AbsentTraitTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+class UsesAbsent {
+    use \Vendor\Tools\Helper;
+    public $k = 1;
+}
+class AbsentTraitTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new UsesAbsent(), new UsesAbsent());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("AbsentTraitTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        match &reduced[0].outcome {
+            Outcome::Bailed(BailReason::UnsupportedConstruct(m)) => assert!(
+                m.contains("not in the codebase"),
+                "the bail must name the unresolvable trait; got {m:?}"
+            ),
+            other => panic!(
+                "constructing a class that uses an unscanned trait must BAIL \
+                 (trait state unmodelled), never a definitive verdict; got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn absent_nested_trait_construction_bails() {
+        // The absent trait is one level down (trait-of-trait): the walk must
+        // recurse, mirroring the transitive ext-ancestor walk.
+        let dir = write_suite(&[(
+            "AbsentNestedTraitTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+trait Outer { use \Vendor\Tools\Absent; }
+class UsesOuter { use Outer; }
+class AbsentNestedTraitTest extends TestCase {
+    public function testEquals(): void {
+        $this->assertEquals(new UsesOuter(), new UsesOuter());
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("AbsentNestedTraitTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        assert!(
+            matches!(
+                reduced[0].outcome,
+                Outcome::Bailed(BailReason::UnsupportedConstruct(_))
+            ),
+            "an absent NESTED trait must bail construction too; got {reduced:?}"
+        );
+    }
+
+    #[test]
+    fn abstract_class_instantiation_bails() {
+        // PHP throws Error "Cannot instantiate abstract class Shape" — the
+        // test ERRORS in PHPUnit. Building a record instead let the test
+        // reduce to a definitive Pass (false green). Bail, fail-closed.
+        let dir = write_suite(&[(
+            "AbstractNewTest.php",
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+abstract class Shape { public $sides = 0; }
+class AbstractNewTest extends TestCase {
+    public function testNew(): void {
+        $s = new Shape();
+        $this->assertSame(0, $s->sides);
+    }
+}
+"#,
+        )]);
+        let reduced = reduce_file(&dir.path().join("AbstractNewTest.php")).unwrap();
+        assert_eq!(reduced.len(), 1, "got {reduced:?}");
+        match &reduced[0].outcome {
+            Outcome::Bailed(BailReason::UnsupportedConstruct(m)) => assert!(
+                m.contains("abstract"),
+                "the bail must name the abstract-instantiation error; got {m:?}"
+            ),
+            other => panic!(
+                "`new` on an abstract class ERRORS in PHP — the reducer must \
+                 BAIL, never a definitive verdict; got {other:?}"
+            ),
+        }
+    }
 }

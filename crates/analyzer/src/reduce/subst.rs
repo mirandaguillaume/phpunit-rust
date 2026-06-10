@@ -456,10 +456,12 @@ impl BridgeResolver<'_> {
             .unwrap_or(Ok(None))
     }
 
-    /// Construct `new class(args)` (Task B): seed props from plain literal property
-    /// defaults + promoted params, then run the constructor body (property writes
-    /// permitted) and return the populated record. The constructor may be inherited
-    /// (resolved via its own declaring class), so it is run in its declaring file.
+    /// Construct `new class(args)` (Task B): seed props from the FULL resolvable
+    /// ancestor chain's plain literal property defaults (each hop's used traits
+    /// flattened in first) + promoted params, then run the constructor body
+    /// (property writes permitted) and return the populated record. The
+    /// constructor may be inherited (resolved via its own declaring class), so
+    /// it is run in its declaring file.
     fn construct_object(&self, class: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
         let codebase = self.project.codebase();
         // Strip a leading `\` so a fully-qualified `\App\Calc` matches mago's key.
@@ -471,52 +473,59 @@ impl BridgeResolver<'_> {
             Some(m) => m,
             None => return Ok(None),
         };
+        // PHP refuses `new` on an abstract class (Error: "Cannot instantiate
+        // abstract class X") — the test ERRORS in PHPUnit. Building a record
+        // anyway let such a test reduce to a definitive Pass (false green).
+        if class_meta.flags.is_abstract() {
+            return Err(BailReason::UnsupportedConstruct(
+                "cannot instantiate abstract class (PHP Error)".into(),
+            ));
+        }
         // Fail-closed: a declared ancestor outside the scanned codebase carries
         // ext-internal state the record cannot model — never construct an empty
         // shell (it would compare as `{}` and diverge from PHPUnit, false green).
         self.bail_unresolvable_declared_ancestry(class, false)?;
+        // The trait sibling: a trait used anywhere in the chain (leaf, ancestor,
+        // nested trait-of-trait) that is absent from the scan carries an
+        // unknowable property set — bail before seeding (fail-closed).
+        self.bail_unresolvable_used_traits(class)?;
         let record_class = class_meta.original_name.as_bytes().to_vec();
-        let class_file = self
-            .project
-            .file_of_span(&class_meta.span)
-            .ok_or_else(|| BailReason::Other("class declaring file not loaded".into()))?;
-        let class_logical = String::from_utf8_lossy(&class_file.name).into_owned();
         let class_fqcn = class_meta.name.as_bytes().to_vec();
 
-        // 1) Seed plain (non-promoted) property declarations with literal defaults
-        //    from THIS class's own AST. Inherited-property defaults are intentionally
-        //    NOT seeded (seed_plain_property_defaults is leaf-only) — a read of an
-        //    unseeded inherited prop bails, fail-closed (no divergence).
+        // 1) Seed plain (non-promoted) literal property defaults across the FULL
+        //    resolvable ancestor chain, parents-first (a child redeclaration
+        //    overrides a parent's), each hop's used traits BEFORE the hop's own
+        //    AST (PHP flattens a trait's properties into the using class; a
+        //    legal redeclare must be an IDENTICAL declaration — incompatible is
+        //    a PHP fatal — so class-after-trait observes PHP's flattening).
+        //    The two bails above guarantee every chain member resolves, so the
+        //    walk is total. Leaf-only seeding recorded `{z:7}` vs `{}` for an
+        //    inherited default — a structural prop-count mismatch the equality
+        //    path compares WITHOUT any property read (false red on assertEquals
+        //    AND false green on assertNotEquals).
         let resolver = self;
-        let mut props: Vec<(Vec<u8>, Value)> = self
-            .project
-            .with_program(&class_logical, |program, _file, _names| {
-                let Some(class_node) = find_class(program, &class_fqcn) else {
-                    return Err(BailReason::Other(
-                        "class AST not found after re-parse".into(),
-                    ));
-                };
-                let mut p: Vec<(Vec<u8>, Value)> = Vec::new();
-                seed_plain_property_defaults(class_node, &mut p, resolver)?;
-                Ok(p)
-            })
-            .unwrap_or_else(|| Err(BailReason::Other("could not re-parse class file".into())))?;
-
-        // Collect the declared SCALAR property hints (round 3 Task A) across the
-        // FULL ancestor chain — symmetric with build_test_case_this — so a typed
-        // `$this->prop = …` write in the ctor body re-checks coercion even when the
-        // property is DECLARED IN A PARENT. (Leaf-only collection missed inherited
-        // hints, letting an un-coerced value through → a divergent Pass/Fail.)
-        // Walk parents-first so a child override wins over a parent on a dup name.
-        let mut hint_chain: Vec<Vec<u8>> = class_meta
+        let mut chain: Vec<Vec<u8>> = class_meta
             .all_parent_classes
             .iter()
             .map(|w| w.as_bytes().to_vec())
             .collect();
-        hint_chain.reverse();
-        hint_chain.push(class_meta.name.as_bytes().to_vec());
+        chain.reverse();
+        chain.push(class_meta.name.as_bytes().to_vec());
+        let mut props: Vec<(Vec<u8>, Value)> = Vec::new();
+        for fqcn in &chain {
+            let mut trait_seen: Vec<Vec<u8>> = Vec::new();
+            self.seed_used_trait_property_defaults(fqcn, &mut props, false, &mut trait_seen)?;
+            self.seed_class_like_property_defaults(fqcn, &mut props, false)?;
+        }
+
+        // Collect the declared SCALAR property hints (round 3 Task A) across the
+        // same chain — symmetric with build_test_case_this — so a typed
+        // `$this->prop = …` write in the ctor body re-checks coercion even when the
+        // property is DECLARED IN A PARENT. (Leaf-only collection missed inherited
+        // hints, letting an un-coerced value through → a divergent Pass/Fail.)
+        // Walk parents-first so a child override wins over a parent on a dup name.
         let mut prop_hints = PropHints::new();
-        for fqcn in &hint_chain {
+        for fqcn in &chain {
             // A class's used traits BEFORE its own hints (round 5: trait-declared
             // typed scalar props are a SEPARATE set, never in all_parent_classes),
             // so a class-level redeclare wins over a trait's hint.
@@ -602,6 +611,11 @@ impl BridgeResolver<'_> {
         // PHPUnit `TestCase` base (never scanned project-only; its internal
         // state is never part of a compared record).
         self.bail_unresolvable_declared_ancestry(class_key.as_bytes(), true)?;
+        // The trait sibling: a trait used anywhere in the RESOLVABLE chain that
+        // is absent from the scan carries an unknowable property set — bail.
+        // (An exempt unresolved `TestCase` is not in `all_parent_classes`, so
+        // its traits are out of reach — and out of the compared record.)
+        self.bail_unresolvable_used_traits(class_key.as_bytes())?;
         let record_class = class_meta.original_name.as_bytes().to_vec();
 
         // 1) Seed plain literal property defaults from the class AND every ancestor
@@ -621,7 +635,12 @@ impl BridgeResolver<'_> {
         // so a typed `$this->prop = …` write inside setUp re-checks coercion.
         let mut prop_hints = PropHints::new();
         for fqcn in &chain {
-            self.seed_class_property_defaults(fqcn, &mut props)?;
+            // Each hop's used traits BEFORE the hop's own AST (PHP flattens a
+            // trait's properties into the using class; a legal class-level
+            // redeclare must be identical, so class-after-trait matches PHP).
+            let mut trait_seen: Vec<Vec<u8>> = Vec::new();
+            self.seed_used_trait_property_defaults(fqcn, &mut props, true, &mut trait_seen)?;
+            self.seed_class_like_property_defaults(fqcn, &mut props, true)?;
             // A class's used traits BEFORE its own hints (round 5: trait-declared
             // typed scalar props are a SEPARATE set, never in all_parent_classes),
             // so a class-level redeclare wins over a trait's hint.
@@ -677,32 +696,105 @@ impl BridgeResolver<'_> {
         Ok(Some(this))
     }
 
-    /// Seed one class's OWN plain literal property defaults into `props` (used by
-    /// the test-case `$this` builder to walk the ancestor chain). A class not on
-    /// disk is silently skipped (its props stay unseeded → a read bails later).
-    fn seed_class_property_defaults(
+    /// Seed one class-like's OWN plain literal property defaults into `props`
+    /// (class OR trait AST — a trait's properties are flattened into the using
+    /// class, so the same member walk applies). `tolerant` selects the
+    /// test-case-chain seeder (skip static/hooked/non-literal members; an
+    /// unresolvable class-like is silently skipped — its props stay unseeded →
+    /// a read bails later) vs the `new`-path seeder (those members BAIL,
+    /// frontier §4, and an unresolvable class-like BAILS — the construction
+    /// path pre-verified the whole chain resolves, so a miss is unexpected).
+    fn seed_class_like_property_defaults(
         &self,
         fqcn: &[u8],
         props: &mut Vec<(Vec<u8>, Value)>,
+        tolerant: bool,
     ) -> Result<(), BailReason> {
+        fn miss(tolerant: bool, what: &str) -> Result<(), BailReason> {
+            if tolerant {
+                Ok(())
+            } else {
+                Err(BailReason::Other(format!(
+                    "class-like {what} not found after re-parse"
+                )))
+            }
+        }
         let codebase = self.project.codebase();
         let key = normalize_fqcn(fqcn);
         let Some(class_meta) = codebase.get_class_like(&key.to_ascii_lowercase()) else {
-            return Ok(());
+            return miss(tolerant, "metadata");
         };
         let Some(file) = self.project.file_of_span(&class_meta.span) else {
-            return Ok(());
+            return miss(tolerant, "file");
         };
         let logical = String::from_utf8_lossy(&file.name).into_owned();
         let class_fqcn = class_meta.name.as_bytes().to_vec();
         self.project
             .with_program(&logical, |program, _file, _names| {
-                let Some(class_node) = find_class(program, &class_fqcn) else {
-                    return Ok(());
-                };
-                seed_plain_property_defaults_tolerant(class_node, props)
+                if let Some(class_node) = find_class(program, &class_fqcn) {
+                    if tolerant {
+                        seed_plain_property_defaults_tolerant(class_node.members.iter(), props)
+                    } else {
+                        seed_plain_property_defaults(class_node.members.iter(), props)
+                    }
+                } else if let Some(trait_node) = find_trait(program, &class_fqcn) {
+                    if tolerant {
+                        seed_plain_property_defaults_tolerant(trait_node.members.iter(), props)
+                    } else {
+                        seed_plain_property_defaults(trait_node.members.iter(), props)
+                    }
+                } else {
+                    miss(tolerant, "AST")
+                }
             })
-            .unwrap_or(Ok(()))
+            .unwrap_or_else(|| miss(tolerant, "program"))
+    }
+
+    /// Seed the plain literal property defaults of every trait `fqcn` USES into
+    /// `props` (recursing into traits a trait itself uses, nested-first so a
+    /// using trait's redeclaration wins), exactly like a class AST — PHP
+    /// flattens trait properties (defaults AND the untyped-defaultless NULL)
+    /// into the using class. Called BEFORE the class's own seeding so a
+    /// class-level redeclaration wins (PHP only allows an IDENTICAL one, so
+    /// either order observes the same value). `seen` guards a (malformed)
+    /// trait-use cycle and dedups mago's populator-flattened `used_traits`.
+    /// The callers bail on any absent trait first
+    /// ([`Self::bail_unresolvable_used_traits`]), so a lookup miss here is a
+    /// defensive dead-path.
+    fn seed_used_trait_property_defaults(
+        &self,
+        fqcn: &[u8],
+        props: &mut Vec<(Vec<u8>, Value)>,
+        tolerant: bool,
+        seen: &mut Vec<Vec<u8>>,
+    ) -> Result<(), BailReason> {
+        let codebase = self.project.codebase();
+        let lower = normalize_fqcn(fqcn).to_ascii_lowercase();
+        if seen.contains(&lower) {
+            return Ok(());
+        }
+        seen.push(lower.clone());
+        let Some(class_meta) = codebase.get_class_like(&lower) else {
+            return Ok(());
+        };
+        // Snapshot the used-trait FQCNs (the borrow of `class_meta` ends here so
+        // the recursive call can re-borrow the codebase).
+        let traits: Vec<Vec<u8>> = class_meta
+            .used_traits
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        for trait_fqcn in &traits {
+            // Skip an already-seeded trait ENTIRELY (mago's populator flattens
+            // nested traits into the user's `used_traits`; re-seeding one after
+            // its using trait would invert the using-trait-wins order).
+            if seen.contains(&normalize_fqcn(trait_fqcn).to_ascii_lowercase()) {
+                continue;
+            }
+            self.seed_used_trait_property_defaults(trait_fqcn, props, tolerant, seen)?;
+            self.seed_class_like_property_defaults(trait_fqcn, props, tolerant)?;
+        }
+        Ok(())
     }
 
     /// Collect one class's OWN declared scalar property hints into `hints` (round 3
@@ -789,6 +881,75 @@ impl BridgeResolver<'_> {
         }
     }
 
+    /// The trait sibling of [`Self::bail_unresolvable_declared_ancestry`]: walk
+    /// every trait used anywhere in `start_key`'s RESOLVABLE chain (the leaf,
+    /// each ancestor, recursing into traits a trait itself uses, cycle-guarded)
+    /// and BAIL (fail-closed) when any is absent from the scanned codebase.
+    ///
+    /// An absent trait's property set is unknowable: seeding would silently
+    /// omit its defaults (the same structural prop-count divergence as the
+    /// ancestry hole) and its typed props would take verbatim (un-coerced)
+    /// writes — the round-5 documented divergence. PHP itself fatals ("Trait
+    /// not found") when the class is declared, so no real verdict is lost.
+    ///
+    /// `all_parent_classes` only carries RESOLVED ancestors; the ancestry bail
+    /// runs first, so the only possibly-unresolved ancestor is an exempt
+    /// PHPUnit `TestCase` — out of the compared record by design.
+    fn bail_unresolvable_used_traits(&self, start_key: &[u8]) -> Result<(), BailReason> {
+        let codebase = self.project.codebase();
+        let leaf_key = normalize_fqcn(start_key).to_ascii_lowercase();
+        let Some(class_meta) = codebase.get_class_like(&leaf_key) else {
+            // The caller verified `start_key` resolves; defensive only.
+            return Ok(());
+        };
+        let mut chain: Vec<Vec<u8>> = class_meta
+            .all_parent_classes
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        chain.push(leaf_key);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        for fqcn in &chain {
+            self.bail_unresolvable_used_traits_of(fqcn, &mut seen)?;
+        }
+        Ok(())
+    }
+
+    /// One hop of [`Self::bail_unresolvable_used_traits`]: check `fqcn`'s own
+    /// `used_traits` (recorded at scan time from the AST `use` list, present
+    /// even when the trait never resolved) and recurse into each.
+    fn bail_unresolvable_used_traits_of(
+        &self,
+        fqcn: &[u8],
+        seen: &mut Vec<Vec<u8>>,
+    ) -> Result<(), BailReason> {
+        let codebase = self.project.codebase();
+        let lower = normalize_fqcn(fqcn).to_ascii_lowercase();
+        if seen.contains(&lower) {
+            return Ok(());
+        }
+        seen.push(lower.clone());
+        let Some(meta) = codebase.get_class_like(&lower) else {
+            return Ok(()); // chain members resolve; defensive only.
+        };
+        let traits: Vec<Vec<u8>> = meta
+            .used_traits
+            .iter()
+            .map(|w| w.as_bytes().to_vec())
+            .collect();
+        for trait_fqcn in &traits {
+            let trait_key = normalize_fqcn(trait_fqcn).to_ascii_lowercase();
+            if codebase.get_class_like(&trait_key).is_none() {
+                return Err(BailReason::UnsupportedConstruct(format!(
+                    "class uses trait `{}`, a trait not in the codebase (trait state unmodelled)",
+                    String::from_utf8_lossy(trait_fqcn),
+                )));
+            }
+            self.bail_unresolvable_used_traits_of(trait_fqcn, seen)?;
+        }
+        Ok(())
+    }
+
     /// Collect a class's USED-TRAIT scalar property hints into `hints` (round 5),
     /// recursing into traits a trait itself `use`s, so a `$this->prop = …` write to
     /// a TRAIT-declared typed scalar property re-checks coercion. Traits are a
@@ -799,8 +960,13 @@ impl BridgeResolver<'_> {
     /// same AST `&Hint` path as a class, so the verified coercion predicate is
     /// reused byte-for-byte. A used trait is collected BEFORE the using class's own
     /// hints by the caller, so a class-level redeclare wins over a trait's hint.
-    /// `seen` guards against a (malformed) trait-use cycle. A trait not on disk is
-    /// silently skipped (its props stay unhinted → stored verbatim, fail-closed).
+    /// `seen` guards against a (malformed) trait-use cycle. A trait absent from
+    /// the codebase is a defensive DEAD PATH here: every record-producing path
+    /// (`construct_object`, `build_test_case_this`, and instance dispatch on a
+    /// record they built) bails on an absent used trait first
+    /// ([`Self::bail_unresolvable_used_traits`]), so a hint walk only ever sees
+    /// resolved traits — verbatim (un-coerced) writes can no longer slip
+    /// through an absent vendor trait's typed props.
     fn collect_trait_scalar_property_hints(
         &self,
         fqcn: &[u8],
@@ -834,8 +1000,9 @@ impl BridgeResolver<'_> {
     }
 }
 
-/// Seed plain literal property defaults for a TEST-CASE ancestor class, TOLERATING
-/// (skipping) static / hooked / non-literal-default properties instead of bailing.
+/// Seed plain literal property defaults for a TEST-CASE chain member (class or
+/// trait members), TOLERATING (skipping) static / hooked / non-literal-default
+/// properties instead of bailing.
 ///
 /// Rationale (frontier, fail-closed-preserving): a base PHPUnit `TestCase` carries
 /// static props and the test-case chain may use property hooks the reducer cannot
@@ -843,14 +1010,14 @@ impl BridgeResolver<'_> {
 /// here is still sound: a test that actually READS an unseeded instance property
 /// bails at the read site (`eval_access` → "read of unset property"). Only a plain,
 /// non-static property carrying a LITERAL default is seeded.
-fn seed_plain_property_defaults_tolerant(
-    class_node: &mago_syntax::ast::ast::class_like::Class,
+fn seed_plain_property_defaults_tolerant<'a>(
+    members: impl Iterator<Item = &'a ClassLikeMember<'a>>,
     props: &mut Vec<(Vec<u8>, Value)>,
 ) -> Result<(), BailReason> {
     use mago_syntax::ast::ast::class_like::property::{Property, PropertyItem};
     use mago_syntax::ast::ast::modifier::Modifier;
 
-    for member in class_node.members.iter() {
+    for member in members {
         let ClassLikeMember::Property(Property::Plain(plain)) = member else {
             continue; // hooked properties / non-properties: skip (tolerant).
         };
@@ -1014,18 +1181,18 @@ fn collect_scalar_property_hints<'a>(
 }
 
 /// Seed plain (non-promoted) property declarations carrying a literal default,
-/// e.g. `public int $x = 5;`. Static / readonly / hooked / non-literal-default
-/// properties BAIL (frontier §4). Properties with no default are left unset (a
-/// later read of one bails).
-fn seed_plain_property_defaults(
-    class_node: &mago_syntax::ast::ast::class_like::Class,
+/// e.g. `public int $x = 5;`, from class OR trait members (a trait's properties
+/// are flattened into the using class). Static / readonly / hooked /
+/// non-literal-default properties BAIL (frontier §4). Properties with no
+/// default are left unset (a later read of one bails).
+fn seed_plain_property_defaults<'a>(
+    members: impl Iterator<Item = &'a ClassLikeMember<'a>>,
     props: &mut Vec<(Vec<u8>, Value)>,
-    _resolver: &BridgeResolver,
 ) -> Result<(), BailReason> {
     use mago_syntax::ast::ast::class_like::property::{Property, PropertyItem};
     use mago_syntax::ast::ast::modifier::Modifier;
 
-    for member in class_node.members.iter() {
+    for member in members {
         let ClassLikeMember::Property(property) = member else {
             continue;
         };
