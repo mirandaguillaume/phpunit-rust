@@ -98,6 +98,7 @@ use mago_syntax::ast::Program;
 use super::eval::BailReason;
 use super::subst::{find_class_method, normalize_fqcn, strip_dollar};
 use super::term::Decision;
+use crate::concrete::{compute, Context, PhpValue};
 use crate::mago_bridge::MagoProject;
 use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
 
@@ -135,6 +136,27 @@ impl Analysis<PhpL> for GroundEval {
                 "+" => a.checked_add(b),
                 "-" => a.checked_sub(b),
                 "*" => a.checked_mul(b),
+                // PHP `/` is a FLOAT operator: `7 / 2` is `3.5`, not `3`. This
+                // fragment models only i64, so `/` folds ONLY when the quotient is
+                // EXACT (`b != 0` and `a % b == 0`) — then PHP yields the integer
+                // anyway; otherwise no fold (fail-closed, the float case is
+                // unmodelled). `i64::MIN / -1` overflows → `checked_div` = None.
+                "/" => {
+                    if b != 0 && a % b == 0 {
+                        a.checked_div(b)
+                    } else {
+                        None
+                    }
+                }
+                // PHP `%` is integer modulo; `b == 0` raises (DivisionByZeroError),
+                // unmodelled → no fold. `i64::MIN % -1` overflows → `checked_rem`.
+                "%" => {
+                    if b != 0 {
+                        a.checked_rem(b)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
         }
@@ -605,6 +627,9 @@ fn arith_op(op: &BinaryOperator) -> Option<&'static str> {
         BinaryOperator::Addition(_) => Some("+"),
         BinaryOperator::Subtraction(_) => Some("-"),
         BinaryOperator::Multiplication(_) => Some("*"),
+        // `/` and `%` fold only on exact/non-zero ground operands (see `GroundEval`).
+        BinaryOperator::Division(_) => Some("/"),
+        BinaryOperator::Modulo(_) => Some("%"),
         _ => None,
     }
 }
@@ -755,6 +780,201 @@ fn single_return_expr<'a>(
     None
 }
 
+// ─── Data-provider substitution: rows of integer leaves ────────────────────────
+
+/// The statically-evaluated provider rows for a PARAMETRIZED test method, each a
+/// tuple of integer leaves bound positionally to the method's parameters. Returns
+/// `None` (fail-closed) when the method has no derivable provider, the provider is
+/// not a pure integer-array literal (a `yield`/loop/string/computed row, an external
+/// provider, …), or any leaf escapes the integer fragment — the runner then executes
+/// the method for real. PHPUnit treats each row as a separate test; we decide the
+/// method by aggregating across rows.
+///
+/// Three provider shapes are honoured, exactly as real php8.4 PHPUnit binds them:
+///   * `#[DataProvider('name')]` — the static method `name()` whose single `return`
+///     is an `array` of integer-array rows;
+///   * `#[TestWith([..])]` — one inline integer row per attribute;
+///   * the legacy `/** @dataProvider name */` docblock — same as the attribute.
+fn provider_rows(
+    program: &Program,
+    source_text: &str,
+    class_fqcn: &[u8],
+    method: &Method,
+) -> Option<Vec<Vec<i64>>> {
+    // `#[TestWith([..])]` rows live ON the method — collect them first.
+    let test_with = test_with_rows(method);
+    if !test_with.is_empty() {
+        return Some(test_with);
+    }
+    // Otherwise a `#[DataProvider('name')]` attribute or a `@dataProvider name`
+    // docblock names a sibling static provider method.
+    let provider_name = data_provider_name(source_text, method)?;
+    let provider = find_class_method(program, class_fqcn, provider_name.as_bytes())?;
+    static_provider_rows(provider)
+}
+
+/// The `#[TestWith([..])]` rows declared directly on `method`: each `TestWith`
+/// attribute carries one positional array literal → one integer row. A non-integer or
+/// non-array-literal `TestWith` makes the WHOLE method fail-closed (we cannot soundly
+/// model a partial set), so a present-but-unmodellable row returns an empty Vec via
+/// `None`-coalescing the row, then the caller's emptiness check sends it to the
+/// provider path; to keep that unambiguous a malformed `TestWith` simply contributes
+/// no row and the method falls through to Unknown if no rows remain.
+fn test_with_rows(method: &Method) -> Vec<Vec<i64>> {
+    let mut rows = Vec::new();
+    for list in method.attribute_lists.iter() {
+        for attr in list.attributes.iter() {
+            if !attribute_simple_name(&attr.name).eq_ignore_ascii_case(b"TestWith") {
+                continue;
+            }
+            let Some(arg_list) = &attr.argument_list else {
+                continue;
+            };
+            let Some(Argument::Positional(p)) = arg_list.arguments.iter().next() else {
+                continue;
+            };
+            if let Some(row) = int_row_from_expr(p.value) {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+/// Evaluate a static data-provider method (`{ return [ [..], [..] ]; }`) to integer
+/// rows. The body must be a single `return` of an `array` LITERAL whose every element
+/// is itself an integer-array literal (positional or `key => [..]`). Anything else —
+/// `yield`, a computed expression, strings, nested non-integers — bails (`None`).
+fn static_provider_rows(provider: &Method) -> Option<Vec<Vec<i64>>> {
+    let MethodBody::Concrete(block) = &provider.body else {
+        return None;
+    };
+    let ret = single_return_expr(block)?;
+    rows_from_array_literal(ret)
+}
+
+/// A `[ [..], [..] ]` (or `[ 'k' => [..] ]`) outer array literal → its rows, each an
+/// integer-array literal. `None` if `expr` is not an array literal, or any row is not
+/// an integer-array literal.
+fn rows_from_array_literal(expr: &Expression) -> Option<Vec<Vec<i64>>> {
+    let mut ctx = Context::new();
+    let value = compute(expr, &mut ctx).ok()?;
+    let PhpValue::Array(outer) = value else {
+        return None;
+    };
+    let mut rows = Vec::new();
+    for (_key, row_val) in outer {
+        rows.push(int_row_from_phpvalue(&row_val)?);
+    }
+    Some(rows)
+}
+
+/// One row literal (`[1, 2, 3]`) → its integer columns. `None` if `expr` does not
+/// concretely evaluate to an array of integers.
+fn int_row_from_expr(expr: &Expression) -> Option<Vec<i64>> {
+    let mut ctx = Context::new();
+    let value = compute(expr, &mut ctx).ok()?;
+    int_row_from_phpvalue(&value)
+}
+
+/// A concretely-evaluated `PhpValue` row → its integer columns. Every element must be
+/// a (`PhpValue::Int`); a string/float/bool/null/nested array fails the whole row
+/// (fail-closed — this fragment models only integer value-objects).
+fn int_row_from_phpvalue(value: &PhpValue) -> Option<Vec<i64>> {
+    let PhpValue::Array(map) = value else {
+        return None;
+    };
+    let mut cols = Vec::new();
+    for v in map.values() {
+        match v {
+            PhpValue::Int(i) => cols.push(*i),
+            _ => return None,
+        }
+    }
+    Some(cols)
+}
+
+/// The data-provider method name bound to `method`: from a `#[DataProvider('name')]`
+/// attribute (its first string-literal argument) or, failing that, a legacy
+/// `/** @dataProvider name */` docblock immediately above the method. `None` if
+/// neither is present (or the provider is external / dynamic — unmodelled).
+fn data_provider_name(source_text: &str, method: &Method) -> Option<String> {
+    use mago_span::HasSpan;
+    for list in method.attribute_lists.iter() {
+        for attr in list.attributes.iter() {
+            if !attribute_simple_name(&attr.name).eq_ignore_ascii_case(b"DataProvider") {
+                continue;
+            }
+            let arg_list = attr.argument_list.as_ref()?;
+            let Some(Argument::Positional(p)) = arg_list.arguments.iter().next() else {
+                continue;
+            };
+            if let Some(name) = string_literal_value(p.value) {
+                return Some(name);
+            }
+        }
+    }
+    // Legacy docblock fallback.
+    let offset = method.span().start.offset as usize;
+    doc_data_provider_name(source_text, offset)
+}
+
+/// The literal value of a `'name'` / `"name"` string argument, if `expr` is one.
+fn string_literal_value(expr: &Expression) -> Option<String> {
+    let Expression::Literal(Literal::String(s)) = expr else {
+        return None;
+    };
+    s.value
+        .as_ref()
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+}
+
+/// Scan the ≤400-byte window ending at the method declaration for a
+/// `@dataProvider <name>` docblock tag, returning `<name>`. Mirrors discovery's
+/// docblock scanner (byte-offset-safe slicing).
+fn doc_data_provider_name(source_text: &str, method_offset: usize) -> Option<String> {
+    let end = floor_char_boundary(source_text, method_offset.min(source_text.len()));
+    let window_start = floor_char_boundary(source_text, end.saturating_sub(400));
+    let window = &source_text[window_start..end];
+    // The docblock must be the one IMMEDIATELY above the method: take the last `/**`.
+    let open = window.rfind("/**")?;
+    let docblock = &window[open..];
+    for line in docblock.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(pos) = lower.find("@dataprovider") {
+            let after = &line[pos + "@dataprovider".len()..];
+            let name = after.split_whitespace().next()?;
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Floor `index` to a UTF-8 char boundary so slicing a byte offset that may land
+/// mid-codepoint (real suites have multibyte docblocks) cannot panic.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The simple (namespace-stripped) name of an attribute identifier.
+fn attribute_simple_name<'a>(
+    name: &'a mago_syntax::ast::ast::identifier::Identifier<'a>,
+) -> &'a [u8] {
+    use mago_syntax::ast::ast::identifier::Identifier;
+    let full = match name {
+        Identifier::Local(l) => l.value,
+        Identifier::Qualified(q) => q.value,
+        Identifier::FullyQualified(f) => f.value,
+    };
+    full.rsplit(|b| *b == b'\\').next().unwrap_or(full)
+}
+
 // ─── Public entry point ────────────────────────────────────────────────────────
 
 /// Decide a test method's final `assertSame(L, R)` by e-graph congruence over rules
@@ -773,85 +993,194 @@ fn decide_inner(project: &MagoProject, class: &str, method: &str) -> Option<Deci
     let logical = String::from_utf8_lossy(&file.name).into_owned();
     let class_fqcn = class_meta.name.as_bytes().to_vec();
 
-    project.with_program(&logical, |program, _src, _names| {
-        decide_with_program(program, &class_fqcn, method)
+    project.with_program(&logical, |program, file, _names| {
+        let source_text = String::from_utf8_lossy(&file.contents);
+        decide_with_program(program, &source_text, &class_fqcn, method)
     })?
 }
 
-fn decide_with_program(program: &Program, class_fqcn: &[u8], method: &str) -> Option<Decision> {
+fn decide_with_program(
+    program: &Program,
+    source_text: &str,
+    class_fqcn: &[u8],
+    method: &str,
+) -> Option<Decision> {
     // 1. Derive the equations from every class in the file.
     let (rules, _descs) = derive_rules(program);
+    let cat = collect_class_catalogue(program);
 
-    // 2. Locate the test method and its final `assertSame(L, R)` arguments.
+    // 2. Locate the test method, its parameters and its final assertion.
     let m = find_class_method(program, class_fqcn, method.as_bytes())?;
     let MethodBody::Concrete(block) = &m.body else {
         return None;
     };
-    // A parametrized test would need provider rows; this v2 engine targets concrete
-    // zero-param assertions (the static-factory showcase), so a param list bails.
-    if !m.parameter_list.parameters.is_empty() {
-        return None;
-    }
-    let (lhs_expr, rhs_expr, bindings) = collect_assertion(block)?;
+    let assertion = collect_assertion(block)?;
 
-    // 3. Build both sides into ONE e-graph and bind any `$r = …` locals.
-    let cat = collect_class_catalogue(program);
+    // 3. Build the substitution rows. A zero-param method has exactly ONE empty row
+    //    (the v2 static-factory path). A parametrized method binds its params,
+    //    positionally, from a STATICALLY-evaluated data provider — every row a tuple
+    //    of integer leaves. A parametrized method with no derivable provider, or a
+    //    provider that is not a pure integer-array literal, yields no rows → the whole
+    //    method is fail-closed Unknown (the runner then executes it for real).
+    let params: Vec<Vec<u8>> = m
+        .parameter_list
+        .parameters
+        .iter()
+        .map(|p| strip_dollar(p.variable.name))
+        .collect();
+    let rows: Vec<Vec<i64>> = if params.is_empty() {
+        vec![Vec::new()]
+    } else {
+        provider_rows(program, source_text, class_fqcn, m)?
+    };
+
+    // 4. Decide each (method × row) independently — PHPUnit treats every provider row
+    //    as a SEPARATE test. Aggregate per-METHOD: True iff EVERY row decides True;
+    //    False iff at least one row is provably False AND no row is Unknown; otherwise
+    //    Unknown (any undecided row poisons a False claim — fail-closed). This mirrors
+    //    "the whole parametrized method passes iff all its rows pass".
+    let mut any_false = false;
+    for row in &rows {
+        match decide_one(&cat, &rules, &params, row, &assertion)? {
+            Decision::True => {}
+            Decision::False => any_false = true,
+            Decision::Unknown => return Some(Decision::Unknown),
+        }
+    }
+    if any_false {
+        Some(Decision::False)
+    } else {
+        Some(Decision::True)
+    }
+}
+
+/// Decide ONE assertion under ONE provider row. Binds the test's parameters to the
+/// row's integer leaves, binds any `$var = …` prefix locals, builds both operands
+/// into one e-graph, saturates with the derived rules + ground folding, and decides
+/// by the assertion's comparison kind. `None` propagates a hard bail (an operand that
+/// escapes the fragment); the caller maps that to Unknown for the whole method.
+fn decide_one(
+    cat: &ClassCatalogue,
+    rules: &[Rewrite<PhpL, GroundEval>],
+    params: &[Vec<u8>],
+    row: &[i64],
+    assertion: &Assertion,
+) -> Option<Decision> {
     let mut egraph: EGraph<PhpL, GroundEval> = EGraph::default();
     let mut vars: HashMap<Vec<u8>, Id> = HashMap::new();
-    for (name, expr) in &bindings {
+
+    // Bind parameters positionally to integer leaves. PHPUnit binds row columns to
+    // params by position; SURPLUS columns are ignored (not an error in PHPUnit), and
+    // a row SHORTER than the param list cannot satisfy the call → bail.
+    if row.len() < params.len() {
+        return None;
+    }
+    for (name, value) in params.iter().zip(row.iter()) {
+        let id = egraph.add(SymbolLang::leaf(value.to_string()));
+        vars.insert(name.clone(), id);
+    }
+
+    // Bind any `$r = <expr>;` prefix locals (built over the param leaves).
+    for (name, expr) in &assertion.bindings {
         let id = {
             let mut b = ExprBuilder {
                 egraph: &mut egraph,
-                cat: &cat,
+                cat,
                 vars: &vars,
             };
             b.build(expr)?
         };
         vars.insert(name.clone(), id);
     }
+
     let l_id = {
         let mut b = ExprBuilder {
             egraph: &mut egraph,
-            cat: &cat,
+            cat,
             vars: &vars,
         };
-        b.build(lhs_expr)?
+        b.build(assertion.lhs)?
     };
     let r_id = {
         let mut b = ExprBuilder {
             egraph: &mut egraph,
-            cat: &cat,
+            cat,
             vars: &vars,
         };
-        b.build(rhs_expr)?
+        b.build(assertion.rhs)?
     };
 
-    // 4. Saturate with the derived rules + ground folding, decide by congruence.
-    let runner = Runner::default().with_egraph(egraph).run(&rules);
+    let runner = Runner::default().with_egraph(egraph).run(rules);
     let egraph = runner.egraph;
-    if egraph.find(l_id) == egraph.find(r_id) {
-        return Some(Decision::True);
-    }
-    // A sound definitive False: both sides are DISTINCT known constants.
-    if let (Some(a), Some(b)) = (egraph[l_id].data, egraph[r_id].data) {
-        if a != b {
-            return Some(Decision::False);
-        }
-    }
-    Some(Decision::Unknown)
+
+    let raw = decide_pair(&egraph, l_id, r_id, assertion.kind);
+    Some(if assertion.invert { invert(raw) } else { raw })
 }
 
-/// The arguments of a test body's `assertSame(L, R)`: the two operand expressions
-/// plus the `$var = <expr>` locals bound before it (each as name → its rhs expr).
-type Assertion<'a> = (
-    &'a Expression<'a>,
-    &'a Expression<'a>,
-    Vec<(Vec<u8>, &'a Expression<'a>)>,
-);
+/// Decide a single operand pair after saturation. For BOTH `Same` (`===`) and
+/// `Equals` (`==`) over the concrete-integer fragment the verdict is the same: True
+/// when the two operands share an e-class (congruence) — which for concrete integers
+/// means equal values — and a definitive False when both reduce to DISTINCT known
+/// constants. Anything else (a side still symbolic / object-bearing / un-folded) is
+/// Unknown. The distinction between the two kinds is preserved for future scalar
+/// widening, where loose `==` would diverge from strict `===` on cross-type pairs;
+/// no such pair can arise here because only integers enter the graph.
+fn decide_pair(
+    egraph: &EGraph<PhpL, GroundEval>,
+    l_id: Id,
+    r_id: Id,
+    _kind: AssertKind,
+) -> Decision {
+    if egraph.find(l_id) == egraph.find(r_id) {
+        return Decision::True;
+    }
+    if let (Some(a), Some(b)) = (egraph[l_id].data, egraph[r_id].data) {
+        if a != b {
+            return Decision::False;
+        }
+    }
+    Decision::Unknown
+}
+
+/// Flip a verdict for a `Not*` assertion. True↔False; Unknown is preserved (an
+/// undecided test stays undecided whether or not it is negated).
+fn invert(d: Decision) -> Decision {
+    match d {
+        Decision::True => Decision::False,
+        Decision::False => Decision::True,
+        Decision::Unknown => Decision::Unknown,
+    }
+}
+
+/// How a recognised assertion compares its operands, and whether the True/False
+/// verdict is inverted (the `Not*` family).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssertKind {
+    /// `assertSame` — `===`, structural identity (exact for concrete integers).
+    Same,
+    /// `assertEquals` — `==`, value equality. For the concrete-integer fragment this
+    /// coincides with `Same` (both decide by the shared e-class / ground constant),
+    /// but the kinds stay distinct so future scalar widening keeps the semantics
+    /// honest (cross-type `==` is not modelled here — only integers flow through).
+    Equals,
+}
+
+/// The two operand expressions of a recognised binary assertion, the kind, an
+/// `invert` flag (the `Not*` family flips True↔False, Unknown stays), plus the
+/// `$var = <expr>` locals bound before it (each as name → its rhs expr).
+struct Assertion<'a> {
+    lhs: &'a Expression<'a>,
+    rhs: &'a Expression<'a>,
+    kind: AssertKind,
+    invert: bool,
+    bindings: Vec<(Vec<u8>, &'a Expression<'a>)>,
+}
 
 /// Walk a test body's pure prefix: `$var = <expr>;` assignments bind locals, and a
-/// final `assertSame(L, R)` (method or bare-function form) yields its two argument
-/// expressions plus the collected bindings. Anything else bails.
+/// final recognised assertion (`assertSame`/`assertEquals`/`assertNotSame`/
+/// `assertNotEquals`, in method, static or bare-function form) yields its two
+/// argument expressions, the comparison kind, the inversion flag and the collected
+/// bindings. Anything else bails (fail-closed).
 fn collect_assertion<'a>(
     block: &'a mago_syntax::ast::ast::block::Block<'a>,
 ) -> Option<Assertion<'a>> {
@@ -861,9 +1190,15 @@ fn collect_assertion<'a>(
         let Statement::Expression(es) = stmt else {
             return None;
         };
-        // An assertSame call?
-        if let Some((l, r)) = assert_same_args(es.expression) {
-            return Some((l, r, bindings));
+        // A recognised binary assertion ends the prefix.
+        if let Some((lhs, rhs, kind, invert)) = binary_assertion_args(es.expression) {
+            return Some(Assertion {
+                lhs,
+                rhs,
+                kind,
+                invert,
+                bindings,
+            });
         }
         // Else a simple `$var = <expr>;` assignment.
         let Expression::Assignment(a) = es.expression else {
@@ -880,27 +1215,50 @@ fn collect_assertion<'a>(
     None
 }
 
-/// If `expr` is `assertSame(L, R)` (as `$this->assertSame(...)`, `self::assertSame`,
-/// or the bare function), the two argument expressions. A trailing message arg is
-/// allowed and ignored.
-fn assert_same_args<'a>(
+/// If `expr` is a recognised two-operand assertion (`assertSame`/`assertEquals`/
+/// `assertNotSame`/`assertNotEquals`, as `$this->…(...)`, `self::…(...)`, or the bare
+/// function), its two argument expressions, the comparison kind and whether it is a
+/// `Not*` (inverting) variant. A trailing message arg is allowed and ignored.
+fn binary_assertion_args<'a>(
     expr: &'a Expression<'a>,
-) -> Option<(&'a Expression<'a>, &'a Expression<'a>)> {
+) -> Option<(&'a Expression<'a>, &'a Expression<'a>, AssertKind, bool)> {
+    let (name, args) = call_name_and_args(expr)?;
+    let (kind, invert) = if name.eq_ignore_ascii_case(b"assertSame") {
+        (AssertKind::Same, false)
+    } else if name.eq_ignore_ascii_case(b"assertNotSame") {
+        (AssertKind::Same, true)
+    } else if name.eq_ignore_ascii_case(b"assertEquals") {
+        (AssertKind::Equals, false)
+    } else if name.eq_ignore_ascii_case(b"assertNotEquals") {
+        (AssertKind::Equals, true)
+    } else {
+        return None;
+    };
+    let exprs = positional_args(args)?;
+    if exprs.len() < 2 {
+        return None;
+    }
+    Some((exprs[0], exprs[1], kind, invert))
+}
+
+/// The callee name and argument list of a call expression, in `$this->m(...)`,
+/// `self::m(...)` / `C::m(...)`, or bare `m(...)` form.
+fn call_name_and_args<'a>(expr: &'a Expression<'a>) -> Option<(&'a [u8], &'a ArgumentList<'a>)> {
     let Expression::Call(call) = expr else {
         return None;
     };
-    let (name, args) = match call {
+    match call {
         Call::Method(m) => {
             let ClassLikeMemberSelector::Identifier(id) = &m.method else {
                 return None;
             };
-            (id.value, &m.argument_list)
+            Some((id.value, &m.argument_list))
         }
         Call::StaticMethod(sm) => {
             let ClassLikeMemberSelector::Identifier(id) = &sm.method else {
                 return None;
             };
-            (id.value, &sm.argument_list)
+            Some((id.value, &sm.argument_list))
         }
         Call::Function(fc) => {
             use mago_syntax::ast::ast::identifier::Identifier;
@@ -912,13 +1270,15 @@ fn assert_same_args<'a>(
                 Identifier::Qualified(q) => q.value,
                 Identifier::FullyQualified(f) => f.value,
             };
-            (n, &fc.argument_list)
+            Some((n, &fc.argument_list))
         }
-        _ => return None,
-    };
-    if !name.eq_ignore_ascii_case(b"assertSame") {
-        return None;
+        _ => None,
     }
+}
+
+/// The positional argument expressions of a call, bailing on a spread or a named
+/// argument (unmodelled).
+fn positional_args<'a>(args: &'a ArgumentList<'a>) -> Option<Vec<&'a Expression<'a>>> {
     let mut exprs = Vec::new();
     for arg in args.arguments.iter() {
         match arg {
@@ -931,10 +1291,7 @@ fn assert_same_args<'a>(
             Argument::Named(_) => return None,
         }
     }
-    if exprs.len() < 2 {
-        return None;
-    }
-    Some((exprs[0], exprs[1]))
+    Some(exprs)
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────────
@@ -1098,6 +1455,226 @@ final class NumTest extends TestCase {{
 "#
         );
         assert_eq!(decide(&src, "NumTest", "testOverflow"), Decision::Unknown);
+    }
+
+    // ─── v3: data-provider substitution + div/assert routing ──────────────────
+
+    /// THE v3 target: a parametrized integer value-object `Frac`, exercised through a
+    /// `#[DataProvider]` whose every row is `[a, b, c, d, expNum]`. Each row binds
+    /// the test params to integer leaves; the body `Frac::of(a,b)->times(Frac::of(c,d))
+    /// ->num()` reduces (derived `of`, `times`, `num` + fold) to `a*c`, compared to
+    /// `expNum`. Rows: 1*3=3, 2*5=10, 0*9=0 — all True → method True. No execution.
+    /// The real php8.4 PHPUnit gold-gate of `testTimesNum` (its 3 rows) PASSES.
+    const FRAC_SRC: &str = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function times(Frac $o): Frac { return new Frac($this->num * $o->num, $this->den * $o->den); }
+    public function num(): int { return $this->num; }
+    public function den(): int { return $this->den; }
+}
+final class FracTest extends TestCase {
+    #[DataProvider('cases')]
+    public function testTimesNum(int $a, int $b, int $c, int $d, int $expNum): void {
+        $this->assertSame($expNum, Frac::of($a, $b)->times(Frac::of($c, $d))->num());
+    }
+    public static function cases(): array { return [[1, 2, 3, 4, 3], [2, 3, 5, 7, 10], [0, 1, 9, 9, 0]]; }
+}
+"#;
+
+    #[test]
+    fn frac_provider_times_decides_true() {
+        assert_eq!(decide(FRAC_SRC, "FracTest", "testTimesNum"), Decision::True);
+    }
+
+    /// A provider whose LAST row expects the wrong product (`999` instead of `10`):
+    /// that row decides False, the others True → the method is NEVER True. With every
+    /// row decided (two True, one False, no Unknown) the aggregate is a coherent False.
+    #[test]
+    fn provider_with_a_false_row_decides_false_or_unknown() {
+        let src = FRAC_SRC.replace("[2, 3, 5, 7, 10]", "[2, 3, 5, 7, 999]");
+        let d = decide(&src, "FracTest", "testTimesNum");
+        assert_ne!(d, Decision::True, "a false row must never decide True");
+        assert_eq!(
+            d,
+            Decision::False,
+            "all rows decided, one provably false → coherent False"
+        );
+    }
+
+    /// A provider that is not a pure integer-array literal (strings here) leaves the
+    /// modelled fragment → the whole method is fail-closed Unknown.
+    #[test]
+    fn non_integer_provider_bails() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function times(Frac $o): Frac { return new Frac($this->num * $o->num, $this->den * $o->den); }
+    public function num(): int { return $this->num; }
+}
+final class FracTest extends TestCase {
+    #[DataProvider('cases')]
+    public function testTimesNum(int $a, int $b, int $c, int $d, int $expNum): void {
+        $this->assertSame($expNum, Frac::of($a, $b)->times(Frac::of($c, $d))->num());
+    }
+    public static function cases(): array { return [["x", "y", "z", "w", "v"]]; }
+}
+"#;
+        assert_eq!(decide(src, "FracTest", "testTimesNum"), Decision::Unknown);
+    }
+
+    /// A provider whose rows are computed by a `yield`/loop rather than a single
+    /// array literal is not statically foldable → fail-closed Unknown.
+    #[test]
+    fn yield_provider_bails() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function times(Frac $o): Frac { return new Frac($this->num * $o->num, $this->den * $o->den); }
+    public function num(): int { return $this->num; }
+}
+final class FracTest extends TestCase {
+    #[DataProvider('cases')]
+    public function testTimesNum(int $a, int $b, int $c, int $d, int $expNum): void {
+        $this->assertSame($expNum, Frac::of($a, $b)->times(Frac::of($c, $d))->num());
+    }
+    public static function cases(): array { yield [1, 2, 3, 4, 3]; }
+}
+"#;
+        assert_eq!(decide(src, "FracTest", "testTimesNum"), Decision::Unknown);
+    }
+
+    const DIV_SRC: &str = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class Ratio {
+    public function __construct(private int $v) {}
+    public static function of(int $v): self { return new Ratio($v); }
+    public function div(Ratio $o): Ratio { return new Ratio($this->v / $o->v); }
+    public function value(): int { return $this->v; }
+}
+final class RatioTest extends TestCase {
+    #[DataProvider('cases')]
+    public function testDiv(int $a, int $b, int $exp): void {
+        $this->assertSame($exp, Ratio::of($a)->div(Ratio::of($b))->value());
+    }
+    public static function cases(): array { return [[6, 2, 3], [10, 5, 2]]; }
+}
+"#;
+
+    /// Integer division that is EXACT in every row (`6/2=3`, `10/5=2`) folds → True.
+    #[test]
+    fn division_exact_folds() {
+        assert_eq!(decide(DIV_SRC, "RatioTest", "testDiv"), Decision::True);
+    }
+
+    /// A row whose division is INEXACT (`7/2` → PHP float `3.5`, unmodelled) does not
+    /// fold → fail-closed Unknown (NOT a wrong True/False).
+    #[test]
+    fn division_inexact_fail_closed() {
+        // Replace the exact rows with one inexact one (`7/2`).
+        let src = DIV_SRC.replace("[[6, 2, 3], [10, 5, 2]]", "[[7, 2, 3]]");
+        assert_eq!(decide(&src, "RatioTest", "testDiv"), Decision::Unknown);
+    }
+
+    /// Division by zero is fail-closed too (PHP raises, the fragment does not model
+    /// it) → Unknown, never a fold.
+    #[test]
+    fn division_by_zero_fail_closed() {
+        let src = DIV_SRC.replace("[[6, 2, 3], [10, 5, 2]]", "[[6, 0, 3]]");
+        assert_eq!(decide(&src, "RatioTest", "testDiv"), Decision::Unknown);
+    }
+
+    /// `assertEquals(expNum, …)` on concrete integers routes exactly like
+    /// `assertSame` (loose `==` coincides with i64 equality for concrete ints).
+    #[test]
+    fn assert_equals_int_routes() {
+        let src = FRAC_SRC.replace("assertSame(", "assertEquals(");
+        assert_eq!(decide(&src, "FracTest", "testTimesNum"), Decision::True);
+    }
+
+    /// `assertNotSame` INVERTS the verdict: a body that would be True under
+    /// `assertSame` becomes False under `assertNotSame`.
+    #[test]
+    fn assert_not_same_inverts() {
+        let src = FRAC_SRC.replace("assertSame(", "assertNotSame(");
+        assert_eq!(decide(&src, "FracTest", "testTimesNum"), Decision::False);
+    }
+
+    /// A single inline `#[TestWith([...])]` row is bound and decided exactly like a
+    /// one-row provider.
+    #[test]
+    fn testwith_inline_row() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\TestWith;
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function times(Frac $o): Frac { return new Frac($this->num * $o->num, $this->den * $o->den); }
+    public function num(): int { return $this->num; }
+}
+final class FracTest extends TestCase {
+    #[TestWith([2, 3, 5, 7, 10])]
+    public function testTimesNum(int $a, int $b, int $c, int $d, int $expNum): void {
+        $this->assertSame($expNum, Frac::of($a, $b)->times(Frac::of($c, $d))->num());
+    }
+}
+"#;
+        assert_eq!(decide(src, "FracTest", "testTimesNum"), Decision::True);
+    }
+
+    /// A parametrized method WITHOUT any provider stays Unknown (PHPUnit would raise
+    /// ArgumentCountError; the engine never invents rows).
+    #[test]
+    fn parametrized_without_provider_unknown() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function num(): int { return $this->num; }
+}
+final class FracTest extends TestCase {
+    public function testTimesNum(int $a, int $b): void {
+        $this->assertSame($a, Frac::of($a, $b)->num());
+    }
+}
+"#;
+        assert_eq!(decide(src, "FracTest", "testTimesNum"), Decision::Unknown);
+    }
+
+    /// The legacy `/** @dataProvider cases */` docblock is honoured exactly like the
+    /// attribute form.
+    #[test]
+    fn docblock_data_provider_decides_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function times(Frac $o): Frac { return new Frac($this->num * $o->num, $this->den * $o->den); }
+    public function num(): int { return $this->num; }
+}
+final class FracTest extends TestCase {
+    /**
+     * @dataProvider cases
+     */
+    public function testTimesNum(int $a, int $b, int $c, int $d, int $expNum): void {
+        $this->assertSame($expNum, Frac::of($a, $b)->times(Frac::of($c, $d))->num());
+    }
+    public static function cases(): array { return [[1, 2, 3, 4, 3], [2, 3, 5, 7, 10]]; }
+}
+"#;
+        assert_eq!(decide(src, "FracTest", "testTimesNum"), Decision::True);
     }
 
     // ─── v1 mechanics, re-proved on the OPEN signature ────────────────────────
