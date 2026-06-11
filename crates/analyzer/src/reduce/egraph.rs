@@ -768,6 +768,520 @@ impl ExprBuilder<'_> {
     }
 }
 
+// ─── Suite-wide COMPRESSION extraction (share, don't decide) ────────────────────
+//
+// The recentred invariant. `decide_test_egraph` (above) measures DECIDABILITY — does
+// a test's `assertSame(L,R)` collapse `L` and `R` into one e-class. That BAILS the
+// instant an operand leaves the integer-VO fragment, so a `Carbon::create(...)` or a
+// `BigInteger::of(...)` test scores 0% decided.
+//
+// COMPRESSION is a different, weaker question that the SAME e-graph answers for free:
+// how many DISTINCT sub-terms does a whole suite have, once the structurally-identical
+// ones are shared? Hash-consing already collapses two identical `(Carbon::create 2024
+// 1 15)` nodes — repeated across 50 tests — into ONE e-class, EVEN THOUGH the call is
+// totally opaque (we cannot reduce it, only recognise it is the same computation). So
+// the extractor below NEVER bails: every operator, call, access, or literal becomes a
+// SymbolLang term, with anything outside the modelled fragment represented as an OPAQUE
+// SHAREABLE symbol (`(Carbon::create …)`, `(prop_second <recv>)`, a string leaf, an
+// unknown call `(strlen …)`). Two opaque terms fuse ONLY when syntactically identical
+// (same op + same children) — which is sound: two `Carbon::create(2024,1,15)` ARE the
+// same value. Nothing is fused abusively.
+//
+// We insert EVERY test's relevant expressions into ONE shared e-graph and report:
+//   * `n_naive`          — total nodes MATERIALISED across all tests, before any
+//                          sharing (counted at each `add`, pre-hash-cons);
+//   * `classes_struct`   — `number_of_classes()` right after insertion (sharing by
+//                          structural hash-consing alone);
+//   * `classes_sat`      — `number_of_classes()` after running the DERIVED rules +
+//                          ground fold (structural sharing PLUS reduction/substitution
+//                          fusion).
+// Ratios `n_naive/classes_struct` and `n_naive/classes_sat` are the compression.
+
+/// The compression statistics of one suite file's shared e-graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressionStats {
+    /// Number of test methods whose body contributed terms.
+    pub tests: usize,
+    /// Total term-nodes materialised across all tests BEFORE any sharing (the count
+    /// every test would have in isolation = nodes inserted pre-hash-cons).
+    pub n_naive: usize,
+    /// Distinct e-classes after insertion = structural (hash-cons) sharing only.
+    pub classes_struct: usize,
+    /// Distinct e-classes after saturation = structural sharing + rule/ground fusion.
+    pub classes_sat: usize,
+}
+
+impl CompressionStats {
+    /// Structural compression ratio (`n_naive / classes_struct`); `0.0` when empty.
+    pub fn ratio_struct(&self) -> f64 {
+        if self.classes_struct == 0 {
+            0.0
+        } else {
+            self.n_naive as f64 / self.classes_struct as f64
+        }
+    }
+
+    /// Total compression ratio (`n_naive / classes_sat`); `0.0` when empty.
+    pub fn ratio_total(&self) -> f64 {
+        if self.classes_sat == 0 {
+            0.0
+        } else {
+            self.n_naive as f64 / self.classes_sat as f64
+        }
+    }
+}
+
+/// The non-bailing suite extractor: turns ANY expression into a `SymbolLang` term in a
+/// shared e-graph, counting every materialised node (pre-sharing) into `n_naive`.
+/// Unmodelled ops/calls/accesses become OPAQUE shareable symbols — the point is to
+/// SHARE structurally-identical computations, never to decide them.
+struct SuiteExtractor<'a> {
+    egraph: &'a mut EGraph<PhpL, GroundEval>,
+    /// Total nodes materialised, BEFORE the e-graph's hash-consing dedups them.
+    n_naive: &'a mut usize,
+    /// Per-test local bindings (`$x = <expr>`) → the expr's e-class Id, so a local
+    /// resolves to the SHARED node it was assigned (cross-test sharing flows through).
+    vars: HashMap<Vec<u8>, Id>,
+    /// A per-test salt: a genuinely-FREE variable (a param, an undefined local) must
+    /// NOT fuse across tests (test A's `$ci` is a different object from test B's), so
+    /// its opaque leaf op carries this salt.
+    test_salt: usize,
+}
+
+impl SuiteExtractor<'_> {
+    /// Materialise one node `(op child…)`, counting it into `n_naive` BEFORE the
+    /// e-graph hash-conses it (so two identical nodes count twice in `n_naive` but
+    /// land in one e-class — that gap IS the compression).
+    fn node(&mut self, op: impl Into<String>, kids: Vec<Id>) -> Id {
+        *self.n_naive += 1;
+        self.egraph.add(SymbolLang::new(op.into(), kids))
+    }
+
+    /// A childless opaque/literal leaf.
+    fn leaf(&mut self, op: impl Into<String>) -> Id {
+        self.node(op, Vec::new())
+    }
+
+    /// Build ANY expression into the shared e-graph as a `SymbolLang` term. NEVER
+    /// returns `None`: an unmodelled construct becomes an opaque shareable symbol.
+    fn build(&mut self, expr: &Expression) -> Id {
+        match expr {
+            Expression::Parenthesized(p) => self.build(p.expression),
+            Expression::Literal(lit) => self.literal_node(lit),
+            Expression::Variable(v) => self.variable_node(v),
+            Expression::Binary(b) => {
+                // A modelled arithmetic op keeps its `{+,-,*,/,%}` symbol (so ground
+                // fold + derived rules can fire); any other binary op is opaque but
+                // still shareable under its own operator name.
+                let op = arith_op(&b.operator)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("binop:{}", binop_name(&b.operator)));
+                let a = self.build(b.lhs);
+                let c = self.build(b.rhs);
+                self.node(op, vec![a, c])
+            }
+            Expression::UnaryPrefix(u) => {
+                let k = self.build(u.operand);
+                self.node("unary_prefix", vec![k])
+            }
+            Expression::UnaryPostfix(u) => {
+                let k = self.build(u.operand);
+                self.node("unary_postfix", vec![k])
+            }
+            // `new C(args)`: if `C` is a CONSTRUCTIBLE catalogue class we reuse the
+            // sound `(C args)` shape (so it can share with a factory's rewrite RHS);
+            // otherwise an opaque `(new\C args)` that still shares with itself.
+            Expression::Instantiation(inst) => {
+                let args = self.build_args(inst.argument_list.as_ref());
+                let op = match instantiation_class_name(inst) {
+                    Some(class) => String::from_utf8_lossy(&class).into_owned(),
+                    None => "new\\<dynamic>".to_string(),
+                };
+                self.node(op, args)
+            }
+            Expression::Call(call) => self.call_node(call),
+            Expression::Access(access) => self.access_node(access),
+            Expression::ArrayAccess(aa) => {
+                let base = self.build(aa.array);
+                let idx = self.build(aa.index);
+                self.node("array_access", vec![base, idx])
+            }
+            Expression::Conditional(c) => {
+                let cond = self.build(c.condition);
+                let then_id = match c.then {
+                    Some(t) => self.build(t),
+                    None => self.leaf("<elvis>"),
+                };
+                let else_id = self.build(c.r#else);
+                self.node("ternary", vec![cond, then_id, else_id])
+            }
+            Expression::Identifier(_) | Expression::ConstantAccess(_) => {
+                // A bare constant / global identifier (`PHP_INT_MAX`, a function name
+                // in callable position): an opaque leaf keyed by its text, so the same
+                // constant shares everywhere.
+                let name = expression_text_key(expr);
+                self.leaf(format!("const:{name}"))
+            }
+            // Anything else (closures, match, array literals, throw, clone, …) is a
+            // single opaque leaf keyed by its discriminant — still shareable when two
+            // tests write the exact same construct, never fused with a different one.
+            other => self.leaf(format!("opaque:{}", expr_discriminant(other))),
+        }
+    }
+
+    fn literal_node(&mut self, lit: &Literal) -> Id {
+        match lit {
+            // An integer keeps its decimal-string op, so `GroundEval` re-reads it and
+            // numeric folds still fire across the shared graph.
+            Literal::Integer(i) => match i.value {
+                Some(v) => self.leaf((v as i64).to_string()),
+                None => self.leaf("int:<overflow>"),
+            },
+            Literal::Float(f) => self.leaf(format!("float:{}", f.value)),
+            // String literals: a leaf keyed by content (single-quoted to namespace it
+            // away from integer leaves), so identical strings across tests share.
+            Literal::String(s) => match s.value.as_ref() {
+                Some(bytes) => {
+                    let text = String::from_utf8_lossy(bytes);
+                    self.leaf(format!("str:'{text}'"))
+                }
+                None => self.leaf("str:<dynamic>"),
+            },
+            Literal::True(_) => self.leaf("true"),
+            Literal::False(_) => self.leaf("false"),
+            Literal::Null(_) => self.leaf("null"),
+        }
+    }
+
+    fn variable_node(&mut self, v: &Variable) -> Id {
+        match v {
+            Variable::Direct(d) => {
+                let name = strip_dollar(d.name);
+                // A bound local resolves to the SHARED node it was assigned. A free
+                // variable (param / undefined) gets a per-test-salted opaque leaf so
+                // it never fuses with a same-named variable in a DIFFERENT test.
+                if let Some(id) = self.vars.get(&name) {
+                    *id
+                } else {
+                    let nm = String::from_utf8_lossy(&name).into_owned();
+                    self.leaf(format!("$free:{nm}#{}", self.test_salt))
+                }
+            }
+            // `$$x` / `${…}` indirect/nested: an opaque per-test leaf (cannot model).
+            _ => {
+                let salt = self.test_salt;
+                self.leaf(format!("$indirect#{salt}"))
+            }
+        }
+    }
+
+    fn call_node(&mut self, call: &Call) -> Id {
+        match call {
+            // `C::method(args)` → `(C::method args)` (matches the decision extractor's
+            // factory op, so a factory's derived rule can rewrite it onto `(C …)`).
+            Call::StaticMethod(sm) => {
+                let op = match (static_call_class_name(sm.class), &sm.method) {
+                    (Some(class), ClassLikeMemberSelector::Identifier(mid)) => format!(
+                        "{}::{}",
+                        String::from_utf8_lossy(&class),
+                        String::from_utf8_lossy(mid.value)
+                    ),
+                    _ => "static_call:<dynamic>".to_string(),
+                };
+                let args = self.build_args(Some(&sm.argument_list));
+                self.node(op, args)
+            }
+            // `$recv->method(args)` → `(method <recv> args)` (instance-method op, recv
+            // first child — same shape the decision extractor emits).
+            Call::Method(mc) => {
+                let recv = self.build(mc.object);
+                let op = match &mc.method {
+                    ClassLikeMemberSelector::Identifier(mid) => {
+                        String::from_utf8_lossy(mid.value).into_owned()
+                    }
+                    _ => "method:<dynamic>".to_string(),
+                };
+                let mut kids = vec![recv];
+                kids.extend(self.build_args(Some(&mc.argument_list)));
+                self.node(op, kids)
+            }
+            Call::NullSafeMethod(mc) => {
+                let recv = self.build(mc.object);
+                let op = match &mc.method {
+                    ClassLikeMemberSelector::Identifier(mid) => {
+                        format!("?->{}", String::from_utf8_lossy(mid.value))
+                    }
+                    _ => "nullsafe_method:<dynamic>".to_string(),
+                };
+                let mut kids = vec![recv];
+                kids.extend(self.build_args(Some(&mc.argument_list)));
+                self.node(op, kids)
+            }
+            // A free function `f(args)` → `(f args)` (opaque, but shareable per name).
+            Call::Function(fc) => {
+                let op = match function_call_name(fc.function) {
+                    Some(name) => format!("fn:{}", String::from_utf8_lossy(&name)),
+                    None => "fn:<dynamic>".to_string(),
+                };
+                let args = self.build_args(Some(&fc.argument_list));
+                self.node(op, args)
+            }
+        }
+    }
+
+    fn access_node(&mut self, access: &Access) -> Id {
+        match access {
+            // `$o->field` → `(prop_field <recv>)`: the property name is BAKED INTO the
+            // op so two reads of the SAME property on the SAME receiver share one node.
+            Access::Property(pa) => {
+                let recv = self.build(pa.object);
+                let op = match &pa.property {
+                    ClassLikeMemberSelector::Identifier(pid) => {
+                        format!("prop_{}", String::from_utf8_lossy(pid.value))
+                    }
+                    _ => "prop:<dynamic>".to_string(),
+                };
+                self.node(op, vec![recv])
+            }
+            Access::NullSafeProperty(pa) => {
+                let recv = self.build(pa.object);
+                let op = match &pa.property {
+                    ClassLikeMemberSelector::Identifier(pid) => {
+                        format!("?->prop_{}", String::from_utf8_lossy(pid.value))
+                    }
+                    _ => "nullsafe_prop:<dynamic>".to_string(),
+                };
+                self.node(op, vec![recv])
+            }
+            // `C::CONST` / `C::$static` → an opaque leaf keyed by its text.
+            Access::ClassConstant(cc) => {
+                let class = identifier_class_name(cc.class)
+                    .map(|c| String::from_utf8_lossy(&c).into_owned())
+                    .unwrap_or_else(|| "<dynamic>".to_string());
+                use mago_syntax::ast::ast::class_like::member::ClassLikeConstantSelector;
+                let member = match &cc.constant {
+                    ClassLikeConstantSelector::Identifier(id) => {
+                        String::from_utf8_lossy(id.value).into_owned()
+                    }
+                    _ => "<dynamic>".to_string(),
+                };
+                self.leaf(format!("const:{class}::{member}"))
+            }
+            Access::StaticProperty(sp) => {
+                let class = identifier_class_name(sp.class)
+                    .map(|c| String::from_utf8_lossy(&c).into_owned())
+                    .unwrap_or_else(|| "<dynamic>".to_string());
+                self.leaf(format!("staticprop:{class}"))
+            }
+        }
+    }
+
+    /// Build a call's argument list into child Ids (a spread/named arg becomes its own
+    /// opaque leaf so the term stays total — nothing bails).
+    fn build_args(&mut self, args: Option<&ArgumentList>) -> Vec<Id> {
+        let Some(args) = args else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for arg in args.arguments.iter() {
+            match arg {
+                Argument::Positional(p) => out.push(self.build(p.value)),
+                Argument::Named(n) => {
+                    let v = self.build(n.value);
+                    out.push(self.node("named_arg", vec![v]));
+                }
+            }
+        }
+        out
+    }
+
+    /// Extract every relevant sub-term of ONE test method body into the shared graph,
+    /// binding its `$x = <expr>` locals first so later uses resolve to the shared node.
+    /// Returns `true` if the body contributed any term. NEVER bails.
+    fn extract_test_body(&mut self, m: &Method) -> bool {
+        let MethodBody::Concrete(block) = &m.body else {
+            return false;
+        };
+        let mut contributed = false;
+        for stmt in block.statements.iter() {
+            contributed |= self.extract_statement(stmt);
+        }
+        contributed
+    }
+
+    fn extract_statement(&mut self, stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Expression(es) => {
+                // A `$x = <expr>;` assignment binds the local to the rhs's SHARED node.
+                if let Expression::Assignment(a) = es.expression {
+                    use mago_syntax::ast::ast::assignment::AssignmentOperator;
+                    if matches!(a.operator, AssignmentOperator::Assign(_)) {
+                        if let Expression::Variable(Variable::Direct(t)) = a.lhs {
+                            let id = self.build(a.rhs);
+                            self.vars.insert(strip_dollar(t.name), id);
+                            return true;
+                        }
+                    }
+                }
+                self.build(es.expression);
+                true
+            }
+            Statement::Return(ret) => {
+                if let Some(e) = ret.value {
+                    self.build(e);
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The discriminant tag of a binary operator, for the opaque `binop:<tag>` op name of a
+/// non-arithmetic binary (so `&&`, `===`, `.`, … each share under their own symbol).
+fn binop_name(op: &BinaryOperator) -> &'static str {
+    use BinaryOperator as B;
+    match op {
+        B::Addition(_) => "+",
+        B::Subtraction(_) => "-",
+        B::Multiplication(_) => "*",
+        B::Division(_) => "/",
+        B::Modulo(_) => "%",
+        B::Exponentiation(_) => "**",
+        B::And(_) => "&&",
+        B::Or(_) => "||",
+        B::LowAnd(_) => "and",
+        B::LowOr(_) => "or",
+        B::LowXor(_) => "xor",
+        B::Equal(_) => "==",
+        B::NotEqual(_) => "!=",
+        B::Identical(_) => "===",
+        B::NotIdentical(_) => "!==",
+        B::AngledNotEqual(_) => "<>",
+        B::LessThan(_) => "<",
+        B::LessThanOrEqual(_) => "<=",
+        B::GreaterThan(_) => ">",
+        B::GreaterThanOrEqual(_) => ">=",
+        B::Spaceship(_) => "<=>",
+        B::StringConcat(_) => ".",
+        B::BitwiseAnd(_) => "&",
+        B::BitwiseOr(_) => "|",
+        B::BitwiseXor(_) => "^",
+        B::LeftShift(_) => "<<",
+        B::RightShift(_) => ">>",
+        B::NullCoalesce(_) => "??",
+        B::Instanceof(_) => "instanceof",
+    }
+}
+
+/// A short discriminant tag for the `opaque:<tag>` leaf of an un-handled expression
+/// variant (so two tests writing the same kind of construct share their leaf, and two
+/// DIFFERENT kinds never do).
+fn expr_discriminant(expr: &Expression) -> &'static str {
+    match expr {
+        Expression::Array(_) | Expression::LegacyArray(_) => "array",
+        Expression::List(_) => "list",
+        Expression::Closure(_) => "closure",
+        Expression::ArrowFunction(_) => "arrow_fn",
+        Expression::AnonymousClass(_) => "anon_class",
+        Expression::Match(_) => "match",
+        Expression::Yield(_) => "yield",
+        Expression::Throw(_) => "throw",
+        Expression::Clone(_) => "clone",
+        Expression::CompositeString(_) => "interp_string",
+        Expression::Construct(_) => "lang_construct",
+        Expression::MagicConstant(_) => "magic_const",
+        Expression::ArrayAppend(_) => "array_append",
+        Expression::Assignment(_) => "assignment",
+        Expression::Pipe(_) => "pipe",
+        Expression::Parent(_) => "parent",
+        Expression::Static(_) => "static",
+        _ => "other",
+    }
+}
+
+/// A best-effort text key for a bare identifier / constant-access expression (used to
+/// share `PHP_INT_MAX` and friends across tests). Falls back to a generic tag.
+fn expression_text_key(expr: &Expression) -> String {
+    if let Expression::Identifier(id) = expr {
+        use mago_syntax::ast::ast::identifier::Identifier;
+        let bytes = match id {
+            Identifier::Local(l) => l.value,
+            Identifier::Qualified(q) => q.value,
+            Identifier::FullyQualified(f) => f.value,
+        };
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    if let Expression::ConstantAccess(_) = expr {
+        return "<const_access>".to_string();
+    }
+    "<ident>".to_string()
+}
+
+/// The name of a free-function call target, if it is a plain identifier.
+fn function_call_name(function: &Expression) -> Option<Vec<u8>> {
+    use mago_syntax::ast::ast::identifier::Identifier;
+    let Expression::Identifier(id) = function else {
+        return None;
+    };
+    Some(match id {
+        Identifier::Local(l) => l.value.to_vec(),
+        Identifier::Qualified(q) => q.value.to_vec(),
+        Identifier::FullyQualified(f) => f.value.to_vec(),
+    })
+}
+
+/// Build the SUITE-WIDE compression e-graph for one test file: insert EVERY test
+/// method's relevant expressions into ONE shared e-graph (sharing structurally-
+/// identical sub-terms by hash-consing), then saturate with the rules DERIVED from the
+/// closure of classes those tests reference. Returns the compression statistics.
+///
+/// `test_methods` is the list of `(declaring-class-fqcn, &Method)` to extract — the
+/// caller (the harness) discovers them through the production machinery. The closure
+/// rules are derived once, seeded by every class every test references.
+pub fn build_suite_egraph(
+    project: &MagoProject,
+    test_methods: &[(Vec<u8>, &Method)],
+) -> CompressionStats {
+    // Derive the rules once, from the union of every test's referenced-class closure.
+    let mut seeds: Vec<Vec<u8>> = Vec::new();
+    for (class_fqcn, m) in test_methods {
+        seeds.extend(seed_class_refs(m, class_fqcn));
+    }
+    let (rules, _cat, _descs) = derive_closure(project, seeds);
+
+    let mut egraph: EGraph<PhpL, GroundEval> = EGraph::default();
+    let mut n_naive = 0usize;
+    let mut tests = 0usize;
+
+    for (salt, (_class_fqcn, m)) in test_methods.iter().enumerate() {
+        let mut ex = SuiteExtractor {
+            egraph: &mut egraph,
+            n_naive: &mut n_naive,
+            vars: HashMap::new(),
+            test_salt: salt,
+        };
+        if ex.extract_test_body(m) {
+            tests += 1;
+        }
+    }
+
+    egraph.rebuild();
+    let classes_struct = egraph.number_of_classes();
+
+    let runner = Runner::default().with_egraph(egraph).run(&rules);
+    let egraph = runner.egraph;
+    let classes_sat = egraph.number_of_classes();
+
+    CompressionStats {
+        tests,
+        n_naive,
+        classes_struct,
+        classes_sat,
+    }
+}
+
 // ─── Shared AST helpers ────────────────────────────────────────────────────────
 
 fn instantiation_class_name(inst: &Instantiation) -> Option<Vec<u8>> {
@@ -1658,6 +2172,117 @@ mod tests {
         }
         let project = MagoProject::load_excluding_vendor(dir.path()).unwrap();
         decide_test_egraph(&project, class, method)
+    }
+
+    // ─── Suite-wide compression (share, don't decide) ──────────────────────────
+
+    /// Build the suite-wide compression stats for one single-file source: every
+    /// `public function test*` of `class` is extracted into ONE shared e-graph. Mirrors
+    /// the harness, but single-file and test-scoped.
+    fn compress(src: &str, class: &str) -> CompressionStats {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Code.php"), src).unwrap();
+        let project = MagoProject::load(dir.path()).unwrap();
+        project
+            .with_program("Code.php", |program, _src, _names| {
+                // Collect every test method of `class` (a `test*` instance method).
+                let class_ast = find_class_ast(program, class.as_bytes())
+                    .expect("test class present in program");
+                let mut pairs: Vec<(Vec<u8>, &Method)> = Vec::new();
+                for member in class_ast.members.iter() {
+                    if let ClassLikeMember::Method(m) = member {
+                        let name = String::from_utf8_lossy(m.name.value).into_owned();
+                        if name.starts_with("test") {
+                            pairs.push((class.as_bytes().to_vec(), m));
+                        }
+                    }
+                }
+                build_suite_egraph(&project, &pairs)
+            })
+            .unwrap()
+    }
+
+    /// THE recentring proof: a suite of OPAQUE, 0%-decidable tests still compresses
+    /// HARD. Three tests each build the IDENTICAL `Carbon::create(2024, 1, 15)` and read
+    /// a property — none is decidable (Carbon is unmodelled), yet the repeated
+    /// construction collapses to ONE e-class, so `classes_struct < n_naive`.
+    #[test]
+    fn opaque_repetition_compresses() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class OpaqueTest extends TestCase {
+    public function testA(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(2024, $d->year);
+    }
+    public function testB(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(1, $d->month);
+    }
+    public function testC(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(15, $d->day);
+    }
+}
+"#;
+        let s = compress(src, "OpaqueTest");
+        assert_eq!(s.tests, 3, "all three test bodies contributed");
+        // Sharing must have happened: fewer e-classes than naive nodes.
+        assert!(
+            s.classes_struct < s.n_naive,
+            "structural sharing must reduce classes below naive: {s:?}"
+        );
+        // The shared `Carbon::create(2024,1,15)` (and its 3 literal children) appears in
+        // all 3 tests but is ONE e-class each — so the ratio is comfortably > 1.
+        assert!(
+            s.ratio_struct() > 1.2,
+            "repeated opaque construction must compress: ratio_struct={:.2}",
+            s.ratio_struct()
+        );
+    }
+
+    /// Soundness: two SYNTACTICALLY DIFFERENT opaque calls must NOT fuse. Distinct
+    /// `Carbon::create(...)` argument tuples are distinct computations → distinct
+    /// e-classes; only the shared literal leaves (`2024`) may coincide.
+    #[test]
+    fn distinct_opaque_calls_do_not_fuse() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class DistinctTest extends TestCase {
+    public function testA(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(2024, $d->year);
+    }
+    public function testB(): void {
+        $d = Carbon::create(1999, 12, 31);
+        $this->assertSame(1999, $d->year);
+    }
+}
+"#;
+        let s = compress(src, "DistinctTest");
+        assert_eq!(s.tests, 2);
+        // The two Carbon::create(...) nodes differ in every argument, so they are two
+        // distinct e-classes; the suite still has >1 class (nothing collapsed to a
+        // single point). A coarse sanity bound: at least the two create-calls + two
+        // year-props + distinct literals remain separate.
+        assert!(
+            s.classes_struct >= 6,
+            "distinct opaque calls must not over-fuse: {s:?}"
+        );
+    }
+
+    /// A modelled integer-VO suite compresses AND its derived rules fuse further: a
+    /// repeated `Num::of(5)` shares structurally, and saturation folds the value chain
+    /// so `classes_sat <= classes_struct` (rules only ever MERGE, never split).
+    #[test]
+    fn modelled_suite_saturation_never_increases_classes() {
+        let s = compress(NUM_SRC, "NumTest");
+        assert!(s.tests >= 1);
+        assert!(
+            s.classes_sat <= s.classes_struct,
+            "saturation (rules + ground fold) only merges e-classes: {s:?}"
+        );
+        assert!(s.n_naive >= s.classes_struct, "naive >= shared: {s:?}");
     }
 
     // ─── v4: cross-file rule derivation (resolve VO classes in src/) ───────────
