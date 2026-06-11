@@ -798,7 +798,7 @@ impl ExprBuilder<'_> {
 // Ratios `n_naive/classes_struct` and `n_naive/classes_sat` are the compression.
 
 /// The compression statistics of one suite file's shared e-graph.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompressionStats {
     /// Number of test methods whose body contributed terms.
     pub tests: usize,
@@ -809,6 +809,39 @@ pub struct CompressionStats {
     pub classes_struct: usize,
     /// Distinct e-classes after saturation = structural sharing + rule/ground fusion.
     pub classes_sat: usize,
+    /// COST-WEIGHTED, naive: Σ over every materialised node (with repetition) of its
+    /// CALL-cost (1 per call/magic-getter, 0 per literal/var/arith/known-field). The
+    /// total call-work if every test computed everything independently.
+    pub cost_naive: usize,
+    /// COST-WEIGHTED, shared: Σ over the DISTINCT (hash-consed) e-classes of their
+    /// CALL-cost (each shared computation counted once). The call-work after memoising
+    /// every structurally-identical computation.
+    pub cost_shared: usize,
+    /// The TOP cost targets: the structurally-shared call-nodes ranked by
+    /// `multiplicity × cost` (= total call-work saved by memoising that one node).
+    /// Aggregated/merged across files in the harness; truncated to the top entries.
+    pub top_targets: Vec<CostTarget>,
+}
+
+/// One memoisation target: a structurally-shared call-node, its op (symbol), how many
+/// naive insertions landed in its e-class (`mult`), and its per-evaluation `cost`.
+/// `saved = (mult - 1) * cost` = the call-units removed by computing it once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CostTarget {
+    pub op: String,
+    pub mult: usize,
+    pub cost: usize,
+}
+
+impl CostTarget {
+    /// Call-units saved by memoising this node: `(mult - 1) * cost`.
+    pub fn saved(&self) -> usize {
+        self.mult.saturating_sub(1) * self.cost
+    }
+    /// Total call-work this node represents naively: `mult * cost`.
+    pub fn weight(&self) -> usize {
+        self.mult * self.cost
+    }
 }
 
 impl CompressionStats {
@@ -829,6 +862,17 @@ impl CompressionStats {
             self.n_naive as f64 / self.classes_sat as f64
         }
     }
+
+    /// COST-WEIGHTED compression = `cost_naive / cost_shared`: the TIME-gain ceiling
+    /// under the call-cost proxy (every call ~ one unit of PHP work). `0.0` when there
+    /// is no call-work to share.
+    pub fn cost_compression(&self) -> f64 {
+        if self.cost_shared == 0 {
+            0.0
+        } else {
+            self.cost_naive as f64 / self.cost_shared as f64
+        }
+    }
 }
 
 /// The non-bailing suite extractor: turns ANY expression into a `SymbolLang` term in a
@@ -839,6 +883,12 @@ struct SuiteExtractor<'a> {
     egraph: &'a mut EGraph<PhpL, GroundEval>,
     /// Total nodes materialised, BEFORE the e-graph's hash-consing dedups them.
     n_naive: &'a mut usize,
+    /// Per-insertion `(raw Id, call-cost)` ledger: ONE entry per materialised node,
+    /// recorded BEFORE saturation so we can later canonicalise each Id (post-rebuild)
+    /// and weight the STRUCTURAL sharing by cost + multiplicity. Cost is `1` for a
+    /// call / magic-getter, `0` for a literal/var/arith/known-field. Shared so every
+    /// test's nodes land in one ledger (cross-test sharing is the whole point).
+    ledger: &'a mut Vec<(Id, u32)>,
     /// Per-test local bindings (`$x = <expr>`) → the expr's e-class Id, so a local
     /// resolves to the SHARED node it was assigned (cross-test sharing flows through).
     vars: HashMap<Vec<u8>, Id>,
@@ -849,17 +899,33 @@ struct SuiteExtractor<'a> {
 }
 
 impl SuiteExtractor<'_> {
-    /// Materialise one node `(op child…)`, counting it into `n_naive` BEFORE the
-    /// e-graph hash-conses it (so two identical nodes count twice in `n_naive` but
-    /// land in one e-class — that gap IS the compression).
-    fn node(&mut self, op: impl Into<String>, kids: Vec<Id>) -> Id {
+    /// Materialise one node `(op child…)` of a given `cost`, counting it into
+    /// `n_naive` BEFORE the e-graph hash-conses it (so two identical nodes count twice
+    /// in `n_naive` but land in one e-class — that gap IS the compression) and pushing
+    /// `(raw Id, cost)` into the ledger for the later cost-weighted aggregation.
+    fn node_costed(&mut self, op: impl Into<String>, kids: Vec<Id>, cost: u32) -> Id {
         *self.n_naive += 1;
-        self.egraph.add(SymbolLang::new(op.into(), kids))
+        let id = self.egraph.add(SymbolLang::new(op.into(), kids));
+        self.ledger.push((id, cost));
+        id
     }
 
-    /// A childless opaque/literal leaf.
+    /// A FREE node (`cost = 0`): an arithmetic op, a ternary, an array access, a
+    /// named-arg wrapper, a unary — cheap relative to a PHP call.
+    fn node(&mut self, op: impl Into<String>, kids: Vec<Id>) -> Id {
+        self.node_costed(op, kids, 0)
+    }
+
+    /// A CALL node (`cost = 1`): a construction `(C …)`, a factory `(C::m …)`, an
+    /// instance/nullsafe method, a free function — each ~ one unit of PHP call-work.
+    fn node_call(&mut self, op: impl Into<String>, kids: Vec<Id>) -> Id {
+        self.node_costed(op, kids, 1)
+    }
+
+    /// A FREE childless leaf (`cost = 0`): a literal, a free/indirect variable, a
+    /// bare constant.
     fn leaf(&mut self, op: impl Into<String>) -> Id {
-        self.node(op, Vec::new())
+        self.node_costed(op, Vec::new(), 0)
     }
 
     /// Build ANY expression into the shared e-graph as a `SymbolLang` term. NEVER
@@ -897,7 +963,8 @@ impl SuiteExtractor<'_> {
                     Some(class) => String::from_utf8_lossy(&class).into_owned(),
                     None => "new\\<dynamic>".to_string(),
                 };
-                self.node(op, args)
+                // A construction is a CALL (the ctor runs): cost 1.
+                self.node_call(op, args)
             }
             Expression::Call(call) => self.call_node(call),
             Expression::Access(access) => self.access_node(access),
@@ -989,7 +1056,8 @@ impl SuiteExtractor<'_> {
                     _ => "static_call:<dynamic>".to_string(),
                 };
                 let args = self.build_args(Some(&sm.argument_list));
-                self.node(op, args)
+                // A static factory / static method is a CALL: cost 1.
+                self.node_call(op, args)
             }
             // `$recv->method(args)` → `(method <recv> args)` (instance-method op, recv
             // first child — same shape the decision extractor emits).
@@ -1003,7 +1071,8 @@ impl SuiteExtractor<'_> {
                 };
                 let mut kids = vec![recv];
                 kids.extend(self.build_args(Some(&mc.argument_list)));
-                self.node(op, kids)
+                // An instance method is a CALL: cost 1.
+                self.node_call(op, kids)
             }
             Call::NullSafeMethod(mc) => {
                 let recv = self.build(mc.object);
@@ -1015,7 +1084,8 @@ impl SuiteExtractor<'_> {
                 };
                 let mut kids = vec![recv];
                 kids.extend(self.build_args(Some(&mc.argument_list)));
-                self.node(op, kids)
+                // A null-safe instance method is a CALL: cost 1.
+                self.node_call(op, kids)
             }
             // A free function `f(args)` → `(f args)` (opaque, but shareable per name).
             Call::Function(fc) => {
@@ -1024,7 +1094,8 @@ impl SuiteExtractor<'_> {
                     None => "fn:<dynamic>".to_string(),
                 };
                 let args = self.build_args(Some(&fc.argument_list));
-                self.node(op, args)
+                // A free function is a CALL: cost 1.
+                self.node_call(op, args)
             }
         }
     }
@@ -1041,7 +1112,11 @@ impl SuiteExtractor<'_> {
                     }
                     _ => "prop:<dynamic>".to_string(),
                 };
-                self.node(op, vec![recv])
+                // A property read on an opaque receiver IS a magic `__get` CALL in PHP:
+                // cost 1. (Structurally we cannot know the receiver is a constructible,
+                // statically-known field — that distinction lives in saturation; at the
+                // struct level every `$o->x` is treated as a getter call.)
+                self.node_call(op, vec![recv])
             }
             Access::NullSafeProperty(pa) => {
                 let recv = self.build(pa.object);
@@ -1051,7 +1126,8 @@ impl SuiteExtractor<'_> {
                     }
                     _ => "nullsafe_prop:<dynamic>".to_string(),
                 };
-                self.node(op, vec![recv])
+                // Null-safe property read = magic `__get` CALL: cost 1.
+                self.node_call(op, vec![recv])
             }
             // `C::CONST` / `C::$static` → an opaque leaf keyed by its text.
             Access::ClassConstant(cc) => {
@@ -1253,12 +1329,14 @@ pub fn build_suite_egraph(
 
     let mut egraph: EGraph<PhpL, GroundEval> = EGraph::default();
     let mut n_naive = 0usize;
+    let mut ledger: Vec<(Id, u32)> = Vec::new();
     let mut tests = 0usize;
 
     for (salt, (_class_fqcn, m)) in test_methods.iter().enumerate() {
         let mut ex = SuiteExtractor {
             egraph: &mut egraph,
             n_naive: &mut n_naive,
+            ledger: &mut ledger,
             vars: HashMap::new(),
             test_salt: salt,
         };
@@ -1270,6 +1348,49 @@ pub fn build_suite_egraph(
     egraph.rebuild();
     let classes_struct = egraph.number_of_classes();
 
+    // COST-WEIGHTED metric at the STRUCTURAL-sharing level. Canonicalise each insertion's
+    // raw Id (post-rebuild it may have been hash-cons-merged into a representative class),
+    // then fold the ledger into per-class `(multiplicity, cost)`. Every node sharing a
+    // structural class has the SAME op, hence the SAME cost, so `max` is just a robust
+    // reduce; the canonical op name comes from that class's first node.
+    let mut per_class: HashMap<Id, (usize, u32)> = HashMap::new();
+    for (raw_id, cost) in &ledger {
+        let canon = egraph.find(*raw_id);
+        let entry = per_class.entry(canon).or_insert((0, 0));
+        entry.0 += 1; // multiplicity: one more naive insertion landed here
+        entry.1 = entry.1.max(*cost);
+    }
+
+    // cost_naive = Σ over every insertion (with repetition) of its cost = Σ mult*cost.
+    // cost_shared = Σ over the DISTINCT classes of cost (each shared compute counted once).
+    let cost_naive: usize = per_class
+        .values()
+        .map(|(mult, c)| mult * (*c as usize))
+        .sum();
+    let cost_shared: usize = per_class.values().map(|(_, c)| *c as usize).sum();
+
+    // TOP cost targets: the call-classes ranked by `mult * cost` (= total call-work this
+    // shared node represents). The op label is read from one representative node of the
+    // class. Only cost>0 classes (actual calls) are memoisation candidates.
+    let mut top: Vec<CostTarget> = per_class
+        .iter()
+        .filter(|(_, (_, cost))| *cost > 0)
+        .map(|(id, (mult, cost))| {
+            let op = egraph[*id]
+                .nodes
+                .first()
+                .map(|n| n.op.to_string())
+                .unwrap_or_default();
+            CostTarget {
+                op,
+                mult: *mult,
+                cost: *cost as usize,
+            }
+        })
+        .collect();
+    top.sort_by(|a, b| b.weight().cmp(&a.weight()).then(b.mult.cmp(&a.mult)));
+    top.truncate(TOP_TARGETS);
+
     let runner = Runner::default().with_egraph(egraph).run(&rules);
     let egraph = runner.egraph;
     let classes_sat = egraph.number_of_classes();
@@ -1279,8 +1400,14 @@ pub fn build_suite_egraph(
         n_naive,
         classes_struct,
         classes_sat,
+        cost_naive,
+        cost_shared,
+        top_targets: top,
     }
 }
+
+/// How many memoisation targets the harness keeps/prints per file.
+const TOP_TARGETS: usize = 10;
 
 // ─── Shared AST helpers ────────────────────────────────────────────────────────
 
@@ -2238,6 +2365,88 @@ final class OpaqueTest extends TestCase {
             s.ratio_struct() > 1.2,
             "repeated opaque construction must compress: ratio_struct={:.2}",
             s.ratio_struct()
+        );
+    }
+
+    /// COST-WEIGHTED: the same three-test opaque suite. The shared `Carbon::create`
+    /// (built 3×, ONE class) is a CALL (cost 1) shared at multiplicity 3, and each
+    /// `$d->prop` getter is a CALL too. The dominant TOP target must be `Carbon::create`
+    /// at multiplicity 3, and `cost_compression > 1` because the heavy calls are shared.
+    #[test]
+    fn cost_weighted_top_target_is_the_shared_constructor() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class OpaqueTest extends TestCase {
+    public function testA(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(2024, $d->year);
+    }
+    public function testB(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(1, $d->month);
+    }
+    public function testC(): void {
+        $d = Carbon::create(2024, 1, 15);
+        $this->assertSame(15, $d->day);
+    }
+}
+"#;
+        let s = compress(src, "OpaqueTest");
+        // cost_naive counts every call insertion with repetition; cost_shared counts each
+        // distinct call class once. The shared constructor makes cost_naive > cost_shared.
+        assert!(
+            s.cost_naive > s.cost_shared && s.cost_shared > 0,
+            "shared calls must lift cost_naive above cost_shared: {s:?}"
+        );
+        assert!(
+            s.cost_compression() > 1.0,
+            "cost_compression must exceed 1 when calls are shared: {:.2}",
+            s.cost_compression()
+        );
+        // The single most valuable memoisation target is the thrice-built constructor.
+        let top = s.top_targets.first().expect("a top target exists");
+        assert_eq!(
+            top.op, "Carbon::create",
+            "dominant target is the constructor"
+        );
+        assert_eq!(top.mult, 3, "the constructor is shared across all 3 tests");
+        assert_eq!(top.cost, 1, "a constructor is one call-unit");
+        assert_eq!(
+            top.saved(),
+            2,
+            "memoising it removes 2 of the 3 evaluations"
+        );
+    }
+
+    /// COST-WEIGHTED, control: a literal/arithmetic-only suite has ZERO call-cost — the
+    /// node compression can be > 1 (literals share) while cost_compression is 0.0,
+    /// proving the weight isolates CALL work from cheap structural sharing.
+    #[test]
+    fn cost_weighted_pure_arithmetic_has_no_call_work() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class ArithTest extends TestCase {
+    public function testA(): void {
+        $this->assertSame(5, 2 + 3);
+    }
+    public function testB(): void {
+        $this->assertSame(5, 2 + 3);
+    }
+}
+"#;
+        let s = compress(src, "ArithTest");
+        // assertSame is a method CALL on $this, so there IS some call-cost; but the
+        // arithmetic `2 + 3` and its literals contribute ZERO. The point: cost only
+        // accrues on calls, never on arithmetic/literals.
+        assert!(
+            s.top_targets.iter().all(|t| t.cost == 1),
+            "every recorded target is a call (cost 1): {:?}",
+            s.top_targets
+        );
+        assert!(
+            !s.top_targets.iter().any(|t| t.op == "+"),
+            "arithmetic must never appear as a cost target: {:?}",
+            s.top_targets
         );
     }
 

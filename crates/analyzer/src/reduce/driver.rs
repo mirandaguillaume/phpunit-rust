@@ -848,6 +848,10 @@ mod tests {
         }
 
         let mut agg = egraph::CompressionStats::default();
+        // Merge each file's TOP targets by op (sum multiplicity, keep the cost), then
+        // re-rank globally — so a multi-file suite still surfaces the heaviest shared call.
+        let mut merged_targets: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
         for (logical, methods) in &by_file {
             // Reparse this file ONCE; the `&Method` borrows live for the whole closure,
             // so `build_suite_egraph` (which inserts every test's terms into ONE shared
@@ -871,7 +875,21 @@ mod tests {
             agg.n_naive += stats.n_naive;
             agg.classes_struct += stats.classes_struct;
             agg.classes_sat += stats.classes_sat;
+            agg.cost_naive += stats.cost_naive;
+            agg.cost_shared += stats.cost_shared;
+            for t in &stats.top_targets {
+                let e = merged_targets.entry(t.op.clone()).or_insert((0, t.cost));
+                e.0 += t.mult;
+                e.1 = e.1.max(t.cost);
+            }
         }
+
+        let mut top: Vec<egraph::CostTarget> = merged_targets
+            .into_iter()
+            .map(|(op, (mult, cost))| egraph::CostTarget { op, mult, cost })
+            .collect();
+        top.sort_by(|a, b| b.weight().cmp(&a.weight()).then(b.mult.cmp(&a.mult)));
+        top.truncate(10);
 
         println!(
             "COMPRESSION file={} tests={} N_naif={} classes_struct={} classes_sat={} \
@@ -884,6 +902,23 @@ mod tests {
             agg.ratio_struct(),
             agg.ratio_total(),
         );
+        println!(
+            "COST file={} cost_naive={} cost_shared={} cost_compression={:.2}",
+            test_file.display(),
+            agg.cost_naive,
+            agg.cost_shared,
+            agg.cost_compression(),
+        );
+        for t in &top {
+            println!(
+                "TOP mult={} cost={} weight={} saved={} op={}",
+                t.mult,
+                t.cost,
+                t.weight(),
+                t.saved(),
+                t.op,
+            );
+        }
     }
 
     /// Build a temp PHP PROJECT (composer.json + src/ + tests/) and return the dir.
