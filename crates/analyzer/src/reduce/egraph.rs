@@ -240,67 +240,81 @@ type FieldLayout = Vec<String>;
 /// fixtures are namespace-free, mirroring the bridge's resolution scope).
 type ClassCatalogue = HashMap<String, FieldLayout>;
 
-/// Collect the field layout of every class declared at the top level of `program`
-/// (descending one level of namespaces, like the bridge's class finder). A class
-/// whose ctor cannot be modelled (no ctor = empty layout; a non-`$this->x=` ctor
-/// body just contributes its promoted params) still gets an entry — the layout is
-/// only used to expand `$this`/typed-class params, and a method referencing an
-/// unmapped class simply fails to derive (fail-closed).
-fn collect_class_catalogue(program: &Program) -> ClassCatalogue {
-    let mut cat = ClassCatalogue::new();
-    collect_from_statements(program.statements.iter(), &mut cat);
-    cat
-}
-
-fn collect_from_statements<'a, I>(stmts: I, cat: &mut ClassCatalogue)
-where
-    I: Iterator<Item = &'a Statement<'a>>,
-{
-    for stmt in stmts {
-        match stmt {
-            Statement::Class(class) => {
-                let name = String::from_utf8_lossy(class.name.value).to_ascii_lowercase();
-                cat.insert(name, field_layout_of(class));
-            }
-            Statement::Namespace(ns) => {
-                collect_from_statements(ns.statements().iter(), cat);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// The field layout of a class: promoted ctor params (in order), then any field
-/// first written by a `$this->x = …` statement in the ctor body (in order, deduped).
-fn field_layout_of(class: &Class) -> FieldLayout {
-    let mut layout: FieldLayout = Vec::new();
+/// The CONSTRUCTIBLE field layout of a class, or `None` when the ctor is not a pure
+/// positional seed (so NO construction rule is derivable and the class stays opaque →
+/// fail-closed Unknown). The construction node is `(C arg0 arg1 …)`, with `argK` bound
+/// positionally to the K-th ctor parameter; for a getter `(f (C a b)) => a` to be
+/// SOUND, layout slot K must hold the value of construction arg K. We therefore accept
+/// ONLY ctors whose K-th parameter flows, unchanged, into exactly one field:
+///   * a PROMOTED param `private int $x` (PHP itself assigns arg K → field `x`), or
+///   * a body that is EXCLUSIVELY pure pass-through assignments `$this->f = $param;`
+///     where `$param` is a direct ctor parameter — and the layout is ordered by PARAM
+///     position so slot K ≡ arg K.
+///
+/// A ctor that VALIDATES (`if (…) throw`), NORMALISES (`$this->n = $n / $g`, a ternary,
+/// a call), reorders, or has ANY non-pass-through statement returns `None`: `new C(a,
+/// b)` is then NOT soundly `(C a b)` (it could reject or rewrite its inputs), so we must
+/// not invent that node. No ctor at all → an empty layout (`new C()`).
+fn constructible_layout(class: &Class) -> Option<FieldLayout> {
     let Some(ctor) = find_method_in_class(class, b"__construct") else {
-        return layout;
+        return Some(Vec::new());
     };
-    for p in ctor.parameter_list.parameters.iter() {
-        if p.is_promoted_property() {
-            let name = String::from_utf8_lossy(&strip_dollar(p.variable.name)).into_owned();
-            push_unique(&mut layout, name);
-        }
-    }
+    // The body's pure pass-throughs: source-param → field. ANY other statement
+    // (throw, if, normalisation, a non-`$this->f=$param` assignment) ⇒ opaque.
+    let mut passthrough: HashMap<Vec<u8>, String> = HashMap::new();
     if let MethodBody::Concrete(block) = &ctor.body {
         for stmt in block.statements.iter() {
-            if let Some(field) = ctor_assignment_field(stmt) {
-                push_unique(&mut layout, field);
+            let (field, src_param) = pure_passthrough_assignment(stmt)?;
+            // A field assigned twice, or two fields from one param, breaks the 1:1
+            // positional mapping ⇒ opaque (fail-closed).
+            if passthrough.values().any(|f| *f == field) || passthrough.contains_key(&src_param) {
+                return None;
             }
+            passthrough.insert(src_param, field);
         }
     }
-    layout
+    // Build the layout in PARAMETER order, so slot K ≡ construction arg K.
+    let mut layout: FieldLayout = Vec::new();
+    let mut used = 0usize;
+    for p in ctor.parameter_list.parameters.iter() {
+        // Variadic / by-ref ctor params are not modelled positionally ⇒ opaque.
+        if p.ellipsis.is_some() || p.ampersand.is_some() {
+            return None;
+        }
+        let pname = strip_dollar(p.variable.name);
+        let field = if p.is_promoted_property() {
+            String::from_utf8_lossy(&pname).into_owned()
+        } else if let Some(f) = passthrough.get(&pname) {
+            used += 1;
+            f.clone()
+        } else {
+            // A ctor param that flows into NO field cannot be a pure seed ⇒ opaque.
+            return None;
+        };
+        layout.push(field);
+    }
+    // Every body pass-through must have been consumed by a param (no stray write).
+    if used != passthrough.len() {
+        return None;
+    }
+    Some(layout)
 }
 
-/// If `stmt` is a `$this->field = <expr>;` statement, the field name.
-fn ctor_assignment_field(stmt: &Statement) -> Option<String> {
+/// If `stmt` is a PURE pass-through `$this->field = $param;` (the rhs a direct ctor
+/// parameter variable, nothing computed), the `(field, source-param)` pair; else
+/// `None` — which fails the whole ctor closed (a throw / if / normalisation / call).
+fn pure_passthrough_assignment(stmt: &Statement) -> Option<(String, Vec<u8>)> {
+    use mago_syntax::ast::ast::assignment::AssignmentOperator;
     let Statement::Expression(es) = stmt else {
         return None;
     };
     let Expression::Assignment(a) = es.expression else {
         return None;
     };
+    // Only a plain `=` seed; `+=` etc. are not pure pass-throughs.
+    if !matches!(a.operator, AssignmentOperator::Assign(_)) {
+        return None;
+    }
     let Expression::Access(Access::Property(pa)) = a.lhs else {
         return None;
     };
@@ -313,13 +327,13 @@ fn ctor_assignment_field(stmt: &Statement) -> Option<String> {
     let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
         return None;
     };
-    Some(String::from_utf8_lossy(prop_id.value).into_owned())
-}
-
-fn push_unique(layout: &mut FieldLayout, name: String) {
-    if !layout.contains(&name) {
-        layout.push(name);
-    }
+    // The RHS must be a DIRECT parameter variable — no arithmetic, ternary, call, or
+    // literal (those would normalise, so the positional `(C a b)` node would be a lie).
+    let Expression::Variable(Variable::Direct(src)) = a.rhs else {
+        return None;
+    };
+    let field = String::from_utf8_lossy(prop_id.value).into_owned();
+    Some((field, strip_dollar(src.name)))
 }
 
 fn find_method_in_class<'a>(class: &'a Class<'a>, method: &[u8]) -> Option<&'a Method<'a>> {
@@ -335,45 +349,9 @@ fn find_method_in_class<'a>(class: &'a Class<'a>, method: &[u8]) -> Option<&'a M
 
 // ─── Equation derivation ───────────────────────────────────────────────────────
 
-/// Derive the full rule set from the test file: walk every class, and for each pure
-/// `{ return <expr>; }` method/factory emit one oriented rewrite. A method that is
-/// not a single return, or whose return expression leaves the modelled fragment,
-/// contributes NO rule (it stays an opaque symbol → congruence cannot fire).
-///
-/// Returns the rules AND, for diagnostics/tests, the human-readable `(lhs) => (rhs)`
-/// of each derived rule.
-fn derive_rules(program: &Program) -> (Vec<Rewrite<PhpL, GroundEval>>, Vec<String>) {
-    let cat = collect_class_catalogue(program);
-    let mut rules = Vec::new();
-    let mut descriptions = Vec::new();
-    derive_from_statements(
-        program.statements.iter(),
-        &cat,
-        &mut rules,
-        &mut descriptions,
-    );
-    (rules, descriptions)
-}
-
-fn derive_from_statements<'a, I>(
-    stmts: I,
-    cat: &ClassCatalogue,
-    rules: &mut Vec<Rewrite<PhpL, GroundEval>>,
-    descriptions: &mut Vec<String>,
-) where
-    I: Iterator<Item = &'a Statement<'a>>,
-{
-    for stmt in stmts {
-        match stmt {
-            Statement::Class(class) => derive_from_class(class, cat, rules, descriptions),
-            Statement::Namespace(ns) => {
-                derive_from_statements(ns.statements().iter(), cat, rules, descriptions)
-            }
-            _ => {}
-        }
-    }
-}
-
+/// Derive the `{ return <expr>; }` rules of ONE class (each pure single-return method
+/// or factory → one oriented rewrite; an opaque body contributes NO rule and stays an
+/// opaque symbol → congruence cannot fire → fail-closed).
 fn derive_from_class(
     class: &Class,
     cat: &ClassCatalogue,
@@ -975,6 +953,274 @@ fn attribute_simple_name<'a>(
     full.rsplit(|b| *b == b'\\').next().unwrap_or(full)
 }
 
+// ─── Cross-file rule derivation: resolve the VO classes the test references ─────
+//
+// THE WALL v4 crosses. v1–v3 derived rules and field layouts from the SINGLE program
+// of the TEST file. But every PSR-4 library puts its value objects in `src/` and its
+// tests in `tests/` — separate files. So a test `new Frac(…)` / `Frac::of(…)` where
+// `Frac` lives in `src/Frac.php` derived NO rule for `Frac` (it is absent from the
+// test program) → Unknown by construction, on 100% of real code.
+//
+// v4 computes the CLOSURE of classes the test references and derives rules + field
+// layouts from THEIR OWN files, resolved exactly the way `subst.rs` resolves a method
+// body: codex `get_class_like` → `file_of_span` → `with_program` (reparse). mago 1.30
+// keeps no AST around, so each reparsed arena drops at the end of its closure — every
+// derived datum (a `FieldLayout = Vec<String>`, an owned `Rewrite`) is extracted while
+// the arena is live. The closure is bounded by a `visited` FQCN set and a depth cap.
+
+/// The cap on how many distinct classes the cross-file closure will resolve, mirroring
+/// `subst.rs`'s `max_depth = 64`. A reference chain longer than this bails (the rules
+/// derived so far still stand — extra classes only ADD rules, and a missing rule is
+/// fail-closed Unknown, never a wrong verdict).
+const MAX_CLOSURE_CLASSES: usize = 64;
+
+/// Build the cross-file catalogue (field layouts) AND rule set for the closure of
+/// classes the test method references. `seed_fqcns` are the classes named directly by
+/// the test body; the closure follows each derivable method/ctor body's own class
+/// references transitively. Resolution is codex → file → reparse, per class.
+///
+/// Returns `(rules, catalogue, descriptions)` — all fully owned, so they outlive every
+/// reparsed arena. A class the codex cannot resolve, or whose file will not reparse,
+/// simply contributes nothing (fail-closed): a method that needs its layout then fails
+/// to derive and stays opaque. `descriptions` are the human-readable `(lhs) => (rhs)`
+/// of each derived rule (for white-box tests / diagnostics).
+fn derive_closure(
+    project: &MagoProject,
+    seed_fqcns: Vec<Vec<u8>>,
+) -> (Vec<Rewrite<PhpL, GroundEval>>, ClassCatalogue, Vec<String>) {
+    // Phase A — catalogue closure. A worklist of FQCNs; for each we reparse its file,
+    // record its field layout, and enqueue every OTHER class it references (param
+    // hints, `new D`, `D::fab`, `$x->m()` is not a class ref but `new`/static are).
+    // Visited is keyed by the lower-cased codex FQCN so each class is reparsed once
+    // per phase.
+    let mut catalogue = ClassCatalogue::new();
+    let mut layout_files: HashMap<String, (String, Vec<u8>)> = HashMap::new();
+    let mut visited: Vec<Vec<u8>> = Vec::new();
+    let mut worklist: Vec<Vec<u8>> = seed_fqcns;
+
+    while let Some(fqcn) = worklist.pop() {
+        let key = String::from_utf8_lossy(&normalize_fqcn(&fqcn)).to_ascii_lowercase();
+        if visited.iter().any(|v| String::from_utf8_lossy(v) == key) {
+            continue;
+        }
+        if visited.len() >= MAX_CLOSURE_CLASSES {
+            break; // depth/size cap — bail the rest (fail-closed: fewer rules only).
+        }
+        visited.push(key.clone().into_bytes());
+
+        let Some((logical, declaring_fqcn)) = locate_class_file(project, &fqcn) else {
+            continue; // class not in codebase / file not loaded → no contribution.
+        };
+        let extracted = project.with_program(&logical, |program, _file, _names| {
+            extract_class_layout_and_refs(program, &declaring_fqcn)
+        });
+        let Some(Some((layout, refs))) = extracted else {
+            continue;
+        };
+        // The catalogue is keyed by the SIMPLE lower-cased name (how `cat.get` is
+        // called everywhere: `instantiation_class_name` / `param_class` lower-case the
+        // simple name). Resolve the simple name from the declaring FQCN.
+        let simple = simple_name_lower(&declaring_fqcn);
+        catalogue.insert(simple.clone(), layout);
+        layout_files.insert(simple, (logical, declaring_fqcn.clone()));
+        for r in refs {
+            worklist.push(r);
+        }
+    }
+
+    // Phase B — rule derivation against the COMPLETE catalogue. Reparse each resolved
+    // class once more and derive its `{return e}` rules (now that every param-typed
+    // class's layout is present). Reparsing twice is bounded and test-scoped.
+    let mut rules = Vec::new();
+    let mut descriptions = Vec::new();
+    for (logical, declaring_fqcn) in layout_files.values() {
+        let _ = project.with_program(logical, |program, _file, _names| {
+            derive_rules_for_class(
+                program,
+                declaring_fqcn,
+                &catalogue,
+                &mut rules,
+                &mut descriptions,
+            )
+        });
+    }
+    (rules, catalogue, descriptions)
+}
+
+/// Resolve a class FQCN to its declaring file's logical name and the codex's canonical
+/// FQCN (used to match the class AST after reparse). Mirrors `subst.rs`'s codex hop.
+fn locate_class_file(project: &MagoProject, fqcn: &[u8]) -> Option<(String, Vec<u8>)> {
+    let key = normalize_fqcn(fqcn).to_ascii_lowercase();
+    let meta = project.codebase().get_class_like(&key)?;
+    let file = project.file_of_span(&meta.span)?;
+    let logical = String::from_utf8_lossy(&file.name).into_owned();
+    let declaring_fqcn = meta.name.as_bytes().to_vec();
+    Some((logical, declaring_fqcn))
+}
+
+/// The simple (namespace-stripped), lower-cased name of an FQCN — the catalogue key.
+fn simple_name_lower(fqcn: &[u8]) -> String {
+    let simple = fqcn.rsplit(|b| *b == b'\\').next().unwrap_or(fqcn);
+    String::from_utf8_lossy(simple).to_ascii_lowercase()
+}
+
+/// Inside a reparsed program, find the class named `declaring_fqcn` (by simple name,
+/// the only name available on the AST node), compute its CONSTRUCTIBLE field layout,
+/// and collect the OTHER class names its methods/ctor reference — so the closure
+/// follows them. Returns `None` when the class is not in this program OR its ctor is
+/// not a pure positional seed (a validating/normalising ctor): such a class is left
+/// OUT of the catalogue entirely, so `new C(…)` builds no node and the test is
+/// fail-closed Unknown (never a fabricated `(C a b)` verdict).
+fn extract_class_layout_and_refs(
+    program: &Program,
+    declaring_fqcn: &[u8],
+) -> Option<(FieldLayout, Vec<Vec<u8>>)> {
+    let class = find_class_ast(program, declaring_fqcn)?;
+    let layout = constructible_layout(class)?;
+    let mut refs: Vec<Vec<u8>> = Vec::new();
+    collect_class_refs(class, &mut refs);
+    Some((layout, refs))
+}
+
+/// Locate a class AST node by simple name (case-insensitive), descending one level of
+/// namespaces — the same scope the class-catalogue closure uses.
+fn find_class_ast<'a>(program: &'a Program<'a>, fqcn: &[u8]) -> Option<&'a Class<'a>> {
+    let simple = fqcn.rsplit(|b| *b == b'\\').next().unwrap_or(fqcn);
+    find_class_ast_in(program.statements.iter(), simple)
+}
+
+fn find_class_ast_in<'a, I>(stmts: I, simple: &[u8]) -> Option<&'a Class<'a>>
+where
+    I: Iterator<Item = &'a Statement<'a>>,
+{
+    for stmt in stmts {
+        match stmt {
+            Statement::Class(class) if class.name.value.eq_ignore_ascii_case(simple) => {
+                return Some(class);
+            }
+            Statement::Namespace(ns) => {
+                if let Some(c) = find_class_ast_in(ns.statements().iter(), simple) {
+                    return Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Derive the `{return e}` rules of ONE class (by simple name) against a catalogue.
+/// Used by the closure's Phase B (the single-class analogue of `derive_from_class`).
+fn derive_rules_for_class(
+    program: &Program,
+    declaring_fqcn: &[u8],
+    cat: &ClassCatalogue,
+    rules: &mut Vec<Rewrite<PhpL, GroundEval>>,
+    descriptions: &mut Vec<String>,
+) {
+    if let Some(class) = find_class_ast(program, declaring_fqcn) {
+        derive_from_class(class, cat, rules, descriptions);
+    }
+}
+
+/// Collect the class names a class's bodies reference: each param's class hint, every
+/// `new D(…)` and `D::fab(…)` in a method/ctor body, plus param hints — so the closure
+/// keeps each referenced VO's layout/rules in scope (e.g. `plus` returning `new Frac`).
+fn collect_class_refs(class: &Class, out: &mut Vec<Vec<u8>>) {
+    for member in class.members.iter() {
+        let ClassLikeMember::Method(m) = member else {
+            continue;
+        };
+        for p in m.parameter_list.parameters.iter() {
+            if let Some(h) = p.hint.as_ref() {
+                if let Some(name) = class_hint_name(h) {
+                    out.push(name);
+                }
+            }
+        }
+        if let MethodBody::Concrete(block) = &m.body {
+            for stmt in block.statements.iter() {
+                collect_refs_in_statement(stmt, out);
+            }
+        }
+    }
+}
+
+fn collect_refs_in_statement(stmt: &Statement, out: &mut Vec<Vec<u8>>) {
+    match stmt {
+        Statement::Expression(es) => collect_refs_in_expr(es.expression, out),
+        Statement::Return(ret) => {
+            if let Some(e) = ret.value {
+                collect_refs_in_expr(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk an expression collecting `new D` / `D::fab` class names (the only things that
+/// introduce a NEW class into the closure; a `$x->m()` receiver class is already in
+/// scope via whatever produced `$x`).
+fn collect_refs_in_expr(expr: &Expression, out: &mut Vec<Vec<u8>>) {
+    match expr {
+        Expression::Parenthesized(p) => collect_refs_in_expr(p.expression, out),
+        Expression::Assignment(a) => {
+            collect_refs_in_expr(a.lhs, out);
+            collect_refs_in_expr(a.rhs, out);
+        }
+        Expression::Binary(b) => {
+            collect_refs_in_expr(b.lhs, out);
+            collect_refs_in_expr(b.rhs, out);
+        }
+        Expression::Instantiation(inst) => {
+            if let Some(name) = instantiation_class_name(inst) {
+                out.push(name);
+            }
+            if let Some(args) = inst.argument_list.as_ref() {
+                collect_refs_in_args(args, out);
+            }
+        }
+        Expression::Call(Call::StaticMethod(sm)) => {
+            if let Some(name) = static_call_class_name(sm.class) {
+                out.push(name);
+            }
+            collect_refs_in_args(&sm.argument_list, out);
+        }
+        Expression::Call(Call::Method(mc)) => {
+            collect_refs_in_expr(mc.object, out);
+            collect_refs_in_args(&mc.argument_list, out);
+        }
+        Expression::Call(Call::Function(fc)) => {
+            collect_refs_in_args(&fc.argument_list, out);
+        }
+        Expression::Access(Access::Property(pa)) => collect_refs_in_expr(pa.object, out),
+        _ => {}
+    }
+}
+
+fn collect_refs_in_args(args: &ArgumentList, out: &mut Vec<Vec<u8>>) {
+    for arg in args.arguments.iter() {
+        match arg {
+            Argument::Positional(p) => collect_refs_in_expr(p.value, out),
+            Argument::Named(n) => collect_refs_in_expr(n.value, out),
+        }
+    }
+}
+
+/// The class FQCNs the TEST method directly references — the closure seed. Walks the
+/// test method body's statements (its bindings and the final assertion's operands) for
+/// `new C` / `C::fab`, plus the test class's own simple name (so same-file VOs and the
+/// test class itself are resolved through the same machinery).
+fn seed_class_refs(test_method: &Method, test_class_fqcn: &[u8]) -> Vec<Vec<u8>> {
+    let mut refs: Vec<Vec<u8>> = vec![test_class_fqcn.to_vec()];
+    if let MethodBody::Concrete(block) = &test_method.body {
+        for stmt in block.statements.iter() {
+            collect_refs_in_statement(stmt, &mut refs);
+        }
+    }
+    refs
+}
+
 // ─── Public entry point ────────────────────────────────────────────────────────
 
 /// Decide a test method's final `assertSame(L, R)` by e-graph congruence over rules
@@ -995,22 +1241,29 @@ fn decide_inner(project: &MagoProject, class: &str, method: &str) -> Option<Deci
 
     project.with_program(&logical, |program, file, _names| {
         let source_text = String::from_utf8_lossy(&file.contents);
-        decide_with_program(program, &source_text, &class_fqcn, method)
+        decide_with_program(project, program, &source_text, &class_fqcn, method)
     })?
 }
 
 fn decide_with_program(
+    project: &MagoProject,
     program: &Program,
     source_text: &str,
     class_fqcn: &[u8],
     method: &str,
 ) -> Option<Decision> {
-    // 1. Derive the equations from every class in the file.
-    let (rules, _descs) = derive_rules(program);
-    let cat = collect_class_catalogue(program);
-
-    // 2. Locate the test method, its parameters and its final assertion.
+    // 1. Locate the test method first — its body seeds the cross-file closure.
     let m = find_class_method(program, class_fqcn, method.as_bytes())?;
+
+    // 1b. Derive the equations + field layouts from the CLOSURE of classes the test
+    //     references — resolved cross-file via the codex (the v4 wall-crossing). This
+    //     subsumes the old single-file `derive_rules(program)`: same-file classes are
+    //     resolved through the same codex→reparse path (the test file is just one more
+    //     file in the closure).
+    let seed = seed_class_refs(m, class_fqcn);
+    let (rules, cat, _descs) = derive_closure(project, seed);
+
+    // 2. The test method's parameters and its final assertion.
     let MethodBody::Concrete(block) = &m.body else {
         return None;
     };
@@ -1310,18 +1563,173 @@ mod tests {
     }
 
     /// Collect the derived-rule descriptions for a source (for white-box assertions
-    /// on WHICH equations were derived).
+    /// on WHICH equations were derived) — through the v4 cross-file closure, seeded
+    /// with every class declared in the source (so all their rules are derived).
     fn derived_descriptions(src: &str) -> Vec<String> {
+        use mago_syntax::ast::ast::statement::Statement;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Code.php"), src).unwrap();
         let project = MagoProject::load(dir.path()).unwrap();
-        let logical = "Code.php";
-        project
-            .with_program(logical, |program, _src, _names| {
-                let (_rules, descs) = derive_rules(program);
-                descs
+        let seed = project
+            .with_program("Code.php", |program, _src, _names| {
+                program
+                    .statements
+                    .iter()
+                    .filter_map(|s| match s {
+                        Statement::Class(c) => Some(c.name.value.to_vec()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
             })
-            .unwrap()
+            .unwrap();
+        let (_rules, _cat, descs) = derive_closure(&project, seed);
+        descs
+    }
+
+    /// Build a multi-file `MagoProject` (a real composer.json + vendor PHPUnit stub +
+    /// the given `(relative-path, source)` files) and decide a test method against it.
+    /// This loads classes that live in SEPARATE files (`src/Point.php`) from the test
+    /// (`tests/PointTest.php`) — the PSR-4 layout EVERY real library uses — so it
+    /// exercises the cross-file rule-derivation path, unlike the single-file `decide`.
+    fn decide_in_project(files: &[(&str, &str)], class: &str, method: &str) -> Decision {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("composer.json"), "{\n}\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor/phpunit/phpunit/src/Framework")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
+        )
+        .unwrap();
+        for (name, src) in files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, src).unwrap();
+        }
+        let project = MagoProject::load_excluding_vendor(dir.path()).unwrap();
+        decide_test_egraph(&project, class, method)
+    }
+
+    // ─── v4: cross-file rule derivation (resolve VO classes in src/) ───────────
+
+    /// THE control. A whole integer value-object `Point` lives in `src/Point.php`,
+    /// SEPARATE from `tests/PointTest.php` — the PSR-4 layout of every real library.
+    /// Before v4 the rules were derived only from the test file, so `Point` was
+    /// Unknown (0%); v4 resolves `Point` through the codex, reparses `src/Point.php`,
+    /// and derives `x`/`y` getters + the promoted-ctor layout → `True`.
+    #[test]
+    fn split_file_point_decides_true() {
+        let point = r#"<?php
+final class Point {
+    public function __construct(private int $x, private int $y) {}
+    public function x(): int { return $this->x; }
+    public function y(): int { return $this->y; }
+}
+"#;
+        let test = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class PointTest extends TestCase {
+    public function testX(): void {
+        $this->assertSame(3, (new Point(3, 4))->x());
+    }
+}
+"#;
+        assert_eq!(
+            decide_in_project(
+                &[("src/Point.php", point), ("tests/PointTest.php", test)],
+                "PointTest",
+                "testX",
+            ),
+            Decision::True
+        );
+    }
+
+    /// Non-regression: the SAME Point, in-file (the v1/v2/v3 single-file path), still
+    /// decides True through the unified cross-file machinery.
+    #[test]
+    fn same_file_still_works() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Point {
+    public function __construct(private int $x, private int $y) {}
+    public function x(): int { return $this->x; }
+    public function y(): int { return $this->y; }
+}
+final class PointTest extends TestCase {
+    public function testX(): void {
+        $this->assertSame(3, (new Point(3, 4))->x());
+    }
+}
+"#;
+        assert_eq!(decide(src, "PointTest", "testX"), Decision::True);
+    }
+
+    /// A value-object whose constructor VALIDATES/NORMALISES (throws on a bad arg) is
+    /// NOT a simple promoted-param/`$this->x=<pure>` seed, so NO construction rule is
+    /// derivable → the class stays opaque → Unknown (fail-closed). We must NEVER force
+    /// a `(C a b)` node when the ctor could reject or rewrite its inputs.
+    #[test]
+    fn validating_ctor_stays_unknown() {
+        let frac = r#"<?php
+final class Frac {
+    public int $n;
+    public int $d;
+    public function __construct(int $n, int $d) {
+        if ($d === 0) { throw new \InvalidArgumentException('zero denominator'); }
+        $this->n = $n;
+        $this->d = $d;
+    }
+    public function num(): int { return $this->n; }
+}
+"#;
+        let test = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class FracTest extends TestCase {
+    public function testNum(): void {
+        $this->assertSame(3, (new Frac(3, 4))->num());
+    }
+}
+"#;
+        assert_eq!(
+            decide_in_project(
+                &[("src/Frac.php", frac), ("tests/FracTest.php", test)],
+                "FracTest",
+                "testNum",
+            ),
+            Decision::Unknown
+        );
+    }
+
+    /// The transitive closure: `Frac::of(..)->times(Frac::of(..))->num()` where `Frac`
+    /// is in `src/`. `of` returns `new Frac(...)`, `times` returns `new Frac(...)` —
+    /// the closure must reparse `src/Frac.php`, derive `of`/`times`/`num` AND follow
+    /// the `new Frac` references inside those bodies to keep `Frac` in the catalogue.
+    #[test]
+    fn cross_file_transform_chain() {
+        let frac = r#"<?php
+final class Frac {
+    public function __construct(private int $num, private int $den) {}
+    public static function of(int $n, int $d): self { return new Frac($n, $d); }
+    public function times(Frac $o): Frac { return new Frac($this->num * $o->num, $this->den * $o->den); }
+    public function num(): int { return $this->num; }
+}
+"#;
+        let test = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class FracTest extends TestCase {
+    public function testTimesNum(): void {
+        $this->assertSame(15, Frac::of(3, 4)->times(Frac::of(5, 7))->num());
+    }
+}
+"#;
+        assert_eq!(
+            decide_in_project(
+                &[("src/Frac.php", frac), ("tests/FracTest.php", test)],
+                "FracTest",
+                "testTimesNum",
+            ),
+            Decision::True
+        );
     }
 
     const NUM_SRC: &str = r#"<?php
