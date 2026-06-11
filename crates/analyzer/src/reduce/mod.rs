@@ -37,6 +37,7 @@
 
 pub mod bridge_term;
 pub mod driver;
+pub mod egraph;
 pub mod eval;
 pub mod gate;
 pub mod subst;
