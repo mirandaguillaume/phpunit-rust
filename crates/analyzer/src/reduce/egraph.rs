@@ -928,6 +928,33 @@ impl SuiteExtractor<'_> {
         self.node_costed(op, Vec::new(), 0)
     }
 
+    /// Materialise a pre-computed data-provider Given as a CONCRETE shareable leaf,
+    /// using the EXACT same op naming as `literal_node` so a provider int `0` fuses
+    /// with a source `0`, a provider `'0'` with a `str:'0'`, etc. Returns `None` for a
+    /// non-scalar Given (an array/object) — that column is not substitutable, the
+    /// caller leaves the param salted for the row. Two leaves fuse iff syntactically
+    /// identical (same op), so sharing here is sound by construction.
+    fn value_leaf(&mut self, value: &PhpValue) -> Option<Id> {
+        let op = match value {
+            PhpValue::Int(i) => i.to_string(),
+            PhpValue::String(s) => {
+                let text = String::from_utf8_lossy(s.as_bytes());
+                format!("str:'{text}'")
+            }
+            PhpValue::Bool(true) => "true".to_string(),
+            PhpValue::Bool(false) => "false".to_string(),
+            PhpValue::Null => "null".to_string(),
+            // A provider float Given: a numeric leaf namespaced exactly like
+            // `literal_node`'s float case, formatted from the f64 so two rows carrying
+            // the same provider float share. (Matching a SOURCE float literal's text is
+            // not guaranteed — only identical strings fuse — but that is sound.)
+            PhpValue::Float(f) => format!("float:{f}"),
+            // Arrays / objects are not a single substitutable leaf.
+            PhpValue::Array(_) => return None,
+        };
+        Some(self.leaf(op))
+    }
+
     /// Build ANY expression into the shared e-graph as a `SymbolLang` term. NEVER
     /// returns `None`: an unmodelled construct becomes an opaque shareable symbol.
     fn build(&mut self, expr: &Expression) -> Id {
@@ -1316,8 +1343,19 @@ fn function_call_name(function: &Expression) -> Option<Vec<u8>> {
 /// `test_methods` is the list of `(declaring-class-fqcn, &Method)` to extract — the
 /// caller (the harness) discovers them through the production machinery. The closure
 /// rules are derived once, seeded by every class every test references.
+///
+/// `program` / `source_text` are the (already-reparsed) test file's AST and bytes,
+/// used to resolve each parametrized method's DATA-PROVIDER rows. A provider row is a
+/// tuple of pre-computed Givens (Rust evaluates the provider at discovery): for every
+/// row we materialise the test body ONCE with each parameter BOUND to its concrete
+/// literal leaf — so two rows (within a method or across methods) that build the same
+/// `(BigInteger::of str:'0')` share ONE e-class. A column that is not a substitutable
+/// literal (an object, an array, a `yield`/computed row) keeps the param salted for
+/// that row (fail-safe); a method with no derivable provider extracts once as before.
 pub fn build_suite_egraph(
     project: &MagoProject,
+    program: &Program,
+    source_text: &str,
     test_methods: &[(Vec<u8>, &Method)],
 ) -> CompressionStats {
     // Derive the rules once, from the union of every test's referenced-class closure.
@@ -1332,15 +1370,56 @@ pub fn build_suite_egraph(
     let mut ledger: Vec<(Id, u32)> = Vec::new();
     let mut tests = 0usize;
 
-    for (salt, (_class_fqcn, m)) in test_methods.iter().enumerate() {
-        let mut ex = SuiteExtractor {
-            egraph: &mut egraph,
-            n_naive: &mut n_naive,
-            ledger: &mut ledger,
-            vars: HashMap::new(),
-            test_salt: salt,
-        };
-        if ex.extract_test_body(m) {
+    for (salt, (class_fqcn, m)) in test_methods.iter().enumerate() {
+        // The substitution rows for this method. `None` → no provider (or a zero-param
+        // method): extract the body ONCE with free params salted (the prior behaviour).
+        // `Some(rows)` → materialise the body once PER ROW, binding each param to its
+        // pre-computed literal leaf (cross-row sharing is the whole point).
+        let rows = provider_value_rows(program, source_text, class_fqcn, m);
+        let params: Vec<Vec<u8>> = m
+            .parameter_list
+            .parameters
+            .iter()
+            .map(|p| strip_dollar(p.variable.name))
+            .collect();
+
+        let mut contributed = false;
+        match rows {
+            Some(rows) if !params.is_empty() => {
+                for row in &rows {
+                    let mut ex = SuiteExtractor {
+                        egraph: &mut egraph,
+                        n_naive: &mut n_naive,
+                        ledger: &mut ledger,
+                        vars: HashMap::new(),
+                        test_salt: salt,
+                    };
+                    // Pre-bind each parameter to the row's concrete Given. A column
+                    // that is absent or not a substitutable literal stays UNBOUND, so
+                    // `variable_node` falls back to the per-test salted free leaf for
+                    // that param on this row (no false fusion).
+                    for (i, pname) in params.iter().enumerate() {
+                        if let Some(Some(value)) = row.get(i) {
+                            if let Some(id) = ex.value_leaf(value) {
+                                ex.vars.insert(pname.clone(), id);
+                            }
+                        }
+                    }
+                    contributed |= ex.extract_test_body(m);
+                }
+            }
+            _ => {
+                let mut ex = SuiteExtractor {
+                    egraph: &mut egraph,
+                    n_naive: &mut n_naive,
+                    ledger: &mut ledger,
+                    vars: HashMap::new(),
+                    test_salt: salt,
+                };
+                contributed = ex.extract_test_body(m);
+            }
+        }
+        if contributed {
             tests += 1;
         }
     }
@@ -1558,6 +1637,122 @@ fn int_row_from_phpvalue(value: &PhpValue) -> Option<Vec<i64>> {
         match v {
             PhpValue::Int(i) => cols.push(*i),
             _ => return None,
+        }
+    }
+    Some(cols)
+}
+
+// ─── Data-provider substitution for COMPRESSION: rows of ANY literal leaf ───────
+//
+// The decision path (above) only accepts rows of INTEGERS — a single non-int column
+// bails the whole method. The COMPRESSION path is laxer because it never DECIDES: it
+// only needs the row's Givens as shareable leaves. So it accepts ANY literal column
+// (int / string / bool / float / null → a concrete leaf) and marks a non-literal
+// column (an array, an object, a computed value) as `None` — that param simply stays
+// salted for the row. A method with no provider at all returns `None` (no rows).
+
+/// The data-provider rows for a parametrized test method, evaluated as
+/// per-column literal Givens for the COMPRESSION substitution. Returns:
+///   * `None` — the method has NO derivable provider (no `#[DataProvider]` /
+///     `#[TestWith]` / `@dataProvider`, or the named provider is missing / not a pure
+///     array literal). The caller then extracts the body once with free params salted.
+///   * `Some(rows)` — one entry per provider row; each row is a `Vec<Option<PhpValue>>`
+///     positionally aligned to the method's parameters. `Some(v)` = a substitutable
+///     literal Given for that column; `None` = a non-literal column (array/object/yield/
+///     computed) → the caller leaves that one param salted for the row (fail-safe).
+fn provider_value_rows(
+    program: &Program,
+    source_text: &str,
+    class_fqcn: &[u8],
+    method: &Method,
+) -> Option<Vec<Vec<Option<PhpValue>>>> {
+    // `#[TestWith([..])]` rows live ON the method — collect them first.
+    let test_with = test_with_value_rows(method);
+    if !test_with.is_empty() {
+        return Some(test_with);
+    }
+    // Otherwise a `#[DataProvider('name')]` attribute or `@dataProvider name` docblock
+    // names a sibling static provider method.
+    let provider_name = data_provider_name(source_text, method)?;
+    let provider = find_class_method(program, class_fqcn, provider_name.as_bytes())?;
+    static_provider_value_rows(provider)
+}
+
+/// The `#[TestWith([..])]` rows declared directly on `method`, each evaluated to a row
+/// of per-column literal Givens (non-literal columns → `None`). A `TestWith` whose
+/// argument does not concretely evaluate to an array contributes no row.
+fn test_with_value_rows(method: &Method) -> Vec<Vec<Option<PhpValue>>> {
+    let mut rows = Vec::new();
+    for list in method.attribute_lists.iter() {
+        for attr in list.attributes.iter() {
+            if !attribute_simple_name(&attr.name).eq_ignore_ascii_case(b"TestWith") {
+                continue;
+            }
+            let Some(arg_list) = &attr.argument_list else {
+                continue;
+            };
+            let Some(Argument::Positional(p)) = arg_list.arguments.iter().next() else {
+                continue;
+            };
+            if let Some(row) = value_row_from_expr(p.value) {
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+/// Evaluate a static data-provider method (`{ return [ [..], [..] ]; }`) to rows of
+/// per-column literal Givens. The body must be a single `return` of an `array`
+/// LITERAL whose every element is itself an array (positional or `key => [..]`); a
+/// non-array element fails the whole provider (`None`). Anything that does not compute
+/// statically (a `yield`, a loop, a computed expression) also fails — the method then
+/// keeps its params salted (no substitution, no false fusion).
+fn static_provider_value_rows(provider: &Method) -> Option<Vec<Vec<Option<PhpValue>>>> {
+    let MethodBody::Concrete(block) = &provider.body else {
+        return None;
+    };
+    let ret = single_return_expr(block)?;
+    value_rows_from_array_literal(ret)
+}
+
+/// A `[ [..], [..] ]` (or `[ 'k' => [..] ]`) outer array literal → its rows, each a
+/// per-column literal Given vector. `None` if `expr` does not compute to an array, or
+/// any row is not itself an array.
+fn value_rows_from_array_literal(expr: &Expression) -> Option<Vec<Vec<Option<PhpValue>>>> {
+    let mut ctx = Context::new();
+    let value = compute(expr, &mut ctx).ok()?;
+    let PhpValue::Array(outer) = value else {
+        return None;
+    };
+    let mut rows = Vec::new();
+    for (_key, row_val) in outer {
+        rows.push(value_row_from_phpvalue(&row_val)?);
+    }
+    Some(rows)
+}
+
+/// One row literal (`[1, 'x', true]`) → its per-column Givens. `None` if `expr` does
+/// not compute to an array.
+fn value_row_from_expr(expr: &Expression) -> Option<Vec<Option<PhpValue>>> {
+    let mut ctx = Context::new();
+    let value = compute(expr, &mut ctx).ok()?;
+    value_row_from_phpvalue(&value)
+}
+
+/// A concretely-evaluated `PhpValue` row → its per-column Givens. Each scalar column
+/// (int / string / bool / float / null) is a substitutable `Some(value)`; a nested
+/// array (or any non-scalar) column is `None` (not a single shareable leaf — the
+/// param stays salted). `None` only when the row itself is not an array.
+fn value_row_from_phpvalue(value: &PhpValue) -> Option<Vec<Option<PhpValue>>> {
+    let PhpValue::Array(map) = value else {
+        return None;
+    };
+    let mut cols = Vec::new();
+    for v in map.values() {
+        match v {
+            PhpValue::Array(_) => cols.push(None),
+            scalar => cols.push(Some(scalar.clone())),
         }
     }
     Some(cols)
@@ -2311,7 +2506,8 @@ mod tests {
         std::fs::write(dir.path().join("Code.php"), src).unwrap();
         let project = MagoProject::load(dir.path()).unwrap();
         project
-            .with_program("Code.php", |program, _src, _names| {
+            .with_program("Code.php", |program, src, _names| {
+                let source_text = String::from_utf8_lossy(&src.contents);
                 // Collect every test method of `class` (a `test*` instance method).
                 let class_ast = find_class_ast(program, class.as_bytes())
                     .expect("test class present in program");
@@ -2324,7 +2520,7 @@ mod tests {
                         }
                     }
                 }
-                build_suite_egraph(&project, &pairs)
+                build_suite_egraph(&project, program, &source_text, &pairs)
             })
             .unwrap()
     }
@@ -3055,5 +3251,174 @@ final class FracTest extends TestCase {
             &format!("{max}"),
         ]);
         assert_ne!(g2.find(r2[0]), g2.find(r2[1]));
+    }
+
+    // ─── Data-provider row substitution in the COMPRESSION path ─────────────────
+
+    /// THE provider-substitution proof: ONE parametrized method whose data provider
+    /// has THREE rows that all bind `$n = 0` builds `BigInteger::of(0)` three times —
+    /// with the param SUBSTITUTED to the concrete leaf `0`, those three constructions
+    /// collapse to ONE e-class. Before substitution `$n` was a per-test salted free
+    /// leaf, so the three `of($n)` could not share. `n_naive` counts the body once per
+    /// row (3×); the shared `BigInteger::of 0` is the dominant cost target at mult 3.
+    #[test]
+    fn provider_rows_substitute_and_share_across_rows() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class ProvTest extends TestCase {
+    public static function zeros(): array {
+        return [[0], [0], [0]];
+    }
+    #[DataProvider('zeros')]
+    public function testOf(int $n): void {
+        $this->assertSame('0', BigInteger::of($n)->__toString());
+    }
+}
+"#;
+        let s = compress(src, "ProvTest");
+        // The body materialises once per provider row.
+        assert!(
+            s.tests >= 1 && s.n_naive > 0,
+            "the parametrized body contributed nodes: {s:?}"
+        );
+        // The thrice-built `BigInteger::of 0` is shared into ONE class → it tops the
+        // targets at multiplicity 3 (substitution made `$n` concrete `0`, fusing them).
+        let of_target = s
+            .top_targets
+            .iter()
+            .find(|t| t.op == "BigInteger::of")
+            .expect("the substituted constructor is a cost target");
+        assert_eq!(
+            of_target.mult, 3,
+            "all 3 rows' `BigInteger::of(0)` share one class: {:?}",
+            s.top_targets
+        );
+        assert!(
+            s.cost_compression() > 1.0,
+            "substituted shared calls lift cost_compression: {:.2}",
+            s.cost_compression()
+        );
+    }
+
+    /// Inter-METHOD sharing through providers: two DIFFERENT parametrized methods whose
+    /// providers each yield a row binding the same `0` both build `BigInteger::of(0)`.
+    /// With substitution the two constructions (in different test bodies) fuse into ONE
+    /// e-class — the cross-test sharing the integer-only path could never see.
+    #[test]
+    fn provider_substitution_shares_across_methods() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class TwoProvTest extends TestCase {
+    public static function zero(): array { return [[0]]; }
+    #[DataProvider('zero')]
+    public function testA(int $n): void {
+        $this->assertSame('0', BigInteger::of($n)->__toString());
+    }
+    #[DataProvider('zero')]
+    public function testB(int $n): void {
+        $this->assertTrue(BigInteger::of($n)->isZero());
+    }
+}
+"#;
+        let s = compress(src, "TwoProvTest");
+        let of_target = s
+            .top_targets
+            .iter()
+            .find(|t| t.op == "BigInteger::of")
+            .expect("the shared constructor is a cost target");
+        assert_eq!(
+            of_target.mult, 2,
+            "both methods' `BigInteger::of(0)` share one class: {:?}",
+            s.top_targets
+        );
+    }
+
+    /// Mixed-type Givens share too: a `#[TestWith]` carrying a STRING `'0'` and another
+    /// carrying `'0'` build `BigInteger::of('0')` that fuses on the `str:'0'` leaf —
+    /// proving substitution handles ANY literal (here string), not just integers.
+    #[test]
+    fn testwith_string_givens_share() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\TestWith;
+final class StrProvTest extends TestCase {
+    #[TestWith(['0'])]
+    #[TestWith(['0'])]
+    public function testOf(string $s): void {
+        $this->assertSame('0', BigInteger::of($s)->__toString());
+    }
+}
+"#;
+        let s = compress(src, "StrProvTest");
+        let of_target = s
+            .top_targets
+            .iter()
+            .find(|t| t.op == "BigInteger::of")
+            .expect("the string-substituted constructor is a cost target");
+        assert_eq!(
+            of_target.mult, 2,
+            "both `'0'` rows' constructor share one class: {:?}",
+            s.top_targets
+        );
+    }
+
+    /// Soundness: substituting DISTINCT provider Givens must NOT fuse. Two rows binding
+    /// `1` and `2` build `BigInteger::of(1)` and `BigInteger::of(2)` — distinct leaves,
+    /// distinct constructions, so the constructor class is NOT shared at multiplicity 2.
+    #[test]
+    fn distinct_provider_givens_do_not_fuse() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class DistinctProvTest extends TestCase {
+    public static function ones_and_twos(): array { return [[1], [2]]; }
+    #[DataProvider('ones_and_twos')]
+    public function testOf(int $n): void {
+        $this->assertSame((string) $n, BigInteger::of($n)->__toString());
+    }
+}
+"#;
+        let s = compress(src, "DistinctProvTest");
+        // Each distinct Given builds its own `BigInteger::of` class — neither reaches
+        // multiplicity 2 (no abusive fusion of different concrete arguments).
+        let max_of_mult = s
+            .top_targets
+            .iter()
+            .filter(|t| t.op == "BigInteger::of")
+            .map(|t| t.mult)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_of_mult < 2,
+            "distinct Givens must keep distinct constructor classes: {:?}",
+            s.top_targets
+        );
+    }
+
+    /// Fail-safe: a provider row that is NOT a substitutable literal (a nested array
+    /// column) leaves that param salted for the row — no panic, no false fusion, and
+    /// the rest of the suite still measures. Here the single column is an array, so the
+    /// param stays free; the body still contributes (the measure does not bail).
+    #[test]
+    fn non_literal_provider_column_stays_salted() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class ArrProvTest extends TestCase {
+    public static function arrays(): array { return [[[1, 2]], [[3, 4]]]; }
+    #[DataProvider('arrays')]
+    public function testOf(array $xs): void {
+        $this->assertNotNull(BigInteger::of($xs));
+    }
+}
+"#;
+        let s = compress(src, "ArrProvTest");
+        // The measure did not bail: the body contributed nodes across the 2 rows.
+        assert!(
+            s.tests >= 1 && s.n_naive > 0,
+            "non-literal column must not bail the measure: {s:?}"
+        );
     }
 }

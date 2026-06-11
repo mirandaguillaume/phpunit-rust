@@ -857,7 +857,8 @@ mod tests {
             // so `build_suite_egraph` (which inserts every test's terms into ONE shared
             // e-graph and saturates) runs entirely inside it.
             let stats = project
-                .with_program(logical, |program, _file, _names| {
+                .with_program(logical, |program, file, _names| {
+                    let source_text = String::from_utf8_lossy(&file.contents);
                     let mut pairs: Vec<(Vec<u8>, &Method)> = Vec::new();
                     for (fqcn, method) in methods {
                         if let Some(m) = super::super::subst::find_class_method(
@@ -868,7 +869,7 @@ mod tests {
                             pairs.push((fqcn.as_bytes().to_vec(), m));
                         }
                     }
-                    egraph::build_suite_egraph(&project, &pairs)
+                    egraph::build_suite_egraph(&project, program, &source_text, &pairs)
                 })
                 .unwrap_or_default();
             agg.tests += stats.tests;
