@@ -41,6 +41,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use mago_names::ResolvedNames;
+use mago_span::HasSpan;
 use mago_syntax::ast::ast::access::Access;
 use mago_syntax::ast::ast::argument::{Argument, ArgumentList};
 use mago_syntax::ast::ast::array::{ArrayElement, LegacyArray};
@@ -905,6 +906,78 @@ fn var_name(name: &[u8]) -> Vec<u8> {
     name.strip_prefix(b"$").unwrap_or(name).to_vec()
 }
 
+/// FIX 4: whether a test method carries a resolvable data provider, so PHPUnit binds
+/// its parameters with arguments (no `ArgumentCountError`). Recognised forms:
+///   * a `#[DataProvider(...)]` / `#[DataProviderExternal(...)]` attribute,
+///   * a `#[TestWith(...)]` / `#[TestWithJson(...)]` attribute,
+///   * the legacy `/** @dataProvider name */` docblock immediately above the method.
+///
+/// Real php8.4 PHPUnit honours the `@dataProvider` docblock, so it must NOT be
+/// over-bailed to `Unknown` (that would regress sound True/False verdicts) — hence the
+/// raw-source docblock scan, mirroring discovery's `@test` scanner.
+fn method_has_data_provider(
+    method: &mago_syntax::ast::ast::class_like::method::Method,
+    source_text: &str,
+    method_offset: usize,
+) -> bool {
+    for list in method.attribute_lists.iter() {
+        for attr in list.attributes.iter() {
+            let simple = attribute_simple_name(&attr.name);
+            if simple.eq_ignore_ascii_case(b"DataProvider")
+                || simple.eq_ignore_ascii_case(b"DataProviderExternal")
+                || simple.eq_ignore_ascii_case(b"TestWith")
+                || simple.eq_ignore_ascii_case(b"TestWithJson")
+            {
+                return true;
+            }
+        }
+    }
+    has_doc_data_provider_annotation(source_text, method_offset)
+}
+
+/// Whether the raw source has a `@dataProvider` (or `@testWith`) docblock tag in the
+/// `/** … */` block immediately before `method_offset`. Mirrors discovery's
+/// `has_doc_test_annotation` (window-scan + UTF-8-boundary safety), keyed on the
+/// data-provider tags rather than `@test`.
+fn has_doc_data_provider_annotation(source_text: &str, method_offset: usize) -> bool {
+    let end = floor_char_boundary(source_text, method_offset.min(source_text.len()));
+    let window_start = floor_char_boundary(source_text, end.saturating_sub(400));
+    let window = source_text[window_start..end].trim_end();
+    if !window.ends_with("*/") {
+        return false;
+    }
+    let Some(open) = window.rfind("/**") else {
+        return false;
+    };
+    let docblock = &window[open..];
+    let lower = docblock.to_ascii_lowercase();
+    lower.contains("@dataprovider") || lower.contains("@testwith")
+}
+
+/// The largest char boundary `<= index` (stable-Rust stand-in for the unstable
+/// `str::floor_char_boundary`); avoids slicing mid-UTF-8-codepoint on accented source.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut i = index.min(s.len());
+    let bytes = s.as_bytes();
+    while i > 0 && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
+        i -= 1;
+    }
+    i
+}
+
+/// The simple (unqualified, namespace-stripped) name of an attribute identifier.
+fn attribute_simple_name<'a>(
+    name: &'a mago_syntax::ast::ast::identifier::Identifier<'a>,
+) -> &'a [u8] {
+    use mago_syntax::ast::ast::identifier::Identifier;
+    let full = match name {
+        Identifier::Local(l) => l.value,
+        Identifier::Qualified(q) => q.value,
+        Identifier::FullyQualified(f) => f.value,
+    };
+    full.rsplit(|b| *b == b'\\').next().unwrap_or(full)
+}
+
 /// The bare name of a call/class target if it is a plain identifier, else `None`.
 fn identifier_name<'a>(expr: &'a Expression<'a>) -> Option<&'a [u8]> {
     use mago_syntax::ast::ast::identifier::Identifier;
@@ -1026,6 +1099,7 @@ fn bind_param_terms(
         let arg_ty = scalar_ty_of_term(arg_term, given_types);
         if let Some(sink) = sink_ty {
             bail_if_term_coerces(arg_term, sink, arg_ty)?;
+            bail_if_symbolic_arith_into_numeric_sink(arg_term, sink)?;
         }
         // Thread the resolved scalar type forward: prefer the arg's own type; else
         // (a non-scalar / unknown arg) the declared sink type narrows a free Sym.
@@ -1089,6 +1163,54 @@ fn bail_if_term_coerces(
             "value of unknown type into a {:?}-typed scalar sink (coercion not modelled)",
             sink
         ))),
+    }
+}
+
+/// FIX 3 (D2): symbolic ARITHMETIC entering a TYPED numeric (`int`/`float`) scalar
+/// sink is unsound under the symbolic-∀ model, because `+`/`-`/`*` are NON-TOTAL:
+/// at an overflow PHP promotes the result to FLOAT, and feeding a float into an
+/// `int`-typed sink is a runtime `TypeError` — a real ERROR the kernel cannot prove
+/// absent over a FREE symbol. So an arg whose (reduced) term is a `Bin` mentioning a
+/// `Sym`, entering an `int`/`float` sink, BAILS. A bare `Sym` (assumed in range by
+/// its declared type) and a fully concrete `Int` (checked → `Opaque` on overflow,
+/// downstream) both still pass — only the symbolic-arithmetic case is shielded.
+///
+/// An UN-typed sink (`sink_ty == None`, so this is never reached) is sound even on
+/// overflow: both sides of the assertion become the same float, so the showcase
+/// `assertSame($a + $b, (new Money($a))->plus($b)->getAmount())` with an UNTYPED
+/// `public $amount` stays `True ∀ a, b`.
+fn bail_if_symbolic_arith_into_numeric_sink(arg: &Term, sink: ScalarTy) -> Result<(), BailReason> {
+    if !matches!(sink, ScalarTy::Int | ScalarTy::Float) {
+        return Ok(());
+    }
+    let reduced = super::term::reduce(arg);
+    if is_symbolic_arith(&reduced) {
+        return Err(BailReason::UnsupportedConstruct(format!(
+            "symbolic arithmetic into a typed {:?} sink (overflow→float→TypeError not \
+             provable on a free symbol)",
+            sink
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a (reduced) term is an ARITHMETIC `Bin` that mentions at least one free
+/// `Sym` — i.e. a non-total operation over an unbounded symbol.
+fn is_symbolic_arith(t: &Term) -> bool {
+    matches!(t, Term::Bin(..)) && term_contains_sym(t)
+}
+
+/// Whether a term mentions any free `Sym` (a local re-implementation: `term`'s own
+/// `contains_sym` is private to that module).
+fn term_contains_sym(t: &Term) -> bool {
+    match t {
+        Term::Sym(_) => true,
+        Term::Bin(_, a, b) => term_contains_sym(a) || term_contains_sym(b),
+        Term::Field(o, _) => term_contains_sym(o),
+        Term::Obj(_, fields) => fields.iter().any(|(_, v)| term_contains_sym(v)),
+        Term::List(items) => items.iter().any(term_contains_sym),
+        Term::Len(i) => term_contains_sym(i),
+        _ => false,
     }
 }
 
@@ -1233,7 +1355,7 @@ fn decide_test_inner(
     let depth = Cell::new(0u32);
 
     project
-        .with_program(&logical, |program, _file, names| {
+        .with_program(&logical, |program, src_file, names| {
             let m =
                 find_class_method(program, &class_fqcn, method.as_bytes()).ok_or_else(|| {
                     BailReason::Other(format!("test method {class}::{method} not found"))
@@ -1243,6 +1365,24 @@ fn decide_test_inner(
                     "abstract/interface test method body".into(),
                 ));
             };
+            // FIX 4 (D1): a test method with ≥1 parameter but NO resolvable data
+            // provider is invoked 0-arg by PHPUnit → ArgumentCountError (a real
+            // ERROR). Treating its params as free Givens and deciding True/False
+            // would be unsound, so BAIL to Unknown (the runner then surfaces the
+            // real error). A no-param method, or one WITH a provider (the
+            // `#[DataProvider]`/`#[TestWith]` attribute OR the legacy
+            // `@dataProvider` docblock), continues.
+            if !m.parameter_list.parameters.is_empty() {
+                let source_text = String::from_utf8_lossy(&src_file.contents);
+                let method_offset = m.span().start.offset as usize;
+                if !method_has_data_provider(m, &source_text, method_offset) {
+                    return Err(BailReason::UnsupportedConstruct(
+                        "test method has parameters but no #[DataProvider]/#[TestWith]/\
+                         @dataProvider (PHPUnit would raise ArgumentCountError)"
+                            .into(),
+                    ));
+                }
+            }
             // Enter the test params as FREE Givens (Sym), recording their scalar
             // type from the hint (so the coercion guard at typed scalar sinks knows
             // each Given's type — e.g. `int $a` → Sym a : Int).
@@ -1287,18 +1427,32 @@ mod tests {
     }
 
     /// The canonical value-object source used by several tests.
+    ///
+    /// `$amount` is UNTYPED (`public $amount`, not `public int $amount`): an
+    /// untyped sink is sound even under integer overflow, because BOTH sides of the
+    /// assertion become the same PHP float — so `assertSame($a + $b, …->getAmount())`
+    /// stays `True ∀ a, b` honestly (FIX 3). A TYPED `int $amount` sink would instead
+    /// turn this into a TypeError on overflow, which the bridge must not claim True —
+    /// see `typed_int_sink_symbolic_arith_is_unknown` below for that negative case.
+    ///
+    /// `testPlus` carries a `#[DataProvider]` so PHPUnit actually invokes it with
+    /// arguments (FIX 4) — a parametrized method with NO provider would be an
+    /// ArgumentCountError, which the bridge now bails on.
     const MONEY_SRC: &str = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class Money {
-    public function __construct(public int $amount) {}
-    public function plus(int $x): Money { return new Money($this->amount + $x); }
-    public function getAmount(): int { return $this->amount; }
+    public function __construct(public $amount) {}
+    public function plus($x): Money { return new Money($this->amount + $x); }
+    public function getAmount() { return $this->amount; }
 }
 class MoneyTest extends TestCase {
+    #[DataProvider('p')]
     public function testPlus(int $a, int $b): void {
         $r = (new Money($a))->plus($b);
         $this->assertSame($a + $b, $r->getAmount());
     }
+    public static function p(): array { return [[1, 2]]; }
 }
 "#;
 
@@ -1306,7 +1460,8 @@ class MoneyTest extends TestCase {
 
     #[test]
     fn money_plus_getamount_decides_true_for_all_givens() {
-        // ∀ a, b — no concrete values: both sides reduce to `a + b`.
+        // ∀ a, b — no concrete values: both sides reduce to `a + b` (UNTYPED sink,
+        // sound even on overflow).
         assert_eq!(decide(MONEY_SRC, "MoneyTest", "testPlus"), Decision::True);
     }
 
@@ -1338,8 +1493,11 @@ class T extends TestCase {
     fn free_param_symbol_same_as_itself_is_true() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, $a); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1371,8 +1529,11 @@ class T extends TestCase {
     fn addition_is_commutative_decides_true() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a, int $b): void { $this->assertSame($a + $b, $b + $a); }
+    public static function p(): array { return [[1, 2]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1382,8 +1543,11 @@ class T extends TestCase {
     fn unmodelled_division_operator_is_unknown() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, $a / 1); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::Unknown);
@@ -1397,12 +1561,15 @@ class T extends TestCase {
         // $this->amount → the Obj field → $a.
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class Money {
     public function __construct(public int $amount) {}
     public function getAmount(): int { return $this->amount; }
 }
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, (new Money($a))->getAmount()); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1412,8 +1579,11 @@ class T extends TestCase {
     fn assert_count_over_list_literal_is_true() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $x, int $y): void { $this->assertCount(2, [$x, $y]); }
+    public static function p(): array { return [[1, 2]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1425,11 +1595,14 @@ class T extends TestCase {
     fn assignment_then_assert_equals_decides() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a, int $b): void {
         $r = $a + $b;
         $this->assertEquals($b + $a, $r);
     }
+    public static function p(): array { return [[1, 2]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1450,9 +1623,12 @@ class T extends TestCase {
     fn bare_assertion_function_form_decides() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 use function PHPUnit\Framework\assertSame;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { assertSame($a, $a); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1462,8 +1638,11 @@ class T extends TestCase {
     fn assertion_with_message_arg_decides() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, $a, "msg"); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1473,8 +1652,11 @@ class T extends TestCase {
     fn control_flow_statement_is_unknown() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { if ($a > 0) { $this->assertSame($a, $a); } }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::Unknown);
@@ -1487,13 +1669,16 @@ class T extends TestCase {
         // A non-promoted ctor: the body writes $this->amount = $amount.
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class Money {
     public int $amount;
     public function __construct(int $amount) { $this->amount = $amount; }
     public function getAmount(): int { return $this->amount; }
 }
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, (new Money($a))->getAmount()); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::True);
@@ -1517,9 +1702,12 @@ class T extends TestCase {
     fn new_on_abstract_is_unknown() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 abstract class Base { public function __construct(public int $n) {} }
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, (new Base($a))->n); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::Unknown);
@@ -1530,12 +1718,15 @@ class T extends TestCase {
         // A multi-statement (non single-return) method body bails the inline.
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class Box {
     public function __construct(public int $v) {}
     public function weird(int $x): int { $y = $x; return $this->v + $y; }
 }
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a, int $b): void { $this->assertSame($a + $b, (new Box($a))->weird($b)); }
+    public static function p(): array { return [[1, 2]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::Unknown);
@@ -1545,12 +1736,15 @@ class T extends TestCase {
     fn null_safe_method_call_is_unknown() {
         let src = r#"<?php
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 class Money {
     public function __construct(public int $amount) {}
     public function getAmount(): int { return $this->amount; }
 }
 class T extends TestCase {
+    #[DataProvider('p')]
     public function t(int $a): void { $this->assertSame($a, (new Money($a))?->getAmount()); }
+    public static function p(): array { return [[1]]; }
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::Unknown);
@@ -1568,5 +1762,151 @@ class T extends TestCase {
 }
 "#;
         assert_eq!(decide(src, "T", "t"), Decision::Unknown);
+    }
+
+    // ── FIX 1: assertEquals is PHP loose `==`, not Rust structural equality ────
+
+    #[test]
+    fn assert_equals_string_int_is_unknown_not_false() {
+        // assertEquals("5", 5) — PHP `==` coerces → PASS. The bridge must NOT claim a
+        // definitive False (which would be a critical divergence) → Unknown.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    public function t(): void { $this->assertEquals("5", 5); }
+}
+"#;
+        assert_eq!(decide(src, "T", "t"), Decision::Unknown);
+    }
+
+    #[test]
+    fn assert_equals_bool_int_is_unknown_not_false() {
+        // assertEquals(true, 1) — PHP `==` → PASS → Unknown.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    public function t(): void { $this->assertEquals(true, 1); }
+}
+"#;
+        assert_eq!(decide(src, "T", "t"), Decision::Unknown);
+    }
+
+    #[test]
+    fn assert_not_equals_string_int_is_unknown_not_true() {
+        // assertNotEquals("5", 5) — PHP: "5"==5 is true → NotEquals FAILS. The bridge
+        // previously returned invert(False) = True (the WORST direction: claims PASS
+        // where PHP FAILS). Must be Unknown now.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    public function t(): void { $this->assertNotEquals("5", 5); }
+}
+"#;
+        assert_eq!(decide(src, "T", "t"), Decision::Unknown);
+    }
+
+    #[test]
+    fn assert_equals_distinct_ints_stays_false() {
+        // A genuine same-variant inequality is still a sound definitive False.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    public function t(): void { $this->assertEquals(5, 6); }
+}
+"#;
+        assert_eq!(decide(src, "T", "t"), Decision::False);
+    }
+
+    // ── FIX 3 (D2): symbolic arithmetic into a TYPED int sink → Unknown ────────
+
+    #[test]
+    fn typed_int_sink_symbolic_arith_is_unknown() {
+        // The SAME showcase as MONEY_SRC but with a TYPED `int $amount` sink: at an
+        // overflow `$a + $b` promotes to float → `new Money(float)` is a TypeError
+        // (a real ERROR). The bridge must NOT claim True over the free symbols.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+class Money {
+    public function __construct(public int $amount) {}
+    public function plus(int $x): Money { return new Money($this->amount + $x); }
+    public function getAmount(): int { return $this->amount; }
+}
+class MoneyTest extends TestCase {
+    #[DataProvider('p')]
+    public function testPlus(int $a, int $b): void {
+        $r = (new Money($a))->plus($b);
+        $this->assertSame($a + $b, $r->getAmount());
+    }
+    public static function p(): array { return [[1, 2]]; }
+}
+"#;
+        assert_eq!(decide(src, "MoneyTest", "testPlus"), Decision::Unknown);
+    }
+
+    #[test]
+    fn bare_sym_into_typed_int_sink_still_passes() {
+        // A bare (non-arithmetic) int Sym into an int sink is in-range by hypothesis
+        // and still decides — FIX 3 only shields symbolic ARITHMETIC, not a plain Sym.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+class Money {
+    public function __construct(public int $amount) {}
+    public function getAmount(): int { return $this->amount; }
+}
+class T extends TestCase {
+    #[DataProvider('p')]
+    public function t(int $a): void { $this->assertSame($a, (new Money($a))->getAmount()); }
+    public static function p(): array { return [[1]]; }
+}
+"#;
+        assert_eq!(decide(src, "T", "t"), Decision::True);
+    }
+
+    // ── FIX 4 (D1): parametrized test with NO data provider → Unknown ──────────
+
+    #[test]
+    fn param_method_without_provider_is_unknown() {
+        // testNoProvider(int $a) with NO #[DataProvider]/#[TestWith]: PHPUnit invokes
+        // it 0-arg → ArgumentCountError (a real ERROR). The bridge must bail, not
+        // decide True over the free Given.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    public function testNoProvider(int $a): void { $this->assertSame($a, $a); }
+}
+"#;
+        assert_eq!(decide(src, "T", "testNoProvider"), Decision::Unknown);
+    }
+
+    #[test]
+    fn no_param_method_without_provider_still_decides() {
+        // A zero-parameter test needs no provider; the gate must NOT fire for it.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    public function testNoParam(): void { $this->assertSame(5, 5); }
+}
+"#;
+        assert_eq!(decide(src, "T", "testNoParam"), Decision::True);
+    }
+
+    #[test]
+    fn docblock_data_provider_is_honored() {
+        // PHPUnit honours the legacy `@dataProvider` docblock, so a parametrized
+        // method carrying it is invoked WITH args (no ArgumentCountError) and must
+        // still decide — the gate must NOT over-bail it to Unknown.
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+class T extends TestCase {
+    /**
+     * @dataProvider p
+     */
+    public function t(int $a): void { $this->assertSame($a, $a); }
+    public static function p(): array { return [[1]]; }
+}
+"#;
+        assert_eq!(decide(src, "T", "t"), Decision::True);
     }
 }

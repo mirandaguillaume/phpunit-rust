@@ -46,6 +46,11 @@ pub enum Term {
     List(Vec<Term>),
     /// `count(term)` — reduces to an `Int` when `term` is a `List`.
     Len(Box<Term>),
+    /// Poison: an INDECIDABLE value (e.g. concrete i64 arithmetic that overflowed —
+    /// PHP would promote to float, which the kernel does not model). Opaque is
+    /// absorbing: any op / Field / Len / Obj containing it reduces to Opaque, and any
+    /// decision touching it is fail-closed [`Decision::Unknown`].
+    Opaque,
 }
 
 /// The verdict of deciding an assertion symbolically. `Unknown` is fail-closed: the
@@ -62,12 +67,16 @@ pub enum Decision {
 /// `b + a` share one normal form (the basis for the cross-test term-fragment cache).
 pub fn reduce(t: &Term) -> Term {
     match t {
-        Term::Sym(_) | Term::Int(_) | Term::Bool(_) | Term::Str(_) => t.clone(),
+        Term::Sym(_) | Term::Int(_) | Term::Bool(_) | Term::Str(_) | Term::Opaque => t.clone(),
 
         // Object transparency: `(new C{f: g})->f` substitutes to `g` (factoring the
         // Given through the object). A field access on a non-object stays symbolic.
+        // A field access on an Opaque receiver is itself indecidable → Opaque.
         Term::Field(obj, name) => {
             let robj = reduce(obj);
+            if robj == Term::Opaque {
+                return Term::Opaque;
+            }
             if let Term::Obj(_, fields) = &robj {
                 if let Some((_, value)) = fields.iter().rev().find(|(k, _)| k == name) {
                     return reduce(value);
@@ -76,16 +85,28 @@ pub fn reduce(t: &Term) -> Term {
             Term::Field(Box::new(robj), name.clone())
         }
 
-        Term::Obj(class, fields) => Term::Obj(
-            class.clone(),
-            fields.iter().map(|(k, v)| (k.clone(), reduce(v))).collect(),
-        ),
+        Term::Obj(class, fields) => {
+            let reduced: Vec<(String, Term)> =
+                fields.iter().map(|(k, v)| (k.clone(), reduce(v))).collect();
+            // An object carrying an indecidable field is itself indecidable.
+            if reduced.iter().any(|(_, v)| *v == Term::Opaque) {
+                return Term::Opaque;
+            }
+            Term::Obj(class.clone(), reduced)
+        }
 
-        Term::List(items) => Term::List(items.iter().map(reduce).collect()),
+        Term::List(items) => {
+            let reduced: Vec<Term> = items.iter().map(reduce).collect();
+            if reduced.contains(&Term::Opaque) {
+                return Term::Opaque;
+            }
+            Term::List(reduced)
+        }
 
         Term::Len(inner) => {
             let rinner = reduce(inner);
             match &rinner {
+                Term::Opaque => Term::Opaque,
                 Term::List(items) => Term::Int(items.len() as i64),
                 _ => Term::Len(Box::new(rinner)),
             }
@@ -94,11 +115,20 @@ pub fn reduce(t: &Term) -> Term {
         Term::Bin(op, a, b) => {
             let ra = reduce(a);
             let rb = reduce(b);
+            // An operand that is already indecidable poisons the whole expression.
+            if ra == Term::Opaque || rb == Term::Opaque {
+                return Term::Opaque;
+            }
             match op {
-                Op::Add => reduce_commutative(Op::Add, ra, rb, 0, |x, y| x + y),
-                Op::Mul => reduce_commutative(Op::Mul, ra, rb, 1, |x, y| x * y),
+                Op::Add => reduce_commutative(Op::Add, ra, rb, 0, i64::checked_add),
+                Op::Mul => reduce_commutative(Op::Mul, ra, rb, 1, i64::checked_mul),
                 Op::Sub => match (&ra, &rb) {
-                    (Term::Int(x), Term::Int(y)) => Term::Int(x - y),
+                    // Concrete i64 subtraction that overflows promotes to float in
+                    // PHP (unmodelled) → Opaque rather than a wrapped/panicking value.
+                    (Term::Int(x), Term::Int(y)) => match x.checked_sub(*y) {
+                        Some(v) => Term::Int(v),
+                        None => Term::Opaque,
+                    },
                     _ => Term::Bin(Op::Sub, Box::new(ra), Box::new(rb)),
                 },
             }
@@ -115,7 +145,7 @@ fn reduce_commutative(
     ra: Term,
     rb: Term,
     identity: i64,
-    fold: fn(i64, i64) -> i64,
+    fold: fn(i64, i64) -> Option<i64>,
 ) -> Term {
     let mut operands = Vec::new();
     flatten(op, ra, &mut operands);
@@ -125,7 +155,12 @@ fn reduce_commutative(
     let mut symbolic = Vec::new();
     for o in operands {
         match o {
-            Term::Int(n) => acc = fold(acc, n),
+            // Concrete-constant folding uses CHECKED arithmetic: an i64 overflow
+            // promotes to float in PHP (unmodelled) → the whole op is Opaque.
+            Term::Int(n) => match fold(acc, n) {
+                Some(v) => acc = v,
+                None => return Term::Opaque,
+            },
             other => symbolic.push(other),
         }
     }
@@ -162,6 +197,7 @@ fn contains_obj(t: &Term) -> bool {
         Term::Field(o, _) => contains_obj(o),
         Term::List(items) => items.iter().any(contains_obj),
         Term::Len(i) => contains_obj(i),
+        Term::Opaque => false,
         _ => false,
     }
 }
@@ -175,8 +211,54 @@ fn contains_sym(t: &Term) -> bool {
         Term::Obj(_, fields) => fields.iter().any(|(_, v)| contains_sym(v)),
         Term::List(items) => items.iter().any(contains_sym),
         Term::Len(i) => contains_sym(i),
+        Term::Opaque => false,
         _ => false,
     }
+}
+
+/// Whether a normal-form term carries an [`Term::Opaque`] poison anywhere. A decision
+/// over such a term is fail-closed [`Decision::Unknown`] (the value is indecidable,
+/// e.g. it overflowed i64 and PHP would have promoted to float). Note: after
+/// [`reduce`] the poison is absorbing, so a reduced term is either Opaque at the root
+/// or Opaque-free — but the recursive walk is kept for robustness / pre-reduce use.
+fn contains_opaque(t: &Term) -> bool {
+    match t {
+        Term::Opaque => true,
+        Term::Bin(_, a, b) => contains_opaque(a) || contains_opaque(b),
+        Term::Field(o, _) => contains_opaque(o),
+        Term::Obj(_, fields) => fields.iter().any(|(_, v)| contains_opaque(v)),
+        Term::List(items) => items.iter().any(contains_opaque),
+        Term::Len(i) => contains_opaque(i),
+        _ => false,
+    }
+}
+
+/// Whether a term is a CONCRETE scalar (no free Given, no object, no opaque): one of
+/// the directly-comparable variants whose value is fully known.
+fn is_concrete_scalar(t: &Term) -> bool {
+    matches!(t, Term::Int(_) | Term::Bool(_) | Term::Str(_))
+}
+
+/// A purely-NUMERIC string (PHP `is_numeric`-ish, the subset that matters for loose
+/// `==`): optional sign, decimal digits with an optional single fractional part. Used
+/// to keep `decide_eq("1.0","1")`-style numeric-string comparisons fail-closed
+/// (PHP `==` compares them as numbers, which the kernel does not model).
+fn is_numeric_str(s: &str) -> bool {
+    let s = s.trim();
+    let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if body.is_empty() {
+        return false;
+    }
+    let mut seen_dot = false;
+    let mut seen_digit = false;
+    for c in body.chars() {
+        match c {
+            '0'..='9' => seen_digit = true,
+            '.' if !seen_dot => seen_dot = true,
+            _ => return false,
+        }
+    }
+    seen_digit
 }
 
 /// Decide `assertSame(a, b)` — PHP `===`, an IDENTITY check.
@@ -191,30 +273,72 @@ fn contains_sym(t: &Term) -> bool {
 pub fn decide_same(a: &Term, b: &Term) -> Decision {
     let ra = reduce(a);
     let rb = reduce(b);
+    // An indecidable (overflowed) operand poisons the decision: fail-closed.
+    if contains_opaque(&ra) || contains_opaque(&rb) {
+        return Decision::Unknown;
+    }
     if contains_obj(&ra) || contains_obj(&rb) {
         return Decision::Unknown;
     }
     if ra == rb {
         return Decision::True;
     }
+    // `===` is STRICT in type: two distinct concrete normal forms (incl. cross-type,
+    // e.g. Str("5") vs Int(5)) are NOT identical → False. This is sound for identity.
     if !contains_sym(&ra) && !contains_sym(&rb) {
         return Decision::False;
     }
     Decision::Unknown
 }
 
-/// Decide `assertEquals(a, b)` — value / structural equality (the comparator chain
-/// for objects). Two value-objects of the same class with equal fields are equal, so
-/// structural identity of the normal forms decides `True`; two fully concrete and
-/// distinct normal forms decide `False`; anything still symbolic is `Unknown`.
+/// Decide `assertEquals(a, b)` — PHP `==`, a LOOSE / value-structural comparison (the
+/// comparator chain for objects).
+///
+/// `True` iff the two normal forms are structurally identical (same scalar value, the
+/// same algebra over the same free symbols, or two value-objects of the same class
+/// with equal fields).
+///
+/// `False` is given ONLY when the kernel can PROVE inequality under PHP `==`: both
+/// reduced forms are concrete scalars of the **SAME variant** (Int&Int, Bool&Bool, or
+/// two NON-both-numeric Strings) with different values. A CROSS-variant concrete pair
+/// (`Str("5")` vs `Int(5)`, `Bool(true)` vs `Int(1)`, …) is the loose-`==` coercion
+/// territory the kernel does not model — PHP may judge them EQUAL — so it is
+/// fail-closed `Unknown`, NEVER `False`. Two numeric strings (`"1.0"` vs `"1"`) are
+/// likewise compared NUMERICALLY by PHP, so they too are `Unknown` rather than `False`.
+/// Anything still symbolic, object-bearing, or opaque is `Unknown`.
 pub fn decide_eq(a: &Term, b: &Term) -> Decision {
     let ra = reduce(a);
     let rb = reduce(b);
+    // An indecidable (overflowed) operand poisons the decision: fail-closed.
+    if contains_opaque(&ra) || contains_opaque(&rb) {
+        return Decision::Unknown;
+    }
     if ra == rb {
         return Decision::True;
     }
-    if !contains_sym(&ra) && !contains_sym(&rb) {
-        return Decision::False;
+    // Definitive False ONLY for a same-variant concrete-scalar pair of differing
+    // value (the kernel can prove `==` is false). Everything else — cross-variant
+    // concrete (loose `==` coercion), numeric-string pairs (numeric `==`), symbolic,
+    // objects, opaque — is fail-closed Unknown.
+    if is_concrete_scalar(&ra) && is_concrete_scalar(&rb) {
+        match (&ra, &rb) {
+            (Term::Int(_), Term::Int(_)) | (Term::Bool(_), Term::Bool(_)) => {
+                return Decision::False
+            }
+            (Term::Str(x), Term::Str(y)) => {
+                // Two numeric strings are compared as NUMBERS by PHP `==`
+                // (`"1.0" == "1"` is true), which the kernel does not model →
+                // Unknown. Otherwise (at least one non-numeric) a byte-distinct
+                // string pair is provably `==`-unequal → False.
+                if is_numeric_str(x) && is_numeric_str(y) {
+                    return Decision::Unknown;
+                }
+                return Decision::False;
+            }
+            // Cross-variant concrete (Str vs Int, Bool vs Int, …): loose-`==`
+            // coercion territory, NOT modelled → fail-closed Unknown.
+            _ => return Decision::Unknown,
+        }
     }
     Decision::Unknown
 }
@@ -317,5 +441,127 @@ mod tests {
             decide_eq(&Term::Int(2), &Term::Len(Box::new(list))),
             Decision::True
         );
+    }
+
+    // ── FIX 1: decide_eq is PHP loose `==`, not Rust structural equality ───────
+
+    #[test]
+    fn decide_eq_cross_variant_str_int_is_unknown_not_false() {
+        // assertEquals("5", 5) — PHP `==` coerces → PASS; the kernel cannot model
+        // the coercion, so it must be Unknown (NOT a definitive False).
+        assert_eq!(
+            decide_eq(&Term::Str("5".into()), &Term::Int(5)),
+            Decision::Unknown
+        );
+    }
+
+    #[test]
+    fn decide_eq_cross_variant_bool_int_is_unknown_not_false() {
+        // assertEquals(true, 1) — PHP `==` → PASS → Unknown.
+        assert_eq!(
+            decide_eq(&Term::Bool(true), &Term::Int(1)),
+            Decision::Unknown
+        );
+    }
+
+    #[test]
+    fn decide_eq_cross_variant_int_str_is_unknown_not_false() {
+        // assertEquals(1, "1") — PHP `==` → PASS → Unknown.
+        assert_eq!(
+            decide_eq(&Term::Int(1), &Term::Str("1".into())),
+            Decision::Unknown
+        );
+    }
+
+    #[test]
+    fn decide_eq_numeric_string_pair_is_unknown_not_false() {
+        // assertEquals("1.0", "1") — PHP compares them as NUMBERS → PASS → Unknown.
+        assert_eq!(
+            decide_eq(&Term::Str("1.0".into()), &Term::Str("1".into())),
+            Decision::Unknown
+        );
+    }
+
+    #[test]
+    fn decide_eq_same_variant_distinct_ints_is_false() {
+        assert_eq!(decide_eq(&Term::Int(5), &Term::Int(6)), Decision::False);
+    }
+
+    #[test]
+    fn decide_eq_same_variant_distinct_nonnumeric_strings_is_false() {
+        // assertEquals("a", "b") — neither numeric, byte-distinct → provably `==`
+        // unequal → False.
+        assert_eq!(
+            decide_eq(&Term::Str("a".into()), &Term::Str("b".into())),
+            Decision::False
+        );
+    }
+
+    #[test]
+    fn decide_eq_equal_ints_is_true() {
+        assert_eq!(decide_eq(&Term::Int(5), &Term::Int(5)), Decision::True);
+    }
+
+    #[test]
+    fn decide_same_cross_type_str_int_is_false() {
+        // assertSame("5", 5) — `===` is strict in TYPE → genuinely FALSE in PHP.
+        assert_eq!(
+            decide_same(&Term::Str("5".into()), &Term::Int(5)),
+            Decision::False
+        );
+    }
+
+    // ── FIX 2: i64 overflow → Opaque, never a panic, never a wrong verdict ─────
+
+    #[test]
+    fn reduce_add_overflow_yields_opaque_not_panic() {
+        // i64::MAX + 1 overflows → Opaque (PHP would promote to float).
+        let t = add(Term::Int(i64::MAX), Term::Int(1));
+        assert_eq!(reduce(&t), Term::Opaque);
+    }
+
+    #[test]
+    fn reduce_mul_overflow_yields_opaque() {
+        let t = Term::Bin(
+            Op::Mul,
+            Box::new(Term::Int(i64::MAX)),
+            Box::new(Term::Int(2)),
+        );
+        assert_eq!(reduce(&t), Term::Opaque);
+    }
+
+    #[test]
+    fn reduce_sub_overflow_yields_opaque() {
+        let t = Term::Bin(
+            Op::Sub,
+            Box::new(Term::Int(i64::MIN)),
+            Box::new(Term::Int(1)),
+        );
+        assert_eq!(reduce(&t), Term::Opaque);
+    }
+
+    #[test]
+    fn opaque_propagates_through_field_and_obj() {
+        // An Obj whose field overflowed reduces to Opaque, and a Field read off it too.
+        let obj = money(add(Term::Int(i64::MAX), Term::Int(1)));
+        assert_eq!(reduce(&obj), Term::Opaque);
+        assert_eq!(reduce(&field(obj, "amount")), Term::Opaque);
+    }
+
+    #[test]
+    fn decide_same_on_identical_overflow_exprs_is_unknown_not_true() {
+        // assertSame(MAX+MAX, MAX+MAX): structurally identical Bin trees, but both
+        // overflow → each reduces to Opaque → fail-closed Unknown (NOT True, and no
+        // panic). PHP computes the same float on both sides (PASS), so True would be
+        // unsound w.r.t. the kernel's claim of having decided it — Unknown is correct.
+        let lhs = add(Term::Int(i64::MAX), Term::Int(i64::MAX));
+        let rhs = add(Term::Int(i64::MAX), Term::Int(i64::MAX));
+        assert_eq!(decide_same(&lhs, &rhs), Decision::Unknown);
+    }
+
+    #[test]
+    fn decide_eq_with_opaque_operand_is_unknown() {
+        let lhs = add(Term::Int(i64::MAX), Term::Int(1));
+        assert_eq!(decide_eq(&lhs, &Term::Int(0)), Decision::Unknown);
     }
 }
