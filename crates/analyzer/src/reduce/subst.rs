@@ -2029,7 +2029,7 @@ fn has_readonly_modifier(param: &FunctionLikeParameter) -> bool {
 }
 
 /// Strip a leading `$` from a variable token to get the bare property/param name.
-fn strip_dollar(name: &[u8]) -> Vec<u8> {
+pub(super) fn strip_dollar(name: &[u8]) -> Vec<u8> {
     name.strip_prefix(b"$").unwrap_or(name).to_vec()
 }
 
@@ -2193,7 +2193,7 @@ where
 }
 
 /// Find `class_fqcn::method` (FQN-aware) and return the method AST.
-fn find_class_method<'a>(
+pub(super) fn find_class_method<'a>(
     program: &'a Program<'a>,
     class_fqcn: &[u8],
     method: &[u8],
@@ -2223,7 +2223,7 @@ fn qualified_name(ns: &[u8], name: &[u8]) -> Vec<u8> {
 }
 
 /// Strip a leading `\` so a `\Foo\Bar` FQCN compares equal to `Foo\Bar`.
-fn normalize_fqcn(fqcn: &[u8]) -> Vec<u8> {
+pub(super) fn normalize_fqcn(fqcn: &[u8]) -> Vec<u8> {
     fqcn.strip_prefix(b"\\").unwrap_or(fqcn).to_vec()
 }
 
