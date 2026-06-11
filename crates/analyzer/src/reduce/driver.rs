@@ -699,6 +699,87 @@ mod tests {
         println!("BRIDGE rows={rows} TRUE={t} FALSE={f} UNKNOWN={u} decided={decided:.0}%");
     }
 
+    /// E-graph coverage harness: enumerate every test method in a PHP test file and
+    /// run the e-graph congruence-closure engine ([`egraph::decide_test_egraph`]) on
+    /// each, printing one `  <Class>::<method> -> True|False|Unknown` line per method
+    /// plus an `EGRAPH rows=<n> TRUE=<t> FALSE=<f> UNKNOWN=<u> decided=<pct>%` footer
+    /// (`decided = (TRUE+FALSE)/rows`). The file comes from `REDUCE_EGRAPH_FILE`; the
+    /// scan root from `REDUCE_EGRAPH_ROOT` (else the composer.json project root via
+    /// [`project_root_of`], same as production `reduce_file`). It reuses the production
+    /// discovery machinery (`MagoProject` + `discover`) — NOT a bespoke enumeration —
+    /// so the (class, method) pairs match what the runner sees. Mirrors
+    /// `measure_bridge_coverage` exactly, swapping the decision engine. Ignored by
+    /// default. Run with:
+    ///   REDUCE_EGRAPH_FILE=/abs/path/to/SomeTest.php cargo test -p analyzer --lib \
+    ///     measure_egraph_coverage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_egraph_coverage() {
+        use super::super::egraph;
+        use super::super::term::Decision;
+        use crate::cache::CacheStore;
+        use crate::mago_bridge::MagoProject;
+        use crate::test_discovery::discover;
+
+        let Ok(file) = std::env::var("REDUCE_EGRAPH_FILE") else {
+            eprintln!("SKIP: set REDUCE_EGRAPH_FILE=/abs/path/to/SomeTest.php");
+            return;
+        };
+        let test_file = Path::new(&file);
+        if !test_file.exists() {
+            eprintln!("SKIP: {} not present", test_file.display());
+            return;
+        }
+        // Default scan root: the composer.json PROJECT ROOT (same as production
+        // `reduce_file` via `project_root_of`) so the suite's own src/ resolves. An
+        // optional REDUCE_EGRAPH_ROOT override pins an explicit root.
+        let root_env = std::env::var("REDUCE_EGRAPH_ROOT").ok();
+        let root = match &root_env {
+            Some(r) => Path::new(r).to_path_buf(),
+            None => project_root_of(test_file),
+        };
+        eprintln!("SCAN_ROOT={}", root.display());
+
+        // Build the codebase + discover the test methods through the SAME path as
+        // `reduce_in_root` (vendor-excluded scan, content-hashed discovery cache).
+        let project = MagoProject::load_excluding_vendor(&root).expect("load project");
+        let cache = CacheStore::open(&root, MagoProject::version()).expect("open discovery cache");
+        let tests =
+            discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover test methods");
+
+        let mut rows = 0usize;
+        let mut t = 0usize;
+        let mut f = 0usize;
+        let mut u = 0usize;
+        for test in &tests {
+            // `decide_test_egraph` takes the CONCRETE runtime class (the one PHPUnit
+            // binds `$this` to) — exactly `TestMethod.class`.
+            let decision = egraph::decide_test_egraph(&project, &test.class, &test.method);
+            let label = match decision {
+                Decision::True => {
+                    t += 1;
+                    "True"
+                }
+                Decision::False => {
+                    f += 1;
+                    "False"
+                }
+                Decision::Unknown => {
+                    u += 1;
+                    "Unknown"
+                }
+            };
+            rows += 1;
+            println!("  {}::{} -> {}", test.class, test.method, label);
+        }
+        let decided = if rows == 0 {
+            0.0
+        } else {
+            100.0 * (t + f) as f64 / rows as f64
+        };
+        println!("EGRAPH rows={rows} TRUE={t} FALSE={f} UNKNOWN={u} decided={decided:.0}%");
+    }
+
     /// Build a temp PHP PROJECT (composer.json + src/ + tests/) and return the dir.
     /// Unlike `write_suite` (flat), this lays out a real project tree so the
     /// project-root scan (Task 1) can resolve the library's own `src/` classes.
