@@ -73,6 +73,56 @@
 //! or `\` never round-trip through tokenisation. Input test expressions are likewise
 //! inserted with `egraph.add(SymbolLang::new(...))` rather than `add_expr` on a
 //! parsed string.
+//!
+//! # v3 — data-provider substitution + arithmetic/assertion routing
+//!
+//! Real tests are mostly `#[DataProvider]`-parametrised. v3 evaluates a static
+//! provider whose body is a literal array of INTEGER rows, binds each row's columns
+//! to the test parameters as concrete leaves, and aggregates: the method decides
+//! `True` iff EVERY row decides `True`, `False` iff some row is provably `False` and
+//! none is `Unknown`, else `Unknown`. Ground folding gains `/` (only when `b != 0 &&
+//! a % b == 0`, since PHP promotes a non-exact `/` to a float we do not model) and
+//! `%`; assertion routing covers `assertEquals`/`assertNotSame`/`assertNotEquals`/
+//! `assertCount`/`assertTrue` beside `assertSame` (all still fail-closed on anything
+//! outside the integer fragment).
+//!
+//! # v4 — cross-file rule derivation (the same-file wall)
+//!
+//! v1–v3 derived rules from the TEST file's program only, so a value object living
+//! in `src/Foo.php` (every PSR-4 library) yielded no rules → `Unknown` by
+//! construction. v4 computes the transitive closure of classes a test references
+//! (`new C`, `C::fab`, and the classes appearing in derived bodies), resolves each
+//! through the codex (`get_class_like` → `file_of_span` → `with_program` reparse, the
+//! same path `subst.rs` uses), and derives the field catalogue + rules across ALL
+//! those files. A `visited` set and a class cap bound it. `constructible_layout`
+//! only admits a class whose ctor is a PURE positional seed (promoted params, or
+//! `$this->f = $param` pass-throughs in argument order); a validating / normalising /
+//! reordering / branching ctor leaves the class OUT of the catalogue → `new C(...)`
+//! builds no node → `Unknown`. So a normalising VO (e.g. a fraction reducing
+//! `new F(0, 5)` to `0/1`) is never given a forged construction rule.
+//!
+//! # Scope & limits (the honest perimeter)
+//!
+//! DECIDES (sound, gold-verified vs real php8.4): tests of INTEGER value objects —
+//! `i64` fields stored by a pure positional ctor, pure `{ return <i64-expr-over-
+//! fields> }` getters/transforms, `new` + static factories, `{+,-,*,exact-/,%}`,
+//! integer `assertSame`/`assertEquals`/…, integer `#[DataProvider]`/`#[TestWith]`
+//! rows — across `src/`+`tests/` files. This is the natural shape of APPLICATION
+//! domain value objects (Money-in-cents, Point, Score, Coordinate).
+//!
+//! FAILS CLOSED (→ `Unknown`, the runner executes for real; never a wrong verdict):
+//! non-integer DOMAINS (bignum/GMP-string, `BigDecimal`, float, date/`DateTime`,
+//! enums, formatted strings), validating/normalising constructors, multi-statement
+//! or branching method bodies, `__get`/magic getters, thrown-exception tests,
+//! collections/arrays beyond `assertCount`, and Pest functional-closure tests
+//! (no method discovery).
+//!
+//! MEASURED OFFER: ~0% on mature OSS PRIMITIVE libraries (brick-math, carbon,
+//! moneyphp, …) — they store GMP/`DateTime`/string state and validate in their
+//! ctors, so the integer-VO shape is structurally absent. The reachable surface is
+//! application-level integer value objects, proven end-to-end here (split-file Point
+//! and a Money-in-cents fixture both decide 100% with a passing real-PHPUnit gold
+//! gate) but not present in the surveyed OSS corpus.
 
 use std::collections::HashMap;
 
