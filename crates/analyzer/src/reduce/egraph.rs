@@ -1074,6 +1074,10 @@ impl SuiteExtractor<'_> {
             // `C::method(args)` → `(C::method args)` (matches the decision extractor's
             // factory op, so a factory's derived rule can rewrite it onto `(C …)`).
             Call::StaticMethod(sm) => {
+                let directive = matches!(
+                    &sm.method,
+                    ClassLikeMemberSelector::Identifier(mid) if is_test_directive(mid.value)
+                );
                 let op = match (static_call_class_name(sm.class), &sm.method) {
                     (Some(class), ClassLikeMemberSelector::Identifier(mid)) => format!(
                         "{}::{}",
@@ -1083,23 +1087,39 @@ impl SuiteExtractor<'_> {
                     _ => "static_call:<dynamic>".to_string(),
                 };
                 let args = self.build_args(Some(&sm.argument_list));
-                // A static factory / static method is a CALL: cost 1.
-                self.node_call(op, args)
+                // A static test DIRECTIVE (`self::assertX` / `static::assertX`) is a
+                // per-test sink: cost 0. A static factory / static method is a CALL: cost 1.
+                if directive {
+                    self.node(op, args)
+                } else {
+                    self.node_call(op, args)
+                }
             }
             // `$recv->method(args)` → `(method <recv> args)` (instance-method op, recv
             // first child — same shape the decision extractor emits).
             Call::Method(mc) => {
                 let recv = self.build(mc.object);
-                let op = match &mc.method {
-                    ClassLikeMemberSelector::Identifier(mid) => {
-                        String::from_utf8_lossy(mid.value).into_owned()
-                    }
-                    _ => "method:<dynamic>".to_string(),
+                let on_this = matches!(
+                    mc.object,
+                    Expression::Variable(Variable::Direct(v)) if strip_dollar(v.name) == b"this"
+                );
+                let (op, directive) = match &mc.method {
+                    ClassLikeMemberSelector::Identifier(mid) => (
+                        String::from_utf8_lossy(mid.value).into_owned(),
+                        on_this && is_test_directive(mid.value),
+                    ),
+                    _ => ("method:<dynamic>".to_string(), false),
                 };
                 let mut kids = vec![recv];
                 kids.extend(self.build_args(Some(&mc.argument_list)));
-                // An instance method is a CALL: cost 1.
-                self.node_call(op, kids)
+                // A test DIRECTIVE on `$this` (`$this->assertX` / `$this->expectException`)
+                // is a per-test sink: cost 0, never a target. Any other instance method is
+                // a CALL: cost 1.
+                if directive {
+                    self.node(op, kids)
+                } else {
+                    self.node_call(op, kids)
+                }
             }
             Call::NullSafeMethod(mc) => {
                 let recv = self.build(mc.object);
@@ -1496,6 +1516,20 @@ fn instantiation_class_name(inst: &Instantiation) -> Option<Vec<u8>> {
 
 fn static_call_class_name(class: &Expression) -> Option<Vec<u8>> {
     identifier_class_name(class)
+}
+
+/// PHPUnit test DIRECTIVES — assertions, expectation setters, and skip/fail markers.
+/// They are per-test SINKS: they register with the framework and run once per test, and
+/// produce NO shareable value. In the cost model they are weighted `0` (not call-work)
+/// and are therefore never memoisation targets — only their value ARGUMENTS are. Inferred
+/// purely from the AST by the `assert*`/`expect*` method-name shape plus a few markers.
+fn is_test_directive(name: &[u8]) -> bool {
+    name.starts_with(b"assert")
+        || name.starts_with(b"expect")
+        || matches!(
+            name,
+            b"fail" | b"markTestSkipped" | b"markTestIncomplete" | b"addToAssertionCount"
+        )
 }
 
 /// The simple/qualified class name of a class-position expression, if it is a plain
@@ -2631,17 +2665,60 @@ final class ArithTest extends TestCase {
 }
 "#;
         let s = compress(src, "ArithTest");
-        // assertSame is a method CALL on $this, so there IS some call-cost; but the
-        // arithmetic `2 + 3` and its literals contribute ZERO. The point: cost only
-        // accrues on calls, never on arithmetic/literals.
+        // `$this->assertSame(...)` is a test DIRECTIVE (a per-test sink) weighted 0, and the
+        // arithmetic `2 + 3` and its literals are free too — so the whole suite has ZERO
+        // call-work and NO memoisation targets, even though literals share structurally.
+        assert_eq!(
+            s.cost_naive, 0,
+            "directives + arithmetic + literals are all cost 0: {:?}",
+            s.top_targets
+        );
         assert!(
-            s.top_targets.iter().all(|t| t.cost == 1),
-            "every recorded target is a call (cost 1): {:?}",
+            s.top_targets.is_empty(),
+            "no call-work means no memoisation targets: {:?}",
             s.top_targets
         );
         assert!(
             !s.top_targets.iter().any(|t| t.op == "+"),
             "arithmetic must never appear as a cost target: {:?}",
+            s.top_targets
+        );
+    }
+
+    /// REFINEMENT (AST-aware cost model): test DIRECTIVES (`assert*`/`expect*`) are per-test
+    /// sinks weighted 0 and are NEVER memoisation targets — only the REAL shared computation
+    /// they wrap is. Three tests each `expectException(...)` then build the same
+    /// `Carbon::create(...)`: the constructor is the dominant target; the directives
+    /// contribute no call-work and never surface as targets.
+    #[test]
+    fn directives_are_zero_cost_only_real_calls_are_targets() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class DirTest extends TestCase {
+    public function testA(): void {
+        $this->expectException(\RuntimeException::class);
+        self::assertSame(2024, Carbon::create(2024, 1, 15)->year);
+    }
+    public function testB(): void {
+        $this->expectException(\RuntimeException::class);
+        self::assertSame(2024, Carbon::create(2024, 1, 15)->year);
+    }
+}
+"#;
+        let s = compress(src, "DirTest");
+        // Neither the `$this->expectException` nor the `self::assertSame` directive may ever
+        // appear as a memoisation target — they are sinks, not shareable work.
+        assert!(
+            s.top_targets
+                .iter()
+                .all(|t| !t.op.starts_with("expect") && !t.op.starts_with("assert")),
+            "directives must never be memoisation targets: {:?}",
+            s.top_targets
+        );
+        // The REAL shared computation (the constructor) IS the dominant target.
+        assert!(
+            s.top_targets.iter().any(|t| t.op == "Carbon::create"),
+            "the real shared call is a target: {:?}",
             s.top_targets
         );
     }
