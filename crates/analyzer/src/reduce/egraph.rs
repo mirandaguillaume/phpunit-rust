@@ -127,7 +127,7 @@
 use std::collections::HashMap;
 
 use egg::{Analysis, DidMerge, EGraph, ENodeOrVar, Id, Pattern, PatternAst, Rewrite, Runner};
-use egg::{Language, SymbolLang, Var};
+use egg::{Condition, ConditionalApplier, Language, Subst, SymbolLang, Var};
 
 use mago_syntax::ast::ast::access::Access;
 use mago_syntax::ast::ast::argument::{Argument, ArgumentList};
@@ -290,6 +290,82 @@ type FieldLayout = Vec<String>;
 /// fixtures are namespace-free, mirroring the bridge's resolution scope).
 type ClassCatalogue = HashMap<String, FieldLayout>;
 
+/// A comparison a ctor VALIDATION GUARD applies to one field: the guard `if ($f <op> N)
+/// throw` means the construction THROWS when `field <op> N` holds. The construction is
+/// VALID (the rule may fire) only when it does NOT hold — proven per-row via the field's
+/// ground constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// One admitted ctor validation guard, resolved to the FIELD it constrains.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FieldGuard {
+    field: String,
+    op: CmpOp,
+    literal: i64,
+}
+
+/// Whether the guard's THROW comparison `v <op> lit` holds for a concrete field value.
+fn cmp_throws(op: CmpOp, v: i64, lit: i64) -> bool {
+    match op {
+        CmpOp::Lt => v < lit,
+        CmpOp::Le => v <= lit,
+        CmpOp::Gt => v > lit,
+        CmpOp::Ge => v >= lit,
+        CmpOp::Eq => v == lit,
+        CmpOp::Ne => v != lit,
+    }
+}
+
+/// Map a binary comparison operator to a foldable `CmpOp`; `None` for non-comparisons or
+/// the loose `==`/`!=` over which an integer guard is not soundly decided here (we keep
+/// only the strict integer comparisons and identical/not-identical, all exact on i64).
+fn cmp_op_of(op: &BinaryOperator) -> Option<CmpOp> {
+    Some(match op {
+        BinaryOperator::LessThan(_) => CmpOp::Lt,
+        BinaryOperator::LessThanOrEqual(_) => CmpOp::Le,
+        BinaryOperator::GreaterThan(_) => CmpOp::Gt,
+        BinaryOperator::GreaterThanOrEqual(_) => CmpOp::Ge,
+        BinaryOperator::Identical(_) | BinaryOperator::Equal(_) => CmpOp::Eq,
+        BinaryOperator::NotIdentical(_) | BinaryOperator::NotEqual(_) => CmpOp::Ne,
+        _ => return None,
+    })
+}
+
+/// An egg rewrite CONDITION encoding a guarded class's ctor validity: a getter/transform
+/// of the class fires ONLY when EVERY ctor guard provably does NOT throw for the bound
+/// receiver fields. Each check `(field-var, throw-cmp, literal)` passes iff the field folds
+/// to a concrete `v` for which the throw-comparison is FALSE. An unfolded field, or a
+/// field that DOES satisfy the throw-comparison, fails the check → the rule does not fire →
+/// the construction stays opaque → fail-closed Unknown (the runner executes it).
+struct GuardCondition {
+    checks: Vec<(Var, CmpOp, i64)>,
+}
+
+impl Condition<PhpL, GroundEval> for GuardCondition {
+    fn check(&self, egraph: &mut EGraph<PhpL, GroundEval>, _eclass: Id, subst: &Subst) -> bool {
+        for (var, op, lit) in &self.checks {
+            let Some(&id) = subst.get(*var) else {
+                return false;
+            };
+            let Some(v) = egraph[id].data else {
+                return false; // field not folded to a constant → cannot prove valid
+            };
+            if cmp_throws(*op, v, *lit) {
+                return false; // this guard throws → construction invalid → do not fire
+            }
+        }
+        true
+    }
+}
+
 /// The CONSTRUCTIBLE field layout of a class, or `None` when the ctor is not a pure
 /// positional seed (so NO construction rule is derivable and the class stays opaque →
 /// fail-closed Unknown). The construction node is `(C arg0 arg1 …)`, with `argK` bound
@@ -306,28 +382,48 @@ type ClassCatalogue = HashMap<String, FieldLayout>;
 /// b)` is then NOT soundly `(C a b)` (it could reject or rewrite its inputs), so we must
 /// not invent that node. No ctor at all → an empty layout (`new C()`).
 fn constructible_layout(class: &Class) -> Option<FieldLayout> {
+    ctor_model(class).map(|(layout, _)| layout)
+}
+
+/// The ctor VALIDATION GUARDS resolved to the fields they constrain (empty when the ctor
+/// has none, or when the class is opaque).
+fn ctor_guards(class: &Class) -> Vec<FieldGuard> {
+    ctor_model(class).map(|(_, g)| g).unwrap_or_default()
+}
+
+/// The CONSTRUCTIBLE model: a class's field layout PLUS any admitted leading validation
+/// guards `if ($param <cmp> N) throw;`, resolved to the fields they constrain. A guard is
+/// no longer a bail — the construction is CONDITIONALLY valid, decided per-row by folding
+/// the field (a getter rule fires only when no guard throws). Still `None` (opaque) for a
+/// normalising/reordering ctor, a guard with an `else`/non-throw body, or a guard over a
+/// param that does not flow into a stored field (it could not be expressed as a receiver
+/// condition).
+fn ctor_model(class: &Class) -> Option<(FieldLayout, Vec<FieldGuard>)> {
     let Some(ctor) = find_method_in_class(class, b"__construct") else {
-        return Some(Vec::new());
+        return Some((Vec::new(), Vec::new()));
     };
-    // The body's pure pass-throughs: source-param → field. ANY other statement
-    // (throw, if, normalisation, a non-`$this->f=$param` assignment) ⇒ opaque.
     let mut passthrough: HashMap<Vec<u8>, String> = HashMap::new();
+    let mut raw_guards: Vec<(Vec<u8>, CmpOp, i64)> = Vec::new();
     if let MethodBody::Concrete(block) = &ctor.body {
         for stmt in block.statements.iter() {
+            // A leading validation guard is ADMITTED (recorded), not bailed.
+            if let Some(g) = validation_guard(stmt) {
+                raw_guards.push(g);
+                continue;
+            }
             let (field, src_param) = pure_passthrough_assignment(stmt)?;
-            // A field assigned twice, or two fields from one param, breaks the 1:1
-            // positional mapping ⇒ opaque (fail-closed).
             if passthrough.values().any(|f| *f == field) || passthrough.contains_key(&src_param) {
                 return None;
             }
             passthrough.insert(src_param, field);
         }
     }
-    // Build the layout in PARAMETER order, so slot K ≡ construction arg K.
+    // Build the layout in PARAMETER order (slot K ≡ arg K) and a param→field map to
+    // resolve guards against.
     let mut layout: FieldLayout = Vec::new();
+    let mut param_field: HashMap<Vec<u8>, String> = HashMap::new();
     let mut used = 0usize;
     for p in ctor.parameter_list.parameters.iter() {
-        // Variadic / by-ref ctor params are not modelled positionally ⇒ opaque.
         if p.ellipsis.is_some() || p.ampersand.is_some() {
             return None;
         }
@@ -338,16 +434,83 @@ fn constructible_layout(class: &Class) -> Option<FieldLayout> {
             used += 1;
             f.clone()
         } else {
-            // A ctor param that flows into NO field cannot be a pure seed ⇒ opaque.
             return None;
         };
+        param_field.insert(pname.clone(), field.clone());
         layout.push(field);
     }
-    // Every body pass-through must have been consumed by a param (no stray write).
     if used != passthrough.len() {
         return None;
     }
-    Some(layout)
+    // Resolve each guard's param to its stored field; a guard over an UNSTORED param
+    // cannot become a receiver condition ⇒ bail (keep the class opaque).
+    let mut guards = Vec::new();
+    for (param, op, literal) in raw_guards {
+        let field = param_field.get(&param)?.clone();
+        guards.push(FieldGuard { field, op, literal });
+    }
+    Some((layout, guards))
+}
+
+/// Recognise a ctor VALIDATION GUARD `if ($param <cmp> <int>) throw …;` (or the literal on
+/// the left): the body a SINGLE throw, no `elseif`/`else`. Returns `(param, throw-cmp,
+/// literal)`; `None` for anything else (the caller then treats it as a failing
+/// pass-through, keeping the ctor opaque).
+fn validation_guard(stmt: &Statement) -> Option<(Vec<u8>, CmpOp, i64)> {
+    use mago_syntax::ast::ast::control_flow::r#if::IfBody;
+    let Statement::If(if_stmt) = stmt else {
+        return None;
+    };
+    let IfBody::Statement(body) = &if_stmt.body else {
+        return None;
+    };
+    if !body.else_if_clauses.is_empty() || body.else_clause.is_some() {
+        return None;
+    }
+    if !statement_is_only_throw(&body.statement) {
+        return None;
+    }
+    let Expression::Binary(b) = &*if_stmt.condition else {
+        return None;
+    };
+    let op = cmp_op_of(&b.operator)?;
+    param_cmp_literal(b.lhs, b.rhs, op).or_else(|| param_cmp_literal(b.rhs, b.lhs, flip_cmp(op)))
+}
+
+/// `($param, op, literal)` when `a` is a direct variable and `b` an integer literal.
+fn param_cmp_literal(a: &Expression, b: &Expression, op: CmpOp) -> Option<(Vec<u8>, CmpOp, i64)> {
+    let Expression::Variable(Variable::Direct(v)) = a else {
+        return None;
+    };
+    let Expression::Literal(Literal::Integer(i)) = b else {
+        return None;
+    };
+    let lit = i.value.map(|v| v as i64)?;
+    Some((strip_dollar(v.name), op, lit))
+}
+
+/// Mirror a comparison when its operands are swapped (`N < $p` ≡ `$p > N`).
+fn flip_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Ge => CmpOp::Le,
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+    }
+}
+
+/// Whether `stmt` is EXACTLY a `throw …;` (optionally wrapped in a single-statement block).
+fn statement_is_only_throw(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Block(block) => {
+            let stmts: Vec<&Statement> = block.statements.iter().collect();
+            stmts.len() == 1 && statement_is_only_throw(stmts[0])
+        }
+        Statement::Expression(es) => matches!(es.expression, Expression::Throw(_)),
+        _ => false,
+    }
 }
 
 /// If `stmt` is a PURE pass-through `$this->field = $param;` (the rhs a direct ctor
@@ -409,6 +572,8 @@ fn derive_from_class(
     descriptions: &mut Vec<String>,
 ) {
     let class_name = String::from_utf8_lossy(class.name.value).into_owned();
+    // The ctor's admitted validation guards condition every instance rule of this class.
+    let guards = ctor_guards(class);
     for member in class.members.iter() {
         let ClassLikeMember::Method(m) = member else {
             continue;
@@ -418,7 +583,7 @@ fn derive_from_class(
         if method_name.eq_ignore_ascii_case("__construct") {
             continue;
         }
-        if let Some(rule) = derive_method_rule(&class_name, m, cat) {
+        if let Some(rule) = derive_method_rule(&class_name, m, cat, &guards) {
             descriptions.push(rule.description);
             rules.push(rule.rewrite);
         }
@@ -433,7 +598,12 @@ struct DerivedRule {
 /// Try to derive a single oriented rewrite from one method body. Returns `None`
 /// (fail-closed) whenever the method is not a single-return or the return
 /// expression escapes the modelled fragment.
-fn derive_method_rule(class_name: &str, m: &Method, cat: &ClassCatalogue) -> Option<DerivedRule> {
+fn derive_method_rule(
+    class_name: &str,
+    m: &Method,
+    cat: &ClassCatalogue,
+    guards: &[FieldGuard],
+) -> Option<DerivedRule> {
     let MethodBody::Concrete(block) = &m.body else {
         return None;
     };
@@ -505,7 +675,27 @@ fn derive_method_rule(class_name: &str, m: &Method, cat: &ClassCatalogue) -> Opt
     let description = format!("{lhs_pat} => {rhs_pat}");
     // `Rewrite::new` rejects an applier referring to a var the searcher does not
     // bind — a built-in soundness check we rely on (fail-closed on a malformed rule).
-    let rewrite = Rewrite::new(rule_name, lhs_pat, rhs_pat).ok()?;
+    let rewrite = if is_static || guards.is_empty() {
+        Rewrite::new(rule_name, lhs_pat, rhs_pat).ok()?
+    } else {
+        // An INSTANCE rule of a guarded class fires only when no ctor guard throws for the
+        // bound receiver fields (`?this_<field>`). A field whose Var cannot be formed bails
+        // the whole rule (opaque, fail-closed).
+        let checks: Option<Vec<(Var, CmpOp, i64)>> = guards
+            .iter()
+            .map(|g| {
+                format!("?this_{}", g.field)
+                    .parse::<Var>()
+                    .ok()
+                    .map(|v| (v, g.op, g.literal))
+            })
+            .collect();
+        let applier = ConditionalApplier {
+            condition: GuardCondition { checks: checks? },
+            applier: rhs_pat,
+        };
+        Rewrite::new(rule_name, lhs_pat, applier).ok()?
+    };
     Some(DerivedRule {
         rewrite,
         description,
@@ -2726,6 +2916,56 @@ final class StrProvTest extends TestCase {
         assert_eq!(decide(src, "StrProvTest", "testRaw"), Decision::True);
     }
 
+    /// VALIDATING CTOR, valid Given: a ctor with a leading `if ($d < 1) throw;` guard is
+    /// admitted — under the concrete Given `2`, the guard `2 < 1` is provably false, so the
+    /// construction is valid and `getDenominator()` reduces. The IF is in the AST and now
+    /// evaluated, not bailed.
+    #[test]
+    fn guarded_ctor_valid_given_decides_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Fraction {
+    public function __construct(private int $numerator, private int $denominator) {
+        if ($denominator < 1) {
+            throw new \InvalidArgumentException('Denominator must be > 0');
+        }
+    }
+    public function getDenominator(): int { return $this->denominator; }
+}
+final class GuardOkTest extends TestCase {
+    public function testDen(): void {
+        self::assertSame(2, (new Fraction(1, 2))->getDenominator());
+    }
+}
+"#;
+        assert_eq!(decide(src, "GuardOkTest", "testDen"), Decision::True);
+    }
+
+    /// SOUNDNESS: the SAME ctor with an INVALID Given (`0`) makes the guard `0 < 1` true →
+    /// the construction throws → the getter rule's condition fails → it does NOT fire → the
+    /// test stays Unknown (the runner executes it and observes the throw). NEVER a false
+    /// `True` for a value that the construction never actually produces.
+    #[test]
+    fn guarded_ctor_throwing_given_stays_unknown() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Fraction {
+    public function __construct(private int $numerator, private int $denominator) {
+        if ($denominator < 1) {
+            throw new \InvalidArgumentException('Denominator must be > 0');
+        }
+    }
+    public function getDenominator(): int { return $this->denominator; }
+}
+final class GuardThrowTest extends TestCase {
+    public function testDen(): void {
+        self::assertSame(0, (new Fraction(1, 0))->getDenominator());
+    }
+}
+"#;
+        assert_eq!(decide(src, "GuardThrowTest", "testDen"), Decision::Unknown);
+    }
+
     /// REFINEMENT (3): an `expectException(DivisionByZero…)` whose subject divides by a
     /// literal `0` is DECIDED True statically (the throw is proven), without executing.
     #[test]
@@ -3189,12 +3429,13 @@ final class PointTest extends TestCase {
         assert_eq!(decide(src, "PointTest", "testX"), Decision::True);
     }
 
-    /// A value-object whose constructor VALIDATES/NORMALISES (throws on a bad arg) is
-    /// NOT a simple promoted-param/`$this->x=<pure>` seed, so NO construction rule is
-    /// derivable → the class stays opaque → Unknown (fail-closed). We must NEVER force
-    /// a `(C a b)` node when the ctor could reject or rewrite its inputs.
+    /// A value-object whose constructor VALIDATES with a leading guard `if ($d === 0)
+    /// throw;` is now ADMITTED: under the concrete Given `4`, the guard `4 === 0` is
+    /// provably false, so the construction is valid and `num()` reduces → True (sound: in
+    /// real PHP `new Frac(3, 4)` constructs and `num()` returns 3). Cross-file (`Frac` in
+    /// `src/`). The throwing case is covered by `guarded_ctor_throwing_given_stays_unknown`.
     #[test]
-    fn validating_ctor_stays_unknown() {
+    fn guarded_ctor_decides_cross_file() {
         let frac = r#"<?php
 final class Frac {
     public int $n;
@@ -3221,7 +3462,7 @@ final class FracTest extends TestCase {
                 "FracTest",
                 "testNum",
             ),
-            Decision::Unknown
+            Decision::True
         );
     }
 
