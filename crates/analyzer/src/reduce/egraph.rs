@@ -148,7 +148,7 @@ use mago_syntax::ast::Program;
 use super::eval::BailReason;
 use super::subst::{find_class_method, normalize_fqcn, strip_dollar};
 use super::term::Decision;
-use crate::concrete::{compute, Context, PhpValue};
+use crate::concrete::{compute, ArrayKey, Context, PhpValue};
 use crate::mago_bridge::MagoProject;
 use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
 
@@ -949,8 +949,28 @@ impl SuiteExtractor<'_> {
             // the same provider float share. (Matching a SOURCE float literal's text is
             // not guaranteed — only identical strings fuse — but that is sound.)
             PhpValue::Float(f) => format!("float:{f}"),
-            // Arrays / objects are not a single substitutable leaf.
-            PhpValue::Array(_) => return None,
+            // A concrete array Given (e.g. a data-provider matrix `[[1,2],[3,4]]` or a
+            // coordinate list) → a STRUCTURAL leaf `(array_lit <k0> <v0> <k1> <v1> …)`:
+            // keys and values materialised recursively, so two syntactically-identical
+            // arrays (same keys, values, order) fuse into ONE e-class. That is the
+            // cross-row / cross-test sharing array providers carry, previously missed
+            // (the column was left as a free salted param). Any non-substitutable element
+            // fails the WHOLE array (fail-closed → param stays salted, no false fusion).
+            PhpValue::Array(map) => {
+                let mut kids = Vec::with_capacity(map.len() * 2);
+                for (k, v) in map.iter() {
+                    let key_op = match k {
+                        ArrayKey::Int(i) => format!("k:{i}"),
+                        ArrayKey::String(s) => format!("k:'{s}'"),
+                    };
+                    let key_id = self.leaf(key_op);
+                    let val_id = self.value_leaf(v)?;
+                    kids.push(key_id);
+                    kids.push(val_id);
+                }
+                // An array literal is free DATA, not a call: cost 0.
+                return Some(self.node("array_lit", kids));
+            }
         };
         Some(self.leaf(op))
     }
@@ -1782,13 +1802,10 @@ fn value_row_from_phpvalue(value: &PhpValue) -> Option<Vec<Option<PhpValue>>> {
     let PhpValue::Array(map) = value else {
         return None;
     };
-    let mut cols = Vec::new();
-    for v in map.values() {
-        match v {
-            PhpValue::Array(_) => cols.push(None),
-            scalar => cols.push(Some(scalar.clone())),
-        }
-    }
+    // Every column is offered for substitution — scalars AND arrays (matrices, lists).
+    // `value_leaf` materialises arrays structurally; a column it cannot represent returns
+    // `None` there and the param stays salted for the row.
+    let cols = map.values().map(|v| Some(v.clone())).collect();
     Some(cols)
 }
 
@@ -2719,6 +2736,40 @@ final class DirTest extends TestCase {
         assert!(
             s.top_targets.iter().any(|t| t.op == "Carbon::create"),
             "the real shared call is a target: {:?}",
+            s.top_targets
+        );
+    }
+
+    /// REFINEMENT (array provider substitution): array-valued data-provider columns
+    /// (matrices, coordinate lists) are materialised as STRUCTURAL leaves, so the SAME
+    /// array reused across rows fuses into one e-class — the cross-row sharing array
+    /// providers carry, previously missed (arrays were left as free salted params).
+    #[test]
+    fn array_provider_columns_substitute_and_share() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class ArrTest extends TestCase {
+    public static function provider(): array {
+        return [
+            [[[1, 2], [3, 4]]],
+            [[[1, 2], [3, 4]]],
+        ];
+    }
+    #[DataProvider('provider')]
+    public function testSum(array $m): void {
+        self::assertSame(10, Matrix::of($m)->sum());
+    }
+}
+"#;
+        let s = compress(src, "ArrTest");
+        // Both rows pass the IDENTICAL matrix, so `Matrix::of(<that matrix>)` is ONE shared
+        // class at multiplicity 2 — provable only because the array Given is now a concrete
+        // structural leaf, not a free salted param.
+        assert!(
+            s.top_targets
+                .iter()
+                .any(|t| t.op == "Matrix::of" && t.mult >= 2),
+            "the array-built construction shares across rows: {:?}",
             s.top_targets
         );
     }
