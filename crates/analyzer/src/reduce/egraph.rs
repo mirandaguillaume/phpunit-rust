@@ -2200,18 +2200,15 @@ fn decide_with_program(
     let seed = seed_class_refs(m, class_fqcn);
     let (rules, cat, _descs) = derive_closure(project, seed);
 
-    // 2. The test method's parameters and its final assertion.
+    // 2. The test method body, its parameters, and its substitution rows. A zero-param
+    //    method has exactly ONE empty row (the v2 static-factory path). A parametrized
+    //    method binds its params, positionally, from a STATICALLY-evaluated data provider
+    //    — every row a tuple of integer leaves. A parametrized method with no derivable
+    //    provider, or a provider that is not a pure integer-array literal, yields no rows
+    //    → fail-closed Unknown (the runner then executes it for real).
     let MethodBody::Concrete(block) = &m.body else {
         return None;
     };
-    let assertion = collect_assertion(block)?;
-
-    // 3. Build the substitution rows. A zero-param method has exactly ONE empty row
-    //    (the v2 static-factory path). A parametrized method binds its params,
-    //    positionally, from a STATICALLY-evaluated data provider — every row a tuple
-    //    of integer leaves. A parametrized method with no derivable provider, or a
-    //    provider that is not a pure integer-array literal, yields no rows → the whole
-    //    method is fail-closed Unknown (the runner then executes it for real).
     let params: Vec<Vec<u8>> = m
         .parameter_list
         .parameters
@@ -2223,6 +2220,16 @@ fn decide_with_program(
     } else {
         provider_rows(program, source_text, class_fqcn, m)?
     };
+
+    // 2b. EXCEPTION-test decision (arithmetic): an `expectException(DivisionByZero…)` whose
+    //     subject divides by a provably-ZERO divisor throws as expected — decide it here
+    //     instead of executing. `None` falls through to the value path (then Unknown).
+    if let Some(d) = decide_exception_rows(&cat, &rules, &params, &rows, block) {
+        return Some(d);
+    }
+
+    // 3. The value-decision path: the test method's final assertion.
+    let assertion = collect_assertion(block)?;
 
     // 4. Decide each (method × row) independently — PHPUnit treats every provider row
     //    as a SEPARATE test. Aggregate per-METHOD: True iff EVERY row decides True;
@@ -2484,6 +2491,215 @@ fn positional_args<'a>(args: &'a ArgumentList<'a>) -> Option<Vec<&'a Expression<
     Some(exprs)
 }
 
+// ─── Exception-test decision (arithmetic) ───────────────────────────────────────
+
+/// Decide an `expectException(...)` test whose subject throws an ARITHMETIC exception the
+/// engine can prove statically — currently DIVISION BY ZERO. `Some(True)` when EVERY row's
+/// subject provably divides by a folded-`0` divisor (the expected exception is thrown),
+/// `Some(False)` when a row provably does NOT throw (a concrete non-zero divisor → the
+/// expected exception never fires → the test fails), and `None` (→ caller falls through to
+/// the value path, then Unknown) for anything not provable: not an exception test, a
+/// message/code constraint we cannot reproduce, a non-div-by-zero type, no recognised
+/// division subject, or a divisor that does not fold to a concrete integer. Fail-closed.
+fn decide_exception_rows(
+    cat: &ClassCatalogue,
+    rules: &[Rewrite<PhpL, GroundEval>],
+    params: &[Vec<u8>],
+    rows: &[Vec<i64>],
+    block: &mago_syntax::ast::ast::block::Block,
+) -> Option<Decision> {
+    use mago_syntax::ast::ast::assignment::AssignmentOperator;
+    let mut expected: Option<Vec<u8>> = None;
+    let mut bindings: Vec<(Vec<u8>, &Expression)> = Vec::new();
+    let mut divisor: Option<&Expression> = None;
+    for stmt in block.statements.iter() {
+        let Statement::Expression(es) = stmt else {
+            return None;
+        };
+        let e = es.expression;
+        if let Some(t) = expect_exception_class(e) {
+            expected = Some(t);
+            continue;
+        }
+        // A message/code/object constraint — we cannot reproduce the exact message:
+        // fail-closed (the runner executes it).
+        if is_expect_constraint(e) {
+            return None;
+        }
+        // A `$var = <expr>;` prefix local.
+        if let Expression::Assignment(a) = e {
+            if matches!(a.operator, AssignmentOperator::Assign(_)) {
+                if let Expression::Variable(Variable::Direct(target)) = a.lhs {
+                    bindings.push((strip_dollar(target.name), a.rhs));
+                    continue;
+                }
+            }
+            return None;
+        }
+        // The subject: an expression containing a division whose divisor we will fold.
+        if let Some(d) = find_division_divisor(e) {
+            divisor = Some(d);
+            continue;
+        }
+        return None;
+    }
+    let expected = expected?;
+    if !is_division_by_zero_exception(&expected) {
+        return None;
+    }
+    let divisor = divisor?;
+
+    // Every row must provably divide by zero (throws) for the method to pass.
+    let mut any_false = false;
+    for row in rows {
+        match eval_expr_int(cat, rules, params, row, &bindings, divisor) {
+            Some(0) => {}                // divisor folds to 0 → throws as expected
+            Some(_) => any_false = true, // a concrete non-zero divisor → no throw → fail
+            None => return None,         // divisor does not fold → Unknown
+        }
+    }
+    Some(if any_false {
+        Decision::False
+    } else {
+        Decision::True
+    })
+}
+
+/// The class named by `$this->expectException(T::class)` (its raw identifier bytes), or
+/// `None` if `expr` is not such a call (or its argument is not a `::class` constant).
+fn expect_exception_class(expr: &Expression) -> Option<Vec<u8>> {
+    let (name, args) = call_name_and_args(expr)?;
+    if !name.eq_ignore_ascii_case(b"expectException") {
+        return None;
+    }
+    let exprs = positional_args(args)?;
+    let first = *exprs.first()?;
+    let Expression::Access(Access::ClassConstant(cc)) = first else {
+        return None;
+    };
+    identifier_class_name(cc.class)
+}
+
+/// A constraint narrowing an expected exception beyond its TYPE — a message / code /
+/// object matcher (`expectExceptionMessage*`, `expectExceptionCode`, …). We cannot
+/// reproduce these statically, so they fail-closed.
+fn is_expect_constraint(expr: &Expression) -> bool {
+    let Some((name, _)) = call_name_and_args(expr) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(b"expectexception") && lower.len() > b"expectexception".len()
+}
+
+/// The simple name (last `\`-separated segment) contains `DivisionByZero` — matches both
+/// Brick's `DivisionByZeroException` and PHP's `DivisionByZeroError`.
+fn is_division_by_zero_exception(name: &[u8]) -> bool {
+    let simple = name.rsplit(|&b| b == b'\\').next().unwrap_or(name);
+    let needle = b"DivisionByZero";
+    simple.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The divisor expression of the FIRST division in `expr` (a `/` or `%` binary, an
+/// `intdiv`/`fmod`/`fdiv` call, or a `dividedBy`/`div`/`mod`/`modulo`/`remainder`/`divide`
+/// method), searched through arithmetic and call sub-expressions only — NOT through
+/// conditionals, so a found division is unconditionally reached (its throw is real).
+fn find_division_divisor<'a>(expr: &'a Expression<'a>) -> Option<&'a Expression<'a>> {
+    match expr {
+        Expression::Binary(b) => {
+            if matches!(
+                b.operator,
+                BinaryOperator::Division(_) | BinaryOperator::Modulo(_)
+            ) {
+                return Some(b.rhs);
+            }
+            find_division_divisor(b.lhs).or_else(|| find_division_divisor(b.rhs))
+        }
+        Expression::Call(Call::Method(mc)) => {
+            if let ClassLikeMemberSelector::Identifier(id) = &mc.method {
+                if is_division_method(id.value) {
+                    if let Some(args) = positional_args(&mc.argument_list) {
+                        if let Some(&first) = args.first() {
+                            return Some(first);
+                        }
+                    }
+                }
+            }
+            find_division_divisor(mc.object).or_else(|| find_division_in_args(&mc.argument_list))
+        }
+        Expression::Call(Call::StaticMethod(sm)) => find_division_in_args(&sm.argument_list),
+        Expression::Call(Call::Function(fc)) => {
+            if let Some(n) = function_call_name(fc.function) {
+                if matches!(n.as_slice(), b"intdiv" | b"fmod" | b"fdiv") {
+                    if let Some(args) = positional_args(&fc.argument_list) {
+                        if args.len() >= 2 {
+                            return Some(args[1]);
+                        }
+                    }
+                }
+            }
+            find_division_in_args(&fc.argument_list)
+        }
+        _ => None,
+    }
+}
+
+fn find_division_in_args<'a>(args: &'a ArgumentList<'a>) -> Option<&'a Expression<'a>> {
+    let exprs = positional_args(args)?;
+    exprs.into_iter().find_map(find_division_divisor)
+}
+
+/// Methods that divide their receiver by their first argument (bignum / decimal APIs).
+fn is_division_method(name: &[u8]) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_slice(),
+        b"dividedby" | b"divide" | b"div" | b"mod" | b"modulo" | b"remainder"
+    )
+}
+
+/// Fold `expr` to a concrete integer under one provider row: bind params to the row's
+/// integer leaves and any `$var = …` prefix locals, build, saturate, and read the ground
+/// constant. `None` when the build bails or the value does not fold to an integer.
+fn eval_expr_int(
+    cat: &ClassCatalogue,
+    rules: &[Rewrite<PhpL, GroundEval>],
+    params: &[Vec<u8>],
+    row: &[i64],
+    bindings: &[(Vec<u8>, &Expression)],
+    expr: &Expression,
+) -> Option<i64> {
+    if row.len() < params.len() {
+        return None;
+    }
+    let mut egraph: EGraph<PhpL, GroundEval> = EGraph::default();
+    let mut vars: HashMap<Vec<u8>, Id> = HashMap::new();
+    for (name, value) in params.iter().zip(row.iter()) {
+        let id = egraph.add(SymbolLang::leaf(value.to_string()));
+        vars.insert(name.clone(), id);
+    }
+    for (name, e) in bindings {
+        let id = {
+            let mut b = ExprBuilder {
+                egraph: &mut egraph,
+                cat,
+                vars: &vars,
+            };
+            b.build(e)?
+        };
+        vars.insert(name.clone(), id);
+    }
+    let id = {
+        let mut b = ExprBuilder {
+            egraph: &mut egraph,
+            cat,
+            vars: &vars,
+        };
+        b.build(expr)?
+    };
+    let runner = Runner::default().with_egraph(egraph).run(rules);
+    let egraph = runner.egraph;
+    egraph[id].data
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2497,6 +2713,96 @@ mod tests {
         std::fs::write(dir.path().join("Code.php"), src).unwrap();
         let project = MagoProject::load(dir.path()).unwrap();
         decide_test_egraph(&project, class, method)
+    }
+
+    /// REFINEMENT (3): an `expectException(DivisionByZero…)` whose subject divides by a
+    /// literal `0` is DECIDED True statically (the throw is proven), without executing.
+    #[test]
+    fn exception_div_by_zero_decides_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class DivZeroTest extends TestCase {
+    public function testThrows(): void {
+        $this->expectException(\Brick\Math\Exception\DivisionByZeroException::class);
+        Num::of(10)->dividedBy(0);
+    }
+}
+"#;
+        assert_eq!(decide(src, "DivZeroTest", "testThrows"), Decision::True);
+    }
+
+    /// A provider whose divisor column is `0` on EVERY row decides True (every row throws).
+    #[test]
+    fn exception_div_by_zero_provider_all_zero_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class DivProvTest extends TestCase {
+    public static function rows(): array {
+        return [[0], [0]];
+    }
+    #[DataProvider('rows')]
+    public function testThrows(int $d): void {
+        $this->expectException(\DivisionByZeroError::class);
+        Num::of(10)->dividedBy($d);
+    }
+}
+"#;
+        assert_eq!(decide(src, "DivProvTest", "testThrows"), Decision::True);
+    }
+
+    /// A row with a concrete NON-zero divisor does not throw → that row fails → the method
+    /// is provably False (fail-closed only on UNfoldable divisors, not on this).
+    #[test]
+    fn exception_div_by_zero_provider_nonzero_row_false() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class DivMixTest extends TestCase {
+    public static function rows(): array {
+        return [[0], [7]];
+    }
+    #[DataProvider('rows')]
+    public function testThrows(int $d): void {
+        $this->expectException(\DivisionByZeroError::class);
+        Num::of(10)->dividedBy($d);
+    }
+}
+"#;
+        assert_eq!(decide(src, "DivMixTest", "testThrows"), Decision::False);
+    }
+
+    /// FAIL-CLOSED: a message constraint (`expectExceptionMessage`) cannot be reproduced
+    /// statically → Unknown (the runner executes it).
+    #[test]
+    fn exception_message_constraint_fail_closed() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class DivMsgTest extends TestCase {
+    public function testThrows(): void {
+        $this->expectException(\DivisionByZeroException::class);
+        $this->expectExceptionMessage('Division by zero.');
+        Num::of(10)->dividedBy(0);
+    }
+}
+"#;
+        assert_eq!(decide(src, "DivMsgTest", "testThrows"), Decision::Unknown);
+    }
+
+    /// FAIL-CLOSED: a non-div-by-zero expected type is not proven by a zero divisor → we do
+    /// NOT claim the throw; Unknown.
+    #[test]
+    fn exception_non_div_by_zero_type_unknown() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class DivOtherTest extends TestCase {
+    public function testThrows(): void {
+        $this->expectException(\InvalidArgumentException::class);
+        Num::of(10)->dividedBy(0);
+    }
+}
+"#;
+        assert_eq!(decide(src, "DivOtherTest", "testThrows"), Decision::Unknown);
     }
 
     /// Collect the derived-rule descriptions for a source (for white-box assertions
