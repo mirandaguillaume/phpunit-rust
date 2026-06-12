@@ -643,11 +643,27 @@ fn motif_args(
 
 /// A literal → a motif. Integers become decimal-string leaf ops (so `GroundEval`
 /// re-reads them); other literals leave the modelled fragment.
-fn literal_motif(lit: &Literal) -> Option<Motif> {
+/// The leaf op-string for a SCALAR literal, byte-for-byte IDENTICAL to `literal_node`'s
+/// encoding (and `value_leaf`'s) so a decision-path literal, a derived-rule literal, and a
+/// compression-/provider-substituted leaf all land in ONE e-class. `None` for a dynamic or
+/// overflowing literal (fail-closed). This is what opens the automaton past the integer
+/// fragment: a string/bool/float/null Given flows through congruence exactly like an int.
+fn literal_op(lit: &Literal) -> Option<String> {
     match lit {
-        Literal::Integer(i) => i.value.map(|v| Motif::leaf((v as i64).to_string())),
-        _ => None,
+        Literal::Integer(i) => i.value.map(|v| (v as i64).to_string()),
+        Literal::Float(f) => Some(format!("float:{}", f.value)),
+        Literal::String(s) => s
+            .value
+            .as_ref()
+            .map(|bytes| format!("str:'{}'", String::from_utf8_lossy(bytes))),
+        Literal::True(_) => Some("true".to_string()),
+        Literal::False(_) => Some("false".to_string()),
+        Literal::Null(_) => Some("null".to_string()),
     }
+}
+
+fn literal_motif(lit: &Literal) -> Option<Motif> {
+    literal_op(lit).map(Motif::leaf)
 }
 
 fn arith_op(op: &BinaryOperator) -> Option<&'static str> {
@@ -2713,6 +2729,66 @@ mod tests {
         std::fs::write(dir.path().join("Code.php"), src).unwrap();
         let project = MagoProject::load(dir.path()).unwrap();
         decide_test_egraph(&project, class, method)
+    }
+
+    /// AUTOMATON BEYOND INTEGERS: a STRING value object (store the Given, forward it) is
+    /// decided by the SAME congruence as integer VOs — the layout/derivation were already
+    /// value-agnostic; only the literal encoder was i64-gated. `value(Slug('hello'))`
+    /// rewrites to `'hello'`, congruent with the asserted `'hello'`.
+    #[test]
+    fn string_value_object_decides_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Slug {
+    public function __construct(private string $v) {}
+    public function value(): string { return $this->v; }
+}
+final class StrVoTest extends TestCase {
+    public function testRaw(): void {
+        self::assertSame('hello', (new Slug('hello'))->value());
+    }
+}
+"#;
+        assert_eq!(decide(src, "StrVoTest", "testRaw"), Decision::True);
+    }
+
+    /// SOUNDNESS: a string VO whose stored value DIFFERS from the asserted one does not
+    /// falsely decide — distinct string leaves never fuse (and strings carry no ground
+    /// constant to prove a definitive False), so the verdict is Unknown (fail-closed).
+    #[test]
+    fn string_vo_mismatch_stays_unknown() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Slug {
+    public function __construct(private string $v) {}
+    public function value(): string { return $this->v; }
+}
+final class StrMismatchTest extends TestCase {
+    public function testRaw(): void {
+        self::assertSame('hello', (new Slug('world'))->value());
+    }
+}
+"#;
+        assert_eq!(decide(src, "StrMismatchTest", "testRaw"), Decision::Unknown);
+    }
+
+    /// A BOOL value object decides too — `true`/`false`/`null` flow through the same
+    /// literal encoding as integers and strings.
+    #[test]
+    fn bool_value_object_decides_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Flag {
+    public function __construct(private bool $b) {}
+    public function get(): bool { return $this->b; }
+}
+final class BoolVoTest extends TestCase {
+    public function testGet(): void {
+        self::assertSame(true, (new Flag(true))->get());
+    }
+}
+"#;
+        assert_eq!(decide(src, "BoolVoTest", "testGet"), Decision::True);
     }
 
     /// REFINEMENT (3): an `expectException(DivisionByZero…)` whose subject divides by a
