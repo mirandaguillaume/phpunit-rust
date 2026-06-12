@@ -467,10 +467,12 @@ fn validation_guard(stmt: &Statement) -> Option<(Vec<u8>, CmpOp, i64)> {
     if !body.else_if_clauses.is_empty() || body.else_clause.is_some() {
         return None;
     }
-    if !statement_is_only_throw(&body.statement) {
+    let body_stmt: &Statement = body.statement;
+    if !statement_is_only_throw(body_stmt) {
         return None;
     }
-    let Expression::Binary(b) = &*if_stmt.condition else {
+    let cond: &Expression = if_stmt.condition;
+    let Expression::Binary(b) = cond else {
         return None;
     };
     let op = cmp_op_of(&b.operator)?;
