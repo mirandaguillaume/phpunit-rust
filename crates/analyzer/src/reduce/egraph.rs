@@ -452,10 +452,11 @@ fn ctor_model(class: &Class) -> Option<(FieldLayout, Vec<FieldGuard>)> {
     Some((layout, guards))
 }
 
-/// Recognise a ctor VALIDATION GUARD `if ($param <cmp> <int>) throw …;` (or the literal on
-/// the left): the body a SINGLE throw, no `elseif`/`else`. Returns `(param, throw-cmp,
-/// literal)`; `None` for anything else (the caller then treats it as a failing
-/// pass-through, keeping the ctor opaque).
+/// Recognise a ctor EXIT GUARD `if ($param <cmp> <int>) <body>;` whose body ALWAYS exits
+/// (a `throw`, or a normalise-and-`return` branch), with no `elseif`/`else`. Returns
+/// `(param, exit-cmp, literal)`: the pass-through below runs only when the comparison is
+/// FALSE, so the rules are conditioned on "guard not taken". `None` for anything else (the
+/// caller then treats it as a failing pass-through, keeping the ctor opaque).
 fn validation_guard(stmt: &Statement) -> Option<(Vec<u8>, CmpOp, i64)> {
     use mago_syntax::ast::ast::control_flow::r#if::IfBody;
     let Statement::If(if_stmt) = stmt else {
@@ -468,7 +469,7 @@ fn validation_guard(stmt: &Statement) -> Option<(Vec<u8>, CmpOp, i64)> {
         return None;
     }
     let body_stmt: &Statement = body.statement;
-    if !statement_is_only_throw(body_stmt) {
+    if !statement_always_exits(body_stmt) {
         return None;
     }
     let cond: &Expression = if_stmt.condition;
@@ -503,14 +504,21 @@ fn flip_cmp(op: CmpOp) -> CmpOp {
     }
 }
 
-/// Whether `stmt` is EXACTLY a `throw …;` (optionally wrapped in a single-statement block).
-fn statement_is_only_throw(stmt: &Statement) -> bool {
+/// Whether `stmt`, when reached, ALWAYS exits the ctor without falling through to the
+/// pass-through assignments — a `throw …;`, a `return …;`, or a block whose LAST statement
+/// always exits. A guarded branch that always exits means the pass-through below runs ONLY
+/// when the guard's condition is FALSE, so conditioning the rules on "guard not taken" is
+/// sound whether the branch throws (invalid input) or normalises-and-returns (a different,
+/// unmodelled path); in both cases we decide only the not-taken case.
+fn statement_always_exits(stmt: &Statement) -> bool {
     match stmt {
-        Statement::Block(block) => {
-            let stmts: Vec<&Statement> = block.statements.iter().collect();
-            stmts.len() == 1 && statement_is_only_throw(stmts[0])
-        }
+        Statement::Block(block) => block
+            .statements
+            .iter()
+            .last()
+            .is_some_and(statement_always_exits),
         Statement::Expression(es) => matches!(es.expression, Expression::Throw(_)),
+        Statement::Return(_) => true,
         _ => false,
     }
 }
@@ -2966,6 +2974,73 @@ final class GuardThrowTest extends TestCase {
 }
 "#;
         assert_eq!(decide(src, "GuardThrowTest", "testDen"), Decision::Unknown);
+    }
+
+    /// GATE 1 — conditional NORMALISE-and-return branch. The fraction-shaped ctor has both a
+    /// throw guard AND a `if (0 == $n) { …; return; }` normalisation branch. Under the Given
+    /// (3, 4) both conditions are provably not taken (`4 < 1` false, `0 == 3` false), so the
+    /// pass-through holds and `getNumerator()` reduces to 3 → True.
+    #[test]
+    fn conditional_return_branch_valid_given_decides() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Fraction {
+    public int $numerator;
+    public int $denominator;
+    public function __construct(int $numerator, int $denominator) {
+        if ($denominator < 1) {
+            throw new \InvalidArgumentException('bad');
+        }
+        if (0 == $numerator) {
+            $this->numerator = 0;
+            $this->denominator = 1;
+            return;
+        }
+        $this->numerator = $numerator;
+        $this->denominator = $denominator;
+    }
+    public function getNumerator(): int { return $this->numerator; }
+}
+final class FracBranchTest extends TestCase {
+    public function testNum(): void {
+        self::assertSame(3, (new Fraction(3, 4))->getNumerator());
+    }
+}
+"#;
+        assert_eq!(decide(src, "FracBranchTest", "testNum"), Decision::True);
+    }
+
+    /// SOUNDNESS: when the normalisation branch IS taken (`0 == 0` true), the pass-through
+    /// rule does not fire → Unknown. We do not model the branch's rewritten fields, so we
+    /// conservatively decline (never a false verdict for the normalised path).
+    #[test]
+    fn conditional_return_branch_taken_stays_unknown() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+final class Fraction {
+    public int $numerator;
+    public int $denominator;
+    public function __construct(int $numerator, int $denominator) {
+        if ($denominator < 1) {
+            throw new \InvalidArgumentException('bad');
+        }
+        if (0 == $numerator) {
+            $this->numerator = 0;
+            $this->denominator = 1;
+            return;
+        }
+        $this->numerator = $numerator;
+        $this->denominator = $denominator;
+    }
+    public function getNumerator(): int { return $this->numerator; }
+}
+final class FracTakenTest extends TestCase {
+    public function testNum(): void {
+        self::assertSame(0, (new Fraction(0, 4))->getNumerator());
+    }
+}
+"#;
+        assert_eq!(decide(src, "FracTakenTest", "testNum"), Decision::Unknown);
     }
 
     /// REFINEMENT (3): an `expectException(DivisionByZero…)` whose subject divides by a
