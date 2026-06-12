@@ -79,9 +79,70 @@ docker run --rm -v $PWD:/p -v <clean-vendor>:/p/vendor:ro -w /p phpunit-rust-ben
   sh -c "php vendor/bin/phpunit -c phpunit.xml <file>"
 ```
 
+## OSS offer scan (`way3_scan.js`) — where does the hoistable shape exist?
+
+`way3_scan.js` resolves each test class's inheritance chain, classifies context
+setters by scope, finds shared literal-arg call sub-trees, and decides HOIST/REFUSE
+per suite. Across the 15 OSS smoke suites:
+
+| suite | test classes | per-test-ctx | shared distinct | HOIST | REFUSE | occHoist | maxMult |
+|-------|-------------:|-------------:|----------------:|------:|-------:|---------:|--------:|
+| brick-money | 41 | 0 | 53 | 53 | 0 | 278 | 17 |
+| carbon | 120 | 110 | 208 | 34 | 174 | 109 | 4 |
+| brick-math | 12 | 0 | 20 | 20 | 0 | 66 | 7 |
+| php-semver | 6 | 0 | 19 | 19 | 0 | 58 | 12 |
+| phpgeo / phpgeo2 | 33 | 0 | 19 | 19 | 0 | 38 | 2 |
+| mathphp, moneyphp, fraction, … | — | 0 | 0 | 0 | 0 | 0 | 0 |
+| **TOTAL** | **480** | — | **338** | **164** | **174** | — | — |
+
+The hoistable shape **exists** (164 sound HOISTs), but every shared literal-arg
+sub-tree is a **cheap value-object construction** — measured per-call cost:
+`Currency::of('EUR')` 0.09 µs, `BigInteger::of('1e1000')` 0.73 µs (a 1001-digit
+integer, stored lazily as a string), `BigRational::of('1/3')` 1.79 µs,
+`Version::parse('5.2.3')` 0.44 µs. Aggregate saving per suite (Σ (mult−1) × cost) is
+an **upper bound of ~0.5 ms** (brick-money) down to tens of µs — **below run-to-run
+noise**, so every primitive OSS suite stays ~1.0×. carbon is dominated by per-test
+`{tz,now}` (110/120 classes) → 174 REFUSE, confirming the prototype's measured ~1.0×.
+
+**Conclusion: literal-arg sharing is real but cheap.** The gain needs an *expensive*
+shared sub-tree — and those are built from variables in multi-statement `setUp`
+bodies, not `Class::method('literal')`, so the literal detector misses them.
+
+## setUp-splitter (`way3_setup.js`) — the expensive shape
+
+The most expensive, highest-multiplicity shared computation in any suite is the
+`setUp()` body itself: it runs once **per test**. `way3_setup.js` hoists the
+deterministic, immutable prefix of `setUp` into `setUpBeforeClass` (run once),
+keeping the per-test-mutable remainder. Two soundness gates:
+
+1. **Determinism + context (Way-3):** no per-test ambient context, no non-deterministic
+   call in the factory.
+2. **No mutation:** no test method mutates the shared object (a non-reader
+   `$this->P->m(...)`, a write, or a reassignment). Else REFUSE — per-test rebuild stays.
+
+`HeavySchema::compile()` does ~10.8 ms of deterministic CPU (the "compile a schema /
+boot an EntityManager" shape). 20 tests each rebuild it in `setUp`.
+
+| case | fixture | Way-3 | parity | PHPUnit-internal |
+|------|---------|-------|--------|------------------|
+| **A** `SchemaReadTest` | read-only | **HOIST** setUp→setUpBeforeClass | `OK (20, 40)` identical | **110 ms → 12 ms (9.2×)** |
+| **B** `SchemaMutateTest` | mutates (`addTable`) | **REFUSE** | `OK (20, 20)` identical | no spurious gain |
+| **C** `SchemaMutateTest` | mutates, **naive** | hoist anyway | **19 FAILURES** | shared schema accumulates: counts 21,22,23… ≠ 4 |
+
+Full-process wall-clock A (median of 7): **0.46 s → 0.34 s (1.35×)** — startup floor
+dominates; the *work* collapses 20×→1×.
+
+Case **C** is the load-bearing proof for the second gate: hoisting a mutated fixture
+lets `addTable()` calls accumulate on the shared object, so later tests see 21/22/23
+tables instead of 4. Way-3 refuses this **statically** via mutation analysis. This is
+the expensive-shape analogue of the timezone result — same structure, different gate.
+
 ## Status
 
-This JS demonstrator proves the Way-3 *decision* (context-scope analysis) end-to-end,
-measured and gated. The next step is porting the analysis into the Rust engine
-(`crates/analyzer/src/reduce/egraph.rs`) as a side-condition on the suite-wide
+This JS demonstrator proves Way-3's two soundness gates (context-scope **and**
+mutation) end-to-end, measured and gated, on both the cheap literal shape and the
+**expensive `setUp` shape** where the gain is real (9.2×). The OSS offer is quantified:
+literal-arg sharing is cheap (~1.0×); the lever pays on heavy deterministic `setUp`
+fixtures. The next step is porting the analysis into the Rust engine
+(`crates/analyzer/src/reduce/egraph.rs`) as side-conditions on the suite-wide
 compression plan, then driving the warm-master `$GLOBALS` precompute from it.
