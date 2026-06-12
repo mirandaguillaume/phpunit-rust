@@ -666,6 +666,24 @@ fn literal_motif(lit: &Literal) -> Option<Motif> {
     literal_op(lit).map(Motif::leaf)
 }
 
+/// The leaf op-string for a pre-computed SCALAR provider Given, IDENTICAL to `literal_op`
+/// (and `value_leaf`) so a substituted provider row fuses with a source literal of the
+/// same value. `None` for an array/object column — that param stays unbound for the row
+/// (its use then bails the row to Unknown, fail-closed). This is what lets a PARAMETRIZED
+/// string/bool value-object test decide: the row's string Given binds the param exactly as
+/// a literal would.
+fn phpvalue_scalar_op(value: &PhpValue) -> Option<String> {
+    Some(match value {
+        PhpValue::Int(i) => i.to_string(),
+        PhpValue::String(s) => format!("str:'{}'", String::from_utf8_lossy(s.as_bytes())),
+        PhpValue::Bool(true) => "true".to_string(),
+        PhpValue::Bool(false) => "false".to_string(),
+        PhpValue::Null => "null".to_string(),
+        PhpValue::Float(f) => format!("float:{f}"),
+        PhpValue::Array(_) => return None,
+    })
+}
+
 fn arith_op(op: &BinaryOperator) -> Option<&'static str> {
     match op {
         BinaryOperator::Addition(_) => Some("+"),
@@ -1598,128 +1616,13 @@ fn single_return_expr<'a>(
     None
 }
 
-// ─── Data-provider substitution: rows of integer leaves ────────────────────────
-
-/// The statically-evaluated provider rows for a PARAMETRIZED test method, each a
-/// tuple of integer leaves bound positionally to the method's parameters. Returns
-/// `None` (fail-closed) when the method has no derivable provider, the provider is
-/// not a pure integer-array literal (a `yield`/loop/string/computed row, an external
-/// provider, …), or any leaf escapes the integer fragment — the runner then executes
-/// the method for real. PHPUnit treats each row as a separate test; we decide the
-/// method by aggregating across rows.
-///
-/// Three provider shapes are honoured, exactly as real php8.4 PHPUnit binds them:
-///   * `#[DataProvider('name')]` — the static method `name()` whose single `return`
-///     is an `array` of integer-array rows;
-///   * `#[TestWith([..])]` — one inline integer row per attribute;
-///   * the legacy `/** @dataProvider name */` docblock — same as the attribute.
-fn provider_rows(
-    program: &Program,
-    source_text: &str,
-    class_fqcn: &[u8],
-    method: &Method,
-) -> Option<Vec<Vec<i64>>> {
-    // `#[TestWith([..])]` rows live ON the method — collect them first.
-    let test_with = test_with_rows(method);
-    if !test_with.is_empty() {
-        return Some(test_with);
-    }
-    // Otherwise a `#[DataProvider('name')]` attribute or a `@dataProvider name`
-    // docblock names a sibling static provider method.
-    let provider_name = data_provider_name(source_text, method)?;
-    let provider = find_class_method(program, class_fqcn, provider_name.as_bytes())?;
-    static_provider_rows(provider)
-}
-
-/// The `#[TestWith([..])]` rows declared directly on `method`: each `TestWith`
-/// attribute carries one positional array literal → one integer row. A non-integer or
-/// non-array-literal `TestWith` makes the WHOLE method fail-closed (we cannot soundly
-/// model a partial set), so a present-but-unmodellable row returns an empty Vec via
-/// `None`-coalescing the row, then the caller's emptiness check sends it to the
-/// provider path; to keep that unambiguous a malformed `TestWith` simply contributes
-/// no row and the method falls through to Unknown if no rows remain.
-fn test_with_rows(method: &Method) -> Vec<Vec<i64>> {
-    let mut rows = Vec::new();
-    for list in method.attribute_lists.iter() {
-        for attr in list.attributes.iter() {
-            if !attribute_simple_name(&attr.name).eq_ignore_ascii_case(b"TestWith") {
-                continue;
-            }
-            let Some(arg_list) = &attr.argument_list else {
-                continue;
-            };
-            let Some(Argument::Positional(p)) = arg_list.arguments.iter().next() else {
-                continue;
-            };
-            if let Some(row) = int_row_from_expr(p.value) {
-                rows.push(row);
-            }
-        }
-    }
-    rows
-}
-
-/// Evaluate a static data-provider method (`{ return [ [..], [..] ]; }`) to integer
-/// rows. The body must be a single `return` of an `array` LITERAL whose every element
-/// is itself an integer-array literal (positional or `key => [..]`). Anything else —
-/// `yield`, a computed expression, strings, nested non-integers — bails (`None`).
-fn static_provider_rows(provider: &Method) -> Option<Vec<Vec<i64>>> {
-    let MethodBody::Concrete(block) = &provider.body else {
-        return None;
-    };
-    let ret = single_return_expr(block)?;
-    rows_from_array_literal(ret)
-}
-
-/// A `[ [..], [..] ]` (or `[ 'k' => [..] ]`) outer array literal → its rows, each an
-/// integer-array literal. `None` if `expr` is not an array literal, or any row is not
-/// an integer-array literal.
-fn rows_from_array_literal(expr: &Expression) -> Option<Vec<Vec<i64>>> {
-    let mut ctx = Context::new();
-    let value = compute(expr, &mut ctx).ok()?;
-    let PhpValue::Array(outer) = value else {
-        return None;
-    };
-    let mut rows = Vec::new();
-    for (_key, row_val) in outer {
-        rows.push(int_row_from_phpvalue(&row_val)?);
-    }
-    Some(rows)
-}
-
-/// One row literal (`[1, 2, 3]`) → its integer columns. `None` if `expr` does not
-/// concretely evaluate to an array of integers.
-fn int_row_from_expr(expr: &Expression) -> Option<Vec<i64>> {
-    let mut ctx = Context::new();
-    let value = compute(expr, &mut ctx).ok()?;
-    int_row_from_phpvalue(&value)
-}
-
-/// A concretely-evaluated `PhpValue` row → its integer columns. Every element must be
-/// a (`PhpValue::Int`); a string/float/bool/null/nested array fails the whole row
-/// (fail-closed — this fragment models only integer value-objects).
-fn int_row_from_phpvalue(value: &PhpValue) -> Option<Vec<i64>> {
-    let PhpValue::Array(map) = value else {
-        return None;
-    };
-    let mut cols = Vec::new();
-    for v in map.values() {
-        match v {
-            PhpValue::Int(i) => cols.push(*i),
-            _ => return None,
-        }
-    }
-    Some(cols)
-}
-
-// ─── Data-provider substitution for COMPRESSION: rows of ANY literal leaf ───────
+// ─── Data-provider substitution: rows of literal leaves ─────────────────────────
 //
-// The decision path (above) only accepts rows of INTEGERS — a single non-int column
-// bails the whole method. The COMPRESSION path is laxer because it never DECIDES: it
-// only needs the row's Givens as shareable leaves. So it accepts ANY literal column
-// (int / string / bool / float / null → a concrete leaf) and marks a non-literal
-// column (an array, an object, a computed value) as `None` — that param simply stays
-// salted for the row. A method with no provider at all returns `None` (no rows).
+// Both the DECISION and the COMPRESSION paths bind a parametrized test's params from a
+// statically-evaluated provider, each column a concrete `PhpValue` literal Given (int /
+// string / bool / float / null → a leaf; a non-literal array/object/computed column →
+// `None`, that param staying unbound/salted for the row). A method with no derivable
+// provider returns `None` (no rows).
 
 /// The data-provider rows for a parametrized test method, evaluated as
 /// per-column literal Givens for the COMPRESSION substitution. Returns:
@@ -2219,9 +2122,9 @@ fn decide_with_program(
     // 2. The test method body, its parameters, and its substitution rows. A zero-param
     //    method has exactly ONE empty row (the v2 static-factory path). A parametrized
     //    method binds its params, positionally, from a STATICALLY-evaluated data provider
-    //    — every row a tuple of integer leaves. A parametrized method with no derivable
-    //    provider, or a provider that is not a pure integer-array literal, yields no rows
-    //    → fail-closed Unknown (the runner then executes it for real).
+    //    — every row a tuple of concrete literal Givens (int/string/bool/float/null). A
+    //    parametrized method with no derivable provider, or a provider that is not a pure
+    //    array literal, yields no rows → fail-closed Unknown (the runner executes it).
     let MethodBody::Concrete(block) = &m.body else {
         return None;
     };
@@ -2231,10 +2134,10 @@ fn decide_with_program(
         .iter()
         .map(|p| strip_dollar(p.variable.name))
         .collect();
-    let rows: Vec<Vec<i64>> = if params.is_empty() {
+    let rows: Vec<Vec<Option<PhpValue>>> = if params.is_empty() {
         vec![Vec::new()]
     } else {
-        provider_rows(program, source_text, class_fqcn, m)?
+        provider_value_rows(program, source_text, class_fqcn, m)?
     };
 
     // 2b. EXCEPTION-test decision (arithmetic): an `expectException(DivisionByZero…)` whose
@@ -2276,21 +2179,25 @@ fn decide_one(
     cat: &ClassCatalogue,
     rules: &[Rewrite<PhpL, GroundEval>],
     params: &[Vec<u8>],
-    row: &[i64],
+    row: &[Option<PhpValue>],
     assertion: &Assertion,
 ) -> Option<Decision> {
     let mut egraph: EGraph<PhpL, GroundEval> = EGraph::default();
     let mut vars: HashMap<Vec<u8>, Id> = HashMap::new();
 
-    // Bind parameters positionally to integer leaves. PHPUnit binds row columns to
-    // params by position; SURPLUS columns are ignored (not an error in PHPUnit), and
-    // a row SHORTER than the param list cannot satisfy the call → bail.
+    // Bind parameters positionally to their row's concrete Given. PHPUnit binds row
+    // columns to params by position; SURPLUS columns are ignored, and a row SHORTER than
+    // the param list cannot satisfy the call → bail. A scalar column binds to its leaf; an
+    // array/absent column leaves the param UNBOUND, so any use of it bails the row to
+    // Unknown (fail-closed, no false fusion).
     if row.len() < params.len() {
         return None;
     }
-    for (name, value) in params.iter().zip(row.iter()) {
-        let id = egraph.add(SymbolLang::leaf(value.to_string()));
-        vars.insert(name.clone(), id);
+    for (name, col) in params.iter().zip(row.iter()) {
+        if let Some(op) = col.as_ref().and_then(phpvalue_scalar_op) {
+            let id = egraph.add(SymbolLang::leaf(op));
+            vars.insert(name.clone(), id);
+        }
     }
 
     // Bind any `$r = <expr>;` prefix locals (built over the param leaves).
@@ -2521,7 +2428,7 @@ fn decide_exception_rows(
     cat: &ClassCatalogue,
     rules: &[Rewrite<PhpL, GroundEval>],
     params: &[Vec<u8>],
-    rows: &[Vec<i64>],
+    rows: &[Vec<Option<PhpValue>>],
     block: &mago_syntax::ast::ast::block::Block,
 ) -> Option<Decision> {
     use mago_syntax::ast::ast::assignment::AssignmentOperator;
@@ -2679,7 +2586,7 @@ fn eval_expr_int(
     cat: &ClassCatalogue,
     rules: &[Rewrite<PhpL, GroundEval>],
     params: &[Vec<u8>],
-    row: &[i64],
+    row: &[Option<PhpValue>],
     bindings: &[(Vec<u8>, &Expression)],
     expr: &Expression,
 ) -> Option<i64> {
@@ -2688,9 +2595,11 @@ fn eval_expr_int(
     }
     let mut egraph: EGraph<PhpL, GroundEval> = EGraph::default();
     let mut vars: HashMap<Vec<u8>, Id> = HashMap::new();
-    for (name, value) in params.iter().zip(row.iter()) {
-        let id = egraph.add(SymbolLang::leaf(value.to_string()));
-        vars.insert(name.clone(), id);
+    for (name, col) in params.iter().zip(row.iter()) {
+        if let Some(op) = col.as_ref().and_then(phpvalue_scalar_op) {
+            let id = egraph.add(SymbolLang::leaf(op));
+            vars.insert(name.clone(), id);
+        }
     }
     for (name, e) in bindings {
         let id = {
@@ -2789,6 +2698,32 @@ final class BoolVoTest extends TestCase {
 }
 "#;
         assert_eq!(decide(src, "BoolVoTest", "testGet"), Decision::True);
+    }
+
+    /// THE parametrized reach: a `#[DataProvider]` of STRING rows now binds each Given as a
+    /// concrete leaf, so `assertSame($s, (new Slug($s))->value())` decides True on EVERY
+    /// row — the shape of real value-object suites, previously fail-closed to Unknown
+    /// because the row was not a pure integer tuple.
+    #[test]
+    fn parametrized_string_vo_decides_true() {
+        let src = r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+final class Slug {
+    public function __construct(private string $v) {}
+    public function value(): string { return $this->v; }
+}
+final class StrProvTest extends TestCase {
+    public static function rows(): array {
+        return [['alpha'], ['beta']];
+    }
+    #[DataProvider('rows')]
+    public function testRaw(string $s): void {
+        self::assertSame($s, (new Slug($s))->value());
+    }
+}
+"#;
+        assert_eq!(decide(src, "StrProvTest", "testRaw"), Decision::True);
     }
 
     /// REFINEMENT (3): an `expectException(DivisionByZero…)` whose subject divides by a
@@ -3502,8 +3437,10 @@ final class FracTest extends TestCase {
         );
     }
 
-    /// A provider that is not a pure integer-array literal (strings here) leaves the
-    /// modelled fragment → the whole method is fail-closed Unknown.
+    /// SOUNDNESS: string Givens now BIND as leaves, but integer arithmetic over them does
+    /// not fold (no ground constant) → the method stays fail-closed Unknown, never a false
+    /// decision. (Before scalar provider rows this bailed earlier, at the provider; the
+    /// verdict is unchanged — only the reason moved.)
     #[test]
     fn non_integer_provider_bails() {
         let src = r#"<?php
