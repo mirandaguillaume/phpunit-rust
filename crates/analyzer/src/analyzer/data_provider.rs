@@ -54,7 +54,14 @@ pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
         return no_data();
     };
 
-    let Some(value) = compute_provider_return(project, &test.class, provider_name) else {
+    // PHPUnit resolves the provider against the CONCRETE run class (most-derived),
+    // NOT the class that declares the test method body. When a concrete subclass
+    // OVERRIDES the provider, the child's rows must win. Resolve the provider's
+    // declaring class by following inheritance from `test.class` (the concrete
+    // run class); fall back to `body_class()` if the codebase can't resolve it.
+    let provider_class = provider_declaring_class(project, &test.class, provider_name)
+        .unwrap_or_else(|| test.body_class().to_string());
+    let Some(value) = compute_provider_return(project, &provider_class, provider_name) else {
         return no_data();
     };
 
@@ -89,6 +96,23 @@ pub fn expand(project: &MagoProject, test: &TestMethod) -> Vec<ExpandedTest> {
 /// is arena-bound; only the owned `PhpValue` escapes. Returns `None` whenever
 /// anything along the way fails (class not found, no concrete return, the
 /// expression is not concretely-computable).
+/// Resolve the class that declares `provider_name` for the CONCRETE run class
+/// `concrete`, following inheritance to the most-derived declaration. When a
+/// subclass overrides the provider, this returns the subclass — matching PHPUnit,
+/// which resolves the provider against the concrete instance (Inc-4 Task 2). Falls
+/// back to `None` if the codebase has no entry (the caller then uses `body_class`).
+fn provider_declaring_class(
+    project: &MagoProject,
+    concrete: &str,
+    provider_name: &str,
+) -> Option<String> {
+    let concrete_key = concrete.trim_start_matches('\\').to_lowercase();
+    let declaring = project
+        .codebase()
+        .get_declaring_method_class(concrete_key.as_bytes(), provider_name.as_bytes())?;
+    Some(word_to_string(&declaring))
+}
+
 fn compute_provider_return(
     project: &MagoProject,
     class_name: &str,
@@ -304,5 +328,86 @@ class MyTest extends TestCase {
             .collect();
         assert!(data_sets.contains(&"first"), "expected 'first' data set");
         assert!(data_sets.contains(&"second"), "expected 'second' data set");
+    }
+
+    #[test]
+    fn overridden_provider_resolves_against_concrete_class() {
+        // An abstract base declares the provider AND the test method; a concrete
+        // subclass OVERRIDES the provider with different rows. PHPUnit resolves the
+        // provider against the CONCRETE run class, so the child's rows win. The
+        // reducer must use `child_a`/`child_b` (2,2 / 3,3), NOT the parent's `parent`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/Attributes"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/TestCase.php"),
+            "<?php namespace PHPUnit\\Framework; abstract class TestCase {}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("vendor/phpunit/phpunit/src/Framework/Attributes/DataProvider.php"),
+            "<?php namespace PHPUnit\\Framework\\Attributes; class DataProvider { public function __construct(string $name) {} }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("BaseProvTestCase.php"),
+            r#"<?php
+use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
+abstract class BaseProvTestCase extends TestCase {
+    public static function rows(): array {
+        return ['parent' => [1, 1]];
+    }
+
+    #[DataProvider('rows')]
+    public function testAdd(int $a, int $b): void {}
+}
+"#,
+        )
+        .unwrap();
+        let concrete = dir.path().join("ConcreteProvTest.php");
+        std::fs::write(
+            &concrete,
+            r#"<?php
+class ConcreteProvTest extends BaseProvTestCase {
+    public static function rows(): array {
+        return ['child_a' => [2, 2], 'child_b' => [3, 3]];
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let project = MagoProject::load(dir.path()).unwrap();
+        let cache = CacheStore::open(dir.path(), MagoProject::version()).unwrap();
+        let tests = discover(&project, &cache, &[concrete]).unwrap();
+        let test = tests
+            .iter()
+            .find(|t| t.method.to_lowercase() == "testadd")
+            .expect("inherited testAdd surfaced onto the concrete class");
+
+        let expanded = expand(&project, test);
+        let data_sets: Vec<&str> = expanded
+            .iter()
+            .filter_map(|e| e.data_set.as_deref())
+            .collect();
+        assert_eq!(
+            expanded.len(),
+            2,
+            "the CHILD's two rows must win, not the parent's one; got: {expanded:?}"
+        );
+        assert!(
+            data_sets.contains(&"child_a") && data_sets.contains(&"child_b"),
+            "must use the concrete subclass's rows; got {data_sets:?}"
+        );
+        assert!(
+            !data_sets.contains(&"parent"),
+            "must NOT use the abstract parent's rows; got {data_sets:?}"
+        );
     }
 }
