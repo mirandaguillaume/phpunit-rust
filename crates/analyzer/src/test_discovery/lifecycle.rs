@@ -61,6 +61,7 @@ mod tests {
         TestMethod {
             class: class.to_string(),
             method: method.to_string(),
+            declaring_class: None,
             file: PathBuf::new(),
             line: 0,
             has_data_provider: None,

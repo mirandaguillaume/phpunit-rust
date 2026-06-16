@@ -1,0 +1,5304 @@
+//! The native evaluator — the CENTER of the reducer.
+//!
+//! A test, given its complete Givens (data-provider row + fixtures), is a trivial
+//! deterministic computation. This module performs that computation NATIVELY: it
+//! evaluates the test-method body over the concrete Given inputs, running the few
+//! trivial ops a test actually touches — arithmetic (with PHP overflow→float),
+//! concat, comparisons (via [`super::value`]), array ops, control flow, and the
+//! assertion intrinsics — folding the whole thing to [`Outcome`].
+//!
+//! Every PHP-semantic op is gold-tested against host `php -r` (expectations
+//! transcribed, never guessed). Anything outside the modelled set returns
+//! [`Outcome::Bailed`] / a [`BailReason`] — fail-closed (spec §5). The standing
+//! differential (reduce vs the real runner) is the soundness backstop and is
+//! driven separately.
+//!
+//! Substitution of user-function calls (inlining their bodies) is layered on in
+//! Task 5 via a resolver hook; this module evaluates a single body with the
+//! resolver pluggable.
+
+use std::collections::{HashMap, HashSet};
+
+use mago_syntax::ast::ast::array::{Array, ArrayElement, LegacyArray};
+use mago_syntax::ast::ast::binary::BinaryOperator;
+use mago_syntax::ast::ast::block::Block;
+use mago_syntax::ast::ast::call::Call;
+use mago_syntax::ast::ast::expression::Expression;
+use mago_syntax::ast::ast::literal::Literal;
+use mago_syntax::ast::ast::statement::Statement;
+use mago_syntax::ast::ast::unary::UnaryPrefixOperator;
+use mago_syntax::ast::ast::variable::Variable;
+
+use mago_span::HasSpan;
+
+use super::value::{ArrayKey, ClosureRef, Value};
+
+// ─── Outcome + bail taxonomy ──────────────────────────────────────────────────
+
+/// The reduced result of one test invocation (one provider row).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Every assertion passed (or the body ran to completion with no failing
+    /// assertion).
+    Pass,
+    /// An assertion failed; the string is the failed-assertion description.
+    Fail(String),
+    /// The reducer could not model some construct/value — the test must run for
+    /// real. NEVER a guess.
+    Bailed(BailReason),
+}
+
+/// Why the reducer abstained. Structured so the driver can histogram bails.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BailReason {
+    /// An AST construct outside the modelled subset (the payload names it).
+    UnsupportedConstruct(String),
+    /// A reference to an unbound variable (a hidden input — incomplete Givens).
+    UnboundVariable(String),
+    /// A function/method call the reducer does not model (and §5 substitution
+    /// did not resolve).
+    UnknownCall(String),
+    /// A type error the reducer refuses to model (e.g. arithmetic on an array).
+    TypeError(String),
+    /// `assertEquals` with a delta / other float-epsilon assertion (spec §12.2).
+    FloatDelta,
+    /// Division or modulo by zero (PHP throws `DivisionByZeroError`; we abstain
+    /// rather than model the exception path).
+    DivisionByZero,
+    /// The step budget was exhausted (runaway loop) — abstain.
+    StepBudget,
+    /// Anything else unmodelled.
+    Other(String),
+}
+
+impl BailReason {
+    /// A short stable tag for histogramming.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            BailReason::UnsupportedConstruct(_) => "unsupported_construct",
+            BailReason::UnboundVariable(_) => "unbound_variable",
+            BailReason::UnknownCall(_) => "unknown_call",
+            BailReason::TypeError(_) => "type_error",
+            BailReason::FloatDelta => "float_delta",
+            BailReason::DivisionByZero => "division_by_zero",
+            BailReason::StepBudget => "step_budget",
+            BailReason::Other(_) => "other",
+        }
+    }
+}
+
+// ─── A resolver hook for user-function substitution (filled in Task 5) ────────
+
+/// The result of dispatching an instance method `$obj->m(args)` (Inc-5 Task 3).
+///
+/// `ret` is the method's return value. `mutated_this` is `Some(obj)` IFF the
+/// inlined body wrote to `$this` (the post-body `$this` record differs from the
+/// pre-body one) — i.e. the method is a MUTATOR. The eval-layer dispatch site uses
+/// `mutated_this` to decide writeback vs the aliasing bail: a read-only method
+/// (`mutated_this == None`) is always sound; a mutator is sound ONLY on a
+/// uniquely-owned `$var` receiver (writeback target), and BAILS otherwise.
+#[derive(Debug)]
+pub struct MethodDispatch {
+    pub ret: Value,
+    pub mutated_this: Option<Value>,
+}
+
+/// Resolves a user function/method call to a concrete [`Value`] by inlining its
+/// body (substitution; spec §12.3). Task 5 supplies a real implementation backed
+/// by the mago bridge; Task 4 uses [`NoResolver`] (every user call bails).
+pub trait CallResolver {
+    /// Attempt to resolve a **free function** call `name(args)`. `Ok(None)` means
+    /// "not a user function I can resolve" (→ caller treats as unknown call);
+    /// `Err` propagates a bail.
+    fn resolve_function(&self, name: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason>;
+
+    /// Attempt to inline an **instance method** call `$obj->method(args)`. The
+    /// receiver `this` is the concrete runtime [`Value::Object`] (its `class` gives
+    /// the exact type — never a static type, spec §13). `Ok(None)` → not a method
+    /// the resolver can inline (caller bails); `Err` propagates a bail. On success
+    /// returns the return value AND (for a mutator) the mutated `$this` so the
+    /// caller can write it back — see [`MethodDispatch`] (Inc-5 Task 3).
+    ///
+    /// Increment-2 default: no instance-method inlining (the [`NoResolver`] path).
+    fn resolve_instance_method(
+        &self,
+        _this: &Value,
+        _method: &[u8],
+        _args: &[Value],
+    ) -> Result<Option<MethodDispatch>, BailReason> {
+        Ok(None)
+    }
+
+    /// Attempt to inline a **static method** call `Class::method(args)`. `class` is
+    /// the resolved FQCN (`self`/`parent`/`static` are bailed by the caller — no
+    /// enclosing-class context in the [`Scope`]).
+    fn resolve_static_method(
+        &self,
+        _class: &[u8],
+        _method: &[u8],
+        _args: &[Value],
+    ) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
+
+    /// Attempt to construct `new Class(args)`: inline the constructor over a fresh
+    /// `$this` record (promoted params seed props; plain literal property defaults
+    /// are read off the class AST) and return the populated [`Value::Object`].
+    fn construct(&self, _class: &[u8], _args: &[Value]) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
+
+    /// Resolve a class CONSTANT read `Class::CONST` (Inc-5 Task 4) by folding the
+    /// const's initializer from the class AST. `class` is the resolved FQCN; the
+    /// constant is looked up on the class + its ancestor chain. `Ok(None)` → the
+    /// class is not in the codebase (caller bails); `Err` → a non-foldable
+    /// initializer (computed/unresolved) or an enum (deferred). Only literal /
+    /// already-modelled constant expressions fold; everything else BAILS.
+    fn resolve_class_constant(
+        &self,
+        _class: &[u8],
+        _const_name: &[u8],
+    ) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
+
+    /// Enforce PHP property-READ visibility (round 18) for a `$obj->prop` read:
+    /// `receiver_class` is the runtime record's class, `reading_class` the class
+    /// declaring the body performing the read (`None` = a free function / closure
+    /// / unit-test scope — no class context). The default allows everything (the
+    /// [`NoResolver`] unit-test path builds records by hand, with no declared
+    /// visibility to consult); the [`super::subst::BridgeResolver`] resolves the
+    /// declared visibility from the scanned codebase and BAILS (fail-closed) on a
+    /// read PHP would deny (Error) or resolve to a DIFFERENT slot
+    /// (parent-private read from a child method → undefined-property null).
+    fn bail_inaccessible_prop_read(
+        &self,
+        _receiver_class: &[u8],
+        _prop: &[u8],
+        _reading_class: Option<&[u8]>,
+    ) -> Result<(), BailReason> {
+        Ok(())
+    }
+
+    /// Enforce PHP property-WRITE visibility (round 19; the symmetric twin of
+    /// [`Self::bail_inaccessible_prop_read`]). A `$this->prop = …` write from a
+    /// scope that cannot WRITE the property diverges: a child writing a
+    /// parent-`private` prop does NOT touch the parent slot (PHP forks a separate
+    /// dynamic property), and a write to an asymmetric `private(set)` /
+    /// `protected(set)` prop from outside the set-scope is a PHP Error. The
+    /// default allows everything (the [`NoResolver`] hand-built records carry no
+    /// declared visibility); the [`super::subst::BridgeResolver`] consults the
+    /// declared `write_visibility` and BAILS (fail-closed).
+    fn bail_inaccessible_prop_write(
+        &self,
+        _receiver_class: &[u8],
+        _prop: &[u8],
+        _writing_class: Option<&[u8]>,
+    ) -> Result<(), BailReason> {
+        Ok(())
+    }
+}
+
+/// A resolver that resolves nothing (all user calls bail). Used by the pure-eval
+/// unit tests; the real substitution is [`super::subst::BridgeResolver`].
+pub struct NoResolver;
+
+impl CallResolver for NoResolver {
+    fn resolve_function(&self, _name: &[u8], _args: &[Value]) -> Result<Option<Value>, BailReason> {
+        Ok(None)
+    }
+}
+
+// ─── Evaluation scope ─────────────────────────────────────────────────────────
+
+/// Lexical scope: by-value variable bindings + a step budget. Any PHP reference
+/// would have made the frontend bail before reaching here, so by-value is exact.
+pub struct Scope<'r> {
+    vars: HashMap<Vec<u8>, Value>,
+    steps: u64,
+    max_steps: u64,
+    resolver: &'r dyn CallResolver,
+    /// The resolved-names table for the CURRENT body's file (Inc-3): maps each
+    /// name occurrence (by source position) to its fully-qualified name, so an
+    /// unqualified / `use`-aliased `new ClassName` / `ClassName::m()` resolves to
+    /// the real FQCN. `None` (unit tests / a body whose names weren't threaded)
+    /// falls back to the raw identifier. Each inlined body carries the names of
+    /// ITS declaring file (set when re-entering the evaluator via `with_program`).
+    names: Option<&'r mago_names::ResolvedNames<'r>>,
+    /// The raw source bytes of the file whose body is being evaluated. Used ONLY to
+    /// slice a closure expression's span into owned bytes at creation
+    /// (`make_closure`/`make_arrow`, Inc-4 Task 1) so the closure carries no arena
+    /// borrow. `None` in scopes that never create a closure from this file (e.g. a
+    /// re-parsed closure body's inner scope, where any nested closure literal is
+    /// itself re-sliced from the inner snippet).
+    source: Option<&'r [u8]>,
+    /// Whether `$this->prop = ...` writes are permitted (true ONLY while a
+    /// constructor body is being inlined to seed props). A write to `$this->prop`
+    /// in any non-constructor body is a MUTATOR — fail-closed BAIL (frontier §2),
+    /// because the by-value scope model would get aliasing wrong.
+    allow_this_write: bool,
+    /// The receiver class's declared SCALAR property hints (round 3, Task A),
+    /// keyed by bare property name. Built once from the class AST inside
+    /// `with_program` (where the `&Hint` is live) and carried OWNED here, so a
+    /// typed `$this->prop = rhs` write can re-check scalar coercion at the lazy
+    /// write site after the AST has dropped. A property absent from this map is
+    /// untyped (or non-scalar-typed) → stored verbatim, no coercion (no bail).
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    /// Bare names of the receiver class's `readonly` properties (round 17 fix 4):
+    /// promoted `readonly` ctor params + plain `readonly` declarations across the
+    /// chain. A ctor/setUp BODY write to one is (at best) PHP's "Cannot modify
+    /// readonly property" Error — the write-once seed happens at promoted-param
+    /// binding, NEVER through the body — so the write site bails (fail-closed).
+    readonly_props: HashSet<Vec<u8>>,
+    /// The FQCN of the class DECLARING the body this scope evaluates (round 18):
+    /// the test-case body class, an inlined method/ctor/setUp's declaring class.
+    /// `None` for a free function, a closure body, or a unit-test scope. Property
+    /// reads pass this to [`CallResolver::bail_inaccessible_prop_read`] so PHP
+    /// visibility (private/protected) is enforced at the read site.
+    current_class: Option<Vec<u8>>,
+}
+
+impl<'r> Scope<'r> {
+    /// A fresh scope with the given initial variable bindings (the Givens).
+    pub fn new(vars: HashMap<Vec<u8>, Value>, resolver: &'r dyn CallResolver) -> Self {
+        Self {
+            vars,
+            steps: 0,
+            // 10M steps — a runaway loop bails rather than hanging (spec §6).
+            max_steps: 10_000_000,
+            resolver,
+            names: None,
+            source: None,
+            allow_this_write: false,
+            prop_hints: HashMap::new(),
+            readonly_props: HashSet::new(),
+            current_class: None,
+        }
+    }
+
+    /// Attach the receiver class's declared scalar property hints (round 3 Task A),
+    /// so a typed `$this->prop = …` write can re-check scalar coercion at the lazy
+    /// write site. Only properties with a coercion-relevant scalar hint appear.
+    pub fn with_prop_hints(mut self, hints: HashMap<Vec<u8>, OwnedScalarHint>) -> Self {
+        self.prop_hints = hints;
+        self
+    }
+
+    /// Attach the receiver class's `readonly` property names (round 17 fix 4), so
+    /// a ctor/setUp BODY write to one bails at the write site (PHP: "Cannot
+    /// modify readonly property" Error; the legal write-once is the promoted-param
+    /// seed, which never flows through `eval_property_assignment`).
+    pub fn with_readonly_props(mut self, readonly: HashSet<Vec<u8>>) -> Self {
+        self.readonly_props = readonly;
+        self
+    }
+
+    /// Attach the FQCN of the class declaring the body about to be evaluated
+    /// (round 18), so a property read can enforce PHP visibility — a private
+    /// prop is only readable from its declaring class, a protected one only
+    /// from the receiver's own chain.
+    pub fn with_current_class(mut self, class: Vec<u8>) -> Self {
+        self.current_class = Some(class);
+        self
+    }
+
+    /// Attach the resolved-names table for the body about to be evaluated, so
+    /// class-name resolution at `new`/static-call sites can produce a FQCN.
+    pub fn with_names(mut self, names: &'r mago_names::ResolvedNames<'r>) -> Self {
+        self.names = Some(names);
+        self
+    }
+
+    /// Attach the file source so a closure literal can own its source bytes
+    /// (sliced by span) at creation — see [`Value::Closure`] (Inc-4 Task 1).
+    pub fn with_source(mut self, source: &'r [u8]) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Resolve a class identifier at `position` to its FQCN via the names table,
+    /// if one is attached and has an entry. Returns `None` to fall back to the raw
+    /// identifier (self/parent/static keywords are handled by the caller).
+    fn resolve_name_at<T: mago_span::HasPosition>(&self, position: &T) -> Option<Vec<u8>> {
+        self.names
+            .and_then(|n| n.resolve(position))
+            .map(|b| b.to_vec())
+    }
+
+    /// Permit `$this->prop` writes in this scope (constructor seeding only).
+    pub fn allow_this_writes(&mut self) {
+        self.allow_this_write = true;
+    }
+
+    fn tick(&mut self) -> Result<(), BailReason> {
+        self.steps += 1;
+        if self.steps > self.max_steps {
+            return Err(BailReason::StepBudget);
+        }
+        Ok(())
+    }
+}
+
+// ─── Control-flow signal ──────────────────────────────────────────────────────
+
+/// What executing a statement/block produced.
+enum Flow {
+    /// Fell through to the next statement.
+    Normal,
+    /// Hit a `return <value>;`.
+    Returned(Value),
+    /// An assertion produced a terminal outcome (first failing assertion → Fail).
+    Asserted(Outcome),
+}
+
+// ─── Public entry: run a method body over the Givens ──────────────────────────
+
+/// Evaluate a test-method body (`block`) over the Given variable bindings,
+/// folding to an [`Outcome`]. The first failing assertion yields `Fail`; running
+/// to the end with no failing assertion yields `Pass`; any unmodelled
+/// construct/value yields `Bailed`.
+pub fn run_method_body(
+    block: &Block,
+    givens: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+) -> Outcome {
+    run_method_body_inner(block, givens, resolver, None, None, None)
+}
+
+/// Like [`run_method_body`] but with the body file's resolved-names table attached
+/// so `new ClassName` / `ClassName::m()` resolve to a FQCN (Inc-3), plus the FQCN
+/// of the class declaring the test-method body (round 18) so property reads in the
+/// body enforce PHP visibility from the right scope.
+pub fn run_method_body_with_names(
+    block: &Block,
+    givens: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+    source: &[u8],
+    current_class: Option<&[u8]>,
+) -> Outcome {
+    run_method_body_inner(
+        block,
+        givens,
+        resolver,
+        Some(names),
+        Some(source),
+        current_class,
+    )
+}
+
+fn run_method_body_inner(
+    block: &Block,
+    givens: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: Option<&mago_names::ResolvedNames>,
+    source: Option<&[u8]>,
+    current_class: Option<&[u8]>,
+) -> Outcome {
+    let mut scope = Scope::new(givens, resolver);
+    if let Some(n) = names {
+        scope = scope.with_names(n);
+    }
+    if let Some(s) = source {
+        scope = scope.with_source(s);
+    }
+    if let Some(c) = current_class {
+        scope = scope.with_current_class(c.to_vec());
+    }
+    match exec_statements(block.statements.iter(), &mut scope) {
+        Ok(Flow::Asserted(outcome)) => outcome,
+        // Body completed (or returned) with no failing assertion → Pass.
+        Ok(Flow::Normal) | Ok(Flow::Returned(_)) => Outcome::Pass,
+        Err(reason) => Outcome::Bailed(reason),
+    }
+}
+
+/// Evaluate a (non-test) function/method body over its bound parameters and
+/// return its `return`ed [`Value`]. This is the substitution primitive used by
+/// the [`CallResolver`] (Task 5) to inline a user function: a body with no
+/// `return` yields `Null` (PHP semantics). An assertion inside such a body is not
+/// expected; if one appears, it is treated as a normal expression by the caller.
+pub fn run_body_returning(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+) -> Result<Value, BailReason> {
+    run_body_returning_inner(block, bindings, resolver, None, None, None)
+}
+
+/// Like [`run_body_returning`] but with the body file's resolved-names table
+/// attached (Inc-3 class-name resolution inside an inlined body) plus the body
+/// file's source (so a closure literal RETURNED from this body owns its bytes)
+/// and the body's declaring class, if any (round 18 — `None` for a free
+/// function), so property reads enforce PHP visibility from the right scope.
+pub fn run_body_returning_with_names(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+    source: &[u8],
+    current_class: Option<&[u8]>,
+) -> Result<Value, BailReason> {
+    run_body_returning_inner(
+        block,
+        bindings,
+        resolver,
+        Some(names),
+        Some(source),
+        current_class,
+    )
+}
+
+fn run_body_returning_inner(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: Option<&mago_names::ResolvedNames>,
+    source: Option<&[u8]>,
+    current_class: Option<&[u8]>,
+) -> Result<Value, BailReason> {
+    let mut scope = Scope::new(bindings, resolver);
+    if let Some(n) = names {
+        scope = scope.with_names(n);
+    }
+    if let Some(s) = source {
+        scope = scope.with_source(s);
+    }
+    if let Some(c) = current_class {
+        scope = scope.with_current_class(c.to_vec());
+    }
+    match exec_statements(block.statements.iter(), &mut scope)? {
+        Flow::Returned(v) => Ok(v),
+        // Fell off the end with no `return` → PHP returns null.
+        Flow::Normal => Ok(Value::Null),
+        // An assertion inside an inlined helper is not modelled here.
+        Flow::Asserted(_) => Err(BailReason::UnsupportedConstruct(
+            "assertion inside an inlined function body".into(),
+        )),
+    }
+}
+
+/// Evaluate a single expression to a [`Value`] in the given scope. Used by the
+/// substitution layer to compute a parameter's default-value expression.
+pub fn eval_default(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
+    eval_expr(expr, scope)
+}
+
+/// PHP coerces an inlined body's `return` value to the declared SCALAR return type
+/// (`: string`/`int`/`float`/`bool`) under weak typing — e.g. `function f(): string
+/// { return true; }` returns `"1"`, not `true`. The reducer does not model this
+/// coercion, so when a bare scalar return hint does not already match the returned
+/// value's type, BAIL (fail-closed) rather than return the un-coerced value — that
+/// was the symfony `LazyString::resolve(): string` false-FAIL. A non-scalar hint
+/// (class, void, mixed, …) needs no coercion and is left alone; `?scalar` and
+/// `scalar|…` unions are unwrapped so the wrapped scalar member still bails.
+pub fn bail_if_scalar_return_coerces(
+    hint: Option<&mago_syntax::ast::ast::function_like::r#return::FunctionLikeReturnTypeHint>,
+    value: &Value,
+) -> Result<(), BailReason> {
+    let Some(rt) = hint else {
+        return Ok(());
+    };
+    bail_if_scalar_hint_coerces(&rt.hint, value, "return")
+}
+
+/// Shared scalar-coercion guard for a declared type `hint` against a runtime
+/// `value` (`site` names the boundary, for the bail message). PHP coerces a scalar
+/// value to a declared scalar type at these boundaries (weak mode) or throws
+/// `TypeError` (strict) — neither is modelled, so any mismatch BAILS (fail-closed,
+/// correct in both modes). The check unwraps `?scalar` (nullable) and descends
+/// `scalar|…` unions / `scalar&…` intersections so a wrapped scalar member is still
+/// enforced.
+///
+/// # The enumerated SCALAR-coercion sink set (round 3 completeness invariant)
+///
+/// EVERY value that crosses a typed scalar boundary MUST pass through this guard
+/// (or its [`OwnedScalarHint`] mirror) before being stored/used. Adding a new typed
+/// scalar boundary REQUIRES adding it to this list AND a bails+no-over-bail test
+/// pair in `subst::tests` (module-level `Round 3: scalar-coercion sink matrix`):
+///
+/// 1. **Named-function / method PARAM** — `subst::bail_if_scalar_param_coerces`
+///    (`bind_params`, `bind_method_params`, constructor param bind).
+/// 2. **Named-function / method RETURN** — [`bail_if_scalar_return_coerces`]
+///    (`inline_function`, `inline_method`).
+/// 3. **Typed PROPERTY WRITE** `$this->prop = rhs` — [`eval_property_assignment`]
+///    via the [`OwnedScalarHint`] carried in [`Scope::prop_hints`] (round 3 Task A).
+/// 4. **Typed PROPERTY DEFAULT** `public float $x = 5;` —
+///    `subst::seed_plain_property_defaults` (+ the tolerant test-case variant).
+/// 5. **Promoted CONSTRUCTOR PARAM** — covered by sink #1 (the promoted param IS
+///    the property; `run_constructor` also records its hint for later body writes).
+/// 6. **CLOSURE / ARROW PARAM** (incl. the default-value branch) —
+///    [`invoke_parsed_closure`] (round 3 Task C).
+/// 7. **CLOSURE / ARROW RETURN** — [`invoke_parsed_closure`] (round 3 Task C).
+///
+/// Fail-closed sinks that are UNREACHABLE today (no guard needed — the construct
+/// bails before any scalar crosses): typed class CONSTANTS (`const int X = …` are
+/// not evaluated — a class-const read bails), STATIC typed properties (bail in the
+/// seeding path), and property HOOKS (bail). See Task D notes at those sites.
+pub fn bail_if_scalar_hint_coerces(
+    hint: &mago_syntax::ast::ast::type_hint::Hint,
+    value: &Value,
+    site: &str,
+) -> Result<(), BailReason> {
+    use mago_syntax::ast::ast::type_hint::Hint;
+
+    match hint {
+        // `?T`: a genuine null needs no coercion; otherwise apply the check to `T`.
+        Hint::Nullable(n) => {
+            if matches!(value, Value::Null) {
+                Ok(())
+            } else {
+                bail_if_scalar_hint_coerces(n.hint, value, site)
+            }
+        }
+        // A union / intersection coerces a SCALAR value unless it already matches a
+        // member exactly. PHP only scalar-coerces a scalar value, so a non-scalar
+        // value (object/array/closure) never undergoes scalar coercion here → Ok.
+        // For a scalar value: if ANY member is a bare scalar and the value matches
+        // NONE of the members exactly, PHP would coerce → BAIL. A value that already
+        // equals a member — a bare scalar (`int`), OR a literal type
+        // (`false`/`true`/`null`, e.g. `array_search(): int|string|false` returning
+        // `false`) — needs no coercion. If no member is a bare scalar, no scalar
+        // coercion is possible → leave alone.
+        Hint::Union(_) | Hint::Intersection(_) => {
+            if !is_scalar_value(value) {
+                return Ok(());
+            }
+            let mut saw_scalar_member = false;
+            let mut matched = false;
+            for_each_hint_leaf(hint, &mut |leaf| {
+                if bare_scalar_hint_matches(leaf, value) == Some(false) {
+                    saw_scalar_member = true;
+                }
+                if value_matches_hint_member(leaf, value) {
+                    matched = true;
+                }
+            });
+            if saw_scalar_member && !matched {
+                Err(BailReason::UnsupportedConstruct(format!(
+                    "scalar {site}-type coercion ({} on a {} value) not modelled",
+                    scalar_hint_name(hint),
+                    value.type_name(),
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        // A bare scalar hint: bail unless the value's type already matches exactly.
+        _ => match bare_scalar_hint_matches(hint, value) {
+            Some(true) | None => Ok(()),
+            Some(false) => Err(BailReason::UnsupportedConstruct(format!(
+                "scalar {site}-type coercion ({} on a {} value) not modelled",
+                scalar_hint_name(hint),
+                value.type_name(),
+            ))),
+        },
+    }
+}
+
+/// For a BARE scalar hint, `Some(true)` if it matches `value`'s type exactly,
+/// `Some(false)` if it is a bare scalar that does NOT match; `None` if `hint` is
+/// not a bare scalar (no scalar coercion is implied by it).
+fn bare_scalar_hint_matches(
+    hint: &mago_syntax::ast::ast::type_hint::Hint,
+    value: &Value,
+) -> Option<bool> {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    Some(match hint {
+        Hint::String(_) => matches!(value, Value::Str(_)),
+        Hint::Integer(_) => matches!(value, Value::Int(_)),
+        Hint::Float(_) => matches!(value, Value::Float(_)),
+        Hint::Bool(_) => matches!(value, Value::Bool(_)),
+        _ => return None,
+    })
+}
+
+/// Whether a SCALAR `value` ALREADY satisfies a single union/intersection member
+/// `leaf` with no coercion. Covers bare scalars (`int`→`Int`) and the literal types
+/// `true`/`false`/`null` (so `array_search(): int|string|false` returning `false`
+/// is a clean member match, not a coercion). `mixed` accepts anything. Any other
+/// member (class, array, callable, object, …) cannot be matched BY A SCALAR value,
+/// so it never counts as a match here — the caller only reaches this with a scalar
+/// value, and the bail decision still requires a non-matching bare-scalar member.
+fn value_matches_hint_member(leaf: &mago_syntax::ast::ast::type_hint::Hint, value: &Value) -> bool {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    match leaf {
+        Hint::String(_) | Hint::Integer(_) | Hint::Float(_) | Hint::Bool(_) => {
+            bare_scalar_hint_matches(leaf, value) == Some(true)
+        }
+        Hint::True(_) => matches!(value, Value::Bool(true)),
+        Hint::False(_) => matches!(value, Value::Bool(false)),
+        Hint::Null(_) => matches!(value, Value::Null),
+        // `mixed` accepts any value, including a scalar → a clean match, no coercion.
+        Hint::Mixed(_) => true,
+        // Any other member (class / array / callable / object / iterable / …) cannot
+        // be satisfied by a scalar value → not a match (fail-closed for the bail).
+        _ => false,
+    }
+}
+
+/// Whether `value` is a PHP scalar (the only values PHP scalar-coerces). Object,
+/// closure and array values are never the subject of scalar coercion.
+fn is_scalar_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Null | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+    )
+}
+
+/// Visit every leaf hint of a (possibly nested) union / intersection tree, calling
+/// `f` on each non-composite leaf. Nullable wrappers are descended too.
+fn for_each_hint_leaf<'a>(
+    hint: &'a mago_syntax::ast::ast::type_hint::Hint,
+    f: &mut impl FnMut(&'a mago_syntax::ast::ast::type_hint::Hint),
+) {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    match hint {
+        Hint::Union(u) => {
+            for_each_hint_leaf(u.left, f);
+            for_each_hint_leaf(u.right, f);
+        }
+        Hint::Intersection(i) => {
+            for_each_hint_leaf(i.left, f);
+            for_each_hint_leaf(i.right, f);
+        }
+        Hint::Nullable(n) => for_each_hint_leaf(n.hint, f),
+        Hint::Parenthesized(p) => for_each_hint_leaf(p.hint, f),
+        leaf => f(leaf),
+    }
+}
+
+/// Display name for a scalar coercion bail message. For a composite hint it names
+/// the kind; for a bare scalar it names the scalar type.
+fn scalar_hint_name(hint: &mago_syntax::ast::ast::type_hint::Hint) -> &'static str {
+    use mago_syntax::ast::ast::type_hint::Hint;
+    match hint {
+        Hint::String(_) => "string",
+        Hint::Integer(_) => "int",
+        Hint::Float(_) => "float",
+        Hint::Bool(_) => "bool",
+        Hint::Nullable(_) => "nullable scalar",
+        Hint::Union(_) => "scalar union",
+        Hint::Intersection(_) => "scalar intersection",
+        _ => "scalar",
+    }
+}
+
+/// One leaf of a type hint, classified for scalar-coercion purposes only. Mirrors
+/// the cases `value_matches_hint_member` / `bare_scalar_hint_matches` test, in an
+/// OWNED form so a property's declared hint can be carried out of the arena-scoped
+/// AST (`with_program`) into the by-value [`Scope`] and re-checked at the lazy
+/// `$this->prop = …` write site — see [`OwnedScalarHint`] and Task A (round 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarLeaf {
+    Int,
+    Float,
+    Bool,
+    Str,
+    /// A literal member (`true`/`false`/`null`) — matches one value, never coerces.
+    LitTrue,
+    LitFalse,
+    LitNull,
+    /// `mixed` — matches anything, so it suppresses any coercion bail.
+    Mixed,
+    /// Any non-scalar, non-mixed member (class / array / callable / …) — a scalar
+    /// value can never match it, and it is not itself a coercing bare scalar.
+    Other,
+}
+
+impl ScalarLeaf {
+    /// The bare-scalar classification mirror of [`bare_scalar_hint_matches`]:
+    /// `Some(true)` exact-match, `Some(false)` non-matching bare scalar, `None`
+    /// not a bare scalar.
+    fn bare_scalar_matches(self, value: &Value) -> Option<bool> {
+        Some(match self {
+            ScalarLeaf::Str => matches!(value, Value::Str(_)),
+            ScalarLeaf::Int => matches!(value, Value::Int(_)),
+            ScalarLeaf::Float => matches!(value, Value::Float(_)),
+            ScalarLeaf::Bool => matches!(value, Value::Bool(_)),
+            _ => return None,
+        })
+    }
+
+    /// The member-match mirror of [`value_matches_hint_member`].
+    fn matches_member(self, value: &Value) -> bool {
+        match self {
+            ScalarLeaf::Int | ScalarLeaf::Float | ScalarLeaf::Bool | ScalarLeaf::Str => {
+                self.bare_scalar_matches(value) == Some(true)
+            }
+            ScalarLeaf::LitTrue => matches!(value, Value::Bool(true)),
+            ScalarLeaf::LitFalse => matches!(value, Value::Bool(false)),
+            ScalarLeaf::LitNull => matches!(value, Value::Null),
+            ScalarLeaf::Mixed => true,
+            ScalarLeaf::Other => false,
+        }
+    }
+
+    fn of_hint(hint: &mago_syntax::ast::ast::type_hint::Hint) -> Self {
+        use mago_syntax::ast::ast::type_hint::Hint;
+        match hint {
+            Hint::Integer(_) => ScalarLeaf::Int,
+            Hint::Float(_) => ScalarLeaf::Float,
+            Hint::Bool(_) => ScalarLeaf::Bool,
+            Hint::String(_) => ScalarLeaf::Str,
+            Hint::True(_) => ScalarLeaf::LitTrue,
+            Hint::False(_) => ScalarLeaf::LitFalse,
+            Hint::Null(_) => ScalarLeaf::LitNull,
+            Hint::Mixed(_) => ScalarLeaf::Mixed,
+            _ => ScalarLeaf::Other,
+        }
+    }
+}
+
+/// An OWNED classification of a declared type hint's scalar-coercion behaviour,
+/// built once from a `&Hint` (inside the arena via [`scalar_hint_of`]) so it can be
+/// stored in the by-value [`Scope`] and re-checked when a typed `$this->prop = …`
+/// write executes after the AST has dropped. `leaves` is the flattened set of
+/// union/intersection members (a bare scalar hint is a single leaf); `nullable` is
+/// set for a `?T` wrapper (a genuine `null` value then needs no coercion). The
+/// runtime decision in [`OwnedScalarHint::bail_if_coerces`] applies EXACTLY the
+/// same predicate as [`bail_if_scalar_hint_coerces`].
+#[derive(Debug, Clone)]
+pub struct OwnedScalarHint {
+    leaves: Vec<ScalarLeaf>,
+    nullable: bool,
+    name: &'static str,
+}
+
+/// Classify a declared `&Hint` into an [`OwnedScalarHint`], returning `None` when
+/// the hint implies NO scalar coercion at all (no bare-scalar leaf anywhere) — e.g.
+/// untyped, a pure class/array/callable hint, `void`, `object`. Callers store
+/// `None` as "store verbatim, never bail" (matching the untyped-property contract).
+pub fn scalar_hint_of(hint: &mago_syntax::ast::ast::type_hint::Hint) -> Option<OwnedScalarHint> {
+    let mut leaves = Vec::new();
+    let mut nullable = matches!(hint, mago_syntax::ast::ast::type_hint::Hint::Nullable(_));
+    for_each_hint_leaf(hint, &mut |leaf| {
+        // `for_each_hint_leaf` descends Nullable, so a `?int` shows up as the
+        // `int` leaf; remember the nullable wrapper so a `null` value is exempt.
+        if matches!(leaf, mago_syntax::ast::ast::type_hint::Hint::Null(_)) {
+            nullable = true;
+        }
+        leaves.push(ScalarLeaf::of_hint(leaf));
+    });
+    // No bare-scalar leaf anywhere → this hint can never scalar-coerce a value.
+    let coerces = leaves.iter().any(|l| {
+        matches!(
+            l,
+            ScalarLeaf::Int | ScalarLeaf::Float | ScalarLeaf::Bool | ScalarLeaf::Str
+        )
+    });
+    if !coerces {
+        return None;
+    }
+    Some(OwnedScalarHint {
+        leaves,
+        nullable,
+        name: scalar_hint_name(hint),
+    })
+}
+
+impl OwnedScalarHint {
+    /// Re-apply the scalar-coercion guard at a lazy sink (the typed-property write).
+    /// Same policy as [`bail_if_scalar_hint_coerces`]: a non-scalar value never
+    /// scalar-coerces; a `null` under a nullable hint is exempt; otherwise a scalar
+    /// value that matches NO member exactly while a bare-scalar member exists is a
+    /// coercion → BAIL (fail-closed). `site` names the boundary in the message.
+    pub fn bail_if_coerces(&self, value: &Value, site: &str) -> Result<(), BailReason> {
+        if !is_scalar_value(value) {
+            return Ok(());
+        }
+        if self.nullable && matches!(value, Value::Null) {
+            return Ok(());
+        }
+        // Exactly the union/bare predicate of `bail_if_scalar_hint_coerces`: a
+        // bare-scalar member exists, AND the value matches NO member → coercion.
+        let saw_scalar_member = self
+            .leaves
+            .iter()
+            .any(|l| l.bare_scalar_matches(value) == Some(false));
+        let matched = self.leaves.iter().any(|l| l.matches_member(value));
+        if saw_scalar_member && !matched {
+            Err(BailReason::UnsupportedConstruct(format!(
+                "scalar {site}-type coercion ({} on a {} value) not modelled",
+                self.name,
+                value.type_name(),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Inline a **constructor** body to seed a fresh `$this` record (Task B). The
+/// `bindings` carry `this` (the partially-seeded object: promoted params + plain
+/// literal defaults already filled) plus the constructor's parameters. Property
+/// writes are PERMITTED here (seeding); the body runs and the mutated `$this`
+/// record is returned. A `return` inside a constructor is ignored by PHP, so we
+/// always return the `$this` record.
+pub fn run_ctor_body(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+) -> Result<Value, BailReason> {
+    run_ctor_body_inner(
+        block,
+        bindings,
+        resolver,
+        None,
+        None,
+        HashMap::new(),
+        HashSet::new(),
+        None,
+    )
+}
+
+/// Like [`run_ctor_body`] but with the body file's resolved-names table attached
+/// (so a constructor/setUp body that does `new Other(...)` resolves the FQCN) plus
+/// the body file's source (so a closure literal stored into `$this` here owns its
+/// bytes — Inc-4 Task 1), the receiver class's declared scalar property hints
+/// (round 3 Task A — so a typed `$this->prop = …` write re-checks scalar coercion),
+/// its `readonly` property names (round 17 fix 4 — a body write to one bails) and
+/// the ctor/setUp's DECLARING class (round 18 — property reads in the body enforce
+/// PHP visibility from that scope).
+#[allow(clippy::too_many_arguments)]
+pub fn run_ctor_body_with_names(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+    source: &[u8],
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    readonly_props: HashSet<Vec<u8>>,
+    declaring_class: &[u8],
+) -> Result<Value, BailReason> {
+    run_ctor_body_inner(
+        block,
+        bindings,
+        resolver,
+        Some(names),
+        Some(source),
+        prop_hints,
+        readonly_props,
+        Some(declaring_class),
+    )
+}
+
+/// Run an INSTANCE method body (Inc-5 Task 3) over its bound params + `$this`,
+/// with `$this->prop = …` writes PERMITTED, returning BOTH the method's return
+/// value (PHP returns null when the body falls off the end) AND the final `$this`
+/// record (which the caller diffs against the input to detect mutation). The
+/// receiver class's scalar property hints re-check coercion at a typed `$this->prop`
+/// write (round 3 Task A), its `readonly` names bail a body write (round 18 — a
+/// method write to a readonly prop is PHP's "Cannot modify readonly property"
+/// Error; the ctor/setUp paths already bailed, the dispatch path did not), and the
+/// method's DECLARING class scopes property-read visibility (round 18). An
+/// assertion inside a non-test method body bails.
+#[allow(clippy::too_many_arguments)]
+pub fn run_method_with_this_writes(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: &mago_names::ResolvedNames,
+    source: &[u8],
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    readonly_props: HashSet<Vec<u8>>,
+    declaring_class: &[u8],
+) -> Result<(Value, Value), BailReason> {
+    let mut scope = Scope::new(bindings, resolver)
+        .with_prop_hints(prop_hints)
+        .with_readonly_props(readonly_props)
+        .with_current_class(declaring_class.to_vec())
+        .with_names(names)
+        .with_source(source);
+    scope.allow_this_writes();
+    let ret = match exec_statements(block.statements.iter(), &mut scope)? {
+        Flow::Returned(v) => v,
+        Flow::Normal => Value::Null,
+        Flow::Asserted(_) => {
+            return Err(BailReason::UnsupportedConstruct(
+                "assertion inside an inlined method body".into(),
+            ))
+        }
+    };
+    let final_this = scope
+        .vars
+        .remove(b"this".as_slice())
+        .ok_or_else(|| BailReason::Other("instance method lost its \\$this".into()))?;
+    Ok((ret, final_this))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ctor_body_inner(
+    block: &Block,
+    bindings: HashMap<Vec<u8>, Value>,
+    resolver: &dyn CallResolver,
+    names: Option<&mago_names::ResolvedNames>,
+    source: Option<&[u8]>,
+    prop_hints: HashMap<Vec<u8>, OwnedScalarHint>,
+    readonly_props: HashSet<Vec<u8>>,
+    declaring_class: Option<&[u8]>,
+) -> Result<Value, BailReason> {
+    let mut scope = Scope::new(bindings, resolver)
+        .with_prop_hints(prop_hints)
+        .with_readonly_props(readonly_props);
+    if let Some(n) = names {
+        scope = scope.with_names(n);
+    }
+    if let Some(s) = source {
+        scope = scope.with_source(s);
+    }
+    if let Some(c) = declaring_class {
+        scope = scope.with_current_class(c.to_vec());
+    }
+    scope.allow_this_writes();
+    match exec_statements(block.statements.iter(), &mut scope)? {
+        // Whatever the body did (returned early or fell through), the constructed
+        // value is the (possibly mutated) `$this` record.
+        Flow::Normal | Flow::Returned(_) => scope
+            .vars
+            .remove(b"this".as_slice())
+            .ok_or_else(|| BailReason::Other("constructor lost its \\$this".into())),
+        Flow::Asserted(_) => Err(BailReason::UnsupportedConstruct(
+            "assertion inside a constructor body".into(),
+        )),
+    }
+}
+
+/// Build a `Value::Object` from a class name and seed props directly (no body) —
+/// used when a class has promoted params + an empty constructor body, or no
+/// constructor at all.
+pub fn make_object(class: Vec<u8>, props: Vec<(Vec<u8>, Value)>) -> Value {
+    // A freshly constructed object is uniquely owned (not yet aliased) — Inc-5
+    // Task 3. The alias flag is set later, the moment a second reference to it
+    // could arise (assignment copy, argument passing, array/property storage).
+    Value::Object {
+        class,
+        props,
+        aliased: false,
+    }
+}
+
+// ─── Statement execution ──────────────────────────────────────────────────────
+
+fn exec_statements<'a, I>(stmts: I, scope: &mut Scope) -> Result<Flow, BailReason>
+where
+    I: IntoIterator<Item = &'a Statement<'a>>,
+{
+    for stmt in stmts {
+        match exec_stmt(stmt, scope)? {
+            Flow::Normal => {}
+            other => return Ok(other),
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+fn exec_stmt(stmt: &Statement, scope: &mut Scope) -> Result<Flow, BailReason> {
+    scope.tick()?;
+    match stmt {
+        Statement::Expression(es) => {
+            // An expression statement may BE an assertion call. A PASSING
+            // assertion falls through to the next statement; only a FAILING
+            // assertion is terminal (first failure wins).
+            if let Some(outcome) = try_assertion(es.expression, scope)? {
+                return Ok(match outcome {
+                    Outcome::Pass => Flow::Normal,
+                    fail_or_bail => Flow::Asserted(fail_or_bail),
+                });
+            }
+            eval_expr(es.expression, scope)?;
+            Ok(Flow::Normal)
+        }
+        Statement::Return(ret) => {
+            let v = match ret.value {
+                Some(e) => eval_expr(e, scope)?,
+                None => Value::Null,
+            };
+            Ok(Flow::Returned(v))
+        }
+        Statement::Block(b) => exec_statements(b.statements.iter(), scope),
+        Statement::If(if_stmt) => exec_if(if_stmt, scope),
+        Statement::While(w) => exec_while(w, scope),
+        Statement::For(f) => exec_for(f, scope),
+        Statement::Foreach(f) => exec_foreach(f, scope),
+        other => Err(BailReason::UnsupportedConstruct(format!(
+            "statement: {}",
+            stmt_kind(other)
+        ))),
+    }
+}
+
+fn stmt_kind(s: &Statement) -> &'static str {
+    match s {
+        Statement::Switch(_) => "switch",
+        Statement::Echo(_) => "echo",
+        Statement::Try(_) => "try",
+        _ => "other",
+    }
+}
+
+fn exec_if(
+    if_stmt: &mago_syntax::ast::ast::control_flow::r#if::If,
+    scope: &mut Scope,
+) -> Result<Flow, BailReason> {
+    use mago_syntax::ast::ast::control_flow::r#if::IfBody;
+    let cond = eval_expr(if_stmt.condition, scope)?;
+    match &if_stmt.body {
+        IfBody::Statement(body) => {
+            if cond.to_bool() {
+                return exec_stmt(body.statement, scope);
+            }
+            for clause in body.else_if_clauses.iter() {
+                let c = eval_expr(clause.condition, scope)?;
+                if c.to_bool() {
+                    return exec_stmt(clause.statement, scope);
+                }
+            }
+            if let Some(else_clause) = &body.else_clause {
+                return exec_stmt(else_clause.statement, scope);
+            }
+            Ok(Flow::Normal)
+        }
+        IfBody::ColonDelimited(_) => Err(BailReason::UnsupportedConstruct(
+            "alternative (colon) if syntax".into(),
+        )),
+    }
+}
+
+fn exec_while(
+    w: &mago_syntax::ast::ast::r#loop::r#while::While,
+    scope: &mut Scope,
+) -> Result<Flow, BailReason> {
+    use mago_syntax::ast::ast::r#loop::r#while::WhileBody;
+    loop {
+        scope.tick()?;
+        let cond = eval_expr(w.condition, scope)?;
+        if !cond.to_bool() {
+            break;
+        }
+        let flow = match &w.body {
+            WhileBody::Statement(s) => exec_stmt(s, scope)?,
+            WhileBody::ColonDelimited(_) => {
+                return Err(BailReason::UnsupportedConstruct(
+                    "alternative (colon) while syntax".into(),
+                ))
+            }
+        };
+        match flow {
+            Flow::Normal => {}
+            // `break`/`continue` are not modelled; a return/assert propagates.
+            other => return Ok(other),
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+/// C-style `for (init; cond; step) body`. Same step-budget guard as `while` →
+/// a runaway loop bails (never hangs). PHP allows comma-separated init/step
+/// expressions and a comma-separated condition list whose LAST element is the
+/// truthiness test (gold-tested vs `php -r`); an EMPTY condition is always-true.
+/// `break`/`continue` inside the body are not modelled — a `return`/assertion
+/// propagates, but a `break`-relying loop would mis-run, so the loop's body is
+/// executed via `exec_stmt` whose unmodelled `break` bails (fail-closed).
+fn exec_for(
+    f: &mago_syntax::ast::ast::r#loop::r#for::For,
+    scope: &mut Scope,
+) -> Result<Flow, BailReason> {
+    use mago_syntax::ast::ast::r#loop::r#for::ForBody;
+
+    // init: evaluate every initialization expression once, in order.
+    for init in f.initializations.iter() {
+        eval_expr(init, scope)?;
+    }
+
+    loop {
+        scope.tick()?;
+        // condition: PHP evaluates ALL condition expressions; the loop continues
+        // iff the LAST one is truthy. An empty condition list is always-true.
+        let mut keep_going = true;
+        let mut last: Option<Value> = None;
+        for cond in f.conditions.iter() {
+            last = Some(eval_expr(cond, scope)?);
+        }
+        if let Some(v) = last {
+            keep_going = v.to_bool();
+        }
+        if !keep_going {
+            break;
+        }
+
+        let flow = match &f.body {
+            ForBody::Statement(s) => exec_stmt(s, scope)?,
+            ForBody::ColonDelimited(body) => {
+                let mut acc = Flow::Normal;
+                for s in body.statements.iter() {
+                    match exec_stmt(s, scope)? {
+                        Flow::Normal => {}
+                        other => {
+                            acc = other;
+                            break;
+                        }
+                    }
+                }
+                acc
+            }
+        };
+        match flow {
+            Flow::Normal => {}
+            // `break`/`continue` are not modelled; a return/assert propagates.
+            other => return Ok(other),
+        }
+
+        // step: evaluate every increment expression once, in order.
+        for step in f.increments.iter() {
+            eval_expr(step, scope)?;
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+fn exec_foreach(
+    f: &mago_syntax::ast::ast::r#loop::foreach::Foreach,
+    scope: &mut Scope,
+) -> Result<Flow, BailReason> {
+    use mago_syntax::ast::ast::r#loop::foreach::{ForeachBody, ForeachTarget};
+
+    let subject = eval_expr(f.expression, scope)?;
+    let Value::Arr(items) = subject else {
+        return Err(BailReason::TypeError(format!(
+            "foreach over non-array ({})",
+            subject.type_name()
+        )));
+    };
+
+    for (key, val) in items {
+        scope.tick()?;
+        // Aliasing defense-in-depth (Round 6): a non-reference foreach binds a COPY
+        // of each element, but for an OBJECT element PHP copies the HANDLE — the
+        // array still holds the same instance, so the loop variable aliases it.
+        // Mark each bound object aliased so a mutating method in the loop body bails
+        // (a `foreach (&$v)` by-ref target would already bail upstream). Fail-closed.
+        let mut val = val;
+        val.mark_aliased();
+        match &f.target {
+            ForeachTarget::Value(t) => {
+                bind_lvalue(t.value, val, scope)?;
+            }
+            ForeachTarget::KeyValue(t) => {
+                let key_val = match key {
+                    ArrayKey::Int(i) => Value::Int(i),
+                    ArrayKey::Str(s) => Value::Str(s),
+                };
+                bind_lvalue(t.key, key_val, scope)?;
+                bind_lvalue(t.value, val, scope)?;
+            }
+        }
+        let flow = match &f.body {
+            ForeachBody::Statement(s) => exec_stmt(s, scope)?,
+            ForeachBody::ColonDelimited(_) => {
+                return Err(BailReason::UnsupportedConstruct(
+                    "alternative (colon) foreach syntax".into(),
+                ))
+            }
+        };
+        match flow {
+            Flow::Normal => {}
+            other => return Ok(other),
+        }
+    }
+    Ok(Flow::Normal)
+}
+
+/// Bind a value to a simple `$var` lvalue (foreach targets / assignment targets).
+fn bind_lvalue(target: &Expression, val: Value, scope: &mut Scope) -> Result<(), BailReason> {
+    match target {
+        Expression::Variable(Variable::Direct(v)) => {
+            scope.vars.insert(var_name(v.name), val);
+            Ok(())
+        }
+        _ => Err(BailReason::UnsupportedConstruct(
+            "non-simple lvalue (only $var assignment is modelled)".into(),
+        )),
+    }
+}
+
+/// Strip a leading `$` from a variable token to get the bare name.
+fn var_name(name: &[u8]) -> Vec<u8> {
+    name.strip_prefix(b"$").unwrap_or(name).to_vec()
+}
+
+// ─── Assertion intrinsics ─────────────────────────────────────────────────────
+
+/// If `expr` is a recognized assertion call (`$this->assertSame(...)` or a bare
+/// `assertSame(...)`), evaluate it and return its [`Outcome`]. Returns `Ok(None)`
+/// when `expr` is not an assertion (the caller then evaluates it as a normal
+/// expression).
+fn try_assertion(expr: &Expression, scope: &mut Scope) -> Result<Option<Outcome>, BailReason> {
+    let Expression::Call(call) = expr else {
+        return Ok(None);
+    };
+    let (name, args) = match call {
+        // `$this->assertSame(...)` — the common PHPUnit form.
+        Call::Method(m) => {
+            let mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector::Identifier(id) =
+                &m.method
+            else {
+                return Ok(None);
+            };
+            (id.value, &m.argument_list)
+        }
+        // Bare `assertSame(...)` (e.g. via function import).
+        Call::Function(fc) => match identifier_name(fc.function) {
+            Some(n) => (n, &fc.argument_list),
+            None => return Ok(None),
+        },
+        // `self::assertSame(...)` / `static::` / `parent::` — the static PHPUnit
+        // form (doctrine/collections uses this). Only a self/static/parent receiver
+        // is intercepted: inside a test method these unambiguously target the
+        // test case, so an assertion-named static call is a real assertion. A
+        // static call through a concrete `Foo::` class name is NOT intercepted
+        // (it could be a user static method) and falls through to dispatch.
+        Call::StaticMethod(sm) => {
+            let mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector::Identifier(id) =
+                &sm.method
+            else {
+                return Ok(None);
+            };
+            if !is_self_parent_static(sm.class) {
+                return Ok(None);
+            }
+            (id.value, &sm.argument_list)
+        }
+        _ => return Ok(None),
+    };
+
+    if !is_assertion_name(name) {
+        return Ok(None);
+    }
+
+    let arg_values = eval_arguments(args, scope)?;
+    Ok(Some(run_assertion(name, &arg_values)?))
+}
+
+/// True when a static-call class expression is `self`, `static`, or `parent` —
+/// the only receivers for which an assertion-named static call is unambiguously a
+/// PHPUnit assertion (inside a test method). A concrete class name is not matched.
+///
+/// mago parses these keywords as their own `Expression` variants (not an
+/// `Identifier`), but in some positions a bare `self` may also arrive as a local
+/// identifier — handle both shapes.
+fn is_self_parent_static(class: &Expression) -> bool {
+    if matches!(
+        class,
+        Expression::Self_(_) | Expression::Static(_) | Expression::Parent(_)
+    ) {
+        return true;
+    }
+    match identifier_name(class) {
+        Some(n) => {
+            n.eq_ignore_ascii_case(b"self")
+                || n.eq_ignore_ascii_case(b"static")
+                || n.eq_ignore_ascii_case(b"parent")
+        }
+        None => false,
+    }
+}
+
+fn is_assertion_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"assertSame"
+            | b"assertEquals"
+            | b"assertNotSame"
+            | b"assertNotEquals"
+            | b"assertTrue"
+            | b"assertFalse"
+            | b"assertNull"
+            | b"assertNotNull"
+            | b"assertCount"
+            | b"assertNotCount"
+            | b"assertIsArray"
+    )
+}
+
+/// Evaluate a recognized assertion over its concrete argument values.
+fn run_assertion(name: &[u8], args: &[Value]) -> Result<Outcome, BailReason> {
+    use super::value::{assert_equals, assert_same};
+
+    // A 3rd argument to assertEquals/assertSame is a message (fine) — but a delta
+    // overload (`assertEqualsWithDelta`, or assertEquals with a float delta) is a
+    // float-epsilon assertion we must NOT model.
+    let pass = |ok: bool, desc: &str| {
+        if ok {
+            Outcome::Pass
+        } else {
+            Outcome::Fail(desc.to_string())
+        }
+    };
+
+    Ok(match name {
+        b"assertSame" => {
+            let (e, a) = two_args(args)?;
+            // assertSame on objects is REFERENCE identity (e.g. a static singleton):
+            // the reducer has no heap/identity model → BAIL, never guess (frontier §1).
+            bail_if_object_operand(e, a)?;
+            pass(assert_same(e, a), "assertSame")
+        }
+        b"assertNotSame" => {
+            let (e, a) = two_args(args)?;
+            bail_if_object_operand(e, a)?;
+            pass(!assert_same(e, a), "assertNotSame")
+        }
+        b"assertEquals" => {
+            let (e, a) = two_args(args)?;
+            // assertEquals on a closure is reference identity, and on a mixed
+            // object/non-object pair PHP CONVERTS (truthiness/int/__toString) →
+            // bail rather than let php_loose_eq short-circuit to a false green.
+            bail_if_object_mixed_loose(e, a)?;
+            // The assertEquals/assertNotEquals ORACLE is PHPUnit's comparator
+            // chain (sebastian/comparator), NOT PHP `==` — bail the pair
+            // classes where the two diverge (see `comparator_eq_divergent`).
+            bail_if_comparator_divergent(e, a)?;
+            pass(assert_equals(e, a), "assertEquals")
+        }
+        b"assertNotEquals" => {
+            let (e, a) = two_args(args)?;
+            bail_if_object_mixed_loose(e, a)?;
+            bail_if_comparator_divergent(e, a)?;
+            pass(!assert_equals(e, a), "assertNotEquals")
+        }
+        b"assertTrue" => {
+            let a = one_arg(args)?;
+            // assertTrue requires the value to be strictly `true` (bool), not truthy.
+            pass(matches!(a, Value::Bool(true)), "assertTrue")
+        }
+        b"assertFalse" => {
+            let a = one_arg(args)?;
+            pass(matches!(a, Value::Bool(false)), "assertFalse")
+        }
+        b"assertNull" => {
+            let a = one_arg(args)?;
+            pass(matches!(a, Value::Null), "assertNull")
+        }
+        b"assertNotNull" => {
+            let a = one_arg(args)?;
+            pass(!matches!(a, Value::Null), "assertNotNull")
+        }
+        b"assertCount" => {
+            let (expected, haystack) = two_args(args)?;
+            pass(count_matches(expected, haystack)?, "assertCount")
+        }
+        b"assertNotCount" => {
+            let (expected, haystack) = two_args(args)?;
+            pass(!count_matches(expected, haystack)?, "assertNotCount")
+        }
+        b"assertIsArray" => {
+            let a = one_arg(args)?;
+            pass(matches!(a, Value::Arr(_)), "assertIsArray")
+        }
+        _ => {
+            return Err(BailReason::UnknownCall(
+                String::from_utf8_lossy(name).into_owned(),
+            ))
+        }
+    })
+}
+
+/// True iff `v` IS, or (transitively through array elements) CONTAINS, a value
+/// carrying PHP reference identity (an object or a closure). Strict (`===`)
+/// comparison recurses into arrays, so an identity-carrying value at ANY depth
+/// reaches `php_strict_eq`'s unmodelled (Object, Object)/(Closure, Closure)
+/// pairs — the equality-layer mirror of `mark_aliased`'s aggregate recursion.
+fn contains_identity_value(v: &Value) -> bool {
+    match v {
+        Value::Object { .. } | Value::Closure(_) => true,
+        Value::Arr(items) => items.iter().any(|(_, e)| contains_identity_value(e)),
+        _ => false,
+    }
+}
+
+/// True iff `v` IS, or (transitively through array elements / object props)
+/// CONTAINS, a closure. Loose (`==`) comparison recurses into both arrays and
+/// object property records, and closure `==` is reference identity — unmodelled.
+fn contains_closure(v: &Value) -> bool {
+    match v {
+        Value::Closure(_) => true,
+        Value::Arr(items) => items.iter().any(|(_, e)| contains_closure(e)),
+        Value::Object { props, .. } => props.iter().any(|(_, e)| contains_closure(e)),
+        _ => false,
+    }
+}
+
+/// `assertSame`/`assertNotSame`/`===` over objects is REFERENCE identity — the
+/// reducer models structure, not heap identity, so it MUST abstain when either
+/// operand is — or is an array reachably HOLDING — an object/closure (frontier
+/// §1): `[$o] === [$o]` recurses to the unmodelled (Object, Object) pair, so a
+/// top-level-only check false-greens. Scalar/scalar-array strict compares stay
+/// exact. `assertEquals`/`==` stays modelable.
+fn bail_if_object_operand(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if contains_identity_value(a) || contains_identity_value(b) {
+        return Err(BailReason::UnsupportedConstruct(
+            "=== / assertSame on (an aggregate holding) an object (reference identity, no heap model)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Walks both loose-equality operands IN PARALLEL, the same way
+/// [`Value::php_loose_eq`] recurses, and reports `true` when the comparison
+/// reaches a pair the model cannot soundly compute:
+///
+/// - (Closure, anything) at any aligned position → unmodelled (closure `==` is
+///   reference identity; was `bail_if_closure_operand`, subsumed here).
+/// - (Object, non-Object) at any aligned position → unmodelled: PHP CONVERTS
+///   under loose `==` — `$o == true` is object TRUTHINESS (true), `$o == 1`
+///   casts the object to int 1 (+ Notice), `$o == "s"` invokes `__toString`.
+///   Computing `false` here was a false green (`assertFalse($o == true)`
+///   Passed in the reducer while PHPUnit Fails).
+/// - (Object, Object) stays MODELED (structural: per-class + per-prop) — only
+///   the aligned prop pairs `php_loose_eq` actually visits are walked.
+/// - (Arr, Arr) recurses over the key-aligned element pairs `php_loose_eq`
+///   visits. Where `php_loose_eq` short-circuits to `false` WITHOUT comparing
+///   (length or class/prop-set mismatch, missing key), that `false` is the
+///   real PHP answer, so only an unvisited closure forces a bail (preserving
+///   the old closure guard's conservatism).
+/// - (Arr, non-Arr) holding an object/closure anywhere → unmodelled: PHP
+///   array==non-array is false EXCEPT vs bool, where ARRAY TRUTHINESS applies
+///   (`[new C] == true` is TRUE) — bail the whole family rather than guess.
+fn loose_eq_pair_unmodelled(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Closure(_), _) | (_, Closure(_)) => true,
+        (
+            Object {
+                class: ca,
+                props: pa,
+                ..
+            },
+            Object {
+                class: cb,
+                props: pb,
+                ..
+            },
+        ) => {
+            if ca != cb || pa.len() != pb.len() {
+                // php_loose_eq returns false without visiting props — sound
+                // (different classes are never ==) unless a closure hides inside.
+                return contains_closure(a) || contains_closure(b);
+            }
+            pa.iter().any(|(k, av)| {
+                match pb.iter().find(|(bk, _)| bk == k) {
+                    Some((_, bv)) => loose_eq_pair_unmodelled(av, bv),
+                    // Missing prop key: php_loose_eq returns false without
+                    // comparing `av` — sound unless `av` holds a closure.
+                    None => contains_closure(av),
+                }
+            })
+        }
+        (Arr(x), Arr(y)) => {
+            if x.len() != y.len() {
+                return contains_closure(a) || contains_closure(b);
+            }
+            x.iter()
+                .any(|(k, xv)| match y.iter().find(|(yk, _)| yk == k) {
+                    Some((_, yv)) => loose_eq_pair_unmodelled(xv, yv),
+                    None => contains_closure(xv),
+                })
+        }
+        // Mixed pair: object on exactly one side → PHP converts → unmodelled.
+        (Object { .. }, _) | (_, Object { .. }) => true,
+        // Arr vs non-Arr: false in PHP EXCEPT vs bool (array truthiness). If
+        // an object/closure lives anywhere inside the array side, abstain.
+        (Arr(_), _) | (_, Arr(_)) => contains_identity_value(a) || contains_identity_value(b),
+        _ => false,
+    }
+}
+
+/// `==`/`!=`/`assertEquals`/`assertNotEquals` MUST abstain when the comparison
+/// reaches — at ANY depth — a closure (reference identity, Inc-4 Task 4) or a
+/// mixed object/non-object pair (PHP converts: truthiness vs bool, int cast +
+/// Notice, `__toString` vs string; `[new C(1)] == [true]` is TRUE in php8.4).
+/// Pure Object↔Object stays modeled per-class + per-prop, and scalar /
+/// scalar-array loose equality keeps computing exactly.
+fn bail_if_object_mixed_loose(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if loose_eq_pair_unmodelled(a, b) {
+        return Err(BailReason::UnsupportedConstruct(
+            "loose == between object and non-object (PHP converts) or on a closure (reference identity) — not modelled"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `assertEquals`/`assertNotEquals` verdicts come from PHPUnit's COMPARATOR
+/// CHAIN (sebastian/comparator), NOT from PHP `==` — this predicate walks both
+/// operands in parallel (the same aligned pairs `php_loose_eq` visits, like
+/// [`loose_eq_pair_unmodelled`]) and reports `true` on the pair classes where
+/// the chain's verdict diverges from `==`. GOLD-verified against real PHPUnit
+/// 10.5.63 AND 12.5.29 on php8.4 (identical verdicts on every probed pair):
+///
+/// DIVERGENT → bail (assertion sites ONLY — the `==`/`!=` OPERATOR stays
+/// PHP-exact and must NOT route through this):
+/// - (Arr, non-Arr) at any aligned depth: TypeComparator rejects BY TYPE
+///   ('false does not match expected type "array"') where `==` applies array
+///   truthiness — gold: assertEquals([], false) FAILS (`==` true, false green),
+///   assertNotEquals([], false) PASSES (`==` model said Fail, false red),
+///   assertEquals([[]], [false]) FAILS at depth, assertEquals([], null) FAILS.
+///   The whole family bails fail-closed, including `==`-aligned members like
+///   ([], 0) / ([], '') — the comparator's reason is the TYPE, not the value.
+/// - (Str, Str) byte-different but loose-equal: two strings are compared AS
+///   STRINGS by the chain — gold: assertEquals('1', '01'), ('10', '1e1'),
+///   ('1.0', '1'), ('0.5', '.5') ALL FAIL while PHP `==` says true
+///   (numeric-string comparison). Applies at depth: (['1'], ['01']) FAILS.
+///
+/// ALIGNED → keep computing (gold-verified, do not over-bail):
+/// - numeric cross-type: (1, '1'), ('01', 1), (10, '1e1'), (0.5, '0.5'),
+///   (1.0, 1), (0, '0'), ([1], ['1']) — all gold-PASS, `==` true.
+/// - null/bool cross-type: (null, false), (null, 0), ('', null), (true, 1),
+///   (false, '0'), ('', false), (true, 'a'), ([null], [false]), ([true], [1])
+///   — all gold-PASS, `==` true.
+/// - ('abc', 0) and (0, '') gold-FAIL, `==` false in PHP 8 — aligned.
+/// - float near-equality: (0.3, 0.1+0.2), (1.0, 1.0+1e-12), (NAN, NAN) all
+///   gold-FAIL — PHPUnit 10+/12 applies NO float epsilon — aligned with `==`.
+/// - (Object, Object): ObjectComparator is per-class + per-prop loose, aligned
+///   with the structural model; props are recursed so a divergent pair INSIDE
+///   a prop still bails. (Mixed object/non-object never reaches here —
+///   `bail_if_object_mixed_loose` already bailed it.)
+/// - (Arr, Arr) length/key mismatch: both the chain and `==` fail — aligned,
+///   no recursion needed into unvisited elements.
+fn comparator_eq_divergent(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Str(x), Str(y)) => x != y && a.php_loose_eq(b),
+        (Arr(x), Arr(y)) => {
+            if x.len() != y.len() {
+                return false;
+            }
+            x.iter()
+                .any(|(k, xv)| match y.iter().find(|(yk, _)| yk == k) {
+                    Some((_, yv)) => comparator_eq_divergent(xv, yv),
+                    None => false,
+                })
+        }
+        (
+            Object {
+                class: ca,
+                props: pa,
+                ..
+            },
+            Object {
+                class: cb,
+                props: pb,
+                ..
+            },
+        ) => {
+            if ca != cb || pa.len() != pb.len() {
+                return false;
+            }
+            pa.iter()
+                .any(|(k, av)| match pb.iter().find(|(bk, _)| bk == k) {
+                    Some((_, bv)) => comparator_eq_divergent(av, bv),
+                    None => false,
+                })
+        }
+        (Arr(_), _) | (_, Arr(_)) => true,
+        _ => false,
+    }
+}
+
+/// Assertion-mode guard for `assertEquals`/`assertNotEquals` ONLY (the `==`
+/// operator keeps PHP semantics): bail where the PHPUnit comparator chain
+/// diverges from `php_loose_eq` — see [`comparator_eq_divergent`].
+fn bail_if_comparator_divergent(a: &Value, b: &Value) -> Result<(), BailReason> {
+    if comparator_eq_divergent(a, b) {
+        return Err(BailReason::UnsupportedConstruct(
+            "assertEquals oracle is PHPUnit's comparator chain, which diverges from PHP == on this pair (array vs non-array type-reject, or a numeric-string pair compared as strings)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Strict `in_array`/`array_search` compare the needle against every haystack
+/// element with `===`. If the needle OR any (recursively reachable) element is
+/// an object/closure, that compare is reference identity — unmodelled → BAIL.
+/// Scalar/scalar-array strict searches stay exact (doctrine relies on them).
+fn bail_if_identity_in_strict_search(
+    needle: &Value,
+    hay: &[(ArrayKey, Value)],
+) -> Result<(), BailReason> {
+    if contains_identity_value(needle) || hay.iter().any(|(_, v)| contains_identity_value(v)) {
+        return Err(BailReason::UnsupportedConstruct(
+            "strict in_array/array_search over (an aggregate holding) an object (reference identity, no heap model)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Two-argument assertions: exactly `(expected, actual)`. A 3rd *string* arg
+/// (message) is allowed; any 3rd non-string arg (a delta) → bail (FloatDelta).
+fn two_args(args: &[Value]) -> Result<(&Value, &Value), BailReason> {
+    match args {
+        [e, a] => Ok((e, a)),
+        [e, a, Value::Str(_)] => Ok((e, a)), // trailing message string is fine
+        [_, _, _, ..] => Err(BailReason::FloatDelta),
+        _ => Err(BailReason::TypeError(
+            "assertion expects 2 arguments".into(),
+        )),
+    }
+}
+
+/// `assertCount($expected, $haystack)`: true iff `count($haystack) === $expected`.
+/// Only an array haystack is modelled — a `Countable` object's count depends on a
+/// user `count()` method (or an iterator), so an object/non-array haystack BAILS
+/// (fail-closed). The expected value must be an int (a non-int is a PHP TypeError).
+fn count_matches(expected: &Value, haystack: &Value) -> Result<bool, BailReason> {
+    let Value::Arr(items) = haystack else {
+        return Err(BailReason::UnsupportedConstruct(
+            "assertCount over a non-array (Countable/iterator) haystack".into(),
+        ));
+    };
+    let Value::Int(n) = expected else {
+        return Err(BailReason::TypeError(
+            "assertCount expected count is not an int".into(),
+        ));
+    };
+    Ok(items.len() as i64 == *n)
+}
+
+fn one_arg(args: &[Value]) -> Result<&Value, BailReason> {
+    match args {
+        [a] => Ok(a),
+        [a, Value::Str(_)] => Ok(a), // trailing message string
+        _ => Err(BailReason::TypeError("assertion expects 1 argument".into())),
+    }
+}
+
+// ─── Expression evaluation ────────────────────────────────────────────────────
+
+fn eval_expr(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
+    scope.tick()?;
+    match expr {
+        Expression::Literal(lit) => eval_literal(lit),
+        Expression::Parenthesized(p) => eval_expr(p.expression, scope),
+        Expression::Variable(Variable::Direct(v)) => {
+            let key = var_name(v.name);
+            scope.vars.get(&key).cloned().ok_or_else(|| {
+                BailReason::UnboundVariable(String::from_utf8_lossy(&key).into_owned())
+            })
+        }
+        Expression::Variable(_) => Err(BailReason::UnsupportedConstruct(
+            "indirect/nested variable".into(),
+        )),
+        Expression::UnaryPrefix(u) => eval_unary(&u.operator, u.operand, scope),
+        Expression::UnaryPostfix(u) => eval_postfix(u.operand, &u.operator, scope),
+        Expression::Binary(b) => eval_binary(b.lhs, &b.operator, b.rhs, scope),
+        Expression::Assignment(a) => eval_assignment(a, scope),
+        Expression::Conditional(c) => eval_conditional(c, scope),
+        Expression::Array(arr) => eval_array(arr, scope),
+        Expression::LegacyArray(arr) => eval_legacy_array(arr, scope),
+        Expression::Call(call) => eval_call(call, scope),
+        // `new C(args)` (Task B) — resolve C's FQCN and inline its constructor.
+        Expression::Instantiation(inst) => eval_instantiation(inst, scope),
+        // Property/const access. Only `$obj->prop` (read) is modelled (Task D);
+        // static-property / class-constant / null-safe access bail.
+        Expression::Access(access) => eval_access(access, scope),
+        // `$arr[$key]` read over any expression evaluating to an array (Task D).
+        // A BARE read of a missing key bails (PHP would warn) — only `?? default`
+        // (handled in `eval_binary`'s NullCoalesce) tolerates a missing key.
+        Expression::ArrayAccess(aa) => eval_array_access(aa, scope),
+        // A closure / arrow function literal → a `Value::Closure` (Task A).
+        Expression::Closure(c) => make_closure(c, scope),
+        Expression::ArrowFunction(a) => make_arrow(a, scope),
+        other => Err(BailReason::UnsupportedConstruct(format!(
+            "expression: {}",
+            expr_kind(other)
+        ))),
+    }
+}
+
+/// `new C(args)` (Task B): resolve the FQCN (Identifier only — `new $var`/
+/// anonymous classes bail) and ask the resolver to construct the record.
+fn eval_instantiation(
+    inst: &mago_syntax::ast::ast::instantiation::Instantiation,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let class = resolve_class_name_in_scope(inst.class, scope)?;
+    let args = match &inst.argument_list {
+        Some(list) => eval_arguments(list, scope)?,
+        None => Vec::new(),
+    };
+    match scope.resolver.construct(&class, &args)? {
+        Some(v) => Ok(v),
+        None => Err(BailReason::UnknownCall(format!(
+            "new {}",
+            String::from_utf8_lossy(&class)
+        ))),
+    }
+}
+
+/// `$obj->prop` read. The receiver must evaluate to a [`Value::Object`]; the
+/// property name must be a static identifier. A missing property bails (PHP warns
+/// then returns null; under `??` the caller swallows this), a non-object receiver
+/// type-errors, a dynamic selector bails.
+fn eval_property_read(
+    pa: &mago_syntax::ast::ast::access::PropertyAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
+    let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
+        return Err(BailReason::UnsupportedConstruct(
+            "dynamic property selector".into(),
+        ));
+    };
+    let receiver = eval_expr(pa.object, scope)?;
+    let Value::Object { class, props, .. } = &receiver else {
+        return Err(BailReason::TypeError(format!(
+            "property read on non-object ({})",
+            receiver.type_name()
+        )));
+    };
+    // PHP visibility at the READ site (round 18): the record model is
+    // scope-blind, but a private/protected prop read from the wrong class is a
+    // PHP Error (external) or an undefined-property null (parent-private from a
+    // child method) — never the slot's value. The resolver consults the
+    // declared visibility and bails fail-closed; public (the overwhelmingly
+    // common case) and dynamic props pass through untouched.
+    scope.resolver.bail_inaccessible_prop_read(
+        class,
+        prop_id.value,
+        scope.current_class.as_deref(),
+    )?;
+    match props.iter().find(|(k, _)| k.as_slice() == prop_id.value) {
+        Some((_, v)) => {
+            // Aliasing defense-in-depth (Round 6 finding 3): reading a nested
+            // `Value::Object` property yields a SECOND reference to that object —
+            // the parent record still holds it. Our by-value clone of the read
+            // would let a later mutation of the read-out object silently diverge
+            // from the parent's copy. Mark the returned clone aliased (fail-closed).
+            let mut out = v.clone();
+            out.mark_aliased();
+            Ok(out)
+        }
+        // PHP would warn + return null for an undefined property; we bail
+        // (an unseeded prop usually means a default/hook we did not model).
+        None => Err(BailReason::UnsupportedConstruct(format!(
+            "read of unset property ${}",
+            String::from_utf8_lossy(prop_id.value)
+        ))),
+    }
+}
+
+/// `$obj->prop` read (Task D). The receiver must evaluate to a [`Value::Object`];
+/// the property name must be a static identifier. A missing property, a non-object
+/// receiver, static-property / class-constant / null-safe access all BAIL.
+fn eval_access(
+    access: &mago_syntax::ast::ast::access::Access,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::access::Access;
+    match access {
+        Access::Property(pa) => eval_property_read(pa, scope),
+        Access::NullSafeProperty(_) => Err(BailReason::UnsupportedConstruct(
+            "null-safe property access (?->)".into(),
+        )),
+        // Round 3 Task D: a STATIC typed property (`public static int $x`) is never
+        // read here (bail) and its declaration bails in the seeding path → no scalar
+        // ever crosses it. Unreachable sink, already fail-closed (no guard needed).
+        Access::StaticProperty(_) => Err(BailReason::UnsupportedConstruct(
+            "static property access".into(),
+        )),
+        // Inc-5 Task 4: a class constant `Class::CONST` or the `Class::class`
+        // magic constant. Resolved via the names table (+ self/static/parent →
+        // the enclosing `$this`'s class). A computed/enum const bails.
+        Access::ClassConstant(cc) => eval_class_constant(cc, scope),
+    }
+}
+
+/// `Class::CONST` / `Class::class` read (Inc-5 Task 4). `Class::class` folds to the
+/// FQCN string literal; `Class::CONST` resolves the FQCN then asks the resolver to
+/// fold the const's literal initializer (computed/enum → bail). Only an EXPLICIT
+/// named class is resolved — `self::`/`parent::`/`static::` BAIL.
+///
+/// Round 6 soundness fix: `self::`/`parent::` bind to the LEXICAL defining class of
+/// the method, and `static::` to the late-static-bound class. The [`Scope`] carries
+/// no lexical-defining-class context — only the bound `$this`'s RUNTIME class. For a
+/// const (or `::class`) read in a method DECLARED in a parent but CALLED on a child,
+/// folding from the runtime class gives the WRONG class → a false fail (divergence).
+/// With no sound recovery, every self/parent/static-qualified form BAILS (fail-
+/// closed). An explicit `Foo::CONST` / `Foo::class` is unambiguous and still folds.
+fn eval_class_constant(
+    cc: &mago_syntax::ast::ast::access::ClassConstantAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::class_like::member::ClassLikeConstantSelector;
+
+    // self/parent/static-qualified access (incl. `self::class`) has no lexical
+    // defining-class context in the Scope → BAIL before any runtime-class fold.
+    if is_self_parent_static(cc.class) {
+        return Err(BailReason::UnsupportedConstruct(
+            "self/parent/static-qualified class-constant access (no lexical class context)".into(),
+        ));
+    }
+
+    // The constant selector must be a static identifier (dynamic `C::{$x}` bails).
+    let ClassLikeConstantSelector::Identifier(const_id) = &cc.constant else {
+        return Err(BailReason::UnsupportedConstruct(
+            "dynamic class-constant selector".into(),
+        ));
+    };
+    let const_name = const_id.value;
+
+    // Resolve the EXPLICIT named class FQCN (self/parent/static already bailed).
+    let class = resolve_const_class(cc.class, scope)?;
+
+    // The `::class` magic constant → the FQCN as a string (no const lookup).
+    if const_name.eq_ignore_ascii_case(b"class") {
+        return Ok(Value::Str(class));
+    }
+
+    match scope.resolver.resolve_class_constant(&class, const_name)? {
+        Some(v) => Ok(v),
+        None => Err(BailReason::UnknownCall(format!(
+            "{}::{}",
+            String::from_utf8_lossy(&class),
+            String::from_utf8_lossy(const_name)
+        ))),
+    }
+}
+
+/// Resolve the EXPLICIT named class side of a `Class::CONST` access to an FQCN.
+/// `self`/`parent`/`static` are bailed by the caller ([`eval_class_constant`]) —
+/// they bind to the LEXICAL/late-static class, which the [`Scope`] does not carry,
+/// so folding from the runtime `$this` class would diverge (Round 6). This path
+/// therefore only sees an explicit class name; a self/static/parent leak here is
+/// still fail-closed (defensive bail). A dynamic/unresolvable class name bails.
+fn resolve_const_class(expr: &Expression, scope: &Scope) -> Result<Vec<u8>, BailReason> {
+    // Defensive: the caller already bails self/parent/static, but never fold one
+    // here from the runtime class (it would be unsound) — fail-closed instead.
+    if is_self_parent_static(expr) {
+        return Err(BailReason::UnsupportedConstruct(
+            "self/parent/static-qualified class-constant access (no lexical class context)".into(),
+        ));
+    }
+    if let Some(name) = identifier_name(expr) {
+        if let Some(fqcn) = scope.resolve_name_at(expr) {
+            return Ok(fqcn);
+        }
+        return Ok(name.to_vec());
+    }
+    Err(BailReason::UnsupportedConstruct(
+        "dynamic/unresolvable class name in class-constant access".into(),
+    ))
+}
+
+/// `$arr[$key]` read (Task D) over ANY expression evaluating to an array. A bare
+/// read (not under `??`) of a missing key BAILS (PHP would emit a warning + null;
+/// a strict suite could escalate that — fail-closed). Subscripting a non-array
+/// (string-offset, ArrayAccess object) bails. Returns `Ok(None)` from the lookup
+/// when `coalesce` is set and the key is missing OR its value is null (isset
+/// semantics) — the `??` caller then uses the default.
+fn eval_array_access(
+    aa: &mago_syntax::ast::ast::array::ArrayAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    match array_access_lookup(aa, scope, false)? {
+        Some(v) => Ok(v),
+        None => Err(BailReason::UnsupportedConstruct(
+            "read of a missing array key (PHP warning)".into(),
+        )),
+    }
+}
+
+/// Shared subscript lookup. `coalesce=false`: a present key returns `Some(value)`
+/// (even a null value), a missing key returns `None` (caller bails on a bare read).
+/// `coalesce=true` (under `??`): a missing key OR a present-but-null value both
+/// return `None` (isset semantics — `$a[$k] ?? $d` uses `$d` when unset OR null).
+fn array_access_lookup(
+    aa: &mago_syntax::ast::ast::array::ArrayAccess,
+    scope: &mut Scope,
+    coalesce: bool,
+) -> Result<Option<Value>, BailReason> {
+    let receiver = eval_expr(aa.array, scope)?;
+    let Value::Arr(items) = &receiver else {
+        return Err(BailReason::TypeError(format!(
+            "array subscript on a non-array ({})",
+            receiver.type_name()
+        )));
+    };
+    let index = eval_expr(aa.index, scope)?;
+    let key = index
+        .to_array_key()
+        .ok_or_else(|| BailReason::TypeError("array/object used as a subscript key".into()))?;
+    match items.iter().find(|(k, _)| *k == key) {
+        Some((_, v)) => {
+            if coalesce && matches!(v, Value::Null) {
+                Ok(None)
+            } else {
+                // Aliasing defense-in-depth (Inc-5): reading a `Value::Object`
+                // element out of an array yields a SECOND reference to that object
+                // — the array still holds it. Store-time marking (every object
+                // entering a `Value::Arr` is marked at insertion: literal /
+                // assignment stores, and — since the closure-builtin fix — the
+                // `array_map` output push) covers the store side; this
+                // clone-then-mark covers the read side, so the pair makes the
+                // invariant LOCALLY true regardless of which store produced the
+                // array. Symmetric with `eval_property_read`. Only objects are
+                // marked — never arrays-of-scalars (no over-bail on the common
+                // scalar-array read path).
+                let mut out = v.clone();
+                if matches!(out, Value::Object { .. }) {
+                    out.mark_aliased();
+                }
+                Ok(Some(out))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Evaluate the lhs of a `??` with isset semantics: returns `None` when the lhs
+/// is unset/missing (a missing array key, an unset object property) OR evaluates
+/// to `null`; otherwise `Some(value)`. A subscript/property lhs is looked up in
+/// "coalesce mode" so a missing key/prop does NOT bail (the `??` default applies).
+fn eval_coalesce_lhs(lhs: &Expression, scope: &mut Scope) -> Result<Option<Value>, BailReason> {
+    use mago_syntax::ast::ast::access::Access;
+    match lhs {
+        // `$arr[$k] ?? d`: a missing key or a null value → use the default.
+        Expression::ArrayAccess(aa) => array_access_lookup(aa, scope, true),
+        // `$obj->prop ?? d`: an unset (unmodelled) property → use the default
+        // rather than bailing; a null-valued property → use the default too.
+        Expression::Access(Access::Property(pa)) => {
+            match eval_property_read(pa, scope) {
+                Ok(v) => Ok(if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v)
+                }),
+                // An unset property bails in a bare read; under `??` it is "unset"
+                // → use the default. Only the unset-property bail is swallowed;
+                // any other bail (non-object receiver, dynamic selector) propagates.
+                Err(BailReason::UnsupportedConstruct(msg))
+                    if msg.starts_with("read of unset") || msg.starts_with("read of a missing") =>
+                {
+                    Ok(None)
+                }
+                Err(other) => Err(other),
+            }
+        }
+        // Any other lhs: normal eval, treat null as "use default".
+        _ => {
+            let v = eval_expr(lhs, scope)?;
+            Ok(if matches!(v, Value::Null) {
+                None
+            } else {
+                Some(v)
+            })
+        }
+    }
+}
+
+fn expr_kind(e: &Expression) -> &'static str {
+    match e {
+        Expression::ArrayAccess(_) => "array_access",
+        Expression::Access(_) => "property/const_access",
+        Expression::Construct(_) => "language_construct",
+        Expression::Match(_) => "match",
+        _ => "other",
+    }
+}
+
+fn eval_literal(lit: &Literal) -> Result<Value, BailReason> {
+    match lit {
+        Literal::Integer(i) => match i.value {
+            Some(v) => Ok(Value::Int(v as i64)),
+            None => Err(BailReason::UnsupportedConstruct(
+                "integer literal overflow (>i64)".into(),
+            )),
+        },
+        Literal::Float(f) => Ok(Value::Float(*f.value)),
+        Literal::String(s) => match &s.value {
+            Some(v) => Ok(Value::Str(v.to_vec())),
+            None => Err(BailReason::UnsupportedConstruct(
+                "string literal with unresolved escapes".into(),
+            )),
+        },
+        Literal::True(_) => Ok(Value::Bool(true)),
+        Literal::False(_) => Ok(Value::Bool(false)),
+        Literal::Null(_) => Ok(Value::Null),
+    }
+}
+
+fn eval_unary(
+    op: &UnaryPrefixOperator,
+    operand: &Expression,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    match op {
+        UnaryPrefixOperator::Not(_) => Ok(Value::Bool(!eval_expr(operand, scope)?.to_bool())),
+        UnaryPrefixOperator::Negation(_) => php_negate(eval_expr(operand, scope)?),
+        UnaryPrefixOperator::Plus(_) => php_unary_plus(eval_expr(operand, scope)?),
+        // `++$x` / `--$x`: mutate then return the NEW value. Only a simple `$var`
+        // numeric lvalue is modelled (the loop-counter case); string/null
+        // increment has PHP-specific quirks (perl-style string ++, `null++`→1 but
+        // `null--`→null) → bail there, fail-closed.
+        UnaryPrefixOperator::PreIncrement(_) => incdec_lvalue(operand, true, true, scope),
+        UnaryPrefixOperator::PreDecrement(_) => incdec_lvalue(operand, false, true, scope),
+        UnaryPrefixOperator::IntCast(..) | UnaryPrefixOperator::IntegerCast(..) => {
+            Ok(Value::Int(eval_expr(operand, scope)?.to_int()))
+        }
+        UnaryPrefixOperator::FloatCast(..) | UnaryPrefixOperator::DoubleCast(..) => {
+            Ok(Value::Float(eval_expr(operand, scope)?.to_float()))
+        }
+        UnaryPrefixOperator::BoolCast(..) | UnaryPrefixOperator::BooleanCast(..) => {
+            Ok(Value::Bool(eval_expr(operand, scope)?.to_bool()))
+        }
+        UnaryPrefixOperator::StringCast(..) => {
+            let v = eval_expr(operand, scope)?;
+            v.to_php_string()
+                .map(Value::Str)
+                .ok_or_else(|| BailReason::TypeError("string cast of array".into()))
+        }
+        other => Err(BailReason::UnsupportedConstruct(format!(
+            "unary prefix {:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
+}
+
+/// PHP unary `-`: int → wrapped negate but `-PHP_INT_MIN` overflows to float.
+fn php_negate(v: Value) -> Result<Value, BailReason> {
+    match v {
+        Value::Int(n) => Ok(match n.checked_neg() {
+            Some(r) => Value::Int(r),
+            None => Value::Float(-(n as f64)), // -PHP_INT_MIN → float
+        }),
+        Value::Float(f) => Ok(Value::Float(-f)),
+        Value::Str(_) | Value::Bool(_) | Value::Null => php_negate(coerce_number(&v)),
+        Value::Arr(_) => Err(BailReason::TypeError("negate array".into())),
+        Value::Object { .. } | Value::Closure(_) => {
+            Err(BailReason::TypeError("negate object".into()))
+        }
+    }
+}
+
+fn php_unary_plus(v: Value) -> Result<Value, BailReason> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Ok(v),
+        Value::Str(_) | Value::Bool(_) | Value::Null => Ok(coerce_number(&v)),
+        Value::Arr(_) => Err(BailReason::TypeError("unary + on array".into())),
+        Value::Object { .. } | Value::Closure(_) => {
+            Err(BailReason::TypeError("unary + on object".into()))
+        }
+    }
+}
+
+/// `$x++` / `$x--`: mutate then return the OLD value (postfix).
+fn eval_postfix(
+    operand: &Expression,
+    op: &mago_syntax::ast::ast::unary::UnaryPostfixOperator,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::unary::UnaryPostfixOperator as Op;
+    match op {
+        Op::PostIncrement(_) => incdec_lvalue(operand, true, false, scope),
+        Op::PostDecrement(_) => incdec_lvalue(operand, false, false, scope),
+    }
+}
+
+/// Shared `++`/`--` on a simple `$var` lvalue. `inc` selects increment vs
+/// decrement; `prefix` selects whether the NEW (prefix) or OLD (postfix) value is
+/// returned. Only an Int/Float counter is modelled — a string/null/bool/array
+/// target bails (PHP's perl-style string `++`, `null--`→null, etc. are quirks we
+/// refuse to guess). The target must be a bound `$var`; an unbound one bails.
+fn incdec_lvalue(
+    operand: &Expression,
+    inc: bool,
+    prefix: bool,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let Expression::Variable(Variable::Direct(v)) = operand else {
+        return Err(BailReason::UnsupportedConstruct(
+            "++/-- on a non-simple lvalue".into(),
+        ));
+    };
+    let key = var_name(v.name);
+    let cur =
+        scope.vars.get(&key).cloned().ok_or_else(|| {
+            BailReason::UnboundVariable(String::from_utf8_lossy(&key).into_owned())
+        })?;
+    let new = match &cur {
+        Value::Int(n) => {
+            let stepped = if inc {
+                n.checked_add(1)
+            } else {
+                n.checked_sub(1)
+            };
+            match stepped {
+                Some(r) => Value::Int(r),
+                // PHP_INT_MAX++ → float (overflow→float), like arithmetic.
+                None => Value::Float(if inc {
+                    *n as f64 + 1.0
+                } else {
+                    *n as f64 - 1.0
+                }),
+            }
+        }
+        Value::Float(f) => Value::Float(if inc { f + 1.0 } else { f - 1.0 }),
+        // String/null/bool/array ++/-- have PHP-specific semantics we won't guess.
+        other => {
+            return Err(BailReason::UnsupportedConstruct(format!(
+                "++/-- on a {} (only numeric counters modelled)",
+                other.type_name()
+            )))
+        }
+    };
+    scope.vars.insert(key, new.clone());
+    Ok(if prefix { new } else { cur })
+}
+
+fn eval_binary(
+    lhs: &Expression,
+    op: &BinaryOperator,
+    rhs: &Expression,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use std::cmp::Ordering;
+    // Short-circuiting logical ops evaluate the rhs lazily.
+    match op {
+        BinaryOperator::And(_) => {
+            let l = eval_expr(lhs, scope)?;
+            return Ok(Value::Bool(l.to_bool() && eval_expr(rhs, scope)?.to_bool()));
+        }
+        BinaryOperator::Or(_) => {
+            let l = eval_expr(lhs, scope)?;
+            return Ok(Value::Bool(l.to_bool() || eval_expr(rhs, scope)?.to_bool()));
+        }
+        BinaryOperator::NullCoalesce(_) => {
+            // `??` is isset-based: a missing array key / unset property on the lhs
+            // yields the default WITHOUT a warning (unlike a bare read). So a
+            // subscript/property lhs is evaluated in coalesce mode (missing → None);
+            // any other lhs uses normal eval and we test for Null.
+            let l = eval_coalesce_lhs(lhs, scope)?;
+            return Ok(match l {
+                Some(v) => v,
+                None => eval_expr(rhs, scope)?,
+            });
+        }
+        _ => {}
+    }
+
+    let l = eval_expr(lhs, scope)?;
+    let r = eval_expr(rhs, scope)?;
+    match op {
+        BinaryOperator::Addition(_) => php_add(&l, &r),
+        BinaryOperator::Subtraction(_) => php_arith(&l, &r, i64::checked_sub, |a, b| a - b),
+        BinaryOperator::Multiplication(_) => php_arith(&l, &r, i64::checked_mul, |a, b| a * b),
+        BinaryOperator::Division(_) => php_div(&l, &r),
+        BinaryOperator::Modulo(_) => php_mod(&l, &r),
+        BinaryOperator::Exponentiation(_) => php_pow(&l, &r),
+        BinaryOperator::StringConcat(_) => php_concat(&l, &r),
+        BinaryOperator::Equal(_) => {
+            // `==` on a closure is reference identity, and on a mixed
+            // object/non-object pair PHP converts (no model for either) → bail.
+            bail_if_object_mixed_loose(&l, &r)?;
+            Ok(Value::Bool(l.php_loose_eq(&r)))
+        }
+        BinaryOperator::NotEqual(_) | BinaryOperator::AngledNotEqual(_) => {
+            bail_if_object_mixed_loose(&l, &r)?;
+            Ok(Value::Bool(!l.php_loose_eq(&r)))
+        }
+        // `===`/`!==` over objects is reference identity (frontier §1) → bail.
+        BinaryOperator::Identical(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_strict_eq(&r)))
+        }
+        BinaryOperator::NotIdentical(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(!l.php_strict_eq(&r)))
+        }
+        // Ordering on objects is uncomparable in PHP (and our model would guess) →
+        // bail when either operand is an object.
+        BinaryOperator::LessThan(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_compare(&r) == Ordering::Less))
+        }
+        BinaryOperator::GreaterThan(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_compare(&r) == Ordering::Greater))
+        }
+        BinaryOperator::LessThanOrEqual(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_compare(&r) != Ordering::Greater))
+        }
+        BinaryOperator::GreaterThanOrEqual(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Bool(l.php_compare(&r) != Ordering::Less))
+        }
+        BinaryOperator::Spaceship(_) => {
+            bail_if_object_operand(&l, &r)?;
+            Ok(Value::Int(match l.php_compare(&r) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            }))
+        }
+        other => Err(BailReason::UnsupportedConstruct(format!(
+            "binary operator {:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
+}
+
+// ─── PHP arithmetic with overflow→float (gold-tested) ─────────────────────────
+
+/// Coerce a non-numeric scalar to its PHP numeric value (int or float).
+fn coerce_number(v: &Value) -> Value {
+    match v {
+        Value::Int(_) | Value::Float(_) => v.clone(),
+        Value::Bool(b) => Value::Int(*b as i64),
+        Value::Null => Value::Int(0),
+        Value::Str(s) => match super::value::full_numeric(s) {
+            Some(super::value::NumericString::Int(i)) => Value::Int(i),
+            Some(super::value::NumericString::Float(f)) => Value::Float(f),
+            // PHP 8: a non-numeric string in arithmetic is a TypeError; we abstain.
+            None => Value::Int(v.to_int()),
+        },
+        // Arrays/objects/closures never reach here: every arithmetic/unary path
+        // excludes them and bails first (`php_add`, `arithmetic_operand`,
+        // `php_negate`/`php_unary_plus`).
+        Value::Arr(_) | Value::Object { .. } | Value::Closure(_) => v.clone(),
+    }
+}
+
+/// Returns `true` if a string is a *leading*-numeric but not fully numeric value
+/// — PHP 8 throws on such in arithmetic, so we must bail rather than coerce.
+fn arithmetic_operand(v: &Value) -> Result<Value, BailReason> {
+    match v {
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Null => Ok(coerce_number(v)),
+        Value::Str(s) => match super::value::full_numeric(s) {
+            Some(super::value::NumericString::Int(i)) => Ok(Value::Int(i)),
+            Some(super::value::NumericString::Float(f)) => Ok(Value::Float(f)),
+            None => Err(BailReason::TypeError(
+                "non-numeric string in arithmetic (PHP 8 TypeError)".into(),
+            )),
+        },
+        Value::Arr(_) => Err(BailReason::TypeError("array in arithmetic".into())),
+        // An object/closure in arithmetic is a PHP TypeError (no __toString/numeric
+        // route in v2) — bail fail-closed (frontier §6).
+        Value::Object { .. } | Value::Closure(_) => {
+            Err(BailReason::TypeError("object in arithmetic".into()))
+        }
+    }
+}
+
+/// `+` (numeric; array+array is union — not modelled, bails).
+fn php_add(l: &Value, r: &Value) -> Result<Value, BailReason> {
+    if matches!(l, Value::Arr(_)) || matches!(r, Value::Arr(_)) {
+        return Err(BailReason::UnsupportedConstruct("array union (+)".into()));
+    }
+    php_arith(l, r, i64::checked_add, |a, b| a + b)
+}
+
+/// Generic int/float arithmetic: int op when both int AND no overflow; otherwise
+/// float. PHP overflow→float is modelled via `checked_*` falling back to `f64`.
+fn php_arith(
+    l: &Value,
+    r: &Value,
+    int_op: fn(i64, i64) -> Option<i64>,
+    float_op: fn(f64, f64) -> f64,
+) -> Result<Value, BailReason> {
+    let (a, b) = (arithmetic_operand(l)?, arithmetic_operand(r)?);
+    match (&a, &b) {
+        (Value::Int(x), Value::Int(y)) => Ok(match int_op(*x, *y) {
+            Some(v) => Value::Int(v),
+            None => Value::Float(float_op(*x as f64, *y as f64)), // overflow→float
+        }),
+        _ => Ok(Value::Float(float_op(a.to_float(), b.to_float()))),
+    }
+}
+
+/// `/`: int when both int and the result is exact; otherwise float. /0 bails.
+fn php_div(l: &Value, r: &Value) -> Result<Value, BailReason> {
+    let (a, b) = (arithmetic_operand(l)?, arithmetic_operand(r)?);
+    if let (Value::Int(x), Value::Int(y)) = (&a, &b) {
+        if *y == 0 {
+            return Err(BailReason::DivisionByZero);
+        }
+        if x % y == 0 {
+            return Ok(Value::Int(x / y));
+        }
+        return Ok(Value::Float(*x as f64 / *y as f64));
+    }
+    let (af, bf) = (a.to_float(), b.to_float());
+    if bf == 0.0 {
+        return Err(BailReason::DivisionByZero);
+    }
+    Ok(Value::Float(af / bf))
+}
+
+/// `%`: integer modulo, sign of the dividend (PHP). %0 bails.
+fn php_mod(l: &Value, r: &Value) -> Result<Value, BailReason> {
+    let (a, b) = (
+        arithmetic_operand(l)?.to_int(),
+        arithmetic_operand(r)?.to_int(),
+    );
+    if b == 0 {
+        return Err(BailReason::DivisionByZero);
+    }
+    // i64::MIN % -1 overflows in Rust; PHP yields 0.
+    if a == i64::MIN && b == -1 {
+        return Ok(Value::Int(0));
+    }
+    Ok(Value::Int(a % b))
+}
+
+/// `**`: int when both int, exponent ≥ 0, and the result fits; otherwise float.
+fn php_pow(l: &Value, r: &Value) -> Result<Value, BailReason> {
+    let (a, b) = (arithmetic_operand(l)?, arithmetic_operand(r)?);
+    if let (Value::Int(base), Value::Int(exp)) = (&a, &b) {
+        if *exp >= 0 {
+            if let Ok(e) = u32::try_from(*exp) {
+                if let Some(v) = base.checked_pow(e) {
+                    return Ok(Value::Int(v));
+                }
+            }
+        }
+        // negative exponent or overflow → float
+    }
+    Ok(Value::Float(a.to_float().powf(b.to_float())))
+}
+
+/// `.`: string concatenation (byte-exact); both sides coerced to PHP strings.
+fn php_concat(l: &Value, r: &Value) -> Result<Value, BailReason> {
+    let mut ls = l
+        .to_php_string()
+        .ok_or_else(|| BailReason::TypeError("concat with array".into()))?;
+    let rs = r
+        .to_php_string()
+        .ok_or_else(|| BailReason::TypeError("concat with array".into()))?;
+    ls.extend_from_slice(&rs);
+    Ok(Value::Str(ls))
+}
+
+// ─── Assignment, ternary, arrays, calls ───────────────────────────────────────
+
+fn eval_assignment(
+    a: &mago_syntax::ast::ast::assignment::Assignment,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::assignment::AssignmentOperator as Op;
+
+    // `$this->prop = rhs` (or another `$obj->prop`): a property write. Permitted
+    // ONLY while seeding a constructor's `$this` (frontier §2 — a mutator in any
+    // other body bails, because the by-value model gets aliasing wrong).
+    if let Expression::Access(mago_syntax::ast::ast::access::Access::Property(pa)) = a.lhs {
+        return eval_property_assignment(a, pa, scope);
+    }
+
+    // Only simple `$var <op>= rhs` is modelled (besides the property write above).
+    let Expression::Variable(Variable::Direct(target)) = a.lhs else {
+        return Err(BailReason::UnsupportedConstruct(
+            "assignment to non-simple lvalue".into(),
+        ));
+    };
+    let key = var_name(target.name);
+    let rhs = eval_expr(a.rhs, scope)?;
+
+    let new_val = match &a.operator {
+        Op::Assign(_) => rhs,
+        // Compound assignments reuse the binary ops over the current value.
+        Op::Addition(_)
+        | Op::Subtraction(_)
+        | Op::Multiplication(_)
+        | Op::Division(_)
+        | Op::Modulo(_)
+        | Op::Exponentiation(_)
+        | Op::Concat(_) => {
+            let cur = scope.vars.get(&key).cloned().ok_or_else(|| {
+                BailReason::UnboundVariable(String::from_utf8_lossy(&key).into_owned())
+            })?;
+            match &a.operator {
+                Op::Addition(_) => php_add(&cur, &rhs)?,
+                Op::Subtraction(_) => php_arith(&cur, &rhs, i64::checked_sub, |x, y| x - y)?,
+                Op::Multiplication(_) => php_arith(&cur, &rhs, i64::checked_mul, |x, y| x * y)?,
+                Op::Division(_) => php_div(&cur, &rhs)?,
+                Op::Modulo(_) => php_mod(&cur, &rhs)?,
+                Op::Exponentiation(_) => php_pow(&cur, &rhs)?,
+                Op::Concat(_) => php_concat(&cur, &rhs)?,
+                _ => unreachable!(),
+            }
+        }
+        other => {
+            return Err(BailReason::UnsupportedConstruct(format!(
+                "assignment operator {:?}",
+                std::mem::discriminant(other)
+            )))
+        }
+    };
+
+    // Aliasing (Inc-5 Task 3): `$x = <obj>` may create a SECOND reference to an
+    // existing object. PHP object assignment copies the HANDLE, not the object —
+    // both names then alias the same instance. The ONLY rhs that yields a freshly
+    // and uniquely owned object is a `new` expression (its result is the caller's
+    // alone); every other object-valued rhs (a variable copy `$b = $a`, a property
+    // read, an array element, a method/function return) may already be referenced
+    // elsewhere. Mark such a stored object aliased, and — when the rhs is a direct
+    // variable — mark the SOURCE binding aliased too, so a later mutating method on
+    // EITHER name bails (fail-closed). Over-marking only over-bails.
+    let mut new_val = new_val;
+    if matches!(new_val, Value::Object { .. }) && !is_fresh_instantiation(a.rhs) {
+        new_val.mark_aliased();
+        // Symmetric with the unconditional `new_val.mark_aliased()` above: the
+        // stored copy is marked for ANY non-fresh-`new` object rhs, so the SOURCE
+        // side must be EQUALLY exhaustive over every value-forwarding form — else a
+        // forwarded source binding stays unmarked and a later mutating method on it
+        // writes back only to it, leaving the stored copy a stale by-value clone (a
+        // 0-divergence wrong Pass/Fail). Recurse all forwarding shapes (ternary/
+        // elvis/parens/chained-assignment), marking each reachable direct source.
+        mark_alias_sources(a.rhs, scope);
+    }
+
+    scope.vars.insert(key, new_val.clone());
+    Ok(new_val)
+}
+
+/// Mark every direct-variable SOURCE binding reachable through the value-forwarding
+/// expression `expr` as possibly-aliased (Inc-5 Task 3, source side). Called when
+/// an object-valued rhs that is NOT a fresh `new` is assigned: such an rhs may hand
+/// the SAME object handle to the new binding, so every source it could forward must
+/// alias too (a later mutating method on EITHER then bails — fail-closed). This is
+/// the exhaustive counterpart to the unconditional `new_val.mark_aliased()`; over-
+/// marking only over-bails, never diverges.
+///
+/// COMPLETE set of value-forwarding forms this must cover (an object handle reaches
+/// the new binding unchanged through each):
+///   - `$src` — a direct variable copy (the base case);
+///   - `($e)` — parentheses (unwrap and recurse);
+///   - `$a = $e` — a chained inner assignment (the inner just-bound var AND whatever
+///     the inner rhs forwarded both alias);
+///   - `$c ? $t : $e` — a ternary (BOTH branches may be selected at runtime — recurse
+///     both) and the elvis `$c ?: $e` (the truthy result is `$c` itself,
+///     `then == None`, so recurse the condition AND the else branch);
+///   - `$l ?? $r` — null-coalesce (when `$l` is a non-null object PHP forwards `$l`;
+///     when `$l` is null it forwards the default `$r` — recurse BOTH operands). The
+///     parenthesized `($l ?? $r)` is covered via the `Parenthesized` arm above.
+///
+/// Every OTHER object-producing form is handled elsewhere, so this set is exhaustive
+/// for SOURCE aliasing: `match` / `clone` / casts / static-property reads either bail
+/// (in `eval_expr`) or cannot forward an existing direct binding; a fresh `new C(...)`
+/// is uniquely owned (no source to mark); method/function calls are covered by arg-
+/// pass marking and fluent-return marking; property reads are clone-marked in
+/// `eval_property_read`. `match` cannot reach here (it bails in `eval_expr`); its arms
+/// are recursed defensively in case that ever changes.
+fn mark_alias_sources(expr: &Expression, scope: &mut Scope) {
+    match expr {
+        // `$src` — the base case: both names now alias the same object.
+        Expression::Variable(Variable::Direct(src)) => {
+            let src_key = var_name(src.name);
+            if let Some(src_val) = scope.vars.get_mut(&src_key) {
+                src_val.mark_aliased();
+            }
+        }
+        // `($e)` — strip parentheses and recurse.
+        Expression::Parenthesized(p) => mark_alias_sources(p.expression, scope),
+        // CHAINED assignment `$a = $b = <obj>` (Round 6 finding 1): the inner
+        // `$b = <obj>` already bound `$b`, but its result is now ALSO bound to this
+        // enclosing target, so `$b` aliases too — mark the inner just-bound var, and
+        // recurse the inner rhs (it may itself forward further sources).
+        Expression::Assignment(inner) => {
+            mark_alias_sources(inner.lhs, scope);
+            mark_alias_sources(inner.rhs, scope);
+        }
+        // `$c ? $t : $e` / `$c ?: $e`: we cannot know statically which branch is
+        // selected, so EVERY branch that could be forwarded must alias. For the
+        // elvis form (`then == None`) the truthy result is the CONDITION itself, so
+        // recurse the condition too.
+        Expression::Conditional(c) => {
+            match c.then {
+                Some(then_expr) => mark_alias_sources(then_expr, scope),
+                None => mark_alias_sources(c.condition, scope),
+            }
+            mark_alias_sources(c.r#else, scope);
+        }
+        // `$l ?? $r` — null-coalesce. PHP forwards `$l` when it is a non-null object
+        // and the default `$r` when `$l` is null; we cannot know statically which, so
+        // recurse BOTH operands (fail-closed). This is `Expression::Binary` with
+        // `BinaryOperator::NullCoalesce` — a DIFFERENT AST node than `Conditional`, so
+        // without this arm `$b = $a ?? $d` hit the `_ => {}` no-op and left the source
+        // `$a` unmarked → a later `$a->inc()` diverged. The parenthesized form
+        // `($l ?? $r)` is reached through the `Parenthesized` arm above.
+        Expression::Binary(b) if matches!(b.operator, BinaryOperator::NullCoalesce(_)) => {
+            mark_alias_sources(b.lhs, scope);
+            mark_alias_sources(b.rhs, scope);
+        }
+        // `match (…) { … }` — bails in `eval_expr` before reaching an assignment,
+        // but recurse its arm bodies defensively (fail-closed) in case that changes.
+        Expression::Match(m) => {
+            use mago_syntax::ast::ast::MatchArm;
+            for arm in m.arms.iter() {
+                match arm {
+                    MatchArm::Expression(e) => mark_alias_sources(e.expression, scope),
+                    MatchArm::Default(d) => mark_alias_sources(d.expression, scope),
+                }
+            }
+        }
+        // Any other rhs cannot forward an existing direct-variable binding.
+        _ => {}
+    }
+}
+
+/// Strip `(…)` parentheses to reach the inner expression (for alias-source and
+/// fresh-`new` detection in `eval_assignment`).
+fn unwrap_parens<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    match expr {
+        Expression::Parenthesized(p) => unwrap_parens(p.expression),
+        other => other,
+    }
+}
+
+/// Whether `expr` is a fresh `new C(...)` instantiation (its object is uniquely
+/// owned by the caller, so an assignment from it creates no alias) — Inc-5 Task 3.
+fn is_fresh_instantiation(expr: &Expression) -> bool {
+    matches!(unwrap_parens(expr), Expression::Instantiation(_))
+}
+
+/// `$this->prop = rhs` — a property write (constructor seeding only). Frontier §2:
+/// permitted only when `scope.allow_this_write` is set; any other body that writes
+/// a property is a MUTATOR and BAILS. Only the receiver `$this` and a plain `=`
+/// are modelled; a write through any other object reference, or a compound op,
+/// bails (the by-value model cannot track aliased writes soundly).
+fn eval_property_assignment(
+    a: &mago_syntax::ast::ast::assignment::Assignment,
+    pa: &mago_syntax::ast::ast::access::PropertyAccess,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::assignment::AssignmentOperator as Op;
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
+
+    if !scope.allow_this_write {
+        return Err(BailReason::UnsupportedConstruct(
+            "property write outside a constructor (mutator method)".into(),
+        ));
+    }
+    if !matches!(a.operator, Op::Assign(_)) {
+        return Err(BailReason::UnsupportedConstruct(
+            "compound property assignment".into(),
+        ));
+    }
+    // Receiver must be `$this`.
+    let Expression::Variable(Variable::Direct(recv)) = pa.object else {
+        return Err(BailReason::UnsupportedConstruct(
+            "property write through a non-$this reference".into(),
+        ));
+    };
+    if var_name(recv.name) != b"this" {
+        return Err(BailReason::UnsupportedConstruct(
+            "property write through a non-$this reference".into(),
+        ));
+    }
+    let ClassLikeMemberSelector::Identifier(prop_id) = &pa.property else {
+        return Err(BailReason::UnsupportedConstruct(
+            "dynamic property selector in write".into(),
+        ));
+    };
+    let rhs = eval_expr(a.rhs, scope)?;
+
+    // A typed SCALAR property coerces the written value in PHP (`int $n` stores
+    // `int(10)` for `$this->n = "10"`); the by-value model would store the raw
+    // `Str("10")` and diverge. Re-check the declared scalar hint (carried OWNED in
+    // the scope from the class AST) at this lazy write site — fail-closed (round 3
+    // Task A). An untyped / non-scalar-typed property is absent from the map →
+    // stored verbatim, no bail.
+    let prop_name = prop_id.value.to_vec();
+    // PHP property-WRITE visibility (round 19): a write the current scope cannot
+    // perform either forks a separate dynamic property (a child writing a
+    // parent-`private` prop leaves the parent slot intact) or Errors (an
+    // asymmetric `private(set)` written from outside its set-scope). The by-value
+    // record would overwrite the modelled slot → a definitive false verdict. Read
+    // the receiver class off the bound `$this` and bail (fail-closed) before any
+    // mutation, the write-side twin of the round-18 read guard.
+    if let Some(Value::Object {
+        class: recv_class, ..
+    }) = scope.vars.get(b"this".as_slice())
+    {
+        let recv_class = recv_class.clone();
+        scope.resolver.bail_inaccessible_prop_write(
+            &recv_class,
+            prop_name.as_slice(),
+            scope.current_class.as_deref(),
+        )?;
+    }
+    // A BODY write to a `readonly` property (round 17 fix 4 for ctor/setUp;
+    // round 18 extends the same set to the instance-method dispatch path): for
+    // a PROMOTED readonly param the param binding already performed the
+    // write-once seed, so this body write is PHP's "Cannot modify readonly
+    // property" Error — the record model would silently overwrite (false
+    // green). BAIL unconditionally on a readonly name. This over-bails the
+    // legal FIRST init of a plain (non-promoted) readonly prop in a ctor body
+    // AND the legal first-init of one in a single method — accepted (consistent
+    // with the ctor-path philosophy): modelling per-prop write-once state risks
+    // getting it wrong, and a bail only costs coverage, never truth.
+    if scope.readonly_props.contains(prop_name.as_slice()) {
+        return Err(BailReason::UnsupportedConstruct(format!(
+            "write to readonly property ${} in a method/constructor/setUp body \
+             (PHP \"Cannot modify readonly property\" Error unmodelled)",
+            String::from_utf8_lossy(&prop_name)
+        )));
+    }
+    if let Some(hint) = scope.prop_hints.get(prop_name.as_slice()) {
+        hint.bail_if_coerces(&rhs, "property")?;
+    }
+
+    // Functional update of the `$this` record in scope.
+    let this = scope.vars.get_mut(b"this".as_slice()).ok_or_else(|| {
+        BailReason::UnsupportedConstruct("property write with no bound \\$this".into())
+    })?;
+    let Value::Object { props, .. } = this else {
+        return Err(BailReason::TypeError(
+            "property write on a non-object \\$this".into(),
+        ));
+    };
+    match props.iter_mut().find(|(k, _)| *k == prop_name) {
+        Some(slot) => slot.1 = rhs.clone(),
+        None => props.push((prop_name, rhs.clone())),
+    }
+    Ok(rhs)
+}
+
+fn eval_conditional(
+    c: &mago_syntax::ast::ast::conditional::Conditional,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let cond = eval_expr(c.condition, scope)?;
+    match c.then {
+        // `cond ? then : else`
+        Some(then_expr) => {
+            if cond.to_bool() {
+                eval_expr(then_expr, scope)
+            } else {
+                eval_expr(c.r#else, scope)
+            }
+        }
+        // `cond ?: else` — returns cond when truthy.
+        None => {
+            if cond.to_bool() {
+                Ok(cond)
+            } else {
+                eval_expr(c.r#else, scope)
+            }
+        }
+    }
+}
+
+fn eval_array(arr: &Array, scope: &mut Scope) -> Result<Value, BailReason> {
+    build_array(arr.elements.as_slice(), scope)
+}
+
+fn eval_legacy_array(arr: &LegacyArray, scope: &mut Scope) -> Result<Value, BailReason> {
+    build_array(arr.elements.as_slice(), scope)
+}
+
+/// Evaluate an array ELEMENT value, marking aliasing (Inc-5 Task 3): an object
+/// stored into an array element gains a second reference path (the array now holds
+/// it), so a later mutation through any reference would diverge — mark the stored
+/// object aliased, AND every value-forwarding SOURCE the element expression reaches.
+///
+/// The source side must be as exhaustive as the assignment-rhs path: an inline
+/// assignment `[$o = new X()]`, a ternary `[$c ? $a : $b]`, an elvis `[$a ?: $b]`,
+/// or a `??` `[$a ?? $b]` element each hands the SAME handle to a source binding
+/// that a later mutating method would write back to alone, leaving the stored
+/// element a stale by-value clone (Round 19 take-9 divergence A: reducer Fail while
+/// real PHP — same handle — Passes). Route through the shared `mark_alias_sources`
+/// (the assignment-rhs path's helper) so every forwarded source aliases too; the
+/// direct-`$var` and parenthesized cases are its base/`Parenthesized` arms, so this
+/// strictly widens coverage. Fail-closed over-approx — over-marking only over-bails.
+fn eval_object_element(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
+    let mut v = eval_expr(expr, scope)?;
+    if matches!(v, Value::Object { .. }) {
+        v.mark_aliased();
+        mark_alias_sources(expr, scope);
+    }
+    Ok(v)
+}
+
+fn build_array(elements: &[ArrayElement], scope: &mut Scope) -> Result<Value, BailReason> {
+    let mut items: Vec<(ArrayKey, Value)> = Vec::new();
+    let mut next_int: i64 = 0;
+
+    for element in elements {
+        match element {
+            ArrayElement::KeyValue(kv) => {
+                let k = eval_expr(kv.key, scope)?;
+                let v = eval_object_element(kv.value, scope)?;
+                let key = k
+                    .to_array_key()
+                    .ok_or_else(|| BailReason::TypeError("array used as array key".into()))?;
+                if let ArrayKey::Int(n) = &key {
+                    if *n >= next_int {
+                        next_int = n.wrapping_add(1);
+                    }
+                }
+                insert_key(&mut items, key, v);
+            }
+            ArrayElement::Value(ve) => {
+                let v = eval_object_element(ve.value, scope)?;
+                insert_key(&mut items, ArrayKey::Int(next_int), v);
+                next_int += 1;
+            }
+            ArrayElement::Variadic(_) => {
+                return Err(BailReason::UnsupportedConstruct(
+                    "array spread (...)".into(),
+                ))
+            }
+            ArrayElement::Missing(_) => {}
+        }
+    }
+    Ok(Value::Arr(items))
+}
+
+/// Insert with last-write-wins on a duplicate key (PHP array semantics), keeping
+/// the original position of the first occurrence.
+fn insert_key(items: &mut Vec<(ArrayKey, Value)>, key: ArrayKey, val: Value) {
+    if let Some(slot) = items.iter_mut().find(|(k, _)| *k == key) {
+        slot.1 = val;
+    } else {
+        items.push((key, val));
+    }
+}
+
+/// Lift an [`ArrayKey`] back to a [`Value`] (for `array_search` / `array_keys`).
+fn array_key_to_value(k: &ArrayKey) -> Value {
+    match k {
+        ArrayKey::Int(i) => Value::Int(*i),
+        ArrayKey::Str(s) => Value::Str(s.clone()),
+    }
+}
+
+// ─── Closures / arrow functions (Inc-4 Task A) ────────────────────────────────
+
+/// Build a `Value::Closure` from a `function (...) use (...) {...}` literal.
+/// Capture is BY VALUE from the explicit `use(...)` list (each named variable's
+/// current value is copied). `use (&$x)` by-reference capture is impurity → BAIL
+/// (frontier). A `static` closure (no `$this`) is fine — and any closure that
+/// reads `$this` will bail at the `$this` read anyway (it is not captured here).
+fn make_closure(
+    c: &mago_syntax::ast::ast::function_like::closure::Closure,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let mut captured: Vec<(Vec<u8>, Value)> = Vec::new();
+    if let Some(use_clause) = &c.use_clause {
+        for uv in use_clause.variables.iter() {
+            // By-reference capture (`use (&$x)`) cannot be modelled by value → bail.
+            if uv.ampersand.is_some() {
+                return Err(BailReason::UnsupportedConstruct(
+                    "by-reference closure capture (use (&$x))".into(),
+                ));
+            }
+            let name = var_name(uv.variable.name);
+            // Aliasing (Inc-5, capture site): `use ($a)` copies the HANDLE of an
+            // object, not the object — the captured copy and the source binding
+            // then alias the SAME instance. Mark the SOURCE binding aliased, then
+            // clone (the clone carries the mark), so a later mutating method on
+            // EITHER side bails fail-closed instead of diverging on a stale
+            // by-value copy. `mark_aliased` recurses into aggregates and is a
+            // no-op on scalars — over-marking only over-bails.
+            let value = match scope.vars.get_mut(&name) {
+                Some(src) => {
+                    src.mark_aliased();
+                    src.clone()
+                }
+                None => {
+                    return Err(BailReason::UnboundVariable(
+                        String::from_utf8_lossy(&name).into_owned(),
+                    ))
+                }
+            };
+            captured.push((name, value));
+        }
+    }
+    let src = closure_source(c.span(), scope)?;
+    Ok(Value::Closure(ClosureRef { src, captured }))
+}
+
+/// Slice the owned source bytes of a closure expression from the current file's
+/// source (Inc-4 Task 1). Bails (fail-closed) if no source is attached or the span
+/// is out of range — never reads dropped/aliased AST memory.
+fn closure_source(span: mago_span::Span, scope: &Scope) -> Result<Vec<u8>, BailReason> {
+    let source = scope.source.ok_or_else(|| {
+        BailReason::UnsupportedConstruct("closure literal without a file source attached".into())
+    })?;
+    let start = span.start.offset as usize;
+    let end = span.end.offset as usize;
+    source
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| BailReason::Other("closure span out of source range".into()))
+}
+
+/// Build a `Value::Closure` from an `fn (...) => expr` arrow function. Arrow
+/// functions AUTO-CAPTURE the enclosing scope by value; we copy the WHOLE current
+/// variable scope (a sound superset — only the variables the body reads matter,
+/// and an unread capture is harmless). `$this` is intentionally NOT copied (an
+/// arrow fn that reads `$this` will bail at the read, fail-closed).
+fn make_arrow(
+    a: &mago_syntax::ast::ast::function_like::arrow_function::ArrowFunction,
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    // Aliasing (Inc-5, capture site): auto-capture copies the HANDLE of every
+    // object in scope — the captured copy and the source binding alias the SAME
+    // instance. Mark each SOURCE binding aliased, then clone (the clone carries
+    // the mark). Auto-capture is already a conservative superset of what the body
+    // reads, so marking every captured object source is correct: `mark_aliased`
+    // recurses into aggregates, is a no-op on scalars, and over-marking only
+    // over-bails (never diverges).
+    let captured: Vec<(Vec<u8>, Value)> = scope
+        .vars
+        .iter_mut()
+        .filter(|(k, _)| k.as_slice() != b"this")
+        .map(|(k, v)| {
+            v.mark_aliased();
+            (k.clone(), v.clone())
+        })
+        .collect();
+    let src = closure_source(a.span(), scope)?;
+    Ok(Value::Closure(ClosureRef { src, captured }))
+}
+
+/// Invoke a `Value::Closure` over concrete `args`, returning its result.
+///
+/// The closure owns its source bytes (`closure.src`, Inc-4 Task 1). We re-parse
+/// that source into a FRESH arena that lives for the whole invocation and walk the
+/// re-parsed body with the existing evaluator — so a closure whose CREATING arena
+/// has dropped (returned from an inlined helper, stored into `$this`) is invoked
+/// soundly, no use-after-free. The re-parsed snippet carries NO original-file name
+/// table (`names = None`): a pure closure over params + captured values + builtins
+/// needs none, and anything that would need the outer file's FQCN table bails
+/// fail-closed at the unknown-call/class boundary.
+///
+/// The bindings are the captured env (by value) overlaid with the bound
+/// parameters; the body runs in a FRESH scope (closures do not see the caller's
+/// other locals) carrying the same resolver + step budget. For a callback invoked
+/// in a loop (`array_map`/`array_filter`/…), parse ONCE via [`ParsedClosure`] and
+/// reuse it across iterations rather than re-parsing per element.
+fn invoke_closure(
+    closure: &ClosureRef,
+    args: &[Value],
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    with_parsed_closure(&closure.src, |kind, snippet| {
+        invoke_parsed_closure(kind, snippet, &closure.captured, args, scope)
+    })
+}
+
+/// A re-parsed closure / arrow-function node, borrowing from a local arena that
+/// lives only for the duration of [`with_parsed_closure`]'s callback.
+enum ParsedClosureKind<'p> {
+    Closure(&'p mago_syntax::ast::ast::function_like::closure::Closure<'p>),
+    Arrow(&'p mago_syntax::ast::ast::function_like::arrow_function::ArrowFunction<'p>),
+}
+
+/// Re-parse `<?php ( <closure-src> );` into a FRESH local arena and call `f` with
+/// the single closure / arrow node plus the snippet bytes the node spans into. The
+/// arena lives for the whole callback and is dropped after — the borrow never
+/// escapes, so this is fully safe (no `unsafe`, no dangling pointer). For a
+/// callback invoked in a loop (`array_map`/…), `f` runs the entire loop so the
+/// parse happens once. Bails (fail-closed) if the snippet is not exactly one
+/// closure expression.
+fn with_parsed_closure<R>(
+    src: &[u8],
+    f: impl FnOnce(&ParsedClosureKind, &[u8]) -> Result<R, BailReason>,
+) -> Result<R, BailReason> {
+    use mago_database::file::File;
+    use mago_syntax::parser::parse_file;
+
+    let arena = bumpalo::Bump::new();
+    let mut full: Vec<u8> = Vec::with_capacity(src.len() + 9);
+    full.extend_from_slice(b"<?php (");
+    full.extend_from_slice(src);
+    full.extend_from_slice(b");");
+    let file = File::ephemeral(
+        std::borrow::Cow::Borrowed(b"closure.php".as_slice()),
+        std::borrow::Cow::Owned(full.clone()),
+    );
+    let program = parse_file(&arena, &file);
+    let kind = find_closure_node(program)
+        .ok_or_else(|| BailReason::Other("closure source did not re-parse to a closure".into()))?;
+    f(&kind, &full)
+}
+
+/// Bind `captured` + `args` onto a re-parsed closure node and evaluate its body in
+/// a fresh scope. `snippet` is the re-parsed source so a closure literal NESTED in
+/// the body can own its own bytes via its span into THIS snippet.
+fn invoke_parsed_closure(
+    kind: &ParsedClosureKind,
+    snippet: &[u8],
+    captured: &[(Vec<u8>, Value)],
+    args: &[Value],
+    scope: &mut Scope,
+) -> Result<Value, BailReason> {
+    let param_list = match kind {
+        ParsedClosureKind::Closure(c) => &c.parameter_list,
+        ParsedClosureKind::Arrow(a) => &a.parameter_list,
+    };
+
+    let mut bindings: HashMap<Vec<u8>, Value> = HashMap::new();
+    // Captured env first; parameters then overlay (a param shadows a capture).
+    for (k, v) in captured {
+        bindings.insert(k.clone(), v.clone());
+    }
+
+    let params: Vec<_> = param_list.parameters.iter().collect();
+    if args.len() > params.len() {
+        return Err(BailReason::Other(
+            "more arguments than closure parameters (variadic call?)".into(),
+        ));
+    }
+    for (i, p) in params.iter().enumerate() {
+        if p.ellipsis.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "variadic closure parameter".into(),
+            ));
+        }
+        if p.ampersand.is_some() {
+            return Err(BailReason::UnsupportedConstruct(
+                "by-reference closure parameter".into(),
+            ));
+        }
+        let name = var_name(p.variable.name);
+        let mut value = match args.get(i) {
+            Some(a) => a.clone(),
+            None => match &p.default_value {
+                Some(d) => eval_expr(d.value, scope)?,
+                None => {
+                    return Err(BailReason::UnboundVariable(format!(
+                        "closure parameter ${}",
+                        String::from_utf8_lossy(&name)
+                    )))
+                }
+            },
+        };
+        // A typed scalar closure parameter (incl. the default-value branch above)
+        // is a coercion boundary just like a named-function parameter — fail-closed.
+        if let Some(hint) = &p.hint {
+            bail_if_scalar_hint_coerces(hint, &value, "closure parameter")?;
+        }
+        // Aliasing (Inc-5): binding an OBJECT argument to a closure parameter
+        // shares the handle in PHP — the callback can mutate it and the caller
+        // sees the change; our by-value clone would diverge. Marking here, at the
+        // BINDING SITE, closes every invocation path at once: direct `$f($a)`
+        // calls (where `eval_arguments` already marked the caller side) AND the
+        // higher-order builtins (array_map/filter/reduce/any/all/find…), which
+        // pass array ELEMENTS to the callback without going through
+        // `eval_arguments`. Object-only — scalars and arrays-of-scalars bind raw,
+        // so the scalar closure-builtin fast path never over-bails. Conservative
+        // over-approximation: a marked object only forbids MUTATION, never reads.
+        if matches!(value, Value::Object { .. }) {
+            value.mark_aliased();
+        }
+        bindings.insert(name, value);
+    }
+
+    // Run the body in a fresh scope sharing the resolver/budget (so the step
+    // budget stays global and a callback in a loop can still bail on runaway).
+    // `source` = the re-parsed snippet (a nested closure literal re-slices from it);
+    // no `names`: the snippet has its own (empty) name table, so anything needing
+    // the outer file's FQCN table bails fail-closed.
+    let mut inner = Scope::new(bindings, scope.resolver).with_source(snippet);
+    inner.steps = scope.steps;
+    inner.max_steps = scope.max_steps;
+
+    let result = match kind {
+        ParsedClosureKind::Closure(c) => {
+            match exec_statements(c.body.statements.iter(), &mut inner)? {
+                Flow::Returned(v) => v,
+                Flow::Normal => Value::Null,
+                Flow::Asserted(_) => {
+                    return Err(BailReason::UnsupportedConstruct(
+                        "assertion inside a closure body".into(),
+                    ))
+                }
+            }
+        }
+        ParsedClosureKind::Arrow(a) => eval_expr(a.expression, &mut inner)?,
+    };
+    // A typed scalar closure/arrow RETURN coerces the produced value in PHP just
+    // like a named-function return — fail-closed on a mismatch.
+    let return_hint = match kind {
+        ParsedClosureKind::Closure(c) => c.return_type_hint.as_ref(),
+        ParsedClosureKind::Arrow(a) => a.return_type_hint.as_ref(),
+    };
+    bail_if_scalar_return_coerces(return_hint, &result)?;
+    // Propagate the consumed step budget back to the caller.
+    scope.steps = inner.steps;
+    Ok(result)
+}
+
+/// Find the single closure / arrow-function node in a re-parsed snippet program.
+fn find_closure_node<'p>(
+    program: &'p mago_syntax::ast::Program<'p>,
+) -> Option<ParsedClosureKind<'p>> {
+    use mago_syntax::ast::ast::expression::Expression as Expr;
+
+    fn unwrap_expr<'p>(expr: &'p Expr<'p>) -> Option<ParsedClosureKind<'p>> {
+        match expr {
+            Expr::Closure(c) => Some(ParsedClosureKind::Closure(c)),
+            Expr::ArrowFunction(a) => Some(ParsedClosureKind::Arrow(a)),
+            Expr::Parenthesized(p) => unwrap_expr(p.expression),
+            _ => None,
+        }
+    }
+
+    for stmt in program.statements.iter() {
+        if let Statement::Expression(es) = stmt {
+            if let Some(k) = unwrap_expr(es.expression) {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Higher-order builtins that take a closure callback. `Ok(None)` = not one of
+/// these (the caller falls through to the scalar builtin path / resolver).
+///
+/// Modelled, gold-tested vs `php -r` (8.1.33):
+/// - `array_map(fn, arr)` (single array): apply `fn($v)` to each value, PRESERVE
+///   keys + order. (The multi-array form, where keys are reindexed, is NOT
+///   modelled — it bails so we never guess its key handling.)
+/// - `array_filter(arr, fn)` (default mode): keep entries where `fn($v)` is
+///   truthy, PRESERVE original keys. The `ARRAY_FILTER_USE_KEY/BOTH` modes (a 3rd
+///   arg) bail. The no-callback form is the scalar builtin's concern (not here).
+/// - `array_reduce(arr, fn, initial?)`: left fold `fn($carry, $v)`; initial
+///   defaults to null.
+///
+/// `usort`/`uasort`/`uksort` are NOT modelled here: they sort the array BY
+/// REFERENCE (mutate the caller's variable), which the by-value scope cannot
+/// write back soundly → they bail (fail-closed) at the unknown-call boundary.
+fn call_closure_builtin(
+    name: &[u8],
+    args: &[Value],
+    scope: &mut Scope,
+) -> Result<Option<Value>, BailReason> {
+    match (name, args) {
+        // array_map(callback, array) — single-array form, keys preserved.
+        (b"array_map", [Value::Closure(cl), Value::Arr(items)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut out: Vec<(ArrayKey, Value)> = Vec::with_capacity(items.len());
+                for (k, v) in items {
+                    let mut mapped = invoke_parsed_closure(
+                        kind,
+                        snip,
+                        &cl.captured,
+                        std::slice::from_ref(v),
+                        scope,
+                    )?;
+                    // Store-time invariant (Inc-5): every object entering a
+                    // `Value::Arr` is marked at insertion. The callback may
+                    // synthesize objects (`fn($i) => new Foo($i)`) the enclosing
+                    // assignment never sees individually (the rhs is an Arr, not
+                    // an Object) — mark them here so a later element read /
+                    // closure-param binding finds them already aliased. No-op for
+                    // scalars; `mark_aliased` recurses into aggregates.
+                    // (array_filter/array_find re-emit ORIGINAL input elements,
+                    // which were marked when they entered the INPUT array — only
+                    // array_map synthesizes new element values.)
+                    if matches!(mapped, Value::Object { .. } | Value::Arr(_)) {
+                        mapped.mark_aliased();
+                    }
+                    out.push((k.clone(), mapped));
+                }
+                Ok(Some(Value::Arr(out)))
+            })
+        }
+        // array_map(null, ...) or the multi-array form → bail (not modelled).
+        (b"array_map", [Value::Closure(_), _, _, ..]) => Err(BailReason::UnsupportedConstruct(
+            "array_map with multiple arrays (key reindexing not modelled)".into(),
+        )),
+        // array_filter(array, callback) — default mode (callback sees the VALUE),
+        // original keys preserved.
+        (b"array_filter", [Value::Arr(items), Value::Closure(cl)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut out: Vec<(ArrayKey, Value)> = Vec::new();
+                for (k, v) in items {
+                    let keep = invoke_parsed_closure(
+                        kind,
+                        snip,
+                        &cl.captured,
+                        std::slice::from_ref(v),
+                        scope,
+                    )?;
+                    if keep.to_bool() {
+                        out.push((k.clone(), v.clone()));
+                    }
+                }
+                Ok(Some(Value::Arr(out)))
+            })
+        }
+        // array_filter with a 3rd `mode` arg (USE_KEY / USE_BOTH) → bail.
+        (b"array_filter", [Value::Arr(_), Value::Closure(_), _, ..]) => {
+            Err(BailReason::UnsupportedConstruct(
+                "array_filter with ARRAY_FILTER_USE_KEY/BOTH mode".into(),
+            ))
+        }
+        // array_reduce(array, callback, initial?) — left fold.
+        (b"array_reduce", [Value::Arr(items), Value::Closure(cl)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut acc = Value::Null;
+                for (_, v) in items {
+                    acc =
+                        invoke_parsed_closure(kind, snip, &cl.captured, &[acc, v.clone()], scope)?;
+                }
+                Ok(Some(acc))
+            })
+        }
+        (b"array_reduce", [Value::Arr(items), Value::Closure(cl), initial]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                let mut acc = initial.clone();
+                for (_, v) in items {
+                    acc =
+                        invoke_parsed_closure(kind, snip, &cl.captured, &[acc, v.clone()], scope)?;
+                }
+                Ok(Some(acc))
+            })
+        }
+        // PHP 8.4 array predicate/search builtins. Their callback takes (value,
+        // key) — value FIRST (RFC: "array_find"/"array_any"/"array_all"). Pure iff
+        // the closure is pure. Short-circuit on the first decisive element, exactly
+        // as PHP does.
+        // array_any(array, fn(value, key)): true iff fn is truthy for ANY element.
+        (b"array_any", [Value::Arr(items), Value::Closure(cl)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if hit.to_bool() {
+                        return Ok(Some(Value::Bool(true)));
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            })
+        }
+        // array_all(array, fn(value, key)): true iff fn is truthy for EVERY element.
+        (b"array_all", [Value::Arr(items), Value::Closure(cl)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if !hit.to_bool() {
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                }
+                Ok(Some(Value::Bool(true)))
+            })
+        }
+        // array_find(array, fn(value, key)): the first VALUE where fn is truthy,
+        // else null.
+        (b"array_find", [Value::Arr(items), Value::Closure(cl)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if hit.to_bool() {
+                        return Ok(Some(v.clone()));
+                    }
+                }
+                Ok(Some(Value::Null))
+            })
+        }
+        // array_find_key(array, fn(value, key)): the first KEY where fn is truthy,
+        // else null.
+        (b"array_find_key", [Value::Arr(items), Value::Closure(cl)]) => {
+            with_parsed_closure(&cl.src, |kind, snip| {
+                for (k, v) in items {
+                    let args = [v.clone(), array_key_to_value(k)];
+                    let hit = invoke_parsed_closure(kind, snip, &cl.captured, &args, scope)?;
+                    if hit.to_bool() {
+                        return Ok(Some(array_key_to_value(k)));
+                    }
+                }
+                Ok(Some(Value::Null))
+            })
+        }
+        // usort & friends mutate by reference → bail (fail-closed): a by-value
+        // model cannot write the sorted array back to the caller's variable.
+        (b"usort" | b"uasort" | b"uksort", _) => Err(BailReason::UnsupportedConstruct(
+            "usort/uasort/uksort (sorts an array by reference; not modelled)".into(),
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn eval_call(call: &Call, scope: &mut Scope) -> Result<Value, BailReason> {
+    use mago_syntax::ast::ast::class_like::member::ClassLikeMemberSelector;
+    match call {
+        Call::Function(fc) => {
+            // A non-identifier callee: a variable / expression holding a closure
+            // (`$f(args)`). Evaluate it; if it is a Closure, invoke it directly.
+            let Some(name) = identifier_name(fc.function) else {
+                let callee = eval_expr(fc.function, scope)?;
+                if let Value::Closure(cl) = callee {
+                    let args = eval_arguments(&fc.argument_list, scope)?;
+                    return invoke_closure(&cl, &args, scope);
+                }
+                return Err(BailReason::UnsupportedConstruct(
+                    "dynamic function call (non-closure callee)".into(),
+                ));
+            };
+            let args = eval_arguments(&fc.argument_list, scope)?;
+            // Higher-order builtins that take a closure (Task A): these need the
+            // scope to invoke the callback, so they are handled here, before the
+            // scope-free `call_pure_builtin`. They are pure IFF the closure is pure
+            // (a closure body that hits an impurity bails inside `invoke_closure`).
+            if let Some(v) = call_closure_builtin(name, &args, scope)? {
+                return Ok(v);
+            }
+            // First try a pure builtin; then the substitution resolver.
+            if let Some(v) = call_pure_builtin(name, &args)? {
+                return Ok(v);
+            }
+            if let Some(v) = scope.resolver.resolve_function(name, &args)? {
+                return Ok(v);
+            }
+            Err(BailReason::UnknownCall(
+                String::from_utf8_lossy(name).into_owned(),
+            ))
+        }
+        // `$obj->method(args)` — the receiver's RUNTIME class drives dispatch
+        // (Task C). Assertions like `$this->assertSame(...)` are intercepted
+        // upstream in `try_assertion`; this path is for real instance methods.
+        Call::Method(m) => {
+            let ClassLikeMemberSelector::Identifier(method_id) = &m.method else {
+                return Err(BailReason::UnsupportedConstruct(
+                    "dynamic method selector".into(),
+                ));
+            };
+            let receiver = eval_expr(m.object, scope)?;
+            if !matches!(receiver, Value::Object { .. }) {
+                return Err(BailReason::TypeError(format!(
+                    "method call on non-object ({})",
+                    receiver.type_name()
+                )));
+            }
+            let receiver_aliased = receiver.is_aliased();
+            let args = eval_arguments(&m.argument_list, scope)?;
+            let dispatch =
+                match scope
+                    .resolver
+                    .resolve_instance_method(&receiver, method_id.value, &args)?
+                {
+                    Some(d) => d,
+                    None => {
+                        return Err(BailReason::UnknownCall(format!(
+                            "->{}",
+                            String::from_utf8_lossy(method_id.value)
+                        )))
+                    }
+                };
+
+            // Object-return aliasing (Inc-5): ANY method that returns a
+            // `Value::Object` may be forwarding the receiver back to the caller
+            // (canonically `return $this;`). PHP hands back the SAME handle, so the
+            // returned value aliases the receiver — and this holds REGARDLESS of
+            // whether the method mutates. Our by-value model otherwise hands back an
+            // unswept clone, so a later mutation of EITHER name diverges. Fail-closed:
+            // when the return is an object, mark the returned value aliased AND, if
+            // the receiver is a plain `$var` binding, mark that binding aliased too,
+            // so any subsequent mutation of either bails. This unifies the read-only
+            // (`None`) and mutator (`Some`) branches on the object-return axis.
+            if matches!(dispatch.ret, Value::Object { .. }) {
+                if let Expression::Variable(Variable::Direct(v)) = m.object {
+                    let key = var_name(v.name);
+                    if let Some(binding) = scope.vars.get_mut(&key) {
+                        binding.mark_aliased();
+                    }
+                }
+            }
+
+            // Mutation handling (Inc-5 Task 3 — the soundness core).
+            match dispatch.mutated_this {
+                // Read-only method: the by-value model is exact for a NON-object
+                // return regardless of aliasing. For an OBJECT return it is NOT
+                // exact (the returned handle aliases the receiver in PHP) — the
+                // object-return marking above has already marked the receiver and
+                // we mark the returned value here so any later mutation bails.
+                None => {
+                    let mut ret = dispatch.ret;
+                    if matches!(ret, Value::Object { .. }) {
+                        ret.mark_aliased();
+                    }
+                    Ok(ret)
+                }
+                // Mutator: PHP would write through the shared handle. Our model
+                // can only stay sound if the object is UNIQUELY OWNED *and* we
+                // have a binding to write the mutation back to.
+                Some(new_this) => {
+                    if receiver_aliased {
+                        // A second reference may exist → writing back to one
+                        // binding would diverge from PHP (which mutates both).
+                        return Err(BailReason::UnsupportedConstruct(
+                            "mutation of a possibly-aliased object".into(),
+                        ));
+                    }
+                    // Writeback is only possible (and sound) when the receiver is a
+                    // plain `$var` lvalue. A temporary / property / chain receiver
+                    // has no safe writeback target → bail (fail-closed).
+                    if let Expression::Variable(Variable::Direct(v)) = m.object {
+                        let key = var_name(v.name);
+                        // Fluent self-return (Round 6 finding 2): when a MUTATING
+                        // method returns a `Value::Object` (typically `return $this`),
+                        // the returned value and the written-back receiver are the
+                        // SAME object in PHP. Our by-value model hands back an
+                        // unswept clone, so a subsequent mutation of EITHER would
+                        // diverge. Mark BOTH the written-back receiver binding AND
+                        // the returned value aliased so any later mutation bails.
+                        let mut new_this = new_this;
+                        let mut ret = dispatch.ret;
+                        if matches!(ret, Value::Object { .. }) {
+                            new_this.mark_aliased();
+                            ret.mark_aliased();
+                        }
+                        scope.vars.insert(key, new_this);
+                        Ok(ret)
+                    } else {
+                        Err(BailReason::UnsupportedConstruct(
+                            "mutating method on a non-assignable receiver (no writeback target)"
+                                .into(),
+                        ))
+                    }
+                }
+            }
+        }
+        // `Class::method(args)` (Task E). self/parent/static → bail (no enclosing
+        // class context in the Scope).
+        Call::StaticMethod(sm) => {
+            let ClassLikeMemberSelector::Identifier(method_id) = &sm.method else {
+                return Err(BailReason::UnsupportedConstruct(
+                    "dynamic static-method selector".into(),
+                ));
+            };
+            let class = resolve_class_name_in_scope(sm.class, scope)?;
+            let args = eval_arguments(&sm.argument_list, scope)?;
+            match scope
+                .resolver
+                .resolve_static_method(&class, method_id.value, &args)?
+            {
+                Some(v) => Ok(v),
+                None => Err(BailReason::UnknownCall(format!(
+                    "{}::{}",
+                    String::from_utf8_lossy(&class),
+                    String::from_utf8_lossy(method_id.value)
+                ))),
+            }
+        }
+        Call::NullSafeMethod(_) => Err(BailReason::UnsupportedConstruct(
+            "null-safe method call (?->)".into(),
+        )),
+    }
+}
+
+/// Resolve a class-name expression to a concrete FQCN, consulting the scope's
+/// resolved-names table (Inc-3): an unqualified / `use`-aliased `new ClassName`
+/// becomes the real FQCN. `self`/`parent`/`static` still bail (no enclosing-class
+/// context). Falls back to the raw identifier when no names table is attached
+/// (unit tests) or the identifier is already fully qualified.
+fn resolve_class_name_in_scope(expr: &Expression, scope: &Scope) -> Result<Vec<u8>, BailReason> {
+    // self/parent/static keyword variants → bail (handled by the raw resolver too,
+    // but check here so a names-table hit can never mask them).
+    if matches!(
+        expr,
+        Expression::Self_(_) | Expression::Static(_) | Expression::Parent(_)
+    ) {
+        return Err(BailReason::UnsupportedConstruct(
+            "self/parent/static class reference (no enclosing-class context)".into(),
+        ));
+    }
+    if let Some(name) = identifier_name(expr) {
+        if name.eq_ignore_ascii_case(b"self")
+            || name.eq_ignore_ascii_case(b"parent")
+            || name.eq_ignore_ascii_case(b"static")
+        {
+            return Err(BailReason::UnsupportedConstruct(
+                "self/parent/static class reference (no enclosing-class context)".into(),
+            ));
+        }
+        // Prefer the resolved FQCN for this identifier's position; else the raw name.
+        if let Some(fqcn) = scope.resolve_name_at(expr) {
+            return Ok(fqcn);
+        }
+        return Ok(name.to_vec());
+    }
+    Err(BailReason::UnsupportedConstruct(
+        "dynamic/unresolvable class name (new \\$var / static::)".into(),
+    ))
+}
+
+/// A pure-builtin whitelist (spec §9). Each is exact PHP-8 byte semantics.
+/// `Ok(None)` = not a builtin (try the resolver next); `Err` = a builtin the
+/// reducer refuses to model (a cursor builtin, or a loose-comparison overload).
+fn call_pure_builtin(name: &[u8], args: &[Value]) -> Result<Option<Value>, BailReason> {
+    // CURSOR builtins have no observable cursor in our `Arr` model — a test mixing
+    // `reset()`/`end()` (which we model as pure first/last) with any of these would
+    // diverge, so they HARD-BAIL unconditionally (Task E, inc-2 frontier §7). This
+    // makes `reset`/`end` safe to model as pure first/last below.
+    if matches!(name, b"key" | b"next" | b"current" | b"prev" | b"each") {
+        return Err(BailReason::UnsupportedConstruct(format!(
+            "cursor builtin {}() — Arr has no observable internal pointer",
+            String::from_utf8_lossy(name)
+        )));
+    }
+
+    let v = match (name, args) {
+        (b"strlen", [Value::Str(s)]) => Value::Int(s.len() as i64),
+        (b"count" | b"sizeof", [Value::Arr(a)]) => Value::Int(a.len() as i64),
+        (b"abs", [Value::Int(i)]) => match i.checked_abs() {
+            Some(v) => Value::Int(v),
+            None => Value::Float((*i as f64).abs()), // abs(PHP_INT_MIN) → float
+        },
+        (b"abs", [Value::Float(f)]) => Value::Float(f.abs()),
+        (b"intval", [v]) => Value::Int(v.to_int()),
+        (b"is_int" | b"is_integer" | b"is_long", [v]) => Value::Bool(matches!(v, Value::Int(_))),
+        (b"is_string", [v]) => Value::Bool(matches!(v, Value::Str(_))),
+        (b"is_array", [v]) => Value::Bool(matches!(v, Value::Arr(_))),
+        (b"is_bool", [v]) => Value::Bool(matches!(v, Value::Bool(_))),
+        (b"is_null", [v]) => Value::Bool(matches!(v, Value::Null)),
+        (b"is_float" | b"is_double", [v]) => Value::Bool(matches!(v, Value::Float(_))),
+
+        // ── Task 2: pure type/inspection + cast builtins (gold vs php8.4) ──
+        // is_scalar: int/float/string/bool → true; null/array/object → false.
+        (b"is_scalar", [v]) => Value::Bool(matches!(
+            v,
+            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Bool(_)
+        )),
+        // gettype: PHP's legacy spelling (NULL/boolean/integer/double/string/array/
+        // object), NOT Value::type_name() (which is lowercase int/float/etc.).
+        (b"gettype", [v]) => Value::Str(php_gettype(v).to_vec()),
+        // boolval/floatval mirror the gold-tested (bool)/(float) casts on Value.
+        // (intval is handled above.) strval mirrors the (string) cast; an array or
+        // object → PHP emits a notice / fatal → we BAIL (fail-closed), never "Array".
+        (b"boolval", [v]) => Value::Bool(v.to_bool()),
+        (b"floatval" | b"doubleval", [v]) => Value::Float(v.to_float()),
+        (b"strval", [v]) => match v.to_php_string() {
+            Some(bytes) => Value::Str(bytes),
+            None => {
+                return Err(BailReason::TypeError(format!(
+                    "strval of a {} (PHP notice/fatal)",
+                    v.type_name()
+                )))
+            }
+        },
+
+        // ── strict array builtins (Task E) ──
+        // reset/end = pure first/last element; empty → false (cursor siblings bail
+        // above, so this can never observably diverge).
+        (b"reset", [Value::Arr(a)]) => a
+            .first()
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Bool(false)),
+        (b"end", [Value::Arr(a)]) => a
+            .last()
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Bool(false)),
+
+        // in_array(needle, haystack, true) — STRICT only. The loose 2-arg / `false`
+        // overload bails (PHP `==` juggling is a divergence risk). Strict `===`
+        // against an object/closure needle or element is REFERENCE identity
+        // (in_array($o, [$o], true) is TRUE in PHP, same instance) — the model
+        // has no heap, so any reachable identity value BAILS.
+        (b"in_array", [needle, Value::Arr(hay), Value::Bool(true)]) => {
+            bail_if_identity_in_strict_search(needle, hay)?;
+            Value::Bool(hay.iter().any(|(_, v)| v.php_strict_eq(needle)))
+        }
+        (b"in_array", _) => {
+            return Err(BailReason::UnsupportedConstruct(
+                "in_array without strict=true (loose == not modelled)".into(),
+            ))
+        }
+        // array_search(needle, haystack, true) — STRICT: returns the KEY or false.
+        // Same identity guard as strict in_array (PHP returns the matching KEY
+        // for a same-instance object needle; the model would wrongly say false).
+        (b"array_search", [needle, Value::Arr(hay), Value::Bool(true)]) => {
+            bail_if_identity_in_strict_search(needle, hay)?;
+            hay.iter()
+                .find(|(_, v)| v.php_strict_eq(needle))
+                .map(|(k, _)| array_key_to_value(k))
+                .unwrap_or(Value::Bool(false))
+        }
+        (b"array_search", _) => {
+            return Err(BailReason::UnsupportedConstruct(
+                "array_search without strict=true (loose == not modelled)".into(),
+            ))
+        }
+        // array_key_exists(key, array): key presence (null value still counts).
+        (b"array_key_exists", [k, Value::Arr(a)]) => {
+            let key = k
+                .to_array_key()
+                .ok_or_else(|| BailReason::TypeError("array/object as array key".into()))?;
+            Value::Bool(a.iter().any(|(ak, _)| *ak == key))
+        }
+        // array_keys / array_values: reindex from 0.
+        (b"array_keys", [Value::Arr(a)]) => Value::Arr(
+            a.iter()
+                .enumerate()
+                .map(|(i, (k, _))| (ArrayKey::Int(i as i64), array_key_to_value(k)))
+                .collect(),
+        ),
+        (b"array_values", [Value::Arr(a)]) => Value::Arr(
+            a.iter()
+                .enumerate()
+                .map(|(i, (_, v))| (ArrayKey::Int(i as i64), v.clone()))
+                .collect(),
+        ),
+        // array_merge: int keys reindex sequentially; string keys overwrite.
+        (b"array_merge", merges) if !merges.is_empty() => {
+            let mut out: Vec<(ArrayKey, Value)> = Vec::new();
+            let mut next_int: i64 = 0;
+            for m in merges {
+                let Value::Arr(items) = m else {
+                    return Err(BailReason::TypeError("array_merge of a non-array".into()));
+                };
+                for (k, v) in items {
+                    match k {
+                        // String/explicit-int keys: int keys APPEND (reindexed),
+                        // string keys overwrite-in-place.
+                        ArrayKey::Int(_) => {
+                            insert_key(&mut out, ArrayKey::Int(next_int), v.clone());
+                            next_int += 1;
+                        }
+                        ArrayKey::Str(_) => insert_key(&mut out, k.clone(), v.clone()),
+                    }
+                }
+            }
+            Value::Arr(out)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(v))
+}
+
+/// PHP `gettype()` legacy type names (gold vs `php8.4 -r 'echo gettype($x);'`):
+/// `NULL`, `boolean`, `integer`, `double`, `string`, `array`, `object`. These
+/// differ from [`Value::type_name`] (lowercase `null`/`bool`/`int`/`float`), so
+/// `gettype` must NOT reuse it. A Closure is an object (`gettype` → "object").
+fn php_gettype(v: &Value) -> &'static [u8] {
+    match v {
+        Value::Null => b"NULL",
+        Value::Bool(_) => b"boolean",
+        Value::Int(_) => b"integer",
+        Value::Float(_) => b"double",
+        Value::Str(_) => b"string",
+        Value::Arr(_) => b"array",
+        Value::Object { .. } | Value::Closure(_) => b"object",
+    }
+}
+
+/// Evaluate a positional argument list to concrete values. Named/spread args bail.
+fn eval_arguments(
+    args: &mago_syntax::ast::ast::argument::ArgumentList,
+    scope: &mut Scope,
+) -> Result<Vec<Value>, BailReason> {
+    use mago_syntax::ast::ast::argument::Argument;
+    let mut out = Vec::new();
+    for arg in args.arguments.iter() {
+        match arg {
+            Argument::Positional(p) => {
+                if p.ellipsis.is_some() {
+                    return Err(BailReason::UnsupportedConstruct("argument spread".into()));
+                }
+                let mut value = eval_expr(p.value, scope)?;
+                // Aliasing (Inc-5 Task 3): passing an object as an argument shares
+                // the HANDLE in PHP — the callee can mutate it (or RETAIN it, e.g. a
+                // constructor storing a promoted param) and the caller sees the
+                // change. Our by-value clone would diverge. Mark the passed value
+                // aliased AND every value-forwarding SOURCE the argument expression
+                // reaches — not just a direct `$var`: an inline assignment
+                // `f($o = new X())`, ternary, elvis, or `??` argument hands the SAME
+                // handle to a source binding that a later caller-side mutation would
+                // write back to alone. Route through the shared `mark_alias_sources`
+                // (the assignment-rhs and array-element paths' helper) so every
+                // forwarded source aliases too — fail-closed; over-marking only
+                // over-bails.
+                if matches!(value, Value::Object { .. }) {
+                    value.mark_aliased();
+                    mark_alias_sources(p.value, scope);
+                }
+                out.push(value);
+            }
+            Argument::Named(_) => {
+                return Err(BailReason::UnsupportedConstruct("named argument".into()))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The bare name of a call target if it is a plain identifier (`foo`), else None.
+fn identifier_name<'a>(expr: &'a Expression<'a>) -> Option<&'a [u8]> {
+    use mago_syntax::ast::ast::identifier::Identifier;
+    if let Expression::Identifier(id) = expr {
+        return Some(match id {
+            Identifier::Local(l) => l.value,
+            Identifier::Qualified(q) => q.value,
+            Identifier::FullyQualified(f) => f.value,
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bumpalo::Bump;
+    use mago_database::file::File;
+    use mago_syntax::ast::ast::statement::Statement;
+    use mago_syntax::parser::parse_file;
+
+    /// Parse `<?php <body>` and run `f` against the first method-body-like block
+    /// (we wrap the body in a function and grab its block), with the given
+    /// initial variable bindings. The arena lives for the closure.
+    fn run_body(body: &str, vars: Vec<(&str, Value)>) -> Outcome {
+        let full = format!("<?php function __t() {{ {} }}", body);
+        let arena = Bump::new();
+        let file = File::ephemeral(
+            std::borrow::Cow::Borrowed(b"eval.php".as_slice()),
+            std::borrow::Cow::Owned(full.into_bytes()),
+        );
+        let program = parse_file(&arena, &file);
+        let block = first_function_block(program).expect("function block");
+        let givens: HashMap<Vec<u8>, Value> = vars
+            .into_iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v))
+            .collect();
+        // Attach the file source so a closure literal in `body` owns its bytes.
+        // No enclosing class in this pure-eval test path → no visibility scope.
+        run_method_body_inner(block, givens, &NoResolver, None, Some(&file.contents), None)
+    }
+
+    fn first_function_block<'a>(
+        program: &'a mago_syntax::ast::Program<'a>,
+    ) -> Option<&'a Block<'a>> {
+        for stmt in program.statements.iter() {
+            if let Statement::Function(f) = stmt {
+                return Some(&f.body);
+            }
+        }
+        None
+    }
+
+    /// Evaluate a single expression to a `Value` (via `$__r = <expr>; return $__r;`).
+    fn eval_one(expr: &str) -> Result<Value, BailReason> {
+        let full = format!("<?php function __t() {{ return {}; }}", expr);
+        let arena = Bump::new();
+        let file = File::ephemeral(
+            std::borrow::Cow::Borrowed(b"e.php".as_slice()),
+            std::borrow::Cow::Owned(full.into_bytes()),
+        );
+        let program = parse_file(&arena, &file);
+        let block = first_function_block(program).unwrap();
+        let mut scope = Scope::new(HashMap::new(), &NoResolver).with_source(&file.contents);
+        // The body is a single `return <expr>;`.
+        for stmt in block.statements.iter() {
+            if let Statement::Return(ret) = stmt {
+                return eval_expr(ret.value.unwrap(), &mut scope);
+            }
+        }
+        panic!("no return");
+    }
+
+    // ── arithmetic / overflow (gold vs `php -r 'var_dump(...)'`) ──
+
+    #[test]
+    fn int_arithmetic() {
+        assert_eq!(eval_one("1 + 2").unwrap(), Value::Int(3));
+        assert_eq!(eval_one("10 - 3").unwrap(), Value::Int(7));
+        assert_eq!(eval_one("6 * 7").unwrap(), Value::Int(42));
+        assert_eq!(eval_one("10 / 2").unwrap(), Value::Int(5));
+        assert_eq!(eval_one("6 % 4").unwrap(), Value::Int(2));
+        // %: sign of the dividend
+        assert_eq!(eval_one("-7 % 3").unwrap(), Value::Int(-1));
+        assert_eq!(eval_one("7 % -3").unwrap(), Value::Int(1));
+    }
+
+    #[test]
+    fn division_to_float() {
+        match eval_one("7 / 2").unwrap() {
+            Value::Float(f) => assert!((f - 3.5).abs() < 1e-12),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    #[test]
+    fn overflow_promotes_to_float() {
+        // php -r 'var_dump(9223372036854775807 + 1);' → float(9.223372036854776E+18)
+        match eval_one("9223372036854775807 + 1").unwrap() {
+            Value::Float(f) => assert!((f - 9.223372036854776e18).abs() / f.abs() < 1e-12),
+            v => panic!("expected float (PHP overflow→float), got {v:?}"),
+        }
+        // mul overflow
+        assert!(matches!(
+            eval_one("9223372036854775807 * 2").unwrap(),
+            Value::Float(_)
+        ));
+    }
+
+    #[test]
+    fn pow_int_and_float() {
+        assert_eq!(eval_one("2 ** 3").unwrap(), Value::Int(8));
+        match eval_one("2 ** -1").unwrap() {
+            Value::Float(f) => assert!((f - 0.5).abs() < 1e-12),
+            v => panic!("{v:?}"),
+        }
+        assert!(matches!(eval_one("2 ** 63").unwrap(), Value::Float(_))); // overflow
+    }
+
+    #[test]
+    fn concat_byte_exact() {
+        assert_eq!(eval_one("'5' . 3").unwrap(), Value::Str(b"53".to_vec()));
+        assert_eq!(eval_one("10 . 20").unwrap(), Value::Str(b"1020".to_vec()));
+        assert_eq!(
+            eval_one("'a' . true . null").unwrap(),
+            Value::Str(b"a1".to_vec())
+        );
+    }
+
+    #[test]
+    fn numeric_string_arithmetic() {
+        assert_eq!(eval_one("'5' + 3").unwrap(), Value::Int(8));
+        match eval_one("'5.5' + 1").unwrap() {
+            Value::Float(f) => assert!((f - 6.5).abs() < 1e-12),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    #[test]
+    fn comparisons_and_logical() {
+        assert_eq!(eval_one("1 < 2").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("'1' == '01'").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("0 == 'a'").unwrap(), Value::Bool(false)); // PHP8
+        assert_eq!(eval_one("1 === 1.0").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("true && false").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("false || 1").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("(5 <=> 3)").unwrap(), Value::Int(1));
+        assert_eq!(eval_one("null ?? 7").unwrap(), Value::Int(7));
+    }
+
+    #[test]
+    fn casts() {
+        assert_eq!(eval_one("(int)'12abc'").unwrap(), Value::Int(12));
+        assert_eq!(
+            eval_one("(string)1.5").unwrap(),
+            Value::Str(b"1.5".to_vec())
+        );
+        assert_eq!(eval_one("(bool)'0'").unwrap(), Value::Bool(false));
+    }
+
+    // ── array subscript read (Task D) ──
+
+    #[test]
+    fn subscript_read_over_variable() {
+        // $a[$k] on an existing key reads the element (gold: $a=[1,2,3]; $a[1]===2).
+        let outcome = run_body("$a = [10, 20, 30]; $this->assertSame(20, $a[1]);", vec![]);
+        assert_eq!(outcome, Outcome::Pass);
+        // string key
+        assert_eq!(
+            run_body(
+                "$a = ['x' => 'X', 'y' => 'Y']; $this->assertSame('Y', $a['y']);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn subscript_missing_key_bails_but_coalesce_defaults() {
+        // A BARE read of a missing key would warn in PHP → bail (fail-closed).
+        assert!(matches!(
+            eval_one("[1, 2][5]"),
+            Err(BailReason::UnsupportedConstruct(_))
+        ));
+        // `?? null` over a missing key yields null (no warning).
+        assert_eq!(eval_one("([1, 2][5] ?? null)").unwrap(), Value::Null);
+        // `?? default` over a missing key yields the default.
+        assert_eq!(eval_one("(['a' => 1]['b'] ?? 99)").unwrap(), Value::Int(99));
+        // `?? default` over an EXISTING non-null key yields the element.
+        assert_eq!(eval_one("(['a' => 1]['a'] ?? 99)").unwrap(), Value::Int(1));
+        // `?? default` over an existing NULL-valued key yields the default (isset
+        // treats null as unset — gold: ['k'=>null]['k'] ?? 'D' === 'D').
+        assert_eq!(
+            eval_one("(['k' => null]['k'] ?? 'D')").unwrap(),
+            Value::Str(b"D".to_vec())
+        );
+    }
+
+    // ── strict array builtins (Task E), gold vs `php -r` ──
+
+    #[test]
+    fn in_array_strict() {
+        // php -r 'var_export(in_array(1,[1],true));' → true; "1" vs 1 → false
+        assert_eq!(
+            eval_one("in_array(1, [1, 2], true)").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_one("in_array('1', [1, 2], true)").unwrap(),
+            Value::Bool(false)
+        );
+        // strict: 0 !== false
+        assert_eq!(
+            eval_one("in_array(0, [false], true)").unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_one("in_array(null, [1, null], true)").unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn array_search_strict_returns_key_or_false() {
+        // returns the KEY (int or string), or false when absent.
+        assert_eq!(
+            eval_one("array_search('b', [5 => 'a', 9 => 'b'], true)").unwrap(),
+            Value::Int(9)
+        );
+        assert_eq!(
+            eval_one("array_search('x', ['k' => 'a'], true)").unwrap(),
+            Value::Bool(false)
+        );
+        // string key is returned as a string.
+        assert_eq!(
+            eval_one("array_search(2, ['a' => 1, 'b' => 2], true)").unwrap(),
+            Value::Str(b"b".to_vec())
+        );
+        // strict: array_search(0, [false], true) === false (no match)
+        assert_eq!(
+            eval_one("array_search(0, [false], true)").unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn loose_in_array_and_search_bail() {
+        // The 2-arg (loose `==`) form is NOT modelled — bail rather than risk
+        // PHP's juggling surprises.
+        assert!(eval_one("in_array(1, [1])").is_err());
+        assert!(eval_one("array_search(1, [1])").is_err());
+        // Explicit loose flag (false) also bails.
+        assert!(eval_one("in_array(1, [1], false)").is_err());
+    }
+
+    #[test]
+    fn array_key_exists_keys_values_merge() {
+        // array_key_exists: true even when the value is null.
+        assert_eq!(
+            eval_one("array_key_exists('k', ['k' => null])").unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_one("array_key_exists('x', ['k' => 1])").unwrap(),
+            Value::Bool(false)
+        );
+        // array_keys / array_values reindex from 0.
+        assert_eq!(
+            eval_one("array_keys([5 => 'a', 9 => 'b'])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Int(0), Value::Int(5)),
+                (ArrayKey::Int(1), Value::Int(9)),
+            ])
+        );
+        assert_eq!(
+            eval_one("array_values([5 => 'a', 9 => 'b'])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Int(0), Value::Str(b"a".to_vec())),
+                (ArrayKey::Int(1), Value::Str(b"b".to_vec())),
+            ])
+        );
+        // array_merge: int keys reindex, string keys overwrite.
+        assert_eq!(
+            eval_one("array_merge([1, 2], [3, 4])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Int(0), Value::Int(1)),
+                (ArrayKey::Int(1), Value::Int(2)),
+                (ArrayKey::Int(2), Value::Int(3)),
+                (ArrayKey::Int(3), Value::Int(4)),
+            ])
+        );
+        assert_eq!(
+            eval_one("array_merge(['a' => 1], ['a' => 2, 'b' => 3])").unwrap(),
+            Value::Arr(vec![
+                (ArrayKey::Str(b"a".to_vec()), Value::Int(2)),
+                (ArrayKey::Str(b"b".to_vec()), Value::Int(3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn reset_end_first_last_pure() {
+        // reset = first element, end = last element; empty → false.
+        assert_eq!(eval_one("reset([10, 20, 30])").unwrap(), Value::Int(10));
+        assert_eq!(eval_one("end([10, 20, 30])").unwrap(), Value::Int(30));
+        assert_eq!(eval_one("reset([])").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("end([])").unwrap(), Value::Bool(false));
+        // first/last over an associative array (value, not key).
+        assert_eq!(
+            eval_one("reset(['a' => 1, 'b' => 2])").unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            eval_one("end(['a' => 1, 'b' => 2])").unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn cursor_builtins_hard_bail() {
+        // Our Arr has no observable cursor; key/next/current/prev/each MUST bail
+        // (a test mixing reset()/end() with one of these would diverge — Task E).
+        for call in [
+            "key([1, 2])",
+            "next([1, 2])",
+            "current([1, 2])",
+            "prev([1, 2])",
+            "each([1, 2])",
+        ] {
+            assert!(
+                matches!(eval_one(call), Err(BailReason::UnsupportedConstruct(_))),
+                "{call} must hard-bail (no cursor model)"
+            );
+        }
+    }
+
+    #[test]
+    fn division_by_zero_bails() {
+        assert!(matches!(eval_one("1 / 0"), Err(BailReason::DivisionByZero)));
+        assert!(matches!(eval_one("1 % 0"), Err(BailReason::DivisionByZero)));
+    }
+
+    #[test]
+    fn unbound_variable_bails() {
+        assert!(matches!(
+            eval_one("$undefined + 1"),
+            Err(BailReason::UnboundVariable(_))
+        ));
+    }
+
+    // ── assertions → Pass/Fail ──
+
+    #[test]
+    fn assert_same_pass_and_fail() {
+        assert_eq!(
+            run_body("$this->assertSame(3, 1 + 2);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertSame(4, 1 + 2);", vec![]),
+            Outcome::Fail("assertSame".into())
+        );
+        // assertSame is strict: 1 vs 1.0 fails
+        assert_eq!(
+            run_body("$this->assertSame(1, 1.0);", vec![]),
+            Outcome::Fail("assertSame".into())
+        );
+    }
+
+    #[test]
+    fn assert_equals_is_loose() {
+        assert_eq!(
+            run_body("$this->assertEquals(1, 1.0);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals('1', 1);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals(0, 'a');", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+    }
+
+    #[test]
+    fn assert_equals_array_vs_non_array_bails() {
+        // GOLD (php8.4, PHPUnit 10.5.63 AND 12.5.29 — identical verdicts):
+        // assertEquals([], false) FAILS ('false does not match expected type
+        // "array"', TypeComparator) while PHP `[] == false` is TRUE — computing
+        // php_loose_eq here was a FALSE GREEN. Bail.
+        assert!(matches!(
+            run_body("$this->assertEquals([], false);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // Mirror: gold assertNotEquals([], false) PASSES in real PHPUnit while
+        // the == model returned Fail (false red). Bail.
+        assert!(matches!(
+            run_body("$this->assertNotEquals([], false);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // Gold: assertEquals([], null) FAILS (== true); assertEquals(0, [])
+        // FAILS too (== false — aligned, but the whole (Arr, non-Arr) family is
+        // bailed fail-closed: the comparator rejects by TYPE, not by ==).
+        assert!(matches!(
+            run_body("$this->assertEquals([], null);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body("$this->assertEquals(0, []);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // At depth: gold assertEquals([[]], [false]) FAILS (ArrayComparator
+        // recurses, TypeComparator type-rejects [] vs false) while `==` is TRUE.
+        assert!(matches!(
+            run_body("$this->assertEquals([[]], [false]);", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn assert_equals_numeric_string_pair_bails() {
+        // GOLD (php8.4, PHPUnit 10.5.63 AND 12.5.29): assertEquals('1', '01'),
+        // ('10', '1e1'), ('1.0', '1'), ('0.5', '.5') ALL FAIL — two strings are
+        // compared AS STRINGS by the comparator chain — while PHP `==` says TRUE
+        // (numeric-string comparison). Bail byte-different-but-loose-equal
+        // string pairs.
+        assert!(matches!(
+            run_body("$this->assertEquals('1', '01');", vec![]),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body("$this->assertEquals('10', '1e1');", vec![]),
+            Outcome::Bailed(_)
+        ));
+        // At depth: gold assertEquals(['1'], ['01']) FAILS too (ArrayComparator
+        // recurses into the string pair) while `==` is TRUE.
+        assert!(matches!(
+            run_body("$this->assertEquals(['1'], ['01']);", vec![]),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body("$this->assertNotEquals('1', '01');", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn assert_equals_comparator_aligned_pairs_still_compute() {
+        // NO-OVER-BAIL controls — every pair below was gold-verified ALIGNED
+        // between the PHPUnit comparator chain and php_loose_eq (php8.4,
+        // PHPUnit 10.5.63 AND 12.5.29), so the model must keep computing.
+        // Gold PASS, == true: numeric cross-type (NumericComparator).
+        assert_eq!(
+            run_body("$this->assertEquals('01', 1);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals(10, '1e1');", vec![]),
+            Outcome::Pass
+        );
+        // Gold PASS, == true: null/bool/empty cross-type.
+        assert_eq!(
+            run_body("$this->assertEquals(null, false);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals('', null);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals(true, 'a');", vec![]),
+            Outcome::Pass
+        );
+        // Gold PASS, == true: numeric / bool pairs INSIDE arrays.
+        assert_eq!(
+            run_body("$this->assertEquals([1], ['1']);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertEquals([null], [false]);", vec![]),
+            Outcome::Pass
+        );
+        // Gold FAIL, == false (PHP 8): aligned failures keep computing.
+        assert_eq!(
+            run_body("$this->assertEquals(0, '');", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+        // Byte-identical strings: gold PASS, == true.
+        assert_eq!(
+            run_body("$this->assertEquals('abc', 'abc');", vec![]),
+            Outcome::Pass
+        );
+        // Byte-different non-numeric strings: gold FAIL, == false — aligned.
+        assert_eq!(
+            run_body("$this->assertEquals('a', 'b');", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+        // Float near-equality: gold assertEquals(0.3, 0.1 + 0.2) FAILS — the
+        // PHPUnit 10+/12 comparator applies NO epsilon — aligned with ==.
+        assert_eq!(
+            run_body("$this->assertEquals(0.3, 0.1 + 0.2);", vec![]),
+            Outcome::Fail("assertEquals".into())
+        );
+    }
+
+    #[test]
+    fn assert_true_false_null() {
+        assert_eq!(
+            run_body("$this->assertTrue(1 === 1);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertTrue(1);", vec![]),
+            Outcome::Fail("assertTrue".into())
+        ); // strict: 1 is not true
+        assert_eq!(
+            run_body("$this->assertFalse(1 > 2);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(run_body("$this->assertNull(null);", vec![]), Outcome::Pass);
+    }
+
+    #[test]
+    fn assert_over_given_args() {
+        // The classic provider-driven test: assertSame($expected, $a + $b).
+        let outcome = run_body(
+            "$this->assertSame($expected, $a + $b);",
+            vec![
+                ("expected", Value::Int(5)),
+                ("a", Value::Int(2)),
+                ("b", Value::Int(3)),
+            ],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn first_failing_assertion_wins() {
+        let outcome = run_body(
+            "$this->assertSame(1, 1); $this->assertSame(2, 3); $this->assertSame(4, 4);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Fail("assertSame".into()));
+    }
+
+    // ── control flow ──
+
+    #[test]
+    fn if_else_branch() {
+        assert_eq!(
+            run_body(
+                "if ($x > 0) { $this->assertSame('pos', 'pos'); } else { $this->assertSame('neg', 'pos'); }",
+                vec![("x", Value::Int(5))]
+            ),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body(
+                "if ($x > 0) { $this->assertSame('pos', 'neg'); } else { $this->assertSame('neg', 'neg'); }",
+                vec![("x", Value::Int(-1))]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn while_loop_accumulates() {
+        // sum 1..3 = 6
+        let outcome = run_body(
+            "$s = 0; $i = 1; while ($i <= 3) { $s = $s + $i; $i = $i + 1; } $this->assertSame(6, $s);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn foreach_sums_array() {
+        let outcome = run_body(
+            "$s = 0; foreach ([1, 2, 3, 4] as $v) { $s = $s + $v; } $this->assertSame(10, $s);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn for_loop_accumulates() {
+        // sum 0..4 = 10 (classic C-style for).
+        let outcome = run_body(
+            "$s = 0; for ($i = 0; $i < 5; $i++) { $s = $s + $i; } $this->assertSame(10, $s);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn for_loop_with_break_and_return() {
+        // a `return` out of a for propagates; a body assertion failing is terminal.
+        assert_eq!(
+            run_returning(
+                "for ($i = 0; $i < 100; $i = $i + 1) { if ($i == 3) { return $i; } } return -1;",
+                vec![]
+            )
+            .unwrap(),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn for_loop_multi_init_and_step() {
+        // PHP allows comma-separated init and step expressions; condition is the
+        // LAST condition expression (gold: php -r with $i,$j twin counters).
+        let outcome = run_body(
+            "$s = 0; for ($i = 0, $j = 10; $i < 3; $i = $i + 1, $j = $j - 1) { $s = $s + $j; } $this->assertSame(27, $s);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn for_loop_empty_condition_needs_break_or_return() {
+        // `for (;;)` with no condition loops forever in PHP; with a return inside it
+        // terminates. (Empty condition = always true.)
+        assert_eq!(
+            run_returning(
+                "$i = 0; for (;;) { if ($i >= 4) { return $i; } $i = $i + 1; }",
+                vec![]
+            )
+            .unwrap(),
+            Value::Int(4)
+        );
+    }
+
+    #[test]
+    fn for_loop_runaway_bails_on_step_budget() {
+        // A genuinely infinite for with no exit must hit the step budget → bail,
+        // never hang or guess.
+        assert!(matches!(
+            run_returning("for (;;) { $x = 1; } return 0;", vec![]),
+            Err(BailReason::StepBudget)
+        ));
+    }
+
+    #[test]
+    fn compound_assignment() {
+        let outcome = run_body(
+            "$x = 10; $x += 5; $x *= 2; $this->assertSame(30, $x);",
+            vec![],
+        );
+        assert_eq!(outcome, Outcome::Pass);
+    }
+
+    // ── closures (Inc-4 Task A) ──
+
+    #[test]
+    fn direct_arrow_closure_invocation() {
+        // $f = fn($x) => $x * 2;  $f(5) === 10
+        assert_eq!(
+            run_body(
+                "$f = fn($x) => $x * 2; $this->assertSame(10, $f(5));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn direct_closure_block_invocation() {
+        // $f = function ($x) { return $x + 1; };  $f(41) === 42
+        assert_eq!(
+            run_body(
+                "$f = function ($x) { return $x + 1; }; $this->assertSame(42, $f(41));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_use_captures_by_value() {
+        // use($n) copies $n at creation; a later reassignment of $n does NOT change
+        // the captured value (gold: php -r → 13, not 23).
+        assert_eq!(
+            run_body(
+                "$n = 3; $f = function ($x) use ($n) { return $x + $n; }; $n = 13; $this->assertSame(13, $f(10));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn arrow_auto_captures_by_value() {
+        // fn auto-captures $base by value.
+        assert_eq!(
+            run_body(
+                "$base = 100; $f = fn($x) => $x + $base; $this->assertSame(105, $f(5));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn array_map_with_closure_is_pure() {
+        // array_map(fn, arr): keys preserved, order preserved (gold vs php -r).
+        assert_eq!(
+            run_body(
+                "$r = array_map(fn($x) => $x * $x, [1, 2, 3]); $this->assertSame([1, 4, 9], $r);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn array_filter_with_closure_preserves_keys() {
+        // array_filter keeps ORIGINAL keys (gold: php -r → [1=>2, 3=>4]).
+        assert_eq!(
+            run_body(
+                "$r = array_filter([1, 2, 3, 4], fn($x) => $x % 2 === 0); $this->assertSame([1 => 2, 3 => 4], $r);",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn array_any_all_find_php84_predicates() {
+        // PHP 8.4 array_any/array_all/array_find. Callback is (value, key). The
+        // semantics are from the RFC (host PHP 8.1 has no these builtins, so the
+        // expectations are transcribed from the RFC spec, not php -r).
+        // array_any: true if ANY value is even.
+        assert_eq!(
+            run_body(
+                "$this->assertTrue(array_any([1, 3, 4], fn($v, $k) => $v % 2 === 0));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // array_all: false because not every value is even.
+        assert_eq!(
+            run_body(
+                "$this->assertFalse(array_all([2, 3, 4], fn($v, $k) => $v % 2 === 0));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // array_find: first value > 2 is 3.
+        assert_eq!(
+            run_body(
+                "$this->assertSame(3, array_find([1, 2, 3, 4], fn($v, $k) => $v > 2));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // array_find: no match → null.
+        assert_eq!(
+            run_body(
+                "$this->assertNull(array_find([1, 2], fn($v, $k) => $v > 9));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+        // The KEY is the SECOND arg (string-keyed array).
+        assert_eq!(
+            run_body(
+                "$this->assertTrue(array_any(['A' => 'a', 'B' => 'b'], fn($v, $k) => $k === 'A' && $v === 'a'));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_invoking_a_captured_closure() {
+        // A closure that captures and INVOKES another closure (the doctrine
+        // exists/array_any pattern: an arrow re-dispatches to a captured $p).
+        assert_eq!(
+            run_body(
+                "$p = fn($k, $e) => $k === 1 && $e === 20; $g = fn($v, $key) => (bool) $p($key, $v); $this->assertTrue(array_any([10, 20, 30], $g));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn by_reference_use_capture_bails() {
+        // use (&$x) by-ref capture is impurity → must bail (frontier).
+        assert!(matches!(
+            run_body(
+                "$n = 0; $f = function () use (&$n) { $n = 5; }; $f(); $this->assertSame(5, $n);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn assert_not_equals_on_closures_bails_not_passes() {
+        // assertNotEquals($f, $g) on two closures: PHP `==` on closures is reference
+        // identity → $f == $g is FALSE → assertNotEquals PASSES in real PHP. The
+        // reducer has no heap-identity model, so php_loose_eq short-circuited to
+        // false → a false-GREEN Pass. It must BAIL instead (no model, no guess).
+        assert!(
+            matches!(
+                run_body(
+                    "$f = fn() => 1; $g = $f; $this->assertNotEquals($f, $g);",
+                    vec![]
+                ),
+                Outcome::Bailed(_)
+            ),
+            "assertNotEquals on closures must bail, not return a false-green Pass"
+        );
+    }
+
+    #[test]
+    fn assert_equals_on_closures_bails() {
+        // assertEquals($f, $g) on closures must bail too (no heap model).
+        assert!(matches!(
+            run_body(
+                "$f = fn() => 1; $g = fn() => 1; $this->assertEquals($f, $g);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn closure_loose_eq_operator_bails() {
+        // The `==` / `!=` operators on a closure operand must bail (the binary path,
+        // not just the assertion helper).
+        assert!(matches!(
+            run_body(
+                "$f = fn() => 1; $r = ($f == $f); $this->assertTrue($r);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+        assert!(matches!(
+            run_body(
+                "$f = fn() => 1; $r = ($f != $f); $this->assertFalse($r);",
+                vec![]
+            ),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn pure_builtin_strlen() {
+        assert_eq!(
+            run_body("$this->assertSame(5, strlen('hello'));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertSame(3, count([1, 2, 3]));", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn unknown_call_bails() {
+        assert!(matches!(
+            run_body("$this->assertSame(1, frobnicate(2));", vec![]),
+            Outcome::Bailed(BailReason::UnknownCall(_))
+        ));
+    }
+
+    #[test]
+    fn unmodelled_construct_bails() {
+        // `match` is not modelled → bail.
+        assert!(matches!(
+            run_body("$x = match(1) { 1 => 'a', default => 'b' };", vec![]),
+            Outcome::Bailed(_)
+        ));
+    }
+
+    /// Run a function body to its returned `Value` (the substitution primitive).
+    fn run_returning(body: &str, vars: Vec<(&str, Value)>) -> Result<Value, BailReason> {
+        let full = format!("<?php function __t() {{ {} }}", body);
+        let arena = Bump::new();
+        let file = File::ephemeral(
+            std::borrow::Cow::Borrowed(b"r.php".as_slice()),
+            std::borrow::Cow::Owned(full.into_bytes()),
+        );
+        let program = parse_file(&arena, &file);
+        let block = first_function_block(program).unwrap();
+        let bindings: HashMap<Vec<u8>, Value> = vars
+            .into_iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v))
+            .collect();
+        run_body_returning(block, bindings, &NoResolver)
+    }
+
+    #[test]
+    fn run_body_returning_reads_return_value() {
+        // A pure helper: return $a + $b; over bound params.
+        assert_eq!(
+            run_returning(
+                "return $a + $b;",
+                vec![("a", Value::Int(2)), ("b", Value::Int(40))]
+            )
+            .unwrap(),
+            Value::Int(42)
+        );
+        // No return → null.
+        assert_eq!(run_returning("$x = 1;", vec![]).unwrap(), Value::Null);
+        // A branch-selected return.
+        assert_eq!(
+            run_returning(
+                "if ($n < 0) { return -$n; } return $n;",
+                vec![("n", Value::Int(-7))]
+            )
+            .unwrap(),
+            Value::Int(7)
+        );
+    }
+
+    // ── Task 2: pure type/inspection builtins (gold vs `php8.4 -r`) ──
+
+    #[test]
+    fn type_inspection_builtins_match_php() {
+        // is_scalar — php8.4: int/float/string/bool → true; null/array → false.
+        assert_eq!(eval_one("is_scalar(1)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar(1.5)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar('x')").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar(true)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_scalar(null)").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("is_scalar([1])").unwrap(), Value::Bool(false));
+
+        // gettype — php8.4: NULL/boolean/integer/double/string/array (NOT type_name()).
+        assert_eq!(
+            eval_one("gettype(null)").unwrap(),
+            Value::Str(b"NULL".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype(true)").unwrap(),
+            Value::Str(b"boolean".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype(1)").unwrap(),
+            Value::Str(b"integer".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype(1.5)").unwrap(),
+            Value::Str(b"double".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype('x')").unwrap(),
+            Value::Str(b"string".to_vec())
+        );
+        assert_eq!(
+            eval_one("gettype([1])").unwrap(),
+            Value::Str(b"array".to_vec())
+        );
+
+        // count on an array (Value::Arr only).
+        assert_eq!(eval_one("count([1, 2, 3])").unwrap(), Value::Int(3));
+        assert_eq!(eval_one("sizeof([])").unwrap(), Value::Int(0));
+
+        // is_* already-present checks (regression-lock the listed set).
+        assert_eq!(eval_one("is_string(5)").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("is_array([1, 2])").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_null(null)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_float(1.5)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("is_bool(false)").unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn cast_builtins_match_php() {
+        // boolval — php8.4 gold: "0"→false, "0.0"→true, []→false, [0]→true.
+        assert_eq!(eval_one("boolval('0')").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("boolval('0.0')").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("boolval([])").unwrap(), Value::Bool(false));
+        assert_eq!(eval_one("boolval([0])").unwrap(), Value::Bool(true));
+        assert_eq!(eval_one("boolval(0)").unwrap(), Value::Bool(false));
+
+        // intval — php8.4 gold: "10abc"→10, "0x1A"→0, "1e2"→100, 1.9→1.
+        assert_eq!(eval_one("intval('10abc')").unwrap(), Value::Int(10));
+        assert_eq!(eval_one("intval('0x1A')").unwrap(), Value::Int(0));
+        assert_eq!(eval_one("intval('1e2')").unwrap(), Value::Int(100));
+        assert_eq!(eval_one("intval(1.9)").unwrap(), Value::Int(1));
+
+        // floatval — php8.4 gold: "10abc"→10.0, "1e2"→100.0, ".5"→0.5.
+        assert_eq!(eval_one("floatval('10abc')").unwrap(), Value::Float(10.0));
+        assert_eq!(eval_one("floatval('1e2')").unwrap(), Value::Float(100.0));
+        assert_eq!(eval_one("floatval('.5')").unwrap(), Value::Float(0.5));
+
+        // strval — php8.4 gold: null→"", true→"1", false→"", 1.0→"1", -0.0→"-0".
+        assert_eq!(eval_one("strval(null)").unwrap(), Value::Str(Vec::new()));
+        assert_eq!(eval_one("strval(true)").unwrap(), Value::Str(b"1".to_vec()));
+        assert_eq!(eval_one("strval(false)").unwrap(), Value::Str(Vec::new()));
+        assert_eq!(eval_one("strval(1.0)").unwrap(), Value::Str(b"1".to_vec()));
+        assert_eq!(
+            eval_one("strval(-0.0)").unwrap(),
+            Value::Str(b"-0".to_vec())
+        );
+
+        // strval of an array → PHP notice; we BAIL (fail-closed).
+        assert!(matches!(
+            eval_one("strval([1, 2])"),
+            Err(BailReason::TypeError(_))
+        ));
+    }
+
+    #[test]
+    fn tricky_numeric_string_inspection_bails() {
+        // The plan defers the tricky `is_numeric` numeric-string corner: it must
+        // BAIL (UnknownCall), never guess. `is_numeric("12abc")` is false in PHP,
+        // but we don't model the corner now → it must not resolve.
+        assert!(matches!(
+            eval_one("is_numeric('12abc')"),
+            Err(BailReason::UnknownCall(_))
+        ));
+    }
+
+    #[test]
+    fn type_builtins_in_assertions() {
+        // The end-to-end assertion form a real ctor/method body uses.
+        assert_eq!(
+            run_body("$this->assertTrue(is_array([1, 2]));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertFalse(is_string(5));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertSame(3, count([1, 2, 3]));", vec![]),
+            Outcome::Pass
+        );
+    }
+
+    // ── object-aliasing source-marking (recurse value-forwarding exprs) ──
+    //
+    // Models a minimal `class Box { public int $v = 0; function inc(): void {
+    // $this->v++; } }`: `new Box()` yields `{v: 0}`, and `inc()` is a MUTATOR that
+    // returns void and writes back `{v: $v + 1}`. This lets the unit layer exercise
+    // the mutating-method dispatch path (NoResolver would bail on any `->inc()`).
+    struct BoxResolver;
+
+    impl CallResolver for BoxResolver {
+        fn resolve_function(
+            &self,
+            _name: &[u8],
+            _args: &[Value],
+        ) -> Result<Option<Value>, BailReason> {
+            Ok(None)
+        }
+
+        fn construct(&self, class: &[u8], _args: &[Value]) -> Result<Option<Value>, BailReason> {
+            if class == b"Box" {
+                Ok(Some(make_object(
+                    b"Box".to_vec(),
+                    vec![(b"v".to_vec(), Value::Int(0))],
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn resolve_instance_method(
+            &self,
+            this: &Value,
+            method: &[u8],
+            _args: &[Value],
+        ) -> Result<Option<MethodDispatch>, BailReason> {
+            let Value::Object { class, props, .. } = this else {
+                return Ok(None);
+            };
+            if class.as_slice() != b"Box" {
+                return Ok(None);
+            }
+            match method {
+                // `function inc(): void { $this->v++; }` — a MUTATOR returning void.
+                b"inc" => {
+                    // `$this->v++` — read the current `v`, write back the
+                    // incremented record.
+                    let cur = props
+                        .iter()
+                        .find(|(k, _)| k.as_slice() == b"v")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Int(0));
+                    let next = match cur {
+                        Value::Int(n) => Value::Int(n + 1),
+                        _ => return Err(BailReason::TypeError("Box::v is not an int".into())),
+                    };
+                    let mutated = make_object(b"Box".to_vec(), vec![(b"v".to_vec(), next)]);
+                    Ok(Some(MethodDispatch {
+                        ret: Value::Null,
+                        mutated_this: Some(mutated),
+                    }))
+                }
+                // `function self() { return $this; }` — a READ-ONLY method that
+                // fluently returns the receiver object (no mutation). PHP hands
+                // back the SAME handle, so the returned value aliases the receiver.
+                b"self" => Ok(Some(MethodDispatch {
+                    ret: this.clone(),
+                    mutated_this: None,
+                })),
+                _ => Ok(None),
+            }
+        }
+    }
+
+    /// Like [`run_body`] but with a pluggable resolver (so a body can call
+    /// `new Box()` / `$x->inc()`).
+    fn run_body_with(body: &str, resolver: &dyn CallResolver) -> Outcome {
+        let full = format!("<?php function __t() {{ {} }}", body);
+        let arena = Bump::new();
+        let file = File::ephemeral(
+            std::borrow::Cow::Borrowed(b"eval.php".as_slice()),
+            std::borrow::Cow::Owned(full.into_bytes()),
+        );
+        let program = parse_file(&arena, &file);
+        let block = first_function_block(program).expect("function block");
+        run_method_body_inner(
+            block,
+            HashMap::new(),
+            resolver,
+            None,
+            Some(&file.contents),
+            None,
+        )
+    }
+
+    #[test]
+    fn ternary_aliasing_source_marking_bails() {
+        // `$b = true ? $a : $a` forwards the existing object `$a` into `$b` — both
+        // names now alias the SAME handle. The rhs is a `Conditional`, not a direct
+        // variable, so before the recursive source-marking fix the SOURCE `$a` was
+        // left unmarked: a later `$a->inc()` wrote back only to `$a`, leaving `$b` a
+        // stale by-value clone (v == 0) → a false-green divergence (reducer reported
+        // Fail while real PHP — same handle — Passes with $b->v === 1). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = true ? $a : $a; $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "ternary-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn elvis_aliasing_source_marking_bails() {
+        // `$b = $a ?: new Box()` — the elvis lhs (`$a`, truthy) is forwarded into
+        // `$b`, aliasing the same handle. The lhs lives in `Conditional.condition`
+        // (with `then == None`); before the fix it was never source-marked, so a
+        // later `$a->inc()` left `$b` stale → wrong Fail. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = $a ?: new Box(); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "elvis-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn null_coalesce_aliasing_source_marking_bails() {
+        // `$b = $a ?? new Box()` — `$a` is a non-null object, so PHP short-circuits
+        // the `??` and forwards the SAME handle into `$b` (`$a === $b`). The rhs is
+        // an `Expression::Binary` with `BinaryOperator::NullCoalesce`, a DIFFERENT
+        // AST node than `Conditional`; before the null-coalesce source-marking fix it
+        // hit the `_ => {}` no-op arm, leaving the source `$a` unmarked. A later
+        // `$a->inc()` then wrote back only to `$a`, leaving `$b` a stale by-value
+        // clone (v == 0) → a false-green divergence (reducer reported Fail while real
+        // PHP — same handle — Passes with $b->v === 1). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = $a ?? new Box(); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "null-coalesce-forwarded alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn parenthesized_null_coalesce_aliasing_source_marking_bails() {
+        // `$b = ($a ?? new Box())` — the parenthesized variant: `Parenthesized`
+        // unwraps into the same `Binary`/`NullCoalesce` node, so the fix covers it
+        // too. The non-null object `$a` is forwarded into `$b` (same handle); the
+        // source `$a` must be marked or a later `$a->inc()` leaves `$b` stale → wrong
+        // Fail. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = ($a ?? new Box()); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "parenthesized null-coalesce-forwarded alias source must bail, not diverge"
+        );
+    }
+
+    #[test]
+    fn array_literal_inline_assign_aliasing_source_marking_bails() {
+        // `$arr = [$o = new Box()]` — the inline assignment hands the SAME fresh
+        // handle to BOTH `$o` and the array element. `eval_object_element` marks the
+        // STORED element aliased, but its source-marking only covered a DIRECT
+        // variable (`unwrap_parens` → `Variable::Direct`), not the
+        // `Expression::Assignment` form, so the source `$o` was left unmarked. A later
+        // `$o->inc()` then wrote back only to `$o`, leaving `$arr[0]` a stale by-value
+        // clone (v == 0) → a 0-divergence wrong Fail (reducer Fail while real PHP —
+        // same handle — Passes with $arr[0]->v === 1). Routing the element source
+        // through the exhaustive `mark_alias_sources` marks `$o` too, so the mutation
+        // BAILs (fail-closed), never diverges.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$arr = [$o = new Box()]; $o->inc(); $this->assertSame(1, $arr[0]->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "array-literal inline-assignment alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn array_literal_inline_assign_no_mutation_reduces() {
+        // No-over-bail control for the fix above: an inline-assignment array element
+        // with NO subsequent mutation only READS the (aliased) object, and reads of an
+        // aliased object are exact — so the body still REDUCES to Pass, not Bail.
+        // Guards against the source-marking change turning every captured object into
+        // a blanket bail.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$arr = [$o = new Box()]; $this->assertSame(0, $arr[0]->v);",
+                    &BoxResolver
+                ),
+                Outcome::Pass
+            ),
+            "reads of an aliased array element must still reduce to Pass, not over-bail"
+        );
+    }
+
+    #[test]
+    fn arg_pass_inline_assign_aliasing_source_marking_bails() {
+        // Sibling of divergence A on the ARGUMENT-pass path: `f($o = new Box())` hands
+        // the SAME fresh handle to both `$o` and the callee. `eval_arguments` marked
+        // the passed value aliased but, exactly like the array-element path, its
+        // source-marking only covered a DIRECT variable — never the
+        // `Expression::Assignment` (or ternary / elvis / `??`) form — so `$o` was left
+        // unmarked. A callee that RETAINS the handle (a constructor storing a promoted
+        // param, say) then diverges when the caller later mutates `$o` (reducer sees a
+        // stale by-value clone; real PHP sees the shared mutation). Routing the
+        // argument source through the shared `mark_alias_sources` marks `$o` too, so a
+        // later `$o->inc()` BAILs (fail-closed). `assertNotNull` does not itself retain
+        // the handle, so this test locks the SOURCE-marking coverage (Bail, not the
+        // pre-fix mutate-and-Fail); the concrete wrong-answer needs an arg-retaining
+        // callee, which the shared helper now also covers.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$this->assertNotNull($o = new Box()); $o->inc(); $this->assertSame(0, $o->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "inline-assignment argument alias source must be marked (bail), not left unmarked"
+        );
+    }
+
+    #[test]
+    fn readonly_return_this_aliasing_bails() {
+        // `$b = $a->self()` — a READ-ONLY method (`function self() { return $this; }`,
+        // `mutated_this: None`) that fluently returns the receiver. PHP hands back the
+        // SAME handle, so `$a === $b`. Before the dispatch-return symmetry fix the
+        // read-only branch returned the object RAW (`None => Ok(dispatch.ret)`) and
+        // never marked the receiver `$a` aliased: a later `$a->inc()` wrote back only
+        // to `$a`, leaving `$b` a stale by-value clone (v == 0) → a false-green
+        // divergence (reducer reported Fail while real PHP — same handle — Passes with
+        // $b->v === 1). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$a = new Box(); $b = $a->self(); $a->inc(); $this->assertSame(1, $b->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "read-only object-returning method (return $this) must mark the receiver \
+             aliased and bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn readonly_return_this_chain_without_later_mutation_still_passes() {
+        // Control: `$a->self()->v` reads through the fluently-returned receiver but
+        // `$a` is NOT mutated again afterward, so marking `$a` aliased is harmless —
+        // the result stays feasible and must still reduce to PASS (no over-bail).
+        // (If a future tightening of the property-read path made this bail, that
+        // would be an ACCEPTABLE conservative over-bail, but today it passes.)
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $a->inc(); $this->assertSame(1, $a->self()->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn unique_owner_mutation_still_passes() {
+        // No aliasing: `$o` is the sole reference to its `Box`. A mutating method on
+        // a uniquely-owned object is exact under the by-value model → must PASS (the
+        // recursive source-marking must not over-bail this control).
+        assert_eq!(
+            run_body_with(
+                "$o = new Box(); $o->inc(); $this->assertSame(1, $o->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn two_independent_boxes_each_mutated_still_passes() {
+        // Two distinct, uniquely-owned boxes, each mutated independently — no alias
+        // between them → both mutations are exact → must PASS (no over-bail).
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $a->inc(); $b->inc(); $b->inc(); \
+                 $this->assertSame(1, $a->v); $this->assertSame(2, $b->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_use_capture_aliasing_bails() {
+        // `function () use ($a) { return $a; }` — PHP `use ($a)` copies the HANDLE
+        // of an object, not the object: the closure's captured `$a` and the outer
+        // `$a` are the SAME instance. Before the capture-site marking fix neither
+        // the source binding nor the captured copy was marked aliased, so a later
+        // `$a->inc()` wrote back only to the outer `$a`, leaving `$b` (returned
+        // from the closure) a stale by-value clone (v == 0) → a false divergence
+        // (reducer reported Fail while real PHP — same handle — Passes with
+        // $b->v === 1). It must BAIL.
+        let o = run_body_with(
+            "$a = new Box(); $f = function () use ($a) { return $a; }; \
+             $b = $f(); $a->inc(); $this->assertSame(1, $b->v);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "closure use($a) object capture must mark both the source binding and \
+             the captured copy aliased and bail, not diverge to a wrong Fail (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn arrow_auto_capture_aliasing_bails() {
+        // `fn () => $a` — arrow functions auto-capture by value, which for an
+        // object copies the HANDLE (same instance inside and outside). Same
+        // divergence shape as the `use ($a)` variant above: must BAIL.
+        let o = run_body_with(
+            "$a = new Box(); $f = fn () => $a; \
+             $b = $f(); $a->inc(); $this->assertSame(1, $b->v);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "arrow-function object auto-capture must mark both the source binding \
+             and the captured copy aliased and bail, not diverge to a wrong Fail (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn closure_capturing_scalar_still_passes() {
+        // Control: a closure over a SCALAR has no object handle to alias — the
+        // capture-site marking is a no-op on non-objects → must still PASS.
+        assert_eq!(
+            run_body_with(
+                "$n = 5; $f = fn () => $n + 1; $this->assertSame(6, $f());",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn closure_capturing_object_without_later_mutation_still_passes() {
+        // Control: the closure captures an object that is NEVER mutated afterward.
+        // The conservative capture mark flags both sides aliased, but the alias
+        // flag only gates MUTATING method dispatch — pure reads through either
+        // name stay exact → must still PASS (no over-bail on read-only use).
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $f = function () use ($a) { return $a; }; \
+                 $b = $f(); $this->assertSame(0, $b->v); $this->assertSame(0, $a->v);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    // ── strict identity leaking through AGGREGATES (objects/closures inside
+    //    arrays reaching php_strict_eq / php_loose_eq) ──
+
+    #[test]
+    fn strict_in_array_object_needle_bails() {
+        // PHP: in_array($o, [$o], true) is TRUE (same instance) → assertFalse
+        // FAILS. The model's php_strict_eq has no Object arm → false → a
+        // false-green Pass. Reference identity is unmodelled → must BAIL.
+        let o = run_body_with(
+            "$o = new Box(); $arr = [$o]; $this->assertFalse(in_array($o, $arr, true));",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "strict in_array with an object needle must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn strict_array_search_object_needle_bails() {
+        // PHP: array_search($o, [$o], true) returns key 0 → assertFalse(0) FAILS.
+        // The model returns false → assertFalse(false) → false-green Pass → BAIL.
+        let o = run_body_with(
+            "$o = new Box(); $arr = [$o]; $this->assertFalse(array_search($o, $arr, true));",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "strict array_search with an object needle must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn assert_not_same_on_arrays_holding_objects_bails() {
+        // PHP: [$o] === [$o] is TRUE (same element instance) → assertNotSame
+        // FAILS. The model's Arr arm recurses to (Object, Object) → false → a
+        // false-green Pass. Both operands are top-level Arrs, so the old
+        // top-level-only guard let them through → must BAIL.
+        let o = run_body_with(
+            "$o = new Box(); $this->assertNotSame([$o], [$o]);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "assertNotSame on arrays holding objects must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn assert_same_on_arrays_holding_objects_bails() {
+        // PHP: [$o] === [$o] is TRUE → assertSame PASSES. The model computes
+        // false → a wrong Fail. Must BAIL instead of diverging either way.
+        let o = run_body_with(
+            "$o = new Box(); $this->assertSame([$o], [$o]);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "assertSame on arrays holding objects must bail, not wrong-Fail (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn assert_not_equals_on_arrays_holding_closures_bails() {
+        // PHP: [$f] == [$f] is TRUE (same closure instance element) →
+        // assertNotEquals FAILS. php_loose_eq's Arr recursion hits
+        // (Closure, Closure) → false → a false-green Pass. The old closure
+        // guard checked only TOP-LEVEL operands → must BAIL.
+        let o = run_body(
+            "$f = fn() => 1; $this->assertNotEquals([$f], [$f]);",
+            vec![],
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "assertNotEquals on arrays holding closures must bail, not false-green (got {o:?})"
+        );
+    }
+
+    #[test]
+    fn strict_eq_operator_on_arrays_holding_objects_bails() {
+        // The `===` operator path (not just the assertion helpers) shares the
+        // same guard — arrays holding objects must bail there too.
+        let o = run_body_with(
+            "$o = new Box(); $r = ([$o] === [$o]); $this->assertTrue($r);",
+            &BoxResolver,
+        );
+        assert!(
+            matches!(o, Outcome::Bailed(_)),
+            "`===` on arrays holding objects must bail (got {o:?})"
+        );
+    }
+
+    // ── no-over-bail controls: scalar strict compares and plain-object loose
+    //    equality stay EXACT ──
+
+    #[test]
+    fn assert_same_scalar_arrays_still_exact() {
+        assert_eq!(
+            run_body("$this->assertSame([1, 'a'], [1, 'a']);", vec![]),
+            Outcome::Pass
+        );
+        assert!(matches!(
+            run_body("$this->assertSame([1, 'a'], [1, 'b']);", vec![]),
+            Outcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn strict_in_array_scalars_still_exact() {
+        assert_eq!(
+            run_body("$this->assertTrue(in_array(2, [1, 2], true));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertFalse(in_array(3, [1, 2], true));", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body(
+                "$this->assertSame(1, array_search(2, [1, 2], true));",
+                vec![]
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn loose_eq_on_plain_objects_still_computes() {
+        // `assertEquals` on two plain (closure-free) objects is STRUCTURAL in
+        // PHP (same class + per-prop ==) — the model computes it exactly and
+        // must NOT bail (only closures are unmodelable under loose eq).
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $this->assertEquals($a, $b);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $b->inc(); $this->assertNotEquals($a, $b);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn loose_eq_object_vs_bool_bails() {
+        // php8.4: `new stdClass() == true` is TRUE (PHP converts: object
+        // truthiness). The model computed `false`, so `assertFalse($o == true)`
+        // was a false-green Pass (reducer Pass, PHPUnit Fail). It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$o = new Box(); $this->assertFalse($o == true);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "`$o == true` (object truthiness) must bail, not compute false"
+        );
+    }
+
+    #[test]
+    fn assert_not_equals_object_vs_bool_bails() {
+        // php8.4: `true == $o` is TRUE → assertNotEquals(true, $o) FAILS in
+        // PHPUnit; the model said not-equal → false-green Pass. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$o = new Box(); $this->assertNotEquals(true, $o);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "assertNotEquals(true, $object) must bail, not pass"
+        );
+    }
+
+    #[test]
+    fn nested_array_object_vs_bool_bails() {
+        // php8.4: `[$o] == [true]` is TRUE — array `==` compares element-wise,
+        // so the mixed (Object, Bool) pair appears at depth 1 and defeats any
+        // top-level check. It must BAIL.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$o = new Box(); $this->assertFalse([$o] == [true]);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "nested `[$o] == [true]` must bail, not compute false"
+        );
+    }
+
+    #[test]
+    fn loose_eq_object_vs_other_scalars_bails() {
+        // php8.4: `$o == 1` → Notice + TRUE (int cast); `$o == "s"` may invoke
+        // __toString; `$o == null` / `$o == []` are false in PHP but sit on the
+        // same converting mixed arm — bail the whole family, never guess.
+        for body in [
+            "$o = new Box(); $this->assertFalse($o == 1);",
+            "$o = new Box(); $this->assertTrue($o != 's');",
+            "$o = new Box(); $this->assertFalse($o == null);",
+            "$o = new Box(); $this->assertFalse($o == []);",
+            "$o = new Box(); $this->assertNotEquals([], $o);",
+        ] {
+            assert!(
+                matches!(run_body_with(body, &BoxResolver), Outcome::Bailed(_)),
+                "object-vs-non-object loose eq must bail: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn loose_eq_aligned_objects_in_arrays_still_compute() {
+        // Object↔Object stays modeled (per-class + per-prop), including when the
+        // pair is structurally aligned INSIDE arrays — no over-bail.
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $this->assertTrue([$a] == [$b]);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body_with(
+                "$a = new Box(); $b = new Box(); $b->inc(); $this->assertNotEquals([1, $a], [1, $b]);",
+                &BoxResolver
+            ),
+            Outcome::Pass
+        );
+    }
+
+    #[test]
+    fn loose_eq_scalar_controls_still_compute() {
+        // Scalar / scalar-array loose equality keeps computing exactly.
+        assert_eq!(
+            run_body("$this->assertEquals([1, 2], [1, 2]);", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertTrue(1 == '1');", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertFalse(0 == 'a');", vec![]),
+            Outcome::Pass
+        );
+        assert_eq!(
+            run_body("$this->assertNotEquals([1], [2]);", vec![]),
+            Outcome::Pass
+        );
+    }
+}

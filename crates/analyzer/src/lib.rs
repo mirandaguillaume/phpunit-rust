@@ -10,6 +10,7 @@ pub mod config;
 pub mod mago_bridge;
 pub mod opacity;
 pub mod output;
+pub mod reduce;
 pub mod report;
 pub mod test_discovery;
 pub mod types;
