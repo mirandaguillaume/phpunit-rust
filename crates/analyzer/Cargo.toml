@@ -38,6 +38,8 @@ mago-php-version = "1.30"
 mago-names       = "1.30"
 mago-word        = "1.30"
 bumpalo          = "3"
+# e-graph congruence-closure reduction engine (decide-by-congruence + subterm sharing).
+egg              = "0.11"
 
 [dev-dependencies]
 tempfile   = { workspace = true }

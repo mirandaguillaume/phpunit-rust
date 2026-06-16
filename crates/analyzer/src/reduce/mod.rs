@@ -35,8 +35,12 @@
 //! differential (reduce vs the real runner) is the soundness backstop; it is
 //! driven separately.
 
+pub mod bridge_term;
 pub mod driver;
+pub mod egraph;
+pub mod eligibility;
 pub mod eval;
 pub mod gate;
 pub mod subst;
+pub mod term;
 pub mod value;

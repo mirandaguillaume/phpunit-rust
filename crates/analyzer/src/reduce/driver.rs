@@ -619,6 +619,309 @@ mod tests {
         }
     }
 
+    /// Bridge coverage harness: enumerate every test method in a PHP test file and
+    /// run the mago-AST→Term bridge ([`bridge_term::decide_test`]) on each, printing
+    /// one `  <Class>::<method> -> True|False|Unknown` line per method plus a
+    /// `BRIDGE rows=<n> TRUE=<t> FALSE=<f> UNKNOWN=<u> decided=<pct>%` footer
+    /// (`decided = (TRUE+FALSE)/rows`). The file comes from `REDUCE_BRIDGE_FILE`;
+    /// the scan root from `REDUCE_BRIDGE_ROOT` (else the composer.json project root
+    /// via [`project_root_of`], same as production `reduce_file`). It reuses the
+    /// production discovery machinery (`MagoProject` + `discover`) — NOT a bespoke
+    /// enumeration — so the (class, method) pairs match what the runner sees.
+    /// Ignored by default. Run with:
+    ///   REDUCE_BRIDGE_FILE=/abs/path/to/SomeTest.php cargo test -p analyzer --lib \
+    ///     measure_bridge_coverage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_bridge_coverage() {
+        use super::super::bridge_term;
+        use super::super::term::Decision;
+        use crate::cache::CacheStore;
+        use crate::mago_bridge::MagoProject;
+        use crate::test_discovery::discover;
+
+        let Ok(file) = std::env::var("REDUCE_BRIDGE_FILE") else {
+            eprintln!("SKIP: set REDUCE_BRIDGE_FILE=/abs/path/to/SomeTest.php");
+            return;
+        };
+        let test_file = Path::new(&file);
+        if !test_file.exists() {
+            eprintln!("SKIP: {} not present", test_file.display());
+            return;
+        }
+        // Default scan root: the composer.json PROJECT ROOT (same as production
+        // `reduce_file` via `project_root_of`) so the suite's own src/ resolves. An
+        // optional REDUCE_BRIDGE_ROOT override pins an explicit root.
+        let root_env = std::env::var("REDUCE_BRIDGE_ROOT").ok();
+        let root = match &root_env {
+            Some(r) => Path::new(r).to_path_buf(),
+            None => project_root_of(test_file),
+        };
+        eprintln!("SCAN_ROOT={}", root.display());
+
+        // Build the codebase + discover the test methods through the SAME path as
+        // `reduce_in_root` (vendor-excluded scan, content-hashed discovery cache).
+        let project = MagoProject::load_excluding_vendor(&root).expect("load project");
+        let cache = CacheStore::open(&root, MagoProject::version()).expect("open discovery cache");
+        let tests =
+            discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover test methods");
+
+        let mut rows = 0usize;
+        let mut t = 0usize;
+        let mut f = 0usize;
+        let mut u = 0usize;
+        for test in &tests {
+            // `decide_test` takes the CONCRETE runtime class (the one PHPUnit binds
+            // `$this` to) — exactly `TestMethod.class`.
+            let decision = bridge_term::decide_test(&project, &test.class, &test.method);
+            let label = match decision {
+                Decision::True => {
+                    t += 1;
+                    "True"
+                }
+                Decision::False => {
+                    f += 1;
+                    "False"
+                }
+                Decision::Unknown => {
+                    u += 1;
+                    "Unknown"
+                }
+            };
+            rows += 1;
+            println!("  {}::{} -> {}", test.class, test.method, label);
+        }
+        let decided = if rows == 0 {
+            0.0
+        } else {
+            100.0 * (t + f) as f64 / rows as f64
+        };
+        println!("BRIDGE rows={rows} TRUE={t} FALSE={f} UNKNOWN={u} decided={decided:.0}%");
+    }
+
+    /// E-graph coverage harness: enumerate every test method in a PHP test file and
+    /// run the e-graph congruence-closure engine ([`egraph::decide_test_egraph`]) on
+    /// each, printing one `  <Class>::<method> -> True|False|Unknown` line per method
+    /// plus an `EGRAPH rows=<n> TRUE=<t> FALSE=<f> UNKNOWN=<u> decided=<pct>%` footer
+    /// (`decided = (TRUE+FALSE)/rows`). The file comes from `REDUCE_EGRAPH_FILE`; the
+    /// scan root from `REDUCE_EGRAPH_ROOT` (else the composer.json project root via
+    /// [`project_root_of`], same as production `reduce_file`). It reuses the production
+    /// discovery machinery (`MagoProject` + `discover`) — NOT a bespoke enumeration —
+    /// so the (class, method) pairs match what the runner sees. Mirrors
+    /// `measure_bridge_coverage` exactly, swapping the decision engine. Ignored by
+    /// default. Run with:
+    ///   REDUCE_EGRAPH_FILE=/abs/path/to/SomeTest.php cargo test -p analyzer --lib \
+    ///     measure_egraph_coverage -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_egraph_coverage() {
+        use super::super::egraph;
+        use super::super::term::Decision;
+        use crate::cache::CacheStore;
+        use crate::mago_bridge::MagoProject;
+        use crate::test_discovery::discover;
+
+        let Ok(file) = std::env::var("REDUCE_EGRAPH_FILE") else {
+            eprintln!("SKIP: set REDUCE_EGRAPH_FILE=/abs/path/to/SomeTest.php");
+            return;
+        };
+        let test_file = Path::new(&file);
+        if !test_file.exists() {
+            eprintln!("SKIP: {} not present", test_file.display());
+            return;
+        }
+        // Default scan root: the composer.json PROJECT ROOT (same as production
+        // `reduce_file` via `project_root_of`) so the suite's own src/ resolves. An
+        // optional REDUCE_EGRAPH_ROOT override pins an explicit root.
+        let root_env = std::env::var("REDUCE_EGRAPH_ROOT").ok();
+        let root = match &root_env {
+            Some(r) => Path::new(r).to_path_buf(),
+            None => project_root_of(test_file),
+        };
+        eprintln!("SCAN_ROOT={}", root.display());
+
+        // Build the codebase + discover the test methods through the SAME path as
+        // `reduce_in_root` (vendor-excluded scan, content-hashed discovery cache).
+        let project = MagoProject::load_excluding_vendor(&root).expect("load project");
+        let cache = CacheStore::open(&root, MagoProject::version()).expect("open discovery cache");
+        let tests =
+            discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover test methods");
+
+        let mut rows = 0usize;
+        let mut t = 0usize;
+        let mut f = 0usize;
+        let mut u = 0usize;
+        for test in &tests {
+            // `decide_test_egraph` takes the CONCRETE runtime class (the one PHPUnit
+            // binds `$this` to) — exactly `TestMethod.class`.
+            let decision = egraph::decide_test_egraph(&project, &test.class, &test.method);
+            let label = match decision {
+                Decision::True => {
+                    t += 1;
+                    "True"
+                }
+                Decision::False => {
+                    f += 1;
+                    "False"
+                }
+                Decision::Unknown => {
+                    u += 1;
+                    "Unknown"
+                }
+            };
+            rows += 1;
+            println!("  {}::{} -> {}", test.class, test.method, label);
+        }
+        let decided = if rows == 0 {
+            0.0
+        } else {
+            100.0 * (t + f) as f64 / rows as f64
+        };
+        println!("EGRAPH rows={rows} TRUE={t} FALSE={f} UNKNOWN={u} decided={decided:.0}%");
+    }
+
+    /// E-graph COMPRESSION harness (the recentred invariant: SHARE, don't decide).
+    /// Where `measure_egraph_coverage` asks "what fraction of tests can we DECIDE", this
+    /// asks "how much does the whole suite COMPRESS when every test's terms share ONE
+    /// e-graph". It enumerates every test method in `REDUCE_EGRAPH_FILE`, inserts ALL of
+    /// their relevant sub-expressions into one shared e-graph via the NON-BAILING suite
+    /// extractor (every opaque op/call/access becomes a shareable symbol — nothing
+    /// bails), and prints:
+    ///   COMPRESSION file=<f> tests=<n> N_naif=<x> classes_struct=<y> classes_sat=<z>
+    ///     ratio_struct=<r1> ratio_total=<r2>
+    /// `N_naif` = total nodes materialised before any sharing; `classes_struct` =
+    /// e-classes after hash-cons sharing alone; `classes_sat` = e-classes after the
+    /// derived rules + ground fold also fuse. The point: a suite that decides 0% (carbon,
+    /// brick-math) can still compress HARD, because identical opaque computations share.
+    /// Ignored by default. Run with:
+    ///   REDUCE_EGRAPH_FILE=/abs/path/to/SomeTest.php cargo test -p analyzer --lib \
+    ///     measure_egraph_compression -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_egraph_compression() {
+        use super::super::egraph;
+        use crate::cache::CacheStore;
+        use crate::mago_bridge::MagoProject;
+        use crate::test_discovery::discover;
+
+        let Ok(file) = std::env::var("REDUCE_EGRAPH_FILE") else {
+            eprintln!("SKIP: set REDUCE_EGRAPH_FILE=/abs/path/to/SomeTest.php");
+            return;
+        };
+        let test_file = Path::new(&file);
+        if !test_file.exists() {
+            eprintln!("SKIP: {} not present", test_file.display());
+            return;
+        }
+        let root_env = std::env::var("REDUCE_EGRAPH_ROOT").ok();
+        let root = match &root_env {
+            Some(r) => Path::new(r).to_path_buf(),
+            None => project_root_of(test_file),
+        };
+        eprintln!("SCAN_ROOT={}", root.display());
+
+        let project = MagoProject::load_excluding_vendor(&root).expect("load project");
+        let cache = CacheStore::open(&root, MagoProject::version()).expect("open discovery cache");
+        let tests =
+            discover(&project, &cache, &[test_file.to_path_buf()]).expect("discover test methods");
+
+        // Group the discovered (class, method) pairs by the LOGICAL file that declares
+        // each method's body, so we can reparse that file ONCE and collect every test's
+        // `&Method` inside the (arena-scoped) `with_program` closure. Normally there is a
+        // single group: the test file itself.
+        let mut by_file: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for test in &tests {
+            let body_class = test.body_class();
+            let Some(meta) = project.find_class(body_class) else {
+                continue;
+            };
+            let Some(src) = project.file_of_span(&meta.span) else {
+                continue;
+            };
+            let logical = String::from_utf8_lossy(&src.name).into_owned();
+            let fqcn = String::from_utf8_lossy(meta.name.as_bytes()).into_owned();
+            by_file
+                .entry(logical)
+                .or_default()
+                .push((fqcn, test.method.clone()));
+        }
+
+        let mut agg = egraph::CompressionStats::default();
+        // Merge each file's TOP targets by op (sum multiplicity, keep the cost), then
+        // re-rank globally — so a multi-file suite still surfaces the heaviest shared call.
+        let mut merged_targets: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (logical, methods) in &by_file {
+            // Reparse this file ONCE; the `&Method` borrows live for the whole closure,
+            // so `build_suite_egraph` (which inserts every test's terms into ONE shared
+            // e-graph and saturates) runs entirely inside it.
+            let stats = project
+                .with_program(logical, |program, file, _names| {
+                    let source_text = String::from_utf8_lossy(&file.contents);
+                    let mut pairs: Vec<(Vec<u8>, &Method)> = Vec::new();
+                    for (fqcn, method) in methods {
+                        if let Some(m) = super::super::subst::find_class_method(
+                            program,
+                            fqcn.as_bytes(),
+                            method.as_bytes(),
+                        ) {
+                            pairs.push((fqcn.as_bytes().to_vec(), m));
+                        }
+                    }
+                    egraph::build_suite_egraph(&project, program, &source_text, &pairs)
+                })
+                .unwrap_or_default();
+            agg.tests += stats.tests;
+            agg.n_naive += stats.n_naive;
+            agg.classes_struct += stats.classes_struct;
+            agg.classes_sat += stats.classes_sat;
+            agg.cost_naive += stats.cost_naive;
+            agg.cost_shared += stats.cost_shared;
+            for t in &stats.top_targets {
+                let e = merged_targets.entry(t.op.clone()).or_insert((0, t.cost));
+                e.0 += t.mult;
+                e.1 = e.1.max(t.cost);
+            }
+        }
+
+        let mut top: Vec<egraph::CostTarget> = merged_targets
+            .into_iter()
+            .map(|(op, (mult, cost))| egraph::CostTarget { op, mult, cost })
+            .collect();
+        top.sort_by(|a, b| b.weight().cmp(&a.weight()).then(b.mult.cmp(&a.mult)));
+        top.truncate(10);
+
+        println!(
+            "COMPRESSION file={} tests={} N_naif={} classes_struct={} classes_sat={} \
+             ratio_struct={:.2} ratio_total={:.2}",
+            test_file.display(),
+            agg.tests,
+            agg.n_naive,
+            agg.classes_struct,
+            agg.classes_sat,
+            agg.ratio_struct(),
+            agg.ratio_total(),
+        );
+        println!(
+            "COST file={} cost_naive={} cost_shared={} cost_compression={:.2}",
+            test_file.display(),
+            agg.cost_naive,
+            agg.cost_shared,
+            agg.cost_compression(),
+        );
+        for t in &top {
+            println!(
+                "TOP mult={} cost={} weight={} saved={} op={}",
+                t.mult,
+                t.cost,
+                t.weight(),
+                t.saved(),
+                t.op,
+            );
+        }
+    }
+
     /// Build a temp PHP PROJECT (composer.json + src/ + tests/) and return the dir.
     /// Unlike `write_suite` (flat), this lays out a real project tree so the
     /// project-root scan (Task 1) can resolve the library's own `src/` classes.
