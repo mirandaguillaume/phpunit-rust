@@ -2704,17 +2704,22 @@ fn eval_legacy_array(arr: &LegacyArray, scope: &mut Scope) -> Result<Value, Bail
 /// Evaluate an array ELEMENT value, marking aliasing (Inc-5 Task 3): an object
 /// stored into an array element gains a second reference path (the array now holds
 /// it), so a later mutation through any reference would diverge — mark the stored
-/// object aliased, and the source `$var` (if direct) too. Fail-closed over-approx.
+/// object aliased, AND every value-forwarding SOURCE the element expression reaches.
+///
+/// The source side must be as exhaustive as the assignment-rhs path: an inline
+/// assignment `[$o = new X()]`, a ternary `[$c ? $a : $b]`, an elvis `[$a ?: $b]`,
+/// or a `??` `[$a ?? $b]` element each hands the SAME handle to a source binding
+/// that a later mutating method would write back to alone, leaving the stored
+/// element a stale by-value clone (Round 19 take-9 divergence A: reducer Fail while
+/// real PHP — same handle — Passes). Route through the shared `mark_alias_sources`
+/// (the assignment-rhs path's helper) so every forwarded source aliases too; the
+/// direct-`$var` and parenthesized cases are its base/`Parenthesized` arms, so this
+/// strictly widens coverage. Fail-closed over-approx — over-marking only over-bails.
 fn eval_object_element(expr: &Expression, scope: &mut Scope) -> Result<Value, BailReason> {
     let mut v = eval_expr(expr, scope)?;
     if matches!(v, Value::Object { .. }) {
         v.mark_aliased();
-        if let Expression::Variable(Variable::Direct(src)) = unwrap_parens(expr) {
-            let src_key = var_name(src.name);
-            if let Some(src_val) = scope.vars.get_mut(&src_key) {
-                src_val.mark_aliased();
-            }
-        }
+        mark_alias_sources(expr, scope);
     }
     Ok(v)
 }
@@ -3604,19 +3609,20 @@ fn eval_arguments(
                 }
                 let mut value = eval_expr(p.value, scope)?;
                 // Aliasing (Inc-5 Task 3): passing an object as an argument shares
-                // the HANDLE in PHP — the callee can mutate it and the caller sees
-                // the change. Our by-value clone would diverge. Mark the passed
-                // value aliased (so a mutation inside the callee bails) and, when
-                // the argument is a direct `$var`, mark the caller's binding aliased
-                // too (a later mutation back in the caller bails). Fail-closed.
+                // the HANDLE in PHP — the callee can mutate it (or RETAIN it, e.g. a
+                // constructor storing a promoted param) and the caller sees the
+                // change. Our by-value clone would diverge. Mark the passed value
+                // aliased AND every value-forwarding SOURCE the argument expression
+                // reaches — not just a direct `$var`: an inline assignment
+                // `f($o = new X())`, ternary, elvis, or `??` argument hands the SAME
+                // handle to a source binding that a later caller-side mutation would
+                // write back to alone. Route through the shared `mark_alias_sources`
+                // (the assignment-rhs and array-element paths' helper) so every
+                // forwarded source aliases too — fail-closed; over-marking only
+                // over-bails.
                 if matches!(value, Value::Object { .. }) {
                     value.mark_aliased();
-                    if let Expression::Variable(Variable::Direct(src)) = unwrap_parens(p.value) {
-                        let src_key = var_name(src.name);
-                        if let Some(src_val) = scope.vars.get_mut(&src_key) {
-                            src_val.mark_aliased();
-                        }
-                    }
+                    mark_alias_sources(p.value, scope);
                 }
                 out.push(value);
             }
@@ -4831,6 +4837,76 @@ mod tests {
                 Outcome::Bailed(_)
             ),
             "parenthesized null-coalesce-forwarded alias source must bail, not diverge"
+        );
+    }
+
+    #[test]
+    fn array_literal_inline_assign_aliasing_source_marking_bails() {
+        // `$arr = [$o = new Box()]` — the inline assignment hands the SAME fresh
+        // handle to BOTH `$o` and the array element. `eval_object_element` marks the
+        // STORED element aliased, but its source-marking only covered a DIRECT
+        // variable (`unwrap_parens` → `Variable::Direct`), not the
+        // `Expression::Assignment` form, so the source `$o` was left unmarked. A later
+        // `$o->inc()` then wrote back only to `$o`, leaving `$arr[0]` a stale by-value
+        // clone (v == 0) → a 0-divergence wrong Fail (reducer Fail while real PHP —
+        // same handle — Passes with $arr[0]->v === 1). Routing the element source
+        // through the exhaustive `mark_alias_sources` marks `$o` too, so the mutation
+        // BAILs (fail-closed), never diverges.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$arr = [$o = new Box()]; $o->inc(); $this->assertSame(1, $arr[0]->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "array-literal inline-assignment alias source must bail, not diverge to a wrong Fail"
+        );
+    }
+
+    #[test]
+    fn array_literal_inline_assign_no_mutation_reduces() {
+        // No-over-bail control for the fix above: an inline-assignment array element
+        // with NO subsequent mutation only READS the (aliased) object, and reads of an
+        // aliased object are exact — so the body still REDUCES to Pass, not Bail.
+        // Guards against the source-marking change turning every captured object into
+        // a blanket bail.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$arr = [$o = new Box()]; $this->assertSame(0, $arr[0]->v);",
+                    &BoxResolver
+                ),
+                Outcome::Pass
+            ),
+            "reads of an aliased array element must still reduce to Pass, not over-bail"
+        );
+    }
+
+    #[test]
+    fn arg_pass_inline_assign_aliasing_source_marking_bails() {
+        // Sibling of divergence A on the ARGUMENT-pass path: `f($o = new Box())` hands
+        // the SAME fresh handle to both `$o` and the callee. `eval_arguments` marked
+        // the passed value aliased but, exactly like the array-element path, its
+        // source-marking only covered a DIRECT variable — never the
+        // `Expression::Assignment` (or ternary / elvis / `??`) form — so `$o` was left
+        // unmarked. A callee that RETAINS the handle (a constructor storing a promoted
+        // param, say) then diverges when the caller later mutates `$o` (reducer sees a
+        // stale by-value clone; real PHP sees the shared mutation). Routing the
+        // argument source through the shared `mark_alias_sources` marks `$o` too, so a
+        // later `$o->inc()` BAILs (fail-closed). `assertNotNull` does not itself retain
+        // the handle, so this test locks the SOURCE-marking coverage (Bail, not the
+        // pre-fix mutate-and-Fail); the concrete wrong-answer needs an arg-retaining
+        // callee, which the shared helper now also covers.
+        assert!(
+            matches!(
+                run_body_with(
+                    "$this->assertNotNull($o = new Box()); $o->inc(); $this->assertSame(0, $o->v);",
+                    &BoxResolver
+                ),
+                Outcome::Bailed(_)
+            ),
+            "inline-assignment argument alias source must be marked (bail), not left unmarked"
         );
     }
 
