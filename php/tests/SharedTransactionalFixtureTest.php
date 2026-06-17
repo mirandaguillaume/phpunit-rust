@@ -28,6 +28,7 @@ final class _SharedFixtureProbe extends TestCase
         self::$built  = 0;
         self::$began  = 0;
         self::$rolled = 0;
+        self::$sharedFixtureBuilt = false; // reset the build-once guard between probe runs
     }
 
     protected static function buildSharedFixture(): void
@@ -72,5 +73,20 @@ final class SharedTransactionalFixtureTest extends TestCase
         $this->assertSame(1, _SharedFixtureProbe::$built, 'fixture built EXACTLY once per class');
         $this->assertSame(2, _SharedFixtureProbe::$began, 'exactly one transaction opened per test');
         $this->assertSame(2, _SharedFixtureProbe::$rolled, 'exactly one rollback per test');
+    }
+
+    public function testBuildsOnceAcrossMultipleRunClassCalls(): void
+    {
+        // The runner fragments a class into multiple runClass calls (one per
+        // batch/plan). setUpBeforeClass fires per call; the trait's static guard
+        // must keep buildSharedFixture to ONCE per worker process regardless.
+        _SharedFixtureProbe::resetCounters();
+
+        TestExecutor::runClass(_SharedFixtureProbe::class, ['testA']);
+        TestExecutor::runClass(_SharedFixtureProbe::class, ['testB']);
+
+        $this->assertSame(1, _SharedFixtureProbe::$built, 'built once across two runClass calls');
+        $this->assertSame(2, _SharedFixtureProbe::$began, 'one transaction per test, both calls');
+        $this->assertSame(2, _SharedFixtureProbe::$rolled, 'one rollback per test, both calls');
     }
 }

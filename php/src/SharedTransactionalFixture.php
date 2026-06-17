@@ -37,10 +37,24 @@ namespace PhpunitRust;
  */
 trait SharedTransactionalFixture
 {
+    /**
+     * Per-process, per-class build-once guard. A trait static property is SEPARATE
+     * per using-class in PHP, so this never conflates two classes. The runner
+     * fragments a class into multiple runClass calls (one per batch/plan) and
+     * setUpBeforeClass fires once per call; a warm worker is a long-lived process,
+     * so this static persists across those calls — keeping buildSharedFixture to
+     * once per (class, worker) instead of once per plan. The whole point: O(plans)
+     * rebuilds collapse to O(1) build per worker.
+     */
+    private static bool $sharedFixtureBuilt = false;
+
     public static function setUpBeforeClass(): void
     {
         parent::setUpBeforeClass();
-        static::buildSharedFixture();
+        if (!static::$sharedFixtureBuilt) {
+            static::buildSharedFixture();
+            static::$sharedFixtureBuilt = true;
+        }
     }
 
     public static function tearDownAfterClass(): void
@@ -61,7 +75,12 @@ trait SharedTransactionalFixture
         parent::tearDown();
     }
 
-    /** Build the expensive deterministic fixture ONCE per class (store it statically). */
+    /**
+     * Build the expensive deterministic fixture (store it statically). Called once
+     * per worker process per class (guarded by self::$sharedFixtureBuilt). A class
+     * that RELEASES the fixture in tearDownSharedFixture() MUST reset
+     * `static::$sharedFixtureBuilt = false` so the next worker rebuilds it.
+     */
     abstract protected static function buildSharedFixture(): void;
 
     /** Open this test's isolation boundary on the shared fixture (transaction / savepoint). */
