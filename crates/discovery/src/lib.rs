@@ -3378,6 +3378,7 @@ class ConcreteTest extends BaseTest {}
         );
     }
 
+    #[test]
     fn discover_class_file_index_finds_classes() {
         let src = r#"<?php
 namespace App\Data;
