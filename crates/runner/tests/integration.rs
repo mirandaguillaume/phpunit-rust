@@ -581,7 +581,8 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
         return;
     }
     let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_inline_crash_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("phpunit_rust_inline_crash_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // An uncatchable E_ERROR (undefined function) kills the inline master process mid-batch.
     let fatal_file = dir.join("InlineFatalTest.php");

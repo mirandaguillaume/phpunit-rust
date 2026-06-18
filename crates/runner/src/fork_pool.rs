@@ -50,8 +50,20 @@ impl PhpForkPool {
         per_slot_dsn: Option<&[String]>,
     ) -> Result<Self> {
         Self::spawn_inner(
-            script, autoload, bootstrap, defines, env, server, ini, vars, n, class_map,
-            worker_memory_limit, max_batches_per_child, per_slot_dsn, false,
+            script,
+            autoload,
+            bootstrap,
+            defines,
+            env,
+            server,
+            ini,
+            vars,
+            n,
+            class_map,
+            worker_memory_limit,
+            max_batches_per_child,
+            per_slot_dsn,
+            false,
         )
     }
 
@@ -75,8 +87,20 @@ impl PhpForkPool {
         per_slot_dsn: Option<&[String]>,
     ) -> Result<Self> {
         Self::spawn_inner(
-            script, autoload, bootstrap, defines, env, server, ini, vars, n, class_map,
-            worker_memory_limit, max_batches_per_child, per_slot_dsn, true,
+            script,
+            autoload,
+            bootstrap,
+            defines,
+            env,
+            server,
+            ini,
+            vars,
+            n,
+            class_map,
+            worker_memory_limit,
+            max_batches_per_child,
+            per_slot_dsn,
+            true,
         )
     }
 

@@ -363,7 +363,10 @@ fn clamp_php_workers(requested: usize, explicit: bool, cases_len: usize, k: usiz
 /// it never fires where parallelism would help; it matches vanilla's single-process model for exactly
 /// the tiny suites where vanilla wins today.
 fn single_process_eligible(workers: usize, cases: &[phpunit_rust::types::TestCase]) -> bool {
-    workers == 1 && cases.iter().all(|c| !c.is_stateful && !c.is_isolated && !c.needs_db)
+    workers == 1
+        && cases
+            .iter()
+            .all(|c| !c.is_stateful && !c.is_isolated && !c.needs_db)
 }
 
 fn real_main() -> Result<ExitCode> {
@@ -1208,7 +1211,7 @@ mod gate_tests {
         assert_eq!(clamp_php_workers(22, false, 100, 16), 7); // ceil(100/16)=7
         assert_eq!(clamp_php_workers(22, false, 2462, 16), 22); // faker: ceil=154 -> min(22,154)=22
         assert_eq!(clamp_php_workers(22, false, 0, 16), 1); // floor 1
-        // Explicit --workers N: honored verbatim, never clamped.
+                                                            // Explicit --workers N: honored verbatim, never clamped.
         assert_eq!(clamp_php_workers(8, true, 12, 16), 8);
     }
 
