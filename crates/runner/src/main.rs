@@ -1390,13 +1390,15 @@ mod gate_tests {
         assert!(!single_process_eligible(1, &[mk(true, false, false)])); // stateful -> fork
         assert!(!single_process_eligible(1, &[mk(false, true, false)])); // isolated -> fork
         assert!(!single_process_eligible(1, &[mk(false, false, true)])); // needs_db -> fork
-        // Size cap: a large all-dispatch-safe suite must NOT inline (no fork isolation means one
-        // crash loses everything); it routes to the fork pool instead. Boundary at INLINE_MAX_CASES.
+                                                                         // Size cap: a large all-dispatch-safe suite must NOT inline (no fork isolation means one
+                                                                         // crash loses everything); it routes to the fork pool instead. Boundary at INLINE_MAX_CASES.
         let big: Vec<_> = (0..INLINE_MAX_CASES + 1)
             .map(|_| mk(false, false, false))
             .collect();
         assert!(!single_process_eligible(1, &big)); // >16 -> fork
-        let at_cap: Vec<_> = (0..INLINE_MAX_CASES).map(|_| mk(false, false, false)).collect();
+        let at_cap: Vec<_> = (0..INLINE_MAX_CASES)
+            .map(|_| mk(false, false, false))
+            .collect();
         assert!(single_process_eligible(1, &at_cap)); // ==16 -> inline
     }
 
