@@ -1490,4 +1490,44 @@ return array(
         assert_eq!(index, full_index);
         assert!(index.contains_key("App\\Helper"));
     }
+
+    #[test]
+    fn build_cases_and_index_falls_back_when_external_provider_not_psr4() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = tmp.path();
+        std::fs::create_dir_all(proj.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(proj.join("tests")).unwrap();
+        std::fs::create_dir_all(proj.join("fixtures")).unwrap();
+        // PSR-4 maps App\Tests\ -> tests ONLY; App\Fixtures\ is NOT mapped.
+        std::fs::write(
+            proj.join("vendor/composer/autoload_psr4.php"),
+            r#"<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'App\\Tests\\' => array($baseDir . '/tests'),
+);
+"#,
+        )
+        .unwrap();
+        // Provider class at a non-PSR-4 path (filename deliberately differs from class name).
+        std::fs::write(
+            proj.join("fixtures/data_rows.php"),
+            "<?php\nnamespace App\\Fixtures;\nclass Data { public static function rows() { return [[1]]; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("tests/FooTest.php"),
+            "<?php\nnamespace App\\Tests;\nuse PHPUnit\\Framework\\TestCase;\nuse PHPUnit\\Framework\\Attributes\\DataProviderExternal;\nclass FooTest extends TestCase {\n  #[DataProviderExternal(\\App\\Fixtures\\Data::class, 'rows')]\n  public function testBar($x) { $this->assertTrue((bool)$x); }\n}\n",
+        )
+        .unwrap();
+
+        let roots = vec![proj.join("tests")];
+        let supp = vec![proj.join("tests"), proj.join("fixtures")];
+        let (_cases, index) = build_cases_and_index(proj, &roots, &[], &supp, false).unwrap();
+        assert!(
+            index.contains_key("App\\Fixtures\\Data"),
+            "non-PSR-4 provider must be kept via the full-parse fallback (parity)"
+        );
+    }
 }
