@@ -449,7 +449,15 @@ if ($inline) {
         @stream_set_close_on_exec($childStdinStreams[0], true);
         @stream_set_close_on_exec($childStdoutStreams[0], true);
     }
-    runChild($childStdinStreams[0], $childStdoutStreams[0], $workerMemoryLimit, $maxBatches);
+    // maxBatches=0 (unlimited) is LOAD-BEARING here: inline has NO master to fork a warm
+    // replacement, so a voluntary recycle (WORKER_EXIT_VOLUNTARY_RECYCLE after $maxBatches batches)
+    // would orphan the run — this process would just exit and the runner would synthesise
+    // "worker crashed" errors for every still-queued test. The K-batch recycle is a fork-pool
+    // memory/isolation device with no meaning without a respawner. Run ALL batches in this one
+    // process, matching vanilla's single-process model (per the comment above). Passing $maxBatches
+    // here was a latent bug: any inline suite exceeding K batches (e.g. a data-provider-heavy suite,
+    // even within the method-count cap) lost every test past batch K.
+    runChild($childStdinStreams[0], $childStdoutStreams[0], $workerMemoryLimit, 0);
     exit(0);
 }
 
