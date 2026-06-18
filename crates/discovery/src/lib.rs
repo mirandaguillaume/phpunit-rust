@@ -1896,18 +1896,34 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
 /// `autoload-dev`) scanned to build a complete class graph — they contribute
 /// abstract base classes to the inheritance chain but never emit test cases
 /// themselves. Pass an empty slice when not needed.
-pub fn discover_in_dirs(
+/// Like [`discover_in_dirs`] but also returns a FQCN→file index for EVERY
+/// class parsed from the test files (roots + supplement `*Test*.php`),
+/// including co-located non-test helper classes defined inside a `*Test*.php`
+/// file (e.g. `TestableLorem` in `LoremTest.php`). Such helpers are absent
+/// from a cases-derived index and would otherwise end up in the "unresolvable"
+/// set, preventing the PSR-4 fast path from triggering.
+///
+/// This index is a SUBSET of [`discover_with_index`]'s full index (it omits
+/// only non-`*Test*` files), so the runner's PSR-4-sufficiency gate remains
+/// sound: a genuinely non-PSR-4 class in a non-test file still lands in `U`
+/// and triggers the full fallback.
+pub fn discover_cases_and_test_index(
     roots: &[PathBuf],
     excludes: &[PathBuf],
     graph_supplement_dirs: &[PathBuf],
-) -> Result<Vec<TestCase>> {
+) -> Result<(Vec<TestCase>, HashMap<String, PathBuf>)> {
     // Canonicalize excludes once so prefix checks are robust.
     let canon_excludes: Vec<PathBuf> = excludes
         .iter()
         .filter_map(|p| p.canonicalize().ok())
         .collect();
 
-    // Pass 1: collect matching paths, then parse in parallel.
+    // Pass 1: collect matching paths, then parse in parallel. A single `seen`
+    // set dedups across overlapping roots (e.g. phpunit.xml declaring both
+    // `tests/` and a nested `tests/unit/`) AND across the supplement walk
+    // below — mirroring `discover_with_index` so the fast path's emission
+    // count matches the full parse (a duplicate would double-count `emit_count`).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut root_files: Vec<PathBuf> = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -1928,7 +1944,11 @@ pub fn discover_in_dirs(
                     continue;
                 }
             }
-            root_files.push(p.to_path_buf());
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) {
+                continue;
+            }
+            root_files.push(buf);
         }
     }
     // Sort for deterministic, filesystem-order-independent discovery. WalkDir
@@ -1952,8 +1972,10 @@ pub fn discover_in_dirs(
 
     // Supplement: parse *Test*.php files from autoload-dev dirs to enrich the
     // class graph with abstract base classes that live outside the testsuite
-    // directories (e.g. Carbon's tests/AbstractTestCase.php).
-    let parsed_paths: HashSet<PathBuf> = parsed.iter().map(|c| c.file.clone()).collect();
+    // directories (e.g. Carbon's tests/AbstractTestCase.php). The shared `seen`
+    // set already holds every root file, so a supplement file already visited in
+    // the roots is skipped — and overlapping supplement dirs dedup against each
+    // other too.
     let mut supp_files: Vec<PathBuf> = Vec::new();
     for dir in graph_supplement_dirs {
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
@@ -1969,9 +1991,11 @@ pub fn discover_in_dirs(
             {
                 continue;
             }
-            if !parsed_paths.contains(p) {
-                supp_files.push(p.to_path_buf());
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) {
+                continue;
             }
+            supp_files.push(buf);
         }
     }
     supp_files.sort(); // same determinism rationale as root_files above
@@ -1990,8 +2014,31 @@ pub fn discover_in_dirs(
         .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
         .collect();
 
+    // FQCN -> file for EVERY class parsed from the test files (roots + supplement),
+    // including non-test helper classes co-located inside a *Test*.php file (e.g. a
+    // `TestableLorem` defined in `LoremTest.php`). First occurrence wins, matching the
+    // index semantics of `discover_with_index`. This is the fast-path fallback index;
+    // it is a subset of `discover_with_index`'s full index (it omits only non-*Test*
+    // files), so the runner's PSR-4-sufficiency gate stays sound.
+    let index: HashMap<String, PathBuf> = {
+        let mut m = HashMap::with_capacity(parsed.len());
+        for c in &parsed {
+            m.entry(c.fqcn.clone()).or_insert_with(|| c.file.clone());
+        }
+        m
+    };
+
     // Pass 3: emit test methods only for classes from the testsuite roots.
-    emit_test_cases(&parsed[..emit_count], &graph)
+    let cases = emit_test_cases(&parsed[..emit_count], &graph)?;
+    Ok((cases, index))
+}
+
+pub fn discover_in_dirs(
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    graph_supplement_dirs: &[PathBuf],
+) -> Result<Vec<TestCase>> {
+    Ok(discover_cases_and_test_index(roots, excludes, graph_supplement_dirs)?.0)
 }
 
 /// Single-pass discovery + FQCN index. Replaces a sequential
@@ -3479,5 +3526,56 @@ class TautologyTest extends TestCase {
             "LatinTest must be discovered despite the non-UTF-8 byte; got {:?}",
             classes.iter().map(|c| &c.fqcn).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn discover_cases_and_test_index_includes_colocated_helper_classes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        // A *Test* file defining BOTH a test class AND a co-located non-test helper.
+        std::fs::write(
+            dir.join("tests/FooTest.php"),
+            "<?php\nnamespace App\\Tests;\nuse PHPUnit\\Framework\\TestCase;\nclass FooHelper {}\nclass FooTest extends TestCase { public function testBar() { $this->assertTrue(true); } }\n",
+        )
+        .unwrap();
+        let roots = vec![dir.join("tests")];
+        let (cases, index) = discover_cases_and_test_index(&roots, &[], &[]).unwrap();
+        // Only the test class is emitted...
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].class, "App\\Tests\\FooTest");
+        // ...but the index captures BOTH the test class and the co-located helper.
+        assert!(index.contains_key("App\\Tests\\FooTest"));
+        assert!(
+            index.contains_key("App\\Tests\\FooHelper"),
+            "co-located helper class must be in the test-file index"
+        );
+    }
+
+    /// Overlapping roots (a phpunit.xml declaring both `tests/` and a nested
+    /// `tests/unit/`) must not double-count: `discover_in_dirs` is the runner's
+    /// fast path and `discover_with_index` is the full path — if the former
+    /// re-visits files under the nested dir while the latter dedups across walks,
+    /// the two emit different test counts → rust count > vanilla (parity failure).
+    #[test]
+    fn discover_in_dirs_dedups_overlapping_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/b/FooTest.php"),
+            "<?php\nclass FooTest extends \\PHPUnit\\Framework\\TestCase {\n    public function testX() {}\n}\n",
+        )
+        .unwrap();
+        let roots = vec![dir.path().join("a"), dir.path().join("a/b")];
+
+        let cases_in_dirs = discover_in_dirs(&roots, &[], &[]).unwrap();
+        let (cases_with_index, _) = discover_with_index(&roots, &[], &[]).unwrap();
+
+        assert_eq!(
+            cases_in_dirs.len(),
+            cases_with_index.len(),
+            "fast-path emission must match full parse"
+        );
+        assert_eq!(cases_in_dirs.len(), 1);
     }
 }
