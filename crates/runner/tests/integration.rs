@@ -797,3 +797,120 @@ fn inline_runs_all_batches_without_voluntary_recycle() {
         );
     }
 }
+
+#[test]
+fn forked_worker_death_salvages_innocent_tail_and_bounds_poison() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_salvage_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // testOk1 passes, testPoison fatals (undefined fn = uncatchable E_ERROR), testOk2 must still run.
+    let file = dir.join("SalvageTest.php");
+    std::fs::write(
+        &file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass SalvageTest extends TestCase {\n  public function testOk1(): void { $this->assertTrue(true); }\n  public function testPoison(): void { __phpunit_rust_no_such_fn_xyz(); }\n  public function testOk2(): void { $this->assertTrue(true); }\n}\n",
+    )
+    .unwrap();
+
+    let mk = |method: &str| TestCase {
+        file: file.clone(),
+        class: "SalvageTest".to_string(),
+        method: method.to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let cases = vec![mk("testOk1"), mk("testPoison"), mk("testOk2")];
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        let mut pool = PhpForkPool::spawn(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            0,
+            None,
+        )
+        .expect("spawn failed");
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, cases, &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(Instant::now() < deadline, "salvage run hung");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let report = handle.join().expect("panicked").expect("Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let status_of = |m: &str| {
+        report
+            .outcomes
+            .iter()
+            .find(|o| o.method == m)
+            .map(|o| o.status.clone())
+    };
+    assert_eq!(
+        status_of("testOk1"),
+        Some(TestStatus::Pass),
+        "outcomes: {:?}",
+        report.outcomes
+    );
+    assert_eq!(
+        status_of("testOk2"),
+        Some(TestStatus::Pass),
+        "innocent tail must be salvaged (re-queued onto a fresh child); outcomes: {:?}",
+        report.outcomes
+    );
+    assert_eq!(
+        status_of("testPoison"),
+        Some(TestStatus::Error),
+        "poison test must end as Error at the cap; outcomes: {:?}",
+        report.outcomes
+    );
+    for m in ["testOk1", "testPoison", "testOk2"] {
+        assert_eq!(
+            report.outcomes.iter().filter(|o| o.method == m).count(),
+            1,
+            "{m} must be reported exactly once; outcomes: {:?}",
+            report.outcomes
+        );
+    }
+}
