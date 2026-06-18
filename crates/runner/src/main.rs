@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use phpunit_rust::discovery::discover_with_index;
@@ -27,6 +27,98 @@ fn parse_autoload_dev_dirs(project: &std::path::Path) -> Vec<PathBuf> {
         collect_classmap_dirs(block, project, &mut dirs);
     }
     dirs
+}
+
+/// First single-quoted substring in `s`, or None.
+#[allow(dead_code)] // used in Task 2
+fn first_single_quoted(s: &str) -> Option<String> {
+    let start = s.find('\'')? + 1;
+    let rest = &s[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse `vendor/composer/autoload_psr4.php` into (namespace prefix, absolute dir) pairs.
+/// Returns None when the file is absent or yields nothing — the caller then takes the full
+/// `discover_with_index` path (never worse than today). PSR-4 only; classmap/psr-0 are
+/// intentionally ignored (an unmatched FQCN is treated as unresolvable and kept via the
+/// full-parse fallback, so this can never wrongly drop a class).
+#[allow(dead_code)] // used in Task 2
+fn load_composer_psr4_map(project: &Path) -> Option<Vec<(String, PathBuf)>> {
+    let text = std::fs::read_to_string(project.join("vendor/composer/autoload_psr4.php")).ok()?;
+    let vendor_dir = project.join("vendor");
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for line in text.lines() {
+        let Some(arrow) = line.find("=>") else {
+            continue;
+        };
+        let (head, tail) = line.split_at(arrow);
+        let Some(prefix_raw) = first_single_quoted(head) else {
+            continue;
+        };
+        if !prefix_raw.ends_with('\\') {
+            continue;
+        }
+        let prefix = prefix_raw.replace("\\\\", "\\");
+        let mut search = tail;
+        loop {
+            let v = search.find("$vendorDir");
+            let b = search.find("$baseDir");
+            let (is_vendor, at) = match (v, b) {
+                (Some(vi), Some(bi)) => {
+                    if vi < bi {
+                        (true, vi)
+                    } else {
+                        (false, bi)
+                    }
+                }
+                (Some(vi), None) => (true, vi),
+                (None, Some(bi)) => (false, bi),
+                (None, None) => break,
+            };
+            let after = &search[at..];
+            let Some(suffix) = first_single_quoted(after) else {
+                break;
+            };
+            let rel = suffix.trim_start_matches('/');
+            let dir = if is_vendor {
+                vendor_dir.join(rel)
+            } else {
+                project.join(rel)
+            };
+            out.push((prefix.clone(), dir));
+            let q = after.find('\'').unwrap_or(0) + 1;
+            let qend = after[q..]
+                .find('\'')
+                .map(|e| q + e + 1)
+                .unwrap_or(after.len());
+            search = &after[qend..];
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// True when composer's PSR-4 autoloader would resolve `fqcn` to an existing file —
+/// i.e. some prefix matches and the derived path is on disk. When true, the runner's
+/// own class-map fallback entry for `fqcn` is dead weight (the worker autoloads it via
+/// composer), so it can be omitted from the shipped index.
+#[allow(dead_code)] // used in Task 2
+fn is_psr4_resolvable(fqcn: &str, psr4: &[(String, PathBuf)]) -> bool {
+    let fqcn = fqcn.trim_start_matches('\\');
+    for (prefix, dir) in psr4 {
+        let pfx = prefix.trim_start_matches('\\');
+        if let Some(rest) = fqcn.strip_prefix(pfx) {
+            let rel = rest.replace('\\', "/");
+            if dir.join(format!("{rel}.php")).is_file() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn collect_psr4_dirs(block: &serde_json::Value, project: &std::path::Path, out: &mut Vec<PathBuf>) {
@@ -1229,5 +1321,53 @@ mod gate_tests {
         assert!(!single_process_eligible(1, &[mk(true, false, false)])); // stateful -> fork
         assert!(!single_process_eligible(1, &[mk(false, true, false)])); // isolated -> fork
         assert!(!single_process_eligible(1, &[mk(false, false, true)])); // needs_db -> fork
+    }
+
+    #[test]
+    fn load_composer_psr4_map_parses_vendor_and_base_dir_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = tmp.path();
+        std::fs::create_dir_all(proj.join("vendor/composer")).unwrap();
+        std::fs::write(
+            proj.join("vendor/composer/autoload_psr4.php"),
+            r#"<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'Psr\\Cache\\' => array($vendorDir . '/psr/cache/src'),
+    'Faker\\Test\\' => array($baseDir . '/test/Faker'),
+    'Faker\\' => array($baseDir . '/src/Faker'),
+);
+"#,
+        )
+        .unwrap();
+
+        let map = load_composer_psr4_map(proj).expect("map should parse");
+        assert!(map.contains(&(
+            "Psr\\Cache\\".to_string(),
+            proj.join("vendor/psr/cache/src")
+        )));
+        assert!(map.contains(&("Faker\\Test\\".to_string(), proj.join("test/Faker"))));
+        assert!(map.contains(&("Faker\\".to_string(), proj.join("src/Faker"))));
+    }
+
+    #[test]
+    fn load_composer_psr4_map_none_when_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(load_composer_psr4_map(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn is_psr4_resolvable_true_only_when_mapped_file_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = tmp.path();
+        std::fs::create_dir_all(proj.join("src/Faker/Provider")).unwrap();
+        std::fs::write(proj.join("src/Faker/Provider/Lorem.php"), "<?php").unwrap();
+        let map = vec![("Faker\\".to_string(), proj.join("src/Faker"))];
+
+        assert!(is_psr4_resolvable("Faker\\Provider\\Lorem", &map));
+        assert!(is_psr4_resolvable("\\Faker\\Provider\\Lorem", &map));
+        assert!(!is_psr4_resolvable("Faker\\Provider\\Nope", &map));
+        assert!(!is_psr4_resolvable("App\\Other", &map));
     }
 }
