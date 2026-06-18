@@ -409,6 +409,19 @@ pub fn run_with_profiler(
         .filter(|c| matches_filter(&c.class, &c.method, cfg.filter.as_deref()))
         .collect();
 
+    // Class -> ordered method list, so requeue_unrun can resolve "all methods" batches.
+    let mut class_methods: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for c in &filtered {
+        class_methods
+            .entry(c.class.clone())
+            .or_default()
+            .push(c.method.clone());
+    }
+    // Per-test execution attempts across worker-death re-queues (the MAX_ATTEMPTS cap).
+    let mut attempts: std::collections::HashMap<(String, String), u8> =
+        std::collections::HashMap::new();
+
     let n = pool.len();
     let (mut queue, synthetic) = profiler.span_with(
         "build_queue",
@@ -643,22 +656,18 @@ pub fn run_with_profiler(
                 // row (which carries the fatal text) — we keep that row and
                 // suppress our redundant per-method synth for it.
                 if let Some(lost) = slot_in_flight[slot].take() {
-                    let cause = if signal != 0 {
-                        format!("worker process died: signal {signal}")
-                    } else if exit_code == 0 {
-                        // Forensic breadcrumb: exit code 0 with a batch still
-                        // in flight means a test/provider/teardown called
-                        // exit(0)/die() mid-batch (a clean recycle exits with
-                        // the reserved code 6 and never lands here, because it
-                        // emits batch_done first so in_flight is None). Name
-                        // the cause so the report explains the lost batch.
-                        "worker process died: exit code 0 (test code called \
-                         exit/die mid-batch)"
-                            .to_string()
-                    } else {
-                        format!("worker process died: exit code {exit_code}")
-                    };
-                    synth_error_outcomes(&lost, &cause, &received, &on_progress, &mut outcomes);
+                    // Re-queue the dead worker's un-run tests onto a fresh child (the master has
+                    // already forked a replacement) instead of erroring them; the per-test
+                    // MAX_ATTEMPTS cap turns a deterministic crasher into a single Error.
+                    requeue_unrun(
+                        &lost,
+                        &mut received,
+                        &class_methods,
+                        &mut attempts,
+                        &on_progress,
+                        &mut outcomes,
+                        &mut queue,
+                    );
                 }
                 // Record the failed batch's span too — useful for spotting
                 // worker crashes in the timeline view.
