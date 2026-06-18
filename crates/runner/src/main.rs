@@ -275,6 +275,12 @@ struct Cli {
     /// --list-tests format.
     #[arg(long)]
     list_tests: bool,
+    /// Print a SharedTransactionalFixture eligibility advisory for the selected test
+    /// roots (one tab-separated line per concrete test class: uses-trait, eligible,
+    /// reason; plus a `WARN` line per ineligible trait user and an `eligible: N/total`
+    /// summary), then exit without running anything. Read-only; no runtime effect.
+    #[arg(long)]
+    report_shared_fixture: bool,
     /// Run only tests impacted by uncommitted git changes: a changed source file
     /// maps (via the class graph) to the test classes whose fingerprint references
     /// it, plus changed test files themselves. Like Pest's --dirty but graph-based
@@ -349,7 +355,9 @@ fn real_main() -> Result<ExitCode> {
         .canonicalize()
         .with_context(|| format!("project path invalid: {}", cli.project.display()))?;
     let autoload = project.join("vendor/autoload.php");
-    if !autoload.is_file() {
+    // The read-only --report-shared-fixture advisory is tree-sitter-only (no PHP
+    // execution), so it must not require `composer install`.
+    if !autoload.is_file() && !cli.report_shared_fixture {
         return Err(anyhow!(
             "autoload not found at {}; run `composer install` first",
             autoload.display()
@@ -754,6 +762,21 @@ fn real_main() -> Result<ExitCode> {
         for c in &cases {
             println!(" - {}::{}", c.class, c.method);
         }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // --report-shared-fixture: advisory only. Verdict each concrete test class in the
+    // selected roots and print the report, then exit (no tests run, no DB touched).
+    if cli.report_shared_fixture {
+        let mut report = Vec::new();
+        for root in &test_roots {
+            report.extend(phpunit_rust::discovery::shared_fixture_report_in_dir(root)?);
+        }
+        report.sort_by(|a, b| a.fqcn.cmp(&b.fqcn));
+        print!(
+            "{}",
+            phpunit_rust::discovery::format_shared_fixture_report(&report)
+        );
         return Ok(ExitCode::SUCCESS);
     }
 

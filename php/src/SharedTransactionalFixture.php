@@ -37,10 +37,28 @@ namespace PhpunitRust;
  */
 trait SharedTransactionalFixture
 {
+    /**
+     * Per-process, PER-CONCRETE-CLASS build-once guard, keyed by `static::class`.
+     *
+     * A trait static is SHARED down an inheritance chain: two concrete children of one
+     * trait-using abstract base (the doctrine pattern) share the same property, so a plain
+     * `bool` would let the first child's build suppress the second's. Keying by the concrete
+     * runtime class keeps each class independent. The runner fragments a class into multiple
+     * runClass calls; setUpBeforeClass fires once per call and a warm worker is long-lived, so
+     * this static persists across calls — collapsing O(plans) rebuilds to O(1) build per
+     * (concrete class, worker).
+     *
+     * @var array<class-string,bool>
+     */
+    private static array $sharedFixtureBuilt = [];
+
     public static function setUpBeforeClass(): void
     {
         parent::setUpBeforeClass();
-        static::buildSharedFixture();
+        if (!(self::$sharedFixtureBuilt[static::class] ?? false)) {
+            static::buildSharedFixture();
+            self::$sharedFixtureBuilt[static::class] = true;
+        }
     }
 
     public static function tearDownAfterClass(): void
@@ -61,7 +79,12 @@ trait SharedTransactionalFixture
         parent::tearDown();
     }
 
-    /** Build the expensive deterministic fixture ONCE per class (store it statically). */
+    /**
+     * Build the expensive deterministic fixture (store it statically). Called once per
+     * (concrete class, worker process), guarded by self::$sharedFixtureBuilt[static::class].
+     * A class that RELEASES the fixture in tearDownSharedFixture() MUST clear its entry
+     * (`unset(self::$sharedFixtureBuilt[static::class])`) so the next run rebuilds it.
+     */
     abstract protected static function buildSharedFixture(): void;
 
     /** Open this test's isolation boundary on the shared fixture (transaction / savepoint). */

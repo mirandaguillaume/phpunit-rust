@@ -38,6 +38,7 @@ dependencies = [
  "bumpalo",
  "clap",
  "criterion",
+ "discovery",
  "egg",
  "insta",
  "mago-analyzer",

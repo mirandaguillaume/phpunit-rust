@@ -107,6 +107,13 @@ struct ParsedClass {
     /// True when the class (or its trait/inheritance chain) requires a
     /// database clone. OR-folded down the chain in [`emit_test_cases`].
     needs_db: bool,
+    /// In-class `use SharedTransactionalFixture;` (the opt-in marker). Folded across the
+    /// inheritance chain in [`shared_fixture_report`]. Advisory only — no runtime effect.
+    uses_shared_fixture: bool,
+    /// This class's OWN setUp calls a recognised DB fixture builder.
+    setup_builds_fixture: bool,
+    /// This class has a test/helper method using a rollback-incompatible construct.
+    has_tx_disqualifier: bool,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -501,6 +508,9 @@ fn collect_parsed_classes(
             DEFAULT_DB_MARKER_TRAITS,
             DEFAULT_DB_MARKER_BASE_CLASSES,
         );
+        let uses_shared_fixture = class_uses_shared_fixture(body, bytes);
+        let (setup_builds_fixture, has_tx_disqualifier) =
+            scan_tx_eligibility_signals(body, bytes, &test_methods);
 
         out.push(ParsedClass {
             file: path.to_path_buf(),
@@ -513,6 +523,9 @@ fn collect_parsed_classes(
             is_stateful,
             is_isolated,
             needs_db,
+            uses_shared_fixture,
+            setup_builds_fixture,
+            has_tx_disqualifier,
         });
     }
     Ok(())
@@ -1033,6 +1046,261 @@ fn class_needs_db(
         }
     }
     false
+}
+
+/// Calls in setUp signalling an expensive deterministic DB fixture. Port of the analyzer
+/// eligibility list (`crates/analyzer/src/reduce/eligibility.rs`); kept in sync by the oracle
+/// integration test. Matched as `<builder>(` substrings of the setUp source.
+const TX_FIXTURE_BUILDERS: &[&str] = &[
+    "createSchema",
+    "createSchemaForModels",
+    "setUpEntitySchema",
+    "getEntityManager",
+    "getSchemaTool",
+    "createSchemaManager",
+];
+
+/// Substrings in a TEST method that a per-test rollback cannot soundly undo. Lowercased: the
+/// source is lowercased before matching, so `rollBack`/`rollback` both hit `->rollback(`.
+const TX_DISQUALIFIERS: &[&str] = &[
+    "->commit(",
+    "->begintransaction(",
+    "->rollback(",
+    "->createsavepoint(",
+    "->createschema(",
+    "->dropschema(",
+    "->dropdatabase(",
+    "expectexception",
+    "@depends",
+];
+
+/// Does this setUp method's source call a recognised fixture builder?
+fn setup_builds_fixture_src(src: &str) -> bool {
+    TX_FIXTURE_BUILDERS
+        .iter()
+        .any(|b| src.contains(&format!("{b}(")))
+}
+
+/// The first disqualifier substring in a test method's source (lowercased match), if any.
+fn method_tx_disqualifier_src(src: &str) -> Option<String> {
+    let low = src.to_ascii_lowercase();
+    TX_DISQUALIFIERS
+        .iter()
+        .find(|d| low.contains(**d))
+        .map(|d| (*d).to_string())
+}
+
+/// Lifecycle method names (scanned for the fixture BUILDER, never for disqualifiers — they
+/// are not tests). Mirrors the analyzer eligibility `is_lifecycle`.
+fn is_tx_lifecycle(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "setup" | "setupbeforeclass" | "teardown" | "teardownafterclass"
+    )
+}
+
+/// Does the class body contain an IN-CLASS `use SharedTransactionalFixture;` trait-use?
+/// Mirrors `class_needs_db`'s in-class scan: a `use_declaration` inside `class_body` is the
+/// trait-use list; a file-scope import is a `namespace_use_declaration` and never reaches here.
+fn class_uses_shared_fixture(class_body: Node, bytes: &[u8]) -> bool {
+    let mut cursor = class_body.walk();
+    for member in class_body.children(&mut cursor) {
+        if member.kind() != "use_declaration" {
+            continue;
+        }
+        let mut tu_cursor = member.walk();
+        for used in member.named_children(&mut tu_cursor) {
+            if matches!(used.kind(), "name" | "qualified_name") {
+                if let Ok(raw) = used.utf8_text(bytes) {
+                    if is_valid_class_name(raw)
+                        && reference_matches_marker(raw, &["SharedTransactionalFixture"])
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Scan a class body for the two SharedTransactionalFixture eligibility signals of THIS class
+/// (folded across the inheritance chain later, in [`shared_fixture_report`]):
+///   - `setup_builds_fixture`: the `setUp` method's source calls a `TX_FIXTURE_BUILDERS` call;
+///   - `has_tx_disqualifier`: a non-lifecycle (test/helper) method's source hits a
+///     `TX_DISQUALIFIERS` substring, OR any test method carries `#[Depends]`/`@depends`
+///     (cross-test state, captured by discovery's `depends_on`).
+fn scan_tx_eligibility_signals(
+    body: Node,
+    bytes: &[u8],
+    test_methods: &[MethodInfo],
+) -> (bool, bool) {
+    let mut builds_fixture = false;
+    let mut has_disqualifier = false;
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(bytes) else {
+            continue;
+        };
+        let src = child.utf8_text(bytes).unwrap_or("");
+        if name.eq_ignore_ascii_case("setUp") && setup_builds_fixture_src(src) {
+            builds_fixture = true;
+        }
+        if !is_tx_lifecycle(name) && method_tx_disqualifier_src(src).is_some() {
+            has_disqualifier = true;
+        }
+    }
+    if test_methods.iter().any(|m| !m.depends_on.is_empty()) {
+        has_disqualifier = true;
+    }
+    (builds_fixture, has_disqualifier)
+}
+
+/// One concrete test class's SharedTransactionalFixture advisory verdict (report-only; no
+/// runtime effect). `uses_shared_fixture` = the class (or an in-project ancestor) opts in via
+/// the trait; `tx_eligible` = a fixture builder exists in the chain AND no disqualifier does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedFixtureReport {
+    pub fqcn: String,
+    pub file: PathBuf,
+    pub uses_shared_fixture: bool,
+    pub tx_eligible: bool,
+    pub tx_ineligible_reason: Option<String>,
+}
+
+/// Advisory analysis: for each CONCRETE (non-abstract) test class, fold the three
+/// SharedTransactionalFixture signals across the in-project inheritance chain (mirroring
+/// `emit_test_cases`'s depth-bounded walk) and produce a verdict. Standalone by design — it does
+/// NOT thread through the public `TestCase`/`TestClass` types, because the runtime never routes
+/// on it (the build-once guard lives in the PHP trait). Consumed only by the report CLI.
+fn shared_fixture_report(parsed: &[ParsedClass], graph: &ClassGraph) -> Vec<SharedFixtureReport> {
+    let by_fqcn: HashMap<&str, &ParsedClass> =
+        parsed.iter().map(|c| (c.fqcn.as_str(), c)).collect();
+    let mut out = Vec::new();
+    for class in parsed {
+        if class.is_abstract || !is_test_class_via_chain(&class.fqcn, graph) {
+            continue;
+        }
+        let (mut uses, mut builds, mut disq) = (false, false, false);
+        let mut visit = class.fqcn.as_str();
+        let mut d = 0;
+        while d < 32 {
+            if let Some(c) = by_fqcn.get(visit) {
+                uses = uses || c.uses_shared_fixture;
+                builds = builds || c.setup_builds_fixture;
+                disq = disq || c.has_tx_disqualifier;
+                match c.parent_fqcn.as_deref() {
+                    Some(p) => visit = p,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+            d += 1;
+        }
+        let (tx_eligible, tx_ineligible_reason) = if !builds {
+            (
+                false,
+                Some("setUp builds no recognised fixture".to_string()),
+            )
+        } else if disq {
+            (
+                false,
+                Some("a test method uses a rollback-incompatible construct".to_string()),
+            )
+        } else {
+            (true, None)
+        };
+        out.push(SharedFixtureReport {
+            fqcn: class.fqcn.clone(),
+            file: class.file.clone(),
+            uses_shared_fixture: uses,
+            tx_eligible,
+            tx_ineligible_reason,
+        });
+    }
+    out
+}
+
+/// Single-file SharedTransactionalFixture advisory report (used by tests and the report CLI).
+pub fn shared_fixture_report_in_file(path: &Path) -> Result<Vec<SharedFixtureReport>> {
+    let parsed = parse_file_classes(path)?;
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+    Ok(shared_fixture_report(&parsed, &graph))
+}
+
+/// Format an advisory report: one tab-separated line per concrete test class
+/// (`<fqcn>\tuses=<yes|no>\teligible=<yes|no>\t<reason>`), a `WARN` line for any class that
+/// `use`s the trait but is ineligible (likely misuse), and a trailing `eligible: N/total`.
+pub fn format_shared_fixture_report(report: &[SharedFixtureReport]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut eligible = 0usize;
+    for c in report {
+        let uses = if c.uses_shared_fixture { "yes" } else { "no" };
+        let el = if c.tx_eligible {
+            eligible += 1;
+            "yes"
+        } else {
+            "no"
+        };
+        let reason = c.tx_ineligible_reason.as_deref().unwrap_or("");
+        let _ = writeln!(
+            out,
+            "{}\tuses={}\teligible={}\t{}",
+            c.fqcn, uses, el, reason
+        );
+        if c.uses_shared_fixture && !c.tx_eligible {
+            let _ = writeln!(
+                out,
+                "WARN {} uses SharedTransactionalFixture but is ineligible: {}",
+                c.fqcn, reason
+            );
+        }
+    }
+    let _ = writeln!(out, "eligible: {}/{}", eligible, report.len());
+    out
+}
+
+/// Project-level SharedTransactionalFixture advisory report: parse every `*Test*.php` under
+/// `root`, build the in-project inheritance graph, and verdict each concrete test class.
+/// Self-contained gather (advisory, not parity-critical) so it never touches the hot
+/// `discover_in_dirs` path.
+pub fn shared_fixture_report_in_dir(root: &Path) -> Result<Vec<SharedFixtureReport>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("php")
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("Test")
+        {
+            files.push(p.to_path_buf());
+        }
+    }
+    files.sort(); // deterministic, machine-order-independent
+    let parsed: Vec<ParsedClass> = files
+        .iter()
+        .map(|p| parse_file_classes(p))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+    Ok(shared_fixture_report(&parsed, &graph))
 }
 
 fn collect_test_methods(
@@ -2019,6 +2287,134 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn setup_with_fixture_builder_is_detected() {
+        assert!(setup_builds_fixture_src(
+            "protected function setUp(): void { $this->createSchema(); }"
+        ));
+        assert!(!setup_builds_fixture_src(
+            "protected function setUp(): void { $this->seed(); }"
+        ));
+    }
+
+    #[test]
+    fn disqualifier_in_method_is_detected() {
+        assert_eq!(
+            method_tx_disqualifier_src("function t(){ $this->conn->commit(); }"),
+            Some("->commit(".to_string())
+        );
+        assert_eq!(
+            method_tx_disqualifier_src("function t(){ $this->expectException(X::class); }"),
+            Some("expectexception".to_string())
+        );
+        assert_eq!(
+            method_tx_disqualifier_src("function t(){ self::assertTrue(true); }"),
+            None
+        );
+    }
+
+    #[test]
+    fn shared_fixture_use_marker_reported_file_scope_not() {
+        // In-class `use SharedTransactionalFixture;` is the opt-in marker.
+        let (_d1, p1) = write_tmp(
+            "<?php\nuse PhpunitRust\\SharedTransactionalFixture;\n\
+             class FooTest extends \\PHPUnit\\Framework\\TestCase {\n\
+                 use SharedTransactionalFixture;\n\
+                 public function testA() { $this->assertTrue(true); }\n\
+             }\n",
+        );
+        let r1 = shared_fixture_report_in_file(&p1).unwrap();
+        assert!(
+            r1.iter()
+                .any(|c| c.fqcn.ends_with("FooTest") && c.uses_shared_fixture),
+            "in-class trait use is reported as uses_shared_fixture"
+        );
+
+        // A file-scope import WITHOUT an in-class use must NOT be reported.
+        let (_d2, p2) = write_tmp(
+            "<?php\nuse PhpunitRust\\SharedTransactionalFixture;\n\
+             class BarTest extends \\PHPUnit\\Framework\\TestCase {\n\
+                 public function testA() { $this->assertTrue(true); }\n\
+             }\n",
+        );
+        let r2 = shared_fixture_report_in_file(&p2).unwrap();
+        assert!(
+            r2.iter().all(|c| !c.uses_shared_fixture),
+            "file-scope import alone is not uses_shared_fixture"
+        );
+    }
+
+    #[test]
+    fn tx_eligible_folds_builder_and_disqualifier_across_chain() {
+        // Abstract base builds the fixture in setUp; a clean concrete child is eligible
+        // (the builder is folded down the in-project inheritance chain).
+        let (_d, p) = write_tmp(
+            "<?php\n\
+             abstract class BaseTest extends \\PHPUnit\\Framework\\TestCase {\n\
+                 protected function setUp(): void { $this->createSchema(); }\n\
+             }\n\
+             class ChildTest extends BaseTest {\n\
+                 public function testReads() { self::assertTrue(true); }\n\
+             }\n",
+        );
+        let r = shared_fixture_report_in_file(&p).unwrap();
+        let child = r
+            .iter()
+            .find(|c| c.fqcn.ends_with("ChildTest"))
+            .expect("ChildTest reported");
+        assert!(
+            child.tx_eligible,
+            "parent builder + clean child = eligible: {:?}",
+            child.tx_ineligible_reason
+        );
+
+        // A committing test disqualifies even with a builder.
+        let (_d2, p2) = write_tmp(
+            "<?php\n\
+             class CommitTest extends \\PHPUnit\\Framework\\TestCase {\n\
+                 protected function setUp(): void { $this->createSchema(); }\n\
+                 public function testWrites() { $this->conn->commit(); }\n\
+             }\n",
+        );
+        let r2 = shared_fixture_report_in_file(&p2).unwrap();
+        let t = r2
+            .iter()
+            .find(|c| c.fqcn.ends_with("CommitTest"))
+            .expect("CommitTest reported");
+        assert!(!t.tx_eligible, "a committing test is ineligible");
+    }
+
+    #[test]
+    fn shared_fixture_report_formats_lines_and_summary() {
+        let report = vec![
+            SharedFixtureReport {
+                fqcn: "A".into(),
+                file: PathBuf::from("/p/A.php"),
+                uses_shared_fixture: true,
+                tx_eligible: true,
+                tx_ineligible_reason: None,
+            },
+            SharedFixtureReport {
+                fqcn: "B".into(),
+                file: PathBuf::from("/p/B.php"),
+                uses_shared_fixture: true,
+                tx_eligible: false,
+                tx_ineligible_reason: Some("setUp builds no recognised fixture".into()),
+            },
+        ];
+        let out = format_shared_fixture_report(&report);
+        assert!(out.contains("A\tuses=yes\teligible=yes"), "{out}");
+        assert!(
+            out.contains("B\tuses=yes\teligible=no\tsetUp builds no recognised fixture"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WARN B uses SharedTransactionalFixture but is ineligible"),
+            "{out}"
+        );
+        assert!(out.contains("eligible: 1/2"), "{out}");
+    }
 
     fn write_tmp(content: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
