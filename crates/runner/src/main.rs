@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::discover_with_index;
+use phpunit_rust::discovery::{discover_in_dirs, discover_with_index};
 
 /// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
 /// into a list of directories, resolved relative to `project`. Used to build
@@ -30,7 +30,6 @@ fn parse_autoload_dev_dirs(project: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// First single-quoted substring in `s`, or None.
-#[allow(dead_code)] // used in Task 2
 fn first_single_quoted(s: &str) -> Option<String> {
     let start = s.find('\'')? + 1;
     let rest = &s[start..];
@@ -43,7 +42,6 @@ fn first_single_quoted(s: &str) -> Option<String> {
 /// `discover_with_index` path (never worse than today). PSR-4 only; classmap/psr-0 are
 /// intentionally ignored (an unmatched FQCN is treated as unresolvable and kept via the
 /// full-parse fallback, so this can never wrongly drop a class).
-#[allow(dead_code)] // used in Task 2
 fn load_composer_psr4_map(project: &Path) -> Option<Vec<(String, PathBuf)>> {
     let text = std::fs::read_to_string(project.join("vendor/composer/autoload_psr4.php")).ok()?;
     let vendor_dir = project.join("vendor");
@@ -106,7 +104,6 @@ fn load_composer_psr4_map(project: &Path) -> Option<Vec<(String, PathBuf)>> {
 /// i.e. some prefix matches and the derived path is on disk. When true, the runner's
 /// own class-map fallback entry for `fqcn` is dead weight (the worker autoloads it via
 /// composer), so it can be omitted from the shipped index.
-#[allow(dead_code)] // used in Task 2
 fn is_psr4_resolvable(fqcn: &str, psr4: &[(String, PathBuf)]) -> bool {
     let fqcn = fqcn.trim_start_matches('\\');
     for (prefix, dir) in psr4 {
@@ -119,6 +116,59 @@ fn is_psr4_resolvable(fqcn: &str, psr4: &[(String, PathBuf)]) -> bool {
         }
     }
     false
+}
+
+/// Discover test cases and the FQCN→file fallback index. When `need_full_index` is false
+/// and composer's PSR-4 map resolves every class the tests reference, parse only `*Test*.php`
+/// (the fast path — skips the production `src/` tree) and ship a test-only index. Otherwise
+/// fall back to the full single-pass `discover_with_index` (identical to prior behavior).
+///
+/// Parity: the emission graph (and thus the test count) is built only from `*Test*.php` on
+/// every path, so it is invariant. The index is only ever a PSR-4-MISS fallback in the worker
+/// (worker_fork.php), so omitting entries for PSR-4-resolvable classes changes nothing at run
+/// time; when ANY referenced class is not PSR-4-resolvable we take the full parse, so the index
+/// is never smaller than what the worker can actually use.
+fn build_cases_and_index(
+    project: &Path,
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    supplement_dirs: &[PathBuf],
+    need_full_index: bool,
+) -> anyhow::Result<(
+    Vec<phpunit_rust::types::TestCase>,
+    std::collections::HashMap<String, PathBuf>,
+)> {
+    if !need_full_index {
+        if let Some(psr4) = load_composer_psr4_map(project) {
+            let cases = discover_in_dirs(roots, excludes, supplement_dirs)?;
+            let test_class_index: std::collections::HashMap<String, PathBuf> = cases
+                .iter()
+                .map(|c| (c.class.clone(), c.file.clone()))
+                .collect();
+
+            let mut wanted: std::collections::HashSet<String> = cases
+                .iter()
+                .flat_map(|c| {
+                    c.external_providers
+                        .iter()
+                        .map(|(fqcn, _)| fqcn.clone())
+                        .chain(c.fingerprint.iter().cloned())
+                })
+                .collect();
+            for c in &cases {
+                wanted.insert(c.class.clone());
+            }
+
+            let all_resolvable = wanted
+                .iter()
+                .all(|f| test_class_index.contains_key(f) || is_psr4_resolvable(f, &psr4));
+            if all_resolvable {
+                return Ok((cases, test_class_index));
+            }
+        }
+    }
+    let (cases, index) = discover_with_index(roots, excludes, supplement_dirs)?;
+    Ok((cases, index))
 }
 
 fn collect_psr4_dirs(block: &serde_json::Value, project: &std::path::Path, out: &mut Vec<PathBuf>) {
@@ -683,7 +733,15 @@ fn real_main() -> Result<ExitCode> {
             "excludes": excludes.len(),
             "supplement_dirs": graph_supplement_dirs.len(),
         }),
-        || discover_with_index(&test_roots, &excludes, &graph_supplement_dirs),
+        || {
+            build_cases_and_index(
+                &project,
+                &test_roots,
+                &excludes,
+                &graph_supplement_dirs,
+                cli.dirty,
+            )
+        },
     )?;
 
     // --dirty: keep only tests impacted by uncommitted git changes. Reverse the
@@ -1369,5 +1427,67 @@ return array(
         assert!(is_psr4_resolvable("\\Faker\\Provider\\Lorem", &map));
         assert!(!is_psr4_resolvable("Faker\\Provider\\Nope", &map));
         assert!(!is_psr4_resolvable("App\\Other", &map));
+    }
+
+    // Writes a minimal PSR-4-clean project: App\ -> src, App\Tests\ -> tests, with one test
+    // class and one unreferenced src class. Returns (project_dir, roots, supplement_dirs).
+    fn write_clean_fixture(tmp: &std::path::Path) -> (PathBuf, Vec<PathBuf>, Vec<PathBuf>) {
+        std::fs::create_dir_all(tmp.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.join("tests")).unwrap();
+        std::fs::write(
+            tmp.join("vendor/composer/autoload_psr4.php"),
+            r#"<?php
+$vendorDir = dirname(__DIR__);
+$baseDir = dirname($vendorDir);
+return array(
+    'App\\Tests\\' => array($baseDir . '/tests'),
+    'App\\' => array($baseDir . '/src'),
+);
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/Helper.php"),
+            "<?php\nnamespace App;\nclass Helper {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("tests/FooTest.php"),
+            "<?php\nnamespace App\\Tests;\nuse PHPUnit\\Framework\\TestCase;\nclass FooTest extends TestCase {\n  public function testBar() { $this->assertTrue(true); }\n}\n",
+        )
+        .unwrap();
+        (
+            tmp.to_path_buf(),
+            vec![tmp.join("tests")],
+            vec![tmp.join("tests"), tmp.join("src")],
+        )
+    }
+
+    #[test]
+    fn build_cases_and_index_fast_path_skips_src_when_psr4_clean() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (proj, roots, supp) = write_clean_fixture(tmp.path());
+
+        let (cases, index) = build_cases_and_index(&proj, &roots, &[], &supp, false).unwrap();
+        let (full_cases, _full_index) =
+            phpunit_rust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+        assert_eq!(cases.len(), full_cases.len());
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].class, "App\\Tests\\FooTest");
+        assert!(!index.contains_key("App\\Helper"));
+    }
+
+    #[test]
+    fn build_cases_and_index_full_path_when_need_full_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (proj, roots, supp) = write_clean_fixture(tmp.path());
+
+        let (cases, index) = build_cases_and_index(&proj, &roots, &[], &supp, true).unwrap();
+        let (full_cases, full_index) =
+            phpunit_rust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+        assert_eq!(cases.len(), full_cases.len());
+        assert_eq!(index, full_index);
+        assert!(index.contains_key("App\\Helper"));
     }
 }
