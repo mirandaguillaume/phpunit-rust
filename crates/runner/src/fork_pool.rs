@@ -49,9 +49,63 @@ impl PhpForkPool {
         max_batches_per_child: u32,
         per_slot_dsn: Option<&[String]>,
     ) -> Result<Self> {
+        Self::spawn_inner(
+            script, autoload, bootstrap, defines, env, server, ini, vars, n, class_map,
+            worker_memory_limit, max_batches_per_child, per_slot_dsn, false,
+        )
+    }
+
+    /// Single-process (no-fork) variant: the master runs the per-batch loop itself instead of
+    /// forking children. The caller (`single_process_eligible`) guarantees exactly one
+    /// dispatch-safe slot (no is_stateful / is_isolated / needs_db).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_inline(
+        script: &Path,
+        autoload: &Path,
+        bootstrap: Option<&Path>,
+        defines: &[[String; 2]],
+        env: &[(String, String, bool)],
+        server: &[[String; 2]],
+        ini: &[[String; 2]],
+        vars: &[[String; 2]],
+        n: usize,
+        class_map: &std::collections::HashMap<String, std::path::PathBuf>,
+        worker_memory_limit: &str,
+        max_batches_per_child: u32,
+        per_slot_dsn: Option<&[String]>,
+    ) -> Result<Self> {
+        Self::spawn_inner(
+            script, autoload, bootstrap, defines, env, server, ini, vars, n, class_map,
+            worker_memory_limit, max_batches_per_child, per_slot_dsn, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        script: &Path,
+        autoload: &Path,
+        bootstrap: Option<&Path>,
+        defines: &[[String; 2]],
+        env: &[(String, String, bool)],
+        server: &[[String; 2]],
+        ini: &[[String; 2]],
+        vars: &[[String; 2]],
+        n: usize,
+        class_map: &std::collections::HashMap<String, std::path::PathBuf>,
+        worker_memory_limit: &str,
+        max_batches_per_child: u32,
+        per_slot_dsn: Option<&[String]>,
+        inline: bool,
+    ) -> Result<Self> {
         if n == 0 {
             return Err(anyhow!("fork pool requires at least 1 slot"));
         }
+        // L3: single-process (no-fork) mode runs the per-batch loop in the master itself; the caller
+        // (single_process_eligible) only enables it for exactly one dispatch-safe slot.
+        debug_assert!(
+            !inline || n == 1,
+            "inline (single-process) mode requires exactly 1 slot"
+        );
 
         // Create N stdin-pipes (Rust writes, PHP reads) and
         //        N stdout-pipes (PHP writes, Rust reads).
@@ -148,6 +202,11 @@ impl PhpForkPool {
             });
         }
 
+        if inline {
+            // L3: master runs the per-batch loop itself (no pcntl_fork). Slot 0's pipes are
+            // driven by the master process directly.
+            cmd.arg("--inline");
+        }
         if let Some(bs) = bootstrap {
             cmd.arg("--bootstrap").arg(bs);
         }

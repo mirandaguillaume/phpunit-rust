@@ -154,8 +154,16 @@ function phpunit_rust_rmtree(string $path): void
 // ---------------------------------------------------------------------------
 $args = [];
 for ($i = 1; $i < $argc; $i++) {
-    if (str_starts_with($argv[$i], '--') && isset($argv[$i + 1])) {
-        $key = substr($argv[$i], 2);
+    if (!str_starts_with($argv[$i], '--')) {
+        continue;
+    }
+    $key = substr($argv[$i], 2);
+    // Valueless boolean flags consume no following value.
+    if ($key === 'inline') {
+        $args[$key] = '1';
+        continue;
+    }
+    if (isset($argv[$i + 1])) {
         $args[$key] = $argv[++$i];
     }
 }
@@ -173,6 +181,10 @@ $classMapFile      = $args['class-map-file']     ?? null;
 $workerMemoryLimit = $args['worker-memory-limit'] ?? '512M';
 $maxBatches        = (int) ($args['max-batches-per-child'] ?? '0'); // 0 = unlimited
 $perSlotDsnJson    = $args['per-slot-dsn']        ?? '[]';
+// L3: single-process (no-fork) mode — run the per-batch loop in THIS master process. The runner
+// only sets it for exactly one dispatch-safe slot, so there is no global-state bleed risk and no
+// child to recover; it matches vanilla's single-process model.
+$inline            = !empty($args['inline']);
 
 if ($autoload === null || $childStdinFdsStr === '' || $childStdoutFdsStr === '') {
     fwrite(STDERR, "worker_fork.php: missing --autoload, --child-stdin-fds, --child-stdout-fds\n");
@@ -428,6 +440,18 @@ $forkChildForSlot = static function (int $slot) use (
     @posix_setpgid($pid, $pid);
     return $pid;
 };
+
+// L3: single-process fast path. The runner sets --inline only for exactly one dispatch-safe slot,
+// so run the per-batch loop in THIS master process — no pcntl_fork, no SIGCHLD/respawn machinery —
+// matching vanilla's single-process model. Same runChild over slot 0's pipes a forked child uses.
+if ($inline) {
+    if (function_exists('stream_set_close_on_exec')) {
+        @stream_set_close_on_exec($childStdinStreams[0], true);
+        @stream_set_close_on_exec($childStdoutStreams[0], true);
+    }
+    runChild($childStdinStreams[0], $childStdoutStreams[0], $workerMemoryLimit, $maxBatches);
+    exit(0);
+}
 
 $slotPid    = array_fill(0, $n, 0);
 $slotClosed = array_fill(0, $n, false);

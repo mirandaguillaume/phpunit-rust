@@ -357,6 +357,15 @@ fn clamp_php_workers(requested: usize, explicit: bool, cases_len: usize, k: usiz
     requested.min(by_size).max(1)
 }
 
+/// True when the suite should take the single-process (no-fork) fast path: exactly one PHP worker
+/// AND every class is pure-CPU dispatch-safe — no global-state mutation (is_stateful), no
+/// `@runInSeparateProcess` (is_isolated), no DB (needs_db). A strict superset of `workers == 1`, so
+/// it never fires where parallelism would help; it matches vanilla's single-process model for exactly
+/// the tiny suites where vanilla wins today.
+fn single_process_eligible(workers: usize, cases: &[phpunit_rust::types::TestCase]) -> bool {
+    workers == 1 && cases.iter().all(|c| !c.is_stateful && !c.is_isolated && !c.needs_db)
+}
+
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     // Profiler clock starts at the earliest opportunity so wall-clock
@@ -848,6 +857,10 @@ fn real_main() -> Result<ExitCode> {
     // pool above already used the unclamped count; from here, `worker_count` is the clamped value,
     // so a tiny suite spawns 1 worker instead of num_cpus (kills the small-suite fork-storm).
     let worker_count = clamp_php_workers(worker_count, cli.workers.is_some(), cases.len(), 16);
+    // L3: single-process (no-fork) fast path when we'd use exactly one worker AND every class is
+    // pure-CPU dispatch-safe. The master runs the per-batch loop itself, matching vanilla's
+    // single-process timing for the tiny suites where vanilla wins.
+    let single_process = single_process_eligible(worker_count, &cases);
 
     let provider_pairs = collect_provider_pairs(&cases);
     let row_counts: RowCounts = profiler.span_with(
@@ -950,18 +963,28 @@ fn real_main() -> Result<ExitCode> {
         None
     };
 
-    eprintln!(
-        "Spawning {} PHP worker{}...",
-        worker_count,
-        if worker_count == 1 { "" } else { "s" }
-    );
+    if single_process {
+        eprintln!("Running tests in-process (no fork: single dispatch-safe worker)...");
+    } else {
+        eprintln!(
+            "Spawning {} PHP worker{}...",
+            worker_count,
+            if worker_count == 1 { "" } else { "s" }
+        );
+    }
     let fork_script = find_fork_script()?;
+    // L3: pick the no-fork master-inline spawn for an eligible tiny suite; identical 13-arg signature.
+    let spawn_fn = if single_process {
+        PhpForkPool::spawn_inline
+    } else {
+        PhpForkPool::spawn
+    };
     let mut pool = profiler.span_with(
         "fork_pool_spawn",
         "main",
-        serde_json::json!({"workers": worker_count}),
+        serde_json::json!({"workers": worker_count, "inline": single_process}),
         || -> Result<_> {
-            PhpForkPool::spawn(
+            spawn_fn(
                 &fork_script,
                 &autoload,
                 bootstrap.as_deref(),
@@ -1187,5 +1210,21 @@ mod gate_tests {
         assert_eq!(clamp_php_workers(22, false, 0, 16), 1); // floor 1
         // Explicit --workers N: honored verbatim, never clamped.
         assert_eq!(clamp_php_workers(8, true, 12, 16), 8);
+    }
+
+    #[test]
+    fn single_process_eligible_only_for_one_worker_all_dispatch_safe() {
+        let mk = |stateful: bool, isolated: bool, needs_db: bool| {
+            let mut c = case("A", "t", needs_db);
+            c.is_stateful = stateful;
+            c.is_isolated = isolated;
+            c
+        };
+        let safe = vec![mk(false, false, false), mk(false, false, false)];
+        assert!(single_process_eligible(1, &safe));
+        assert!(!single_process_eligible(2, &safe)); // >1 worker -> fork
+        assert!(!single_process_eligible(1, &[mk(true, false, false)])); // stateful -> fork
+        assert!(!single_process_eligible(1, &[mk(false, true, false)])); // isolated -> fork
+        assert!(!single_process_eligible(1, &[mk(false, false, true)])); // needs_db -> fork
     }
 }
