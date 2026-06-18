@@ -2240,6 +2240,65 @@ pub fn discover_class_file_index_targeted(
     index
 }
 
+/// FQCN→file index over the NON-`*Test*.php` files in `dirs` (the "IndexOnly" bucket),
+/// honoring `excludes`, with the same path-sorted, first-occurrence-wins semantics as
+/// [`discover_with_index`]. Lets the runner's fallback build the full index by merging this
+/// with the already-parsed test-file index, WITHOUT re-parsing the test files. Equivalent to
+/// the non-test portion of `discover_with_index`'s index for any suite without a cross-file
+/// FQCN redeclaration (which would be a PHP fatal anyway).
+pub fn discover_nontest_class_index(
+    dirs: &[PathBuf],
+    excludes: &[PathBuf],
+) -> HashMap<String, PathBuf> {
+    let canon_excludes: Vec<PathBuf> = excludes
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for dir in dirs {
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.contains("Test"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Ok(canon) = p.canonicalize() {
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) {
+                    continue;
+                }
+            }
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) {
+                continue;
+            }
+            files.push(buf);
+        }
+    }
+    files.sort();
+    let pairs: Vec<(String, PathBuf)> = files
+        .par_iter()
+        .flat_map(|p| {
+            parse_file_classes(p)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.fqcn, c.file))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut index = HashMap::with_capacity(pairs.len());
+    for (fqcn, file) in pairs {
+        index.entry(fqcn).or_insert(file);
+    }
+    index
+}
+
 pub fn discover_class_file_index(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
     let files: Vec<PathBuf> = dirs
         .iter()
@@ -3290,6 +3349,32 @@ class ConcreteTest extends BaseTest {}
         assert_eq!(
             cases[0].external_providers,
             vec![("App\\Data\\Provider".to_string(), "rows".to_string())]
+        );
+    }
+
+    #[test]
+    fn discover_nontest_class_index_indexes_only_nontest_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/Helper.php"),
+            "<?php\nnamespace App;\nclass Helper {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/FooTest.php"),
+            "<?php\nnamespace App;\nclass FooTest {}\n",
+        )
+        .unwrap();
+        let idx = discover_nontest_class_index(&[dir.join("src")], &[]);
+        assert!(
+            idx.contains_key("App\\Helper"),
+            "non-test class must be indexed"
+        );
+        assert!(
+            !idx.contains_key("App\\FooTest"),
+            "*Test* file must be skipped"
         );
     }
 
