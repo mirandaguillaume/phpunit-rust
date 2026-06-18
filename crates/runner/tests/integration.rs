@@ -675,3 +675,125 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
         "InlineFatalTest must be an Error after the inline master crash; got: {fatal_rows:?}"
     );
 }
+
+#[test]
+fn inline_runs_all_batches_without_voluntary_recycle() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+    // Regression: the inline (no-fork) path must NOT honour the K-batch voluntary recycle. There is
+    // no master to fork a warm replacement, so a recycle would orphan every batch past K — the
+    // process just exits and the runner synthesises "worker crashed" errors for the rest. With
+    // max_batches_per_child=1 and 3 single-class batches, the pre-fix inline worker recycled after
+    // batch 1 (WORKER_EXIT_VOLUNTARY_RECYCLE) and lost classes 2 and 3. All 3 must now pass.
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!(
+        "phpunit_rust_inline_norecycle_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut files = Vec::new();
+    for n in 1..=3 {
+        let class = format!("InlineBatch{n}Test");
+        let f = dir.join(format!("{class}.php"));
+        std::fs::write(
+            &f,
+            format!(
+                "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass {class} extends TestCase {{\n    public function testOk(): void {{ $this->assertTrue(true); }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        files.push((f, class));
+    }
+
+    let mk = |file: &std::path::Path, class: &str| TestCase {
+        file: file.to_path_buf(),
+        class: class.to_string(),
+        method: "testOk".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let cases: Vec<TestCase> = files.iter().map(|(f, c)| mk(f, c)).collect();
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        // max_batches_per_child = 1: pre-fix this made the inline worker recycle after the FIRST
+        // batch. The fix passes 0 (unlimited) to runChild on the inline path, so all batches run.
+        let mut pool = PhpForkPool::spawn_inline(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            1,
+            None,
+        )
+        .expect("spawn_inline failed");
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, cases, &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "inline run did not return within 25s"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let report = handle
+        .join()
+        .expect("run thread panicked")
+        .expect("run returned Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for (_f, class) in &files {
+        let rows: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| &o.class == class)
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "{class} was lost (orphaned by a voluntary recycle?); outcomes: {:?}",
+            report.outcomes
+        );
+        assert!(
+            rows.iter().all(|o| o.status == TestStatus::Pass),
+            "{class} must Pass on the inline path (no recycle death); got: {rows:?}"
+        );
+    }
+}
