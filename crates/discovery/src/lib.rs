@@ -1896,11 +1896,22 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
 /// `autoload-dev`) scanned to build a complete class graph — they contribute
 /// abstract base classes to the inheritance chain but never emit test cases
 /// themselves. Pass an empty slice when not needed.
-pub fn discover_in_dirs(
+/// Like [`discover_in_dirs`] but also returns a FQCN→file index for EVERY
+/// class parsed from the test files (roots + supplement `*Test*.php`),
+/// including co-located non-test helper classes defined inside a `*Test*.php`
+/// file (e.g. `TestableLorem` in `LoremTest.php`). Such helpers are absent
+/// from a cases-derived index and would otherwise end up in the "unresolvable"
+/// set, preventing the PSR-4 fast path from triggering.
+///
+/// This index is a SUBSET of [`discover_with_index`]'s full index (it omits
+/// only non-`*Test*` files), so the runner's PSR-4-sufficiency gate remains
+/// sound: a genuinely non-PSR-4 class in a non-test file still lands in `U`
+/// and triggers the full fallback.
+pub fn discover_cases_and_test_index(
     roots: &[PathBuf],
     excludes: &[PathBuf],
     graph_supplement_dirs: &[PathBuf],
-) -> Result<Vec<TestCase>> {
+) -> Result<(Vec<TestCase>, HashMap<String, PathBuf>)> {
     // Canonicalize excludes once so prefix checks are robust.
     let canon_excludes: Vec<PathBuf> = excludes
         .iter()
@@ -2003,8 +2014,31 @@ pub fn discover_in_dirs(
         .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
         .collect();
 
+    // FQCN -> file for EVERY class parsed from the test files (roots + supplement),
+    // including non-test helper classes co-located inside a *Test*.php file (e.g. a
+    // `TestableLorem` defined in `LoremTest.php`). First occurrence wins, matching the
+    // index semantics of `discover_with_index`. This is the fast-path fallback index;
+    // it is a subset of `discover_with_index`'s full index (it omits only non-*Test*
+    // files), so the runner's PSR-4-sufficiency gate stays sound.
+    let index: HashMap<String, PathBuf> = {
+        let mut m = HashMap::with_capacity(parsed.len());
+        for c in &parsed {
+            m.entry(c.fqcn.clone()).or_insert_with(|| c.file.clone());
+        }
+        m
+    };
+
     // Pass 3: emit test methods only for classes from the testsuite roots.
-    emit_test_cases(&parsed[..emit_count], &graph)
+    let cases = emit_test_cases(&parsed[..emit_count], &graph)?;
+    Ok((cases, index))
+}
+
+pub fn discover_in_dirs(
+    roots: &[PathBuf],
+    excludes: &[PathBuf],
+    graph_supplement_dirs: &[PathBuf],
+) -> Result<Vec<TestCase>> {
+    Ok(discover_cases_and_test_index(roots, excludes, graph_supplement_dirs)?.0)
 }
 
 /// Single-pass discovery + FQCN index. Replaces a sequential
@@ -3491,6 +3525,30 @@ class TautologyTest extends TestCase {
             classes.iter().any(|c| c.fqcn == "LatinTest"),
             "LatinTest must be discovered despite the non-UTF-8 byte; got {:?}",
             classes.iter().map(|c| &c.fqcn).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn discover_cases_and_test_index_includes_colocated_helper_classes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        // A *Test* file defining BOTH a test class AND a co-located non-test helper.
+        std::fs::write(
+            dir.join("tests/FooTest.php"),
+            "<?php\nnamespace App\\Tests;\nuse PHPUnit\\Framework\\TestCase;\nclass FooHelper {}\nclass FooTest extends TestCase { public function testBar() { $this->assertTrue(true); } }\n",
+        )
+        .unwrap();
+        let roots = vec![dir.join("tests")];
+        let (cases, index) = discover_cases_and_test_index(&roots, &[], &[]).unwrap();
+        // Only the test class is emitted...
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].class, "App\\Tests\\FooTest");
+        // ...but the index captures BOTH the test class and the co-located helper.
+        assert!(index.contains_key("App\\Tests\\FooTest"));
+        assert!(
+            index.contains_key("App\\Tests\\FooHelper"),
+            "co-located helper class must be in the test-file index"
         );
     }
 

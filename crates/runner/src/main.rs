@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::{discover_in_dirs, discover_with_index};
+use phpunit_rust::discovery::{discover_cases_and_test_index, discover_with_index};
 
 /// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
 /// into a list of directories, resolved relative to `project`. Used to build
@@ -140,11 +140,8 @@ fn build_cases_and_index(
 )> {
     if !need_full_index {
         if let Some(psr4) = load_composer_psr4_map(project) {
-            let cases = discover_in_dirs(roots, excludes, supplement_dirs)?;
-            let test_class_index: std::collections::HashMap<String, PathBuf> = cases
-                .iter()
-                .map(|c| (c.class.clone(), c.file.clone()))
-                .collect();
+            let (cases, test_class_index) =
+                discover_cases_and_test_index(roots, excludes, supplement_dirs)?;
 
             let mut wanted: std::collections::HashSet<String> = cases
                 .iter()
