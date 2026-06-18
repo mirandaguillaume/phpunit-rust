@@ -185,7 +185,7 @@ const MAX_ATTEMPTS: u8 = 2;
 #[allow(clippy::too_many_arguments, dead_code)]
 fn requeue_unrun(
     lost: &BatchPlan,
-    received: &ReceivedOutcomes,
+    received: &mut ReceivedOutcomes,
     class_methods: &std::collections::HashMap<String, Vec<String>>,
     attempts: &mut std::collections::HashMap<(String, String), u8>,
     on_progress: &impl Fn(&TestOutcome),
@@ -197,7 +197,28 @@ fn requeue_unrun(
         let methods: Vec<String> = if bc.methods.is_empty() {
             match class_methods.get(&bc.class) {
                 Some(ms) => ms.clone(),
-                None => vec!["<class>".to_string()],
+                None => {
+                    // Can't reconstruct the method list → can't re-queue cleanly. Synthesise a
+                    // class-level Error (matching synth_error_outcomes) rather than re-queue a
+                    // garbage method name. Record it so a later synth pass won't double-count.
+                    if !received.covers(&bc.class, "<class>") {
+                        let o = TestOutcome {
+                            class: bc.class.clone(),
+                            method: "<class>".to_string(),
+                            dataset: None,
+                            status: TestStatus::Error,
+                            message: Some(
+                                "worker died; method list unavailable for re-queue".to_string(),
+                            ),
+                            trace: None,
+                            duration_ms: 0.0,
+                        };
+                        on_progress(&o);
+                        received.record(&o);
+                        outcomes.push(o);
+                    }
+                    continue;
+                }
             }
         } else {
             bc.methods.clone()
@@ -230,6 +251,7 @@ fn requeue_unrun(
                 duration_ms: 0.0,
             };
             on_progress(&o);
+            received.record(&o);
             outcomes.push(o);
             continue;
         }
@@ -2128,7 +2150,7 @@ mod tests {
 
         requeue_unrun(
             &lost,
-            &received,
+            &mut received,
             &class_methods,
             &mut attempts,
             &|_o| {},
@@ -2151,7 +2173,7 @@ mod tests {
         let mut outcomes2: Vec<TestOutcome> = Vec::new();
         requeue_unrun(
             &lost,
-            &received,
+            &mut received,
             &class_methods,
             &mut attempts,
             &|_o| {},
