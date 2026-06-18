@@ -38,22 +38,26 @@ namespace PhpunitRust;
 trait SharedTransactionalFixture
 {
     /**
-     * Per-process, per-class build-once guard. A trait static property is SEPARATE
-     * per using-class in PHP, so this never conflates two classes. The runner
-     * fragments a class into multiple runClass calls (one per batch/plan) and
-     * setUpBeforeClass fires once per call; a warm worker is a long-lived process,
-     * so this static persists across those calls — keeping buildSharedFixture to
-     * once per (class, worker) instead of once per plan. The whole point: O(plans)
-     * rebuilds collapse to O(1) build per worker.
+     * Per-process, PER-CONCRETE-CLASS build-once guard, keyed by `static::class`.
+     *
+     * A trait static is SHARED down an inheritance chain: two concrete children of one
+     * trait-using abstract base (the doctrine pattern) share the same property, so a plain
+     * `bool` would let the first child's build suppress the second's. Keying by the concrete
+     * runtime class keeps each class independent. The runner fragments a class into multiple
+     * runClass calls; setUpBeforeClass fires once per call and a warm worker is long-lived, so
+     * this static persists across calls — collapsing O(plans) rebuilds to O(1) build per
+     * (concrete class, worker).
+     *
+     * @var array<class-string,bool>
      */
-    private static bool $sharedFixtureBuilt = false;
+    private static array $sharedFixtureBuilt = [];
 
     public static function setUpBeforeClass(): void
     {
         parent::setUpBeforeClass();
-        if (!static::$sharedFixtureBuilt) {
+        if (!(self::$sharedFixtureBuilt[static::class] ?? false)) {
             static::buildSharedFixture();
-            static::$sharedFixtureBuilt = true;
+            self::$sharedFixtureBuilt[static::class] = true;
         }
     }
 
@@ -76,10 +80,10 @@ trait SharedTransactionalFixture
     }
 
     /**
-     * Build the expensive deterministic fixture (store it statically). Called once
-     * per worker process per class (guarded by self::$sharedFixtureBuilt). A class
-     * that RELEASES the fixture in tearDownSharedFixture() MUST reset
-     * `static::$sharedFixtureBuilt = false` so the next worker rebuilds it.
+     * Build the expensive deterministic fixture (store it statically). Called once per
+     * (concrete class, worker process), guarded by self::$sharedFixtureBuilt[static::class].
+     * A class that RELEASES the fixture in tearDownSharedFixture() MUST clear its entry
+     * (`unset(self::$sharedFixtureBuilt[static::class])`) so the next run rebuilds it.
      */
     abstract protected static function buildSharedFixture(): void;
 
