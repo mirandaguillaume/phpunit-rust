@@ -496,13 +496,27 @@ fn clamp_php_workers(requested: usize, explicit: bool, cases_len: usize, k: usiz
     requested.min(by_size).max(1)
 }
 
-/// True when the suite should take the single-process (no-fork) fast path: exactly one PHP worker
-/// AND every class is pure-CPU dispatch-safe — no global-state mutation (is_stateful), no
-/// `@runInSeparateProcess` (is_isolated), no DB (needs_db). A strict superset of `workers == 1`, so
-/// it never fires where parallelism would help; it matches vanilla's single-process model for exactly
-/// the tiny suites where vanilla wins today.
+/// Max cases for the single-process (no-fork) fast path. Aligned with `clamp_php_workers`'s
+/// `k=16`: in default mode the worker count only collapses to 1 for suites this small, so the
+/// inline path naturally served exactly the tiny suites it was designed for. The cap makes that
+/// bound explicit so an EXPLICIT `--workers 1` on a large suite does NOT inline.
+const INLINE_MAX_CASES: usize = 16;
+
+/// True when the suite should take the single-process (no-fork) fast path: exactly one PHP worker,
+/// a tiny suite (≤ [`INLINE_MAX_CASES`]), AND every class is pure-CPU dispatch-safe — no
+/// global-state mutation (is_stateful), no `@runInSeparateProcess` (is_isolated), no DB (needs_db).
+///
+/// The size cap is load-bearing: the inline path runs every test in ONE process with no fork
+/// isolation or per-K recycling, so a single test that fatals/`exit()`s/segfaults takes down the
+/// whole run (the runner then synthesises errors for every remaining test). That is acceptable for
+/// a tiny suite — vanilla PHPUnit is single-process too — but catastrophic at scale (e.g. an
+/// explicit `--workers 1` on doctrine-orm's 3004 tests lost all of them to one crash). Large suites
+/// must use the fork pool, whose children are isolated and recycled, so a crash is contained to one
+/// batch and the worker respawns. Matches vanilla's single-process model only for the tiny suites
+/// where vanilla wins today.
 fn single_process_eligible(workers: usize, cases: &[phpunit_rust::types::TestCase]) -> bool {
     workers == 1
+        && cases.len() <= INLINE_MAX_CASES
         && cases
             .iter()
             .all(|c| !c.is_stateful && !c.is_isolated && !c.needs_db)
@@ -1376,6 +1390,16 @@ mod gate_tests {
         assert!(!single_process_eligible(1, &[mk(true, false, false)])); // stateful -> fork
         assert!(!single_process_eligible(1, &[mk(false, true, false)])); // isolated -> fork
         assert!(!single_process_eligible(1, &[mk(false, false, true)])); // needs_db -> fork
+                                                                         // Size cap: a large all-dispatch-safe suite must NOT inline (no fork isolation means one
+                                                                         // crash loses everything); it routes to the fork pool instead. Boundary at INLINE_MAX_CASES.
+        let big: Vec<_> = (0..INLINE_MAX_CASES + 1)
+            .map(|_| mk(false, false, false))
+            .collect();
+        assert!(!single_process_eligible(1, &big)); // >16 -> fork
+        let at_cap: Vec<_> = (0..INLINE_MAX_CASES)
+            .map(|_| mk(false, false, false))
+            .collect();
+        assert!(single_process_eligible(1, &at_cap)); // ==16 -> inline
     }
 
     #[test]
