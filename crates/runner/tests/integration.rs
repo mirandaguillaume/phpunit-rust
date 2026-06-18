@@ -563,3 +563,114 @@ fn multi_class_bin_crash_counts_each_test_once() {
         report.outcomes
     );
 }
+
+#[test]
+fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+    // L3 crash-safety: in the single-process (no-fork) path the master IS the worker, so a fatal in
+    // a test kills the master itself — there is NO surviving master to emit slot_died. The run loop's
+    // EOF path must still synthesise an error for the lost in-flight batch and terminate, never hang.
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_inline_crash_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // An uncatchable E_ERROR (undefined function) kills the inline master process mid-batch.
+    let fatal_file = dir.join("InlineFatalTest.php");
+    std::fs::write(
+        &fatal_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass InlineFatalTest extends TestCase {\n    public function testFatal(): void { __phpunit_rust_inline_no_such_fn_xyz(); }\n}\n",
+    )
+    .unwrap();
+
+    let mk = |file: &std::path::Path, class: &str, method: &str| TestCase {
+        file: file.to_path_buf(),
+        class: class.to_string(),
+        method: method.to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let cases = vec![mk(&fatal_file, "InlineFatalTest", "testFatal")];
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        // spawn_inline: the master runs the per-batch loop itself (no fork), single slot.
+        let mut pool = PhpForkPool::spawn_inline(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            0,
+            None,
+        )
+        .expect("spawn_inline failed");
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, cases, &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    // Deadline guard: a broken inline-EOF path would hang the dispatcher waiting for outcomes the
+    // dead master can never send.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "inline run did not return within 25s — the master crash hung the dispatcher"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let report = handle
+        .join()
+        .expect("run thread panicked")
+        .expect("run returned Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The fatal class must be reported (not silently lost), as an Error — via the PHP shutdown
+    // handler's `<class>` row or the EOF synth path.
+    let fatal_rows: Vec<_> = report
+        .outcomes
+        .iter()
+        .filter(|o| o.class == "InlineFatalTest")
+        .collect();
+    assert!(
+        !fatal_rows.is_empty(),
+        "InlineFatalTest must be reported, not silently lost; outcomes: {:?}",
+        report.outcomes
+    );
+    assert!(
+        fatal_rows.iter().all(|o| o.status == TestStatus::Error),
+        "InlineFatalTest must be an Error after the inline master crash; got: {fatal_rows:?}"
+    );
+}
