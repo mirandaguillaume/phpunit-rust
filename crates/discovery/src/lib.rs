@@ -1035,6 +1035,52 @@ fn class_needs_db(
     false
 }
 
+/// Calls in setUp signalling an expensive deterministic DB fixture. Port of the analyzer
+/// eligibility list (`crates/analyzer/src/reduce/eligibility.rs`); kept in sync by the oracle
+/// integration test. Matched as `<builder>(` substrings of the setUp source.
+const TX_FIXTURE_BUILDERS: &[&str] = &[
+    "createSchema",
+    "createSchemaForModels",
+    "setUpEntitySchema",
+    "getEntityManager",
+    "getSchemaTool",
+    "createSchemaManager",
+];
+
+/// Substrings in a TEST method that a per-test rollback cannot soundly undo. Lowercased: the
+/// source is lowercased before matching, so `rollBack`/`rollback` both hit `->rollback(`.
+const TX_DISQUALIFIERS: &[&str] = &[
+    "->commit(",
+    "->begintransaction(",
+    "->rollback(",
+    "->createsavepoint(",
+    "->createschema(",
+    "->dropschema(",
+    "->dropdatabase(",
+    "expectexception",
+    "@depends",
+];
+
+/// Does this setUp method's source call a recognised fixture builder?
+// `#[allow(dead_code)]`: used by unit tests now; wired into the tx-eligibility detector in a
+// follow-up task (B3). Remove the allow when the detection path calls it.
+#[allow(dead_code)]
+fn setup_builds_fixture_src(src: &str) -> bool {
+    TX_FIXTURE_BUILDERS
+        .iter()
+        .any(|b| src.contains(&format!("{b}(")))
+}
+
+/// The first disqualifier substring in a test method's source (lowercased match), if any.
+#[allow(dead_code)]
+fn method_tx_disqualifier_src(src: &str) -> Option<String> {
+    let low = src.to_ascii_lowercase();
+    TX_DISQUALIFIERS
+        .iter()
+        .find(|d| low.contains(**d))
+        .map(|d| (*d).to_string())
+}
+
 fn collect_test_methods(
     body: Node,
     bytes: &[u8],
@@ -2019,6 +2065,32 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    #[test]
+    fn setup_with_fixture_builder_is_detected() {
+        assert!(setup_builds_fixture_src(
+            "protected function setUp(): void { $this->createSchema(); }"
+        ));
+        assert!(!setup_builds_fixture_src(
+            "protected function setUp(): void { $this->seed(); }"
+        ));
+    }
+
+    #[test]
+    fn disqualifier_in_method_is_detected() {
+        assert_eq!(
+            method_tx_disqualifier_src("function t(){ $this->conn->commit(); }"),
+            Some("->commit(".to_string())
+        );
+        assert_eq!(
+            method_tx_disqualifier_src("function t(){ $this->expectException(X::class); }"),
+            Some("expectexception".to_string())
+        );
+        assert_eq!(
+            method_tx_disqualifier_src("function t(){ self::assertTrue(true); }"),
+            None
+        );
+    }
 
     fn write_tmp(content: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
