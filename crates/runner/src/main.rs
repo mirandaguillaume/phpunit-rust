@@ -345,6 +345,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// PHP fork-pool worker count, clamped by suite size. When the operator did NOT pass `--workers`
+/// (explicit=false), never fork more children than `ceil(cases_len / k)` — a 12-test suite forks 1
+/// child, not num_cpus, killing the small-suite fork-storm. An explicit `--workers N` is honored
+/// verbatim. Floor 1. Pure for unit testing; the discovery rayon pool keeps the full count.
+fn clamp_php_workers(requested: usize, explicit: bool, cases_len: usize, k: usize) -> usize {
+    if explicit {
+        return requested.max(1);
+    }
+    let by_size = cases_len.div_ceil(k.max(1)).max(1);
+    requested.min(by_size).max(1)
+}
+
 fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     // Profiler clock starts at the earliest opportunity so wall-clock
@@ -832,6 +844,11 @@ fn real_main() -> Result<ExitCode> {
     // method into multiple stride-partitioned plans (see build_queue).
     // A failed enumeration is non-fatal: missing entries fall back to
     // single-bucket dispatch.
+    // L1: clamp the PHP fork-pool worker count by suite size (default only). The discovery rayon
+    // pool above already used the unclamped count; from here, `worker_count` is the clamped value,
+    // so a tiny suite spawns 1 worker instead of num_cpus (kills the small-suite fork-storm).
+    let worker_count = clamp_php_workers(worker_count, cli.workers.is_some(), cases.len(), 16);
+
     let provider_pairs = collect_provider_pairs(&cases);
     let row_counts: RowCounts = profiler.span_with(
         "enumerate_providers",
@@ -1157,5 +1174,16 @@ mod gate_tests {
         cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(filter)));
         assert_eq!(cases.len(), 1);
         assert!(selected_needs_db(&cases), "filtered set still needs DB");
+    }
+
+    #[test]
+    fn clamp_php_workers_caps_default_by_suite_size_but_honors_explicit() {
+        // Default (not explicit): clamp to ceil(cases/K), floor 1.
+        assert_eq!(clamp_php_workers(22, false, 12, 16), 1); // 12 tiny tests -> 1
+        assert_eq!(clamp_php_workers(22, false, 100, 16), 7); // ceil(100/16)=7
+        assert_eq!(clamp_php_workers(22, false, 2462, 16), 22); // faker: ceil=154 -> min(22,154)=22
+        assert_eq!(clamp_php_workers(22, false, 0, 16), 1); // floor 1
+        // Explicit --workers N: honored verbatim, never clamped.
+        assert_eq!(clamp_php_workers(8, true, 12, 16), 8);
     }
 }
