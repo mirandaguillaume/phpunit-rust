@@ -855,7 +855,9 @@ fn real_main() -> Result<ExitCode> {
         "main",
         serde_json::json!({"pairs": provider_pairs.len()}),
         || -> Result<_> {
-            if provider_pairs.is_empty() {
+            // L2: the row counts only inform stride-splitting heavy providers ACROSS workers; at a
+            // single worker they are inert, so skip the whole extra PHP-interpreter boot.
+            if provider_pairs.is_empty() || worker_count <= 1 {
                 return Ok(RowCounts::new());
             }
             let enum_script = find_enumerate_script()?;
