@@ -1907,7 +1907,12 @@ pub fn discover_in_dirs(
         .filter_map(|p| p.canonicalize().ok())
         .collect();
 
-    // Pass 1: collect matching paths, then parse in parallel.
+    // Pass 1: collect matching paths, then parse in parallel. A single `seen`
+    // set dedups across overlapping roots (e.g. phpunit.xml declaring both
+    // `tests/` and a nested `tests/unit/`) AND across the supplement walk
+    // below — mirroring `discover_with_index` so the fast path's emission
+    // count matches the full parse (a duplicate would double-count `emit_count`).
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut root_files: Vec<PathBuf> = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -1928,7 +1933,11 @@ pub fn discover_in_dirs(
                     continue;
                 }
             }
-            root_files.push(p.to_path_buf());
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) {
+                continue;
+            }
+            root_files.push(buf);
         }
     }
     // Sort for deterministic, filesystem-order-independent discovery. WalkDir
@@ -1952,8 +1961,10 @@ pub fn discover_in_dirs(
 
     // Supplement: parse *Test*.php files from autoload-dev dirs to enrich the
     // class graph with abstract base classes that live outside the testsuite
-    // directories (e.g. Carbon's tests/AbstractTestCase.php).
-    let parsed_paths: HashSet<PathBuf> = parsed.iter().map(|c| c.file.clone()).collect();
+    // directories (e.g. Carbon's tests/AbstractTestCase.php). The shared `seen`
+    // set already holds every root file, so a supplement file already visited in
+    // the roots is skipped — and overlapping supplement dirs dedup against each
+    // other too.
     let mut supp_files: Vec<PathBuf> = Vec::new();
     for dir in graph_supplement_dirs {
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
@@ -1969,9 +1980,11 @@ pub fn discover_in_dirs(
             {
                 continue;
             }
-            if !parsed_paths.contains(p) {
-                supp_files.push(p.to_path_buf());
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) {
+                continue;
             }
+            supp_files.push(buf);
         }
     }
     supp_files.sort(); // same determinism rationale as root_files above
@@ -3479,5 +3492,32 @@ class TautologyTest extends TestCase {
             "LatinTest must be discovered despite the non-UTF-8 byte; got {:?}",
             classes.iter().map(|c| &c.fqcn).collect::<Vec<_>>()
         );
+    }
+
+    /// Overlapping roots (a phpunit.xml declaring both `tests/` and a nested
+    /// `tests/unit/`) must not double-count: `discover_in_dirs` is the runner's
+    /// fast path and `discover_with_index` is the full path — if the former
+    /// re-visits files under the nested dir while the latter dedups across walks,
+    /// the two emit different test counts → rust count > vanilla (parity failure).
+    #[test]
+    fn discover_in_dirs_dedups_overlapping_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        std::fs::write(
+            dir.path().join("a/b/FooTest.php"),
+            "<?php\nclass FooTest extends \\PHPUnit\\Framework\\TestCase {\n    public function testX() {}\n}\n",
+        )
+        .unwrap();
+        let roots = vec![dir.path().join("a"), dir.path().join("a/b")];
+
+        let cases_in_dirs = discover_in_dirs(&roots, &[], &[]).unwrap();
+        let (cases_with_index, _) = discover_with_index(&roots, &[], &[]).unwrap();
+
+        assert_eq!(
+            cases_in_dirs.len(),
+            cases_with_index.len(),
+            "fast-path emission must match full parse"
+        );
+        assert_eq!(cases_in_dirs.len(), 1);
     }
 }
