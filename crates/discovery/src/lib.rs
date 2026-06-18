@@ -1238,6 +1238,71 @@ pub fn shared_fixture_report_in_file(path: &Path) -> Result<Vec<SharedFixtureRep
     Ok(shared_fixture_report(&parsed, &graph))
 }
 
+/// Format an advisory report: one tab-separated line per concrete test class
+/// (`<fqcn>\tuses=<yes|no>\teligible=<yes|no>\t<reason>`), a `WARN` line for any class that
+/// `use`s the trait but is ineligible (likely misuse), and a trailing `eligible: N/total`.
+pub fn format_shared_fixture_report(report: &[SharedFixtureReport]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let mut eligible = 0usize;
+    for c in report {
+        let uses = if c.uses_shared_fixture { "yes" } else { "no" };
+        let el = if c.tx_eligible {
+            eligible += 1;
+            "yes"
+        } else {
+            "no"
+        };
+        let reason = c.tx_ineligible_reason.as_deref().unwrap_or("");
+        let _ = writeln!(
+            out,
+            "{}\tuses={}\teligible={}\t{}",
+            c.fqcn, uses, el, reason
+        );
+        if c.uses_shared_fixture && !c.tx_eligible {
+            let _ = writeln!(
+                out,
+                "WARN {} uses SharedTransactionalFixture but is ineligible: {}",
+                c.fqcn, reason
+            );
+        }
+    }
+    let _ = writeln!(out, "eligible: {}/{}", eligible, report.len());
+    out
+}
+
+/// Project-level SharedTransactionalFixture advisory report: parse every `*Test*.php` under
+/// `root`, build the in-project inheritance graph, and verdict each concrete test class.
+/// Self-contained gather (advisory, not parity-critical) so it never touches the hot
+/// `discover_in_dirs` path.
+pub fn shared_fixture_report_in_dir(root: &Path) -> Result<Vec<SharedFixtureReport>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("php")
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("Test")
+        {
+            files.push(p.to_path_buf());
+        }
+    }
+    files.sort(); // deterministic, machine-order-independent
+    let parsed: Vec<ParsedClass> = files
+        .iter()
+        .map(|p| parse_file_classes(p))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+    Ok(shared_fixture_report(&parsed, &graph))
+}
+
 fn collect_test_methods(
     body: Node,
     bytes: &[u8],
@@ -2318,6 +2383,37 @@ mod tests {
             .find(|c| c.fqcn.ends_with("CommitTest"))
             .expect("CommitTest reported");
         assert!(!t.tx_eligible, "a committing test is ineligible");
+    }
+
+    #[test]
+    fn shared_fixture_report_formats_lines_and_summary() {
+        let report = vec![
+            SharedFixtureReport {
+                fqcn: "A".into(),
+                file: PathBuf::from("/p/A.php"),
+                uses_shared_fixture: true,
+                tx_eligible: true,
+                tx_ineligible_reason: None,
+            },
+            SharedFixtureReport {
+                fqcn: "B".into(),
+                file: PathBuf::from("/p/B.php"),
+                uses_shared_fixture: true,
+                tx_eligible: false,
+                tx_ineligible_reason: Some("setUp builds no recognised fixture".into()),
+            },
+        ];
+        let out = format_shared_fixture_report(&report);
+        assert!(out.contains("A\tuses=yes\teligible=yes"), "{out}");
+        assert!(
+            out.contains("B\tuses=yes\teligible=no\tsetUp builds no recognised fixture"),
+            "{out}"
+        );
+        assert!(
+            out.contains("WARN B uses SharedTransactionalFixture but is ineligible"),
+            "{out}"
+        );
+        assert!(out.contains("eligible: 1/2"), "{out}");
     }
 
     fn write_tmp(content: &str) -> (tempfile::TempDir, PathBuf) {
