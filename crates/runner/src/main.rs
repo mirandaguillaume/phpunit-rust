@@ -3,7 +3,9 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::{discover_cases_and_test_index, discover_with_index};
+use phpunit_rust::discovery::{
+    discover_cases_and_test_index, discover_nontest_class_index, discover_with_index,
+};
 
 /// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
 /// into a list of directories, resolved relative to `project`. Used to build
@@ -162,6 +164,20 @@ fn build_cases_and_index(
             if all_resolvable {
                 return Ok((cases, test_class_index));
             }
+            // Fallback WITHOUT re-parsing the test files: parse only the non-test files and
+            // merge with the already-parsed test-file index. Byte-identical to
+            // discover_with_index's (cases, index) for any suite without a cross-file FQCN
+            // redeclaration (which is a PHP fatal). Avoids the double test-file parse.
+            let dirs: Vec<PathBuf> = roots
+                .iter()
+                .chain(supplement_dirs.iter())
+                .cloned()
+                .collect();
+            let mut index = discover_nontest_class_index(&dirs, excludes);
+            for (fqcn, file) in test_class_index {
+                index.entry(fqcn).or_insert(file);
+            }
+            return Ok((cases, index));
         }
     }
     let (cases, index) = discover_with_index(roots, excludes, supplement_dirs)?;
@@ -1526,5 +1542,40 @@ return array(
             index.contains_key("App\\Fixtures\\Data"),
             "non-PSR-4 provider must be kept via the full-parse fallback (parity)"
         );
+    }
+
+    #[test]
+    fn build_cases_and_index_fallback_index_matches_full_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let proj = tmp.path();
+        std::fs::create_dir_all(proj.join("vendor/composer")).unwrap();
+        std::fs::create_dir_all(proj.join("tests")).unwrap();
+        std::fs::create_dir_all(proj.join("fixtures")).unwrap();
+        std::fs::write(
+            proj.join("vendor/composer/autoload_psr4.php"),
+            "<?php\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\nreturn array(\n    'App\\\\Tests\\\\' => array($baseDir . '/tests'),\n);\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("fixtures/data_rows.php"),
+            "<?php\nnamespace App\\Fixtures;\nclass Data { public static function rows() { return [[1]]; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("tests/FooTest.php"),
+            "<?php\nnamespace App\\Tests;\nuse PHPUnit\\Framework\\TestCase;\nuse PHPUnit\\Framework\\Attributes\\DataProviderExternal;\nclass FooTest extends TestCase {\n  #[DataProviderExternal(\\App\\Fixtures\\Data::class, 'rows')]\n  public function testBar($x) { $this->assertTrue((bool)$x); }\n}\n",
+        )
+        .unwrap();
+        let roots = vec![proj.join("tests")];
+        let supp = vec![proj.join("tests"), proj.join("fixtures")];
+
+        let (_c1, fallback_index) = build_cases_and_index(proj, &roots, &[], &supp, false).unwrap();
+        let (_c2, full_index) =
+            phpunit_rust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+        assert_eq!(
+            fallback_index, full_index,
+            "fallback index must byte-match discover_with_index"
+        );
+        assert!(fallback_index.contains_key("App\\Fixtures\\Data"));
     }
 }
