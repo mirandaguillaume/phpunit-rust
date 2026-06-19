@@ -29,11 +29,15 @@ mkdir -p "$SMOKE"
 # ---------------------------------------------------------------------------
 prepared_suites=()
 
-while IFS=$'\t' read -r name git_url ref extra_env; do
-    # Skip header line
-    [[ "$name" == "name" ]] && continue
-    # Skip blank lines
-    [[ -z "$name" ]] && continue
+while IFS= read -r line; do
+    # Split with cut, NOT `IFS=$'\t' read`: tab is IFS-whitespace, so read
+    # collapses consecutive tabs and would drop an empty middle field (a suite
+    # with composer_args but no extra_env). cut -f preserves empty fields.
+    name="$(printf '%s' "$line" | cut -f1)"
+    [[ "$name" == "name" || -z "$name" ]] && continue   # skip header / blank
+    git_url="$(printf '%s' "$line" | cut -f2)"
+    ref="$(printf '%s' "$line" | cut -f3)"
+    composer_args="$(printf '%s' "$line" | cut -f5)"     # optional `composer install` flags
 
     suite_dir="${SMOKE}/${name}"
 
@@ -50,7 +54,7 @@ while IFS=$'\t' read -r name git_url ref extra_env; do
         if ! (
             export COMPOSER_NO_INTERACTION=1
             cd "${suite_dir}"
-            composer install --no-interaction --prefer-dist --no-progress 2>&1
+            composer install --no-interaction --prefer-dist --no-progress ${composer_args} 2>&1
         ); then
             echo "[oss-bench] ERROR: composer install failed for ${name} — skipping suite" >&2
             rm -rf "${suite_dir}"
@@ -82,11 +86,11 @@ header_written=0
 for suite_name in "${prepared_suites[@]}"; do
     # Look up extra_env for this suite
     suite_extra_env=""
-    while IFS=$'\t' read -r name _git_url _ref extra_env; do
-        [[ "$name" == "name" ]] && continue
-        [[ -z "$name" ]] && continue
+    while IFS= read -r line; do
+        name="$(printf '%s' "$line" | cut -f1)"
+        [[ "$name" == "name" || -z "$name" ]] && continue
         if [[ "$name" == "$suite_name" ]]; then
-            suite_extra_env="$extra_env"
+            suite_extra_env="$(printf '%s' "$line" | cut -f4)"
             break
         fi
     done < "$MANIFEST"
