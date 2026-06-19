@@ -125,7 +125,12 @@ final class TransactionResetTest extends TestCase
         // process-global and noisy to assert in-process, so drive the fixture
         // in a child PHP process and capture its stderr.
         $autoload = dirname(__DIR__) . '/vendor/autoload.php';
+        // _TxCommitLeakFixture is a helper class co-located in THIS file, not a
+        // PSR-4 file the composer autoloader can resolve. The fresh child process
+        // must require this file to declare it (autoload alone finds the shim +
+        // PHPUnit, but not a co-located test helper).
         $php = <<<'PHP'
+            require %s;
             require %s;
             putenv('PHPUNIT_RUST_DB_DSN=sqlite:' . %s);
             putenv('PHPUNIT_RUST_SLOT=3');
@@ -134,7 +139,7 @@ final class TransactionResetTest extends TestCase
                 ['testCommitsInsideTransaction']
             );
             PHP;
-        $script = sprintf($php, var_export($autoload, true), var_export($this->dbFile, true));
+        $script = sprintf($php, var_export($autoload, true), var_export(__FILE__, true), var_export($this->dbFile, true));
 
         $descriptors = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
         $proc = proc_open(PHP_BINARY . ' -r ' . escapeshellarg($script), $descriptors, $pipes);
