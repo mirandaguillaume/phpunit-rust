@@ -1,0 +1,12 @@
+# Candidate OSS suites under evaluation -- read ONLY by bench-candidates.yml
+# (parity_one.sh via OSS_MANIFEST). NOT in oss_suites.tsv, so the daily
+# gate/table never touch them. Promote to oss_suites.tsv once a suite
+# reaches exact parity at workers=4.
+#   monolog     -- composer install needs ext-mongodb (absent from the CI
+#                  image); needs --ignore-platform-req before it can run.
+#   phpstan-src -- real gap: data providers use PHP Fibers; rust pre-fork
+#                  enumeration hits "Cannot switch fibers" so N-row providers
+#                  collapse to 1 (rust 12093 vs vanilla 12586).
+name	git_url	ref	extra_env
+monolog	https://github.com/Seldaek/monolog	3.10.0
+phpstan-src	https://github.com/phpstan/phpstan-src	2.2.2

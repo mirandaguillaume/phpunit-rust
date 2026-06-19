@@ -19,7 +19,10 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MANIFEST="${SCRIPT_DIR}/oss_suites.tsv"
+# Default registry is the gated, at-parity production suites. The candidate lane
+# (bench-candidates.yml) overrides this with OSS_MANIFEST=.../oss_candidates.tsv
+# to vet suites that are NOT yet in the daily gate/table.
+MANIFEST="${OSS_MANIFEST:-${SCRIPT_DIR}/oss_suites.tsv}"
 
 # Worker-death markers the runner/worker write into the dump's message field
 # (Class::method|Status|message) when a child is lost mid-batch. A death on a
