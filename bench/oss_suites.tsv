@@ -7,3 +7,6 @@ guzzle-psr7	https://github.com/guzzle/psr7	2.11.0
 php-parser	https://github.com/nikic/PHP-Parser	v5.7.0
 phpunit-itself	https://github.com/sebastianbergmann/phpunit	11.5.55
 commonmark	https://github.com/thephpleague/commonmark	2.8.2
+monolog	https://github.com/Seldaek/monolog	3.10.0
+rector	https://github.com/rectorphp/rector-src	2.4.6
+phpstan-src	https://github.com/phpstan/phpstan-src	2.2.2
