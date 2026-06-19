@@ -417,7 +417,23 @@ impl PhpForkPool {
         if self.reaped {
             return false;
         }
-        matches!(self.master.try_wait(), Ok(None))
+        // First try non-blocking.
+        if !matches!(self.master.try_wait(), Ok(None)) {
+            return false;
+        }
+        // Short retry: SIGKILL causes a brief window between "FDs closed (EOF seen by Rust)"
+        // and "process fully zombie". Give the kernel up to 50 ms to mark the process as exited.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if !matches!(self.master.try_wait(), Ok(None)) {
+                return false;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        true
     }
 }
 
