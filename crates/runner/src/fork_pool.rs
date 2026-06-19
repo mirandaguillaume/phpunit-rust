@@ -184,13 +184,16 @@ impl PhpForkPool {
         let mut cmd = Command::new("php");
         cmd.arg("-d")
             .arg("opcache.enable_cli=1")
-            // The master pre-warms opcache for every test file before forking,
-            // so each compile bumps the master's resident set. On large test
-            // suites (rector: ~1500 fixture files in class_file_index, phpstan
-            // similar) the default 128M memory_limit fills up and PHP fatals
-            // the master half-way through. -1 (unlimited) is safe here because
-            // the OS still enforces real limits and the master is short-lived
-            // — by design we strip the per-child cap via --worker-memory-limit.
+            // opcache.enable_cli stays on, but the master no longer pre-warms
+            // opcache — that loop early-bound classes into every fork and was
+            // removed (see php/worker_fork.php). The master still loads the
+            // project autoloader, bootstrap, and the discovered class-file index
+            // in one short-lived process before forking; on large suites
+            // (rector: ~1500 fixture files in class_file_index, phpstan similar)
+            // the default 128M memory_limit fills up and PHP fatals the master
+            // half-way through. -1 (unlimited) is safe here because the OS still
+            // enforces real limits and the master is short-lived — by design we
+            // strip the per-child cap via --worker-memory-limit.
             .arg("-d")
             .arg("memory_limit=-1")
             .arg(script)

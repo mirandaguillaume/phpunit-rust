@@ -443,9 +443,9 @@ struct Cli {
     /// repo / no changes → nothing to run.
     #[arg(long)]
     dirty: bool,
-    /// Base DSN for per-worker database provisioning (Phase 3). Passing this flag
-    /// marks a database as "configured" for the preflight gate — actual
-    /// provisioning is wired in Phase 3. Example: postgres://user:pw@localhost/mydb
+    /// Base DSN for per-worker database provisioning. Marks a database as
+    /// "configured" for the preflight gate and creates one clone per worker
+    /// (CREATE DATABASE … TEMPLATE). Example: postgres://user:pw@localhost/mydb
     #[arg(long)]
     provision_db: Option<String>,
     /// When `needs_db` tests are selected but no database is configured,
