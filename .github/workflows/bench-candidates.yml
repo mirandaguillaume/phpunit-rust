@@ -1,0 +1,51 @@
+---
+# bench-candidates.yml — manual (workflow_dispatch) parity validation for
+# CANDIDATE OSS suites before they are promoted into the blocking daily gate.
+#
+# Why a separate workflow: adding an unproven suite straight into
+# bench-daily.yml's `gate` matrix would block publication (and the auto-PR) the
+# moment that suite diverges from vanilla. This lane runs the same workers=4,
+# in-container parity check (bench/parity_one.sh) but is NON-BLOCKING and never
+# publishes — so we can measure a candidate's real parity, then move only the
+# green suites into bench-daily.yml's gate/diag matrices.
+#
+# Run it from the Actions tab (or `gh workflow run bench-candidates.yml --ref <branch>`).
+# Each suite must already exist in bench/oss_suites.tsv.
+
+name: Candidate OSS Parity (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  candidate:
+    name: candidate parity · ${{ matrix.suite }} (workers=4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [monolog, rector, phpstan-src]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build phpunit-rust (release)
+        run: cargo build --release -p phpunit-rust
+      # PHP+composer on the runner ONLY to generate the worker-shim autoloader
+      # (php/vendor); the suites themselves are cloned + run inside the container.
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          tools: composer
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+      - name: Build CI-faithful PHP image
+        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+      - name: Make bench scripts executable
+        run: chmod +x bench/*.sh
+      - name: Parity (workers=4, in container)
+        env:
+          IMAGE: prust-ci:php84
+          WORKERS: "4"
+        run: bench/run_in_container.sh bash /work/bench/parity_one.sh "${{ matrix.suite }}"
