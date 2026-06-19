@@ -915,6 +915,165 @@ fn forked_worker_death_salvages_innocent_tail_and_bounds_poison() {
     }
 }
 
+/// Phase 1 — SIGKILL-based proof that the child-death re-queue salvages the innocent tail.
+///
+/// The sibling test `forked_worker_death_salvages_innocent_tail_and_bounds_poison` uses an
+/// undefined-function call as its poison. In PHP 8 that surfaces as a catchable `Error` which
+/// PHPUnit's `catch (\Throwable)` swallows, so the forked CHILD never actually dies — the tail
+/// "passes" by running normally, never exercising the SlotDied → `requeue_unrun` salvage path.
+/// That makes the sibling test vacuous about Phase 1's headline mechanism.
+///
+/// This test pokes the real wiring: `testPoison` sends SIGKILL to its own PID, which is
+/// UNCATCHABLE. The forked child dies mid-batch, the master emits `slot_died`, and the runner's
+/// `requeue_unrun` re-queues the batch's un-run methods onto a fresh child. The DISTINGUISHING
+/// signal is the poison message: `testPoison` ends as `Error` with "poison pill" in its message,
+/// which ONLY `requeue_unrun` emits when a test reaches the MAX_ATTEMPTS cap (killed → re-queued
+/// isolated → killed again). If `testPoison` is `Error` WITHOUT "poison pill", the death/requeue
+/// path did NOT fire and Phase 1 is broken.
+///
+/// All of this happens inside ONE `run` call: the master forks the replacement child, so there is
+/// no master death and no manual respawn loop.
+///
+/// CRITICAL: this requires FORK-SERVER mode (max_batches_per_child > 0). In long-lived mode
+/// (max_batches_per_child = 0 — what the sibling test uses) the master closes its copies of the
+/// child FDs and blocks on a plain `pcntl_waitpid` with NO SIGCHLD handler, so a child death
+/// surfaces to Rust only as EOF, never `slot_died` — and `requeue_unrun` cannot fire. The salvage
+/// mechanism is therefore exercised ONLY when the runner runs the master as a fork-server.
+#[test]
+fn forked_salvage_via_sigkill_proves_requeue() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir =
+        std::env::temp_dir().join(format!("phpunit_rust_salvage_kill_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // testOk1 passes, testPoison SIGKILLs the forked child (uncatchable — unlike an undefined fn),
+    // testOk2 must still run after the master forks a replacement child and re-queues it.
+    let file = dir.join("SalvageKillTest.php");
+    std::fs::write(
+        &file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass SalvageKillTest extends TestCase {\n  public function testOk1(): void { $this->assertTrue(true); }\n  public function testPoison(): void { posix_kill(posix_getpid(), 9); }\n  public function testOk2(): void { $this->assertTrue(true); }\n}\n",
+    )
+    .unwrap();
+
+    let mk = |method: &str| TestCase {
+        file: file.clone(),
+        class: "SalvageKillTest".to_string(),
+        method: method.to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let cases = vec![mk("testOk1"), mk("testPoison"), mk("testOk2")];
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        // Fork-server mode (max_batches_per_child = 1, NOT 0): the SlotDied → requeue_unrun
+        // salvage only exists in fork-server mode. In long-lived mode (0) the master closes its
+        // copies of the child FDs and blocks on pcntl_waitpid with NO SIGCHLD handler, so a child
+        // death surfaces only as EOF — never `slot_died` — and the re-queue path cannot fire.
+        let mut pool = PhpForkPool::spawn(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            1,
+            None,
+        )
+        .expect("spawn failed");
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, cases, &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(Instant::now() < deadline, "salvage-via-sigkill run hung");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let report = handle.join().expect("panicked").expect("Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let outcome_of = |m: &str| report.outcomes.iter().find(|o| o.method == m);
+    let status_of = |m: &str| outcome_of(m).map(|o| o.status.clone());
+
+    // testOk1 ran and reported before the kill.
+    assert_eq!(
+        status_of("testOk1"),
+        Some(TestStatus::Pass),
+        "testOk1 must pass; outcomes: {:?}",
+        report.outcomes
+    );
+    // The innocent tail must be SALVAGED — re-queued onto the fresh replacement child.
+    assert_eq!(
+        status_of("testOk2"),
+        Some(TestStatus::Pass),
+        "testOk2 (innocent tail) must be salvaged via re-queue onto a fresh child; outcomes: {:?}",
+        report.outcomes
+    );
+    // The poison test must end as Error AT THE CAP. The "poison pill" message is the
+    // distinguishing signal that the SlotDied → requeue_unrun → MAX_ATTEMPTS path genuinely fired
+    // (death → re-queue isolated → death again). An Error WITHOUT it means the kill/requeue path
+    // never ran — Phase 1 would be broken/vacuous.
+    let poison = outcome_of("testPoison");
+    assert_eq!(
+        poison.map(|o| o.status.clone()),
+        Some(TestStatus::Error),
+        "testPoison must end as Error at the cap; outcomes: {:?}",
+        report.outcomes
+    );
+    let poison_msg = poison.and_then(|o| o.message.clone()).unwrap_or_default();
+    assert!(
+        poison_msg.contains("poison pill"),
+        "testPoison's Error must come from requeue_unrun's MAX_ATTEMPTS cap (message must contain \
+         \"poison pill\"); without it the child-death re-queue salvage never fired. Got message: \
+         {poison_msg:?}; outcomes: {:?}",
+        report.outcomes
+    );
+
+    for m in ["testOk1", "testPoison", "testOk2"] {
+        assert_eq!(
+            report.outcomes.iter().filter(|o| o.method == m).count(),
+            1,
+            "{m} must be reported exactly once; outcomes: {:?}",
+            report.outcomes
+        );
+    }
+}
+
 /// Phase 2 — transient master death: when an inline master dies with work still queued, the
 /// queued-but-never-dispatched tests come back as `unfinished` from `run_resumable`. After
 /// re-spawning a fresh pool and re-running all unfinished tests, they pass and nothing is left
