@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [brick-math, carbon, commonmark, doctrine-orm, faker, guzzle-psr7, php-parser, phpunit-itself]
+        suite: [brick-math, carbon, commonmark, doctrine-orm, faker, guzzle-psr7, php-parser, phpunit-itself, rector]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -73,7 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [brick-math, carbon, commonmark, doctrine-orm, faker, guzzle-psr7, php-parser, phpunit-itself]
+        suite: [brick-math, carbon, commonmark, doctrine-orm, faker, guzzle-psr7, php-parser, phpunit-itself, rector]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
