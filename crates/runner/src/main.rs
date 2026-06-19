@@ -1189,6 +1189,10 @@ fn real_main() -> Result<ExitCode> {
     } else {
         phpunit_rust::runner::StopOn::default()
     };
+    // Keep clones for pool respawns; cfg takes ownership of the originals.
+    let autoload_respawn = autoload.clone();
+    let defines_respawn = defines.clone();
+    let class_file_index_respawn = class_file_index.clone();
     let cfg = RunConfig {
         autoload,
         bootstrap: None,
@@ -1202,21 +1206,76 @@ fn real_main() -> Result<ExitCode> {
             .then(|| std::time::Duration::from_secs(cli.worker_timeout)),
     };
     let n_cases = cases.len();
-    let mut report = profiler.span_with(
-        "run",
-        "main",
-        serde_json::json!({"cases": n_cases, "workers": worker_count}),
-        || {
-            phpunit_rust::runner::run_with_profiler(
-                &mut pool,
-                cases,
-                &cfg,
-                &row_counts,
-                print_progress,
-                &profiler,
-            )
-        },
-    )?;
+    profiler.mark("run_start", "main");
+    const MAX_MASTER_RESPAWNS: u32 = 3;
+    let mut all_outcomes: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
+    let mut pending = cases;
+    let mut master_respawns = 0u32;
+    loop {
+        let (partial, unfinished) = phpunit_rust::runner::run_resumable(
+            &mut pool,
+            pending,
+            &cfg,
+            &row_counts,
+            print_progress,
+            &profiler,
+        )?;
+        all_outcomes.extend(partial.outcomes);
+        if unfinished.is_empty() {
+            break;
+        }
+        master_respawns += 1;
+        if master_respawns > MAX_MASTER_RESPAWNS {
+            eprintln!(
+                "phpunit-rust: PHP master died {} times; giving up on {} unfinished test(s)",
+                master_respawns,
+                unfinished.len()
+            );
+            for c in unfinished {
+                let o = phpunit_rust::types::TestOutcome {
+                    class: c.class,
+                    method: c.method,
+                    dataset: None,
+                    status: phpunit_rust::types::TestStatus::Error,
+                    message: Some("worker process crashed repeatedly; giving up".to_string()),
+                    trace: None,
+                    duration_ms: 0.0,
+                };
+                print_progress(&o);
+                all_outcomes.push(o);
+            }
+            break;
+        }
+        eprintln!(
+            "phpunit-rust: PHP master died; respawning ({}/{}) for {} unfinished test(s)",
+            master_respawns,
+            MAX_MASTER_RESPAWNS,
+            unfinished.len()
+        );
+        pool = spawn_fn(
+            &fork_script,
+            &autoload_respawn,
+            bootstrap.as_deref(),
+            &defines_respawn,
+            &env_triples,
+            &server_pairs,
+            &ini_pairs,
+            &var_pairs,
+            worker_count,
+            &class_file_index_respawn,
+            &cli.worker_memory_limit,
+            cli.worker_max_batches,
+            per_slot_dsn_opt.as_deref(),
+        )?;
+        pending = unfinished;
+    }
+    profiler.mark("run_end", "main");
+    let total_duration_ms: f64 = all_outcomes.iter().map(|o| o.duration_ms).sum();
+    let mut report = phpunit_rust::runner::Report {
+        outcomes: all_outcomes,
+        total_duration_ms,
+    };
+    let _ = n_cases;
 
     // Append synthetic skips for DB tests suppressed by --skip-db.
     if !synthetic_db_skips.is_empty() {

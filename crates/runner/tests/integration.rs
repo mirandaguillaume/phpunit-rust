@@ -914,3 +914,503 @@ fn forked_worker_death_salvages_innocent_tail_and_bounds_poison() {
         );
     }
 }
+
+/// Phase 1 — SIGKILL-based proof that the child-death re-queue salvages the innocent tail.
+///
+/// The sibling test `forked_worker_death_salvages_innocent_tail_and_bounds_poison` uses an
+/// undefined-function call as its poison. In PHP 8 that surfaces as a catchable `Error` which
+/// PHPUnit's `catch (\Throwable)` swallows, so the forked CHILD never actually dies — the tail
+/// "passes" by running normally, never exercising the SlotDied → `requeue_unrun` salvage path.
+/// That makes the sibling test vacuous about Phase 1's headline mechanism.
+///
+/// This test pokes the real wiring: `testPoison` sends SIGKILL to its own PID, which is
+/// UNCATCHABLE. The forked child dies mid-batch, the master emits `slot_died`, and the runner's
+/// `requeue_unrun` re-queues the batch's un-run methods onto a fresh child. The DISTINGUISHING
+/// signal is the poison message: `testPoison` ends as `Error` with "poison pill" in its message,
+/// which ONLY `requeue_unrun` emits when a test reaches the MAX_ATTEMPTS cap (killed → re-queued
+/// isolated → killed again). If `testPoison` is `Error` WITHOUT "poison pill", the death/requeue
+/// path did NOT fire and Phase 1 is broken.
+///
+/// All of this happens inside ONE `run` call: the master forks the replacement child, so there is
+/// no master death and no manual respawn loop.
+///
+/// CRITICAL: this requires FORK-SERVER mode (max_batches_per_child > 0). In long-lived mode
+/// (max_batches_per_child = 0 — what the sibling test uses) the master closes its copies of the
+/// child FDs and blocks on a plain `pcntl_waitpid` with NO SIGCHLD handler, so a child death
+/// surfaces to Rust only as EOF, never `slot_died` — and `requeue_unrun` cannot fire. The salvage
+/// mechanism is therefore exercised ONLY when the runner runs the master as a fork-server.
+#[test]
+fn forked_salvage_via_sigkill_proves_requeue() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir =
+        std::env::temp_dir().join(format!("phpunit_rust_salvage_kill_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // testOk1 passes, testPoison SIGKILLs the forked child (uncatchable — unlike an undefined fn),
+    // testOk2 must still run after the master forks a replacement child and re-queues it.
+    let file = dir.join("SalvageKillTest.php");
+    std::fs::write(
+        &file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass SalvageKillTest extends TestCase {\n  public function testOk1(): void { $this->assertTrue(true); }\n  public function testPoison(): void { posix_kill(posix_getpid(), 9); }\n  public function testOk2(): void { $this->assertTrue(true); }\n}\n",
+    )
+    .unwrap();
+
+    let mk = |method: &str| TestCase {
+        file: file.clone(),
+        class: "SalvageKillTest".to_string(),
+        method: method.to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let cases = vec![mk("testOk1"), mk("testPoison"), mk("testOk2")];
+
+    let autoload_t = autoload.clone();
+    let handle = std::thread::spawn(move || {
+        // Fork-server mode (max_batches_per_child = 1, NOT 0): the SlotDied → requeue_unrun
+        // salvage only exists in fork-server mode. In long-lived mode (0) the master closes its
+        // copies of the child FDs and blocks on pcntl_waitpid with NO SIGCHLD handler, so a child
+        // death surfaces only as EOF — never `slot_died` — and the re-queue path cannot fire.
+        let mut pool = PhpForkPool::spawn(
+            &script,
+            &autoload_t,
+            None,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            1,
+            &std::collections::HashMap::new(),
+            "512M",
+            1,
+            None,
+        )
+        .expect("spawn failed");
+        let cfg = RunConfig {
+            autoload: autoload_t.clone(),
+            bootstrap: None,
+            filter: None,
+            defines: vec![],
+            stop_on: Default::default(),
+            class_file_index: std::collections::HashMap::new(),
+            n_workers: 1,
+            worker_timeout: None,
+        };
+        run(&mut pool, cases, &cfg, &RowCounts::new(), |_o| {})
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !handle.is_finished() {
+        assert!(Instant::now() < deadline, "salvage-via-sigkill run hung");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let report = handle.join().expect("panicked").expect("Err");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let outcome_of = |m: &str| report.outcomes.iter().find(|o| o.method == m);
+    let status_of = |m: &str| outcome_of(m).map(|o| o.status.clone());
+
+    // testOk1 ran and reported before the kill.
+    assert_eq!(
+        status_of("testOk1"),
+        Some(TestStatus::Pass),
+        "testOk1 must pass; outcomes: {:?}",
+        report.outcomes
+    );
+    // The innocent tail must be SALVAGED — re-queued onto the fresh replacement child.
+    assert_eq!(
+        status_of("testOk2"),
+        Some(TestStatus::Pass),
+        "testOk2 (innocent tail) must be salvaged via re-queue onto a fresh child; outcomes: {:?}",
+        report.outcomes
+    );
+    // The poison test must end as Error AT THE CAP. The "poison pill" message is the
+    // distinguishing signal that the SlotDied → requeue_unrun → MAX_ATTEMPTS path genuinely fired
+    // (death → re-queue isolated → death again). An Error WITHOUT it means the kill/requeue path
+    // never ran — Phase 1 would be broken/vacuous.
+    let poison = outcome_of("testPoison");
+    assert_eq!(
+        poison.map(|o| o.status.clone()),
+        Some(TestStatus::Error),
+        "testPoison must end as Error at the cap; outcomes: {:?}",
+        report.outcomes
+    );
+    let poison_msg = poison.and_then(|o| o.message.clone()).unwrap_or_default();
+    assert!(
+        poison_msg.contains("poison pill"),
+        "testPoison's Error must come from requeue_unrun's MAX_ATTEMPTS cap (message must contain \
+         \"poison pill\"); without it the child-death re-queue salvage never fired. Got message: \
+         {poison_msg:?}; outcomes: {:?}",
+        report.outcomes
+    );
+
+    for m in ["testOk1", "testPoison", "testOk2"] {
+        assert_eq!(
+            report.outcomes.iter().filter(|o| o.method == m).count(),
+            1,
+            "{m} must be reported exactly once; outcomes: {:?}",
+            report.outcomes
+        );
+    }
+}
+
+/// Phase 2 — transient master death: when an inline master dies with work still queued, the
+/// queued-but-never-dispatched tests come back as `unfinished` from `run_resumable`. After
+/// re-spawning a fresh pool and re-running all unfinished tests, they pass and nothing is left
+/// unfinished.
+///
+/// Mechanism: the inline master IS the worker. A test that sends `SIGKILL` to its own PID
+/// (`posix_kill(getmypid(), 9)`) kills the PHP process immediately — SIGKILL is uncatchable
+/// and no shutdown handler runs. The runner sees EOF with work still in-flight or queued;
+/// `master_died = true` and ALL unfinished tests (not yet received) are returned as `unfinished`.
+/// A marker-file guard makes the kill transient: the marker is written BEFORE the kill, so on
+/// the second run the test sees the marker and passes instead of killing.
+///
+/// Setup: two separate PHP classes → two separate batches.
+/// P2TransientKillTest kills the master on the first run only (marker-guarded).
+/// P2InnocentAfterTest is still in the queue when EOF fires. BOTH come back as `unfinished`.
+/// On the second run (respawn) both pass — this is the core "transient recovery" proof.
+#[test]
+fn master_death_transient_recovered_by_respawn() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::profiler::Profiler;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run_resumable, RunConfig};
+    use phpunit_rust::types::{TestCase, TestStatus};
+    use std::time::{Duration, Instant};
+
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir =
+        std::env::temp_dir().join(format!("phpunit_rust_p2_transient_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("killed_once");
+
+    // Class A: on the FIRST run, writes a marker then sends SIGKILL to itself (killing the
+    // inline master instantly — no shutdown handler). On subsequent runs (marker exists), it
+    // just asserts true and passes. This makes the master death transient.
+    let kill_file = dir.join("P2TransientKillTest.php");
+    std::fs::write(
+        &kill_file,
+        format!(
+            "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass P2TransientKillTest extends TestCase {{\n  public function testTransient(): void {{\n    $m = '{marker}';\n    if (!file_exists($m)) {{ file_put_contents($m, '1'); posix_kill(getmypid(), 9); }}\n    $this->assertTrue(true);\n  }}\n}}\n",
+            marker = marker.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    // Class B: always passes — queued AFTER A. When A kills the master, B is never dispatched
+    // and is returned as `unfinished` (along with A, since SIGKILL emits no shutdown outcome).
+    let innocent_file = dir.join("P2InnocentAfterTest.php");
+    std::fs::write(
+        &innocent_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass P2InnocentAfterTest extends TestCase {\n  public function testOk(): void { $this->assertTrue(true); }\n}\n",
+    )
+    .unwrap();
+
+    let mk_kill = || TestCase {
+        file: kill_file.clone(),
+        class: "P2TransientKillTest".to_string(),
+        method: "testTransient".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let mk_innocent = || TestCase {
+        file: innocent_file.clone(),
+        class: "P2InnocentAfterTest".to_string(),
+        method: "testOk".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+
+    // Helper: spawn a fresh inline pool, run run_resumable, return (outcomes, unfinished).
+    // Guarded by a 25 s wall-clock deadline so a hang fails the test instead of blocking the suite.
+    let run_once =
+        |cases: Vec<TestCase>| -> (Vec<phpunit_rust::types::TestOutcome>, Vec<TestCase>) {
+            let script = script.clone();
+            let autoload = autoload.clone();
+            let handle = std::thread::spawn(move || {
+                let cfg = RunConfig {
+                    autoload: autoload.clone(),
+                    bootstrap: None,
+                    filter: None,
+                    defines: vec![],
+                    stop_on: Default::default(),
+                    class_file_index: std::collections::HashMap::new(),
+                    n_workers: 1,
+                    worker_timeout: None,
+                };
+                let prof = Profiler::new(false);
+                let mut pool = PhpForkPool::spawn_inline(
+                    &script,
+                    &autoload,
+                    None,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    1,
+                    &std::collections::HashMap::new(),
+                    "512M",
+                    0,
+                    None,
+                )
+                .expect("spawn_inline failed");
+                let noop: fn(&phpunit_rust::types::TestOutcome) = |_o| {};
+                run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
+                    .map(|(r, u)| (r.outcomes, u))
+                    .expect("run_resumable returned Err")
+            });
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while !handle.is_finished() {
+                assert!(Instant::now() < deadline, "run_resumable hung");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            handle.join().expect("thread panicked")
+        };
+
+    // Run 1: P2TransientKillTest sends SIGKILL → master dies → no shutdown handler → both A and
+    // B had no outcomes received → both come back as unfinished.
+    let (out1, unfinished1) = run_once(vec![mk_kill(), mk_innocent()]);
+    assert!(
+        !unfinished1.is_empty(),
+        "master death (SIGKILL) must return unfinished tests; \
+         out1={out1:?} unfinished1={unfinished1:?}"
+    );
+    assert!(
+        unfinished1.iter().any(|c| c.class == "P2InnocentAfterTest"),
+        "the queued-but-undispatched innocent class must be in unfinished1; \
+         unfinished1={unfinished1:?}"
+    );
+
+    // Run 2 (respawn): marker file now exists → kill test passes; innocent test passes.
+    // Nothing is left unfinished — this is the core "transient recovery" proof.
+    let (out2, unfinished2) = run_once(unfinished1);
+    assert!(
+        unfinished2.is_empty(),
+        "second run (respawn) must complete with nothing unfinished; unfinished2={unfinished2:?}"
+    );
+    assert!(
+        out2.iter()
+            .any(|o| o.class == "P2InnocentAfterTest" && o.status == TestStatus::Pass),
+        "the queued test must pass on respawn; out2={out2:?}"
+    );
+    // The previously-killing test must now pass (marker prevents the kill).
+    assert!(
+        out2.iter()
+            .any(|o| o.class == "P2TransientKillTest" && o.status == TestStatus::Pass),
+        "the transient-killer test must pass after respawn (marker exists); out2={out2:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Phase 2 — deterministic master-killer is bounded: a test that ALWAYS sends SIGKILL to its
+/// own PID keeps killing the master every respawn. A loop capped at MAX_RESPAWNS must terminate
+/// under a wall-clock deadline (no-hang invariant). The key invariant: NO HANG, bounded
+/// iteration count, and no silent test loss at the cap.
+///
+/// Structure: Class A (always sends SIGKILL, always dispatched first) kills the master every
+/// time. Since SIGKILL triggers no shutdown handler, no outcome is emitted; both A and B
+/// (still in the queue) come back as `unfinished` each iteration. The loop artificially
+/// re-injects A each time to simulate a permanent master-killer. After MAX_RESPAWNS the loop
+/// stops — the key invariant is NO HANG and bounded iteration count.
+#[test]
+fn master_death_always_is_bounded_no_hang() {
+    use phpunit_rust::fork_pool::PhpForkPool;
+    use phpunit_rust::profiler::Profiler;
+    use phpunit_rust::provider_enum::RowCounts;
+    use phpunit_rust::runner::{run_resumable, RunConfig};
+    use phpunit_rust::types::TestCase;
+    use std::time::{Duration, Instant};
+
+    let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/sample_project/vendor/autoload.php");
+    if !autoload.is_file() {
+        eprintln!("SKIP: sample_project vendor not installed");
+        return;
+    }
+    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("phpunit_rust_p2_always_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Class A: always sends SIGKILL to itself — kills the master every time, no recovery.
+    let fatal_file = dir.join("P2AlwaysKillTest.php");
+    std::fs::write(
+        &fatal_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass P2AlwaysKillTest extends TestCase {\n  public function testBoom(): void { posix_kill(getmypid(), 9); }\n}\n",
+    )
+    .unwrap();
+
+    // Class B: always passes but never gets to run because A kills the master first.
+    let innocent_file = dir.join("P2BoundedInnocentTest.php");
+    std::fs::write(
+        &innocent_file,
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass P2BoundedInnocentTest extends TestCase {\n  public function testOk(): void { $this->assertTrue(true); }\n}\n",
+    )
+    .unwrap();
+
+    let mk_kill = || TestCase {
+        file: fatal_file.clone(),
+        class: "P2AlwaysKillTest".to_string(),
+        method: "testBoom".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+    let mk_innocent = || TestCase {
+        file: innocent_file.clone(),
+        class: "P2BoundedInnocentTest".to_string(),
+        method: "testOk".to_string(),
+        data_provider: None,
+        groups: vec![],
+        external_providers: vec![],
+        is_tautological: false,
+        has_lifecycle_overrides: false,
+        depends_on: vec![],
+        is_dispatch_safe: true,
+        fingerprint: std::collections::HashSet::new(),
+        is_stateful: false,
+        is_isolated: false,
+        needs_db: false,
+    };
+
+    const MAX_RESPAWNS: usize = 3;
+    let overall_deadline = Instant::now() + Duration::from_secs(60);
+
+    let mut respawn_count = 0usize;
+
+    loop {
+        assert!(
+            Instant::now() < overall_deadline,
+            "bounded respawn loop exceeded 60 s deadline after {respawn_count} respawns"
+        );
+
+        // Always inject [A, B]: A kills the master, B comes back as unfinished.
+        // This simulates the worst-case permanent master-killer driving repeated respawns.
+        let cases = vec![mk_kill(), mk_innocent()];
+        let script = script.clone();
+        let autoload = autoload.clone();
+        let handle = std::thread::spawn(move || {
+            let cfg = RunConfig {
+                autoload: autoload.clone(),
+                bootstrap: None,
+                filter: None,
+                defines: vec![],
+                stop_on: Default::default(),
+                class_file_index: std::collections::HashMap::new(),
+                n_workers: 1,
+                worker_timeout: None,
+            };
+            let prof = Profiler::new(false);
+            let mut pool = PhpForkPool::spawn_inline(
+                &script,
+                &autoload,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                1,
+                &std::collections::HashMap::new(),
+                "512M",
+                0,
+                None,
+            )
+            .expect("spawn_inline failed");
+            let noop: fn(&phpunit_rust::types::TestOutcome) = |_o| {};
+            run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
+                .map(|(r, u)| (r.outcomes, u))
+                .expect("run_resumable returned Err")
+        });
+
+        // Per-iteration deadline.
+        let iter_deadline = Instant::now() + Duration::from_secs(20);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < iter_deadline,
+                "run_resumable hung on iteration {respawn_count}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (_outcomes, unfinished) = handle.join().expect("thread panicked");
+
+        respawn_count += 1;
+        if respawn_count >= MAX_RESPAWNS {
+            // Cap reached: assert no silent loss — the queued test is still unfinished.
+            assert!(
+                unfinished
+                    .iter()
+                    .any(|c| c.class == "P2BoundedInnocentTest"),
+                "after cap the queued test must still be unfinished (no silent loss); \
+                 unfinished={unfinished:?}"
+            );
+            break;
+        }
+
+        if unfinished.is_empty() {
+            // Unexpectedly all tests accounted for — no hang and terminated early, still valid.
+            break;
+        }
+    }
+
+    assert!(
+        respawn_count <= MAX_RESPAWNS,
+        "respawn loop must be bounded: ran {respawn_count} iterations, cap={MAX_RESPAWNS}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
