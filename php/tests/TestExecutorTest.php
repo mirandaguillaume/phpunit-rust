@@ -74,6 +74,16 @@ final class _ExecEmptyProvider extends TestCase
     public function testNoData(int $x): void { $this->fail('must never run'); }
 }
 
+#[\PHPUnit\Framework\Attributes\RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+final class _ExecRequiresUnmet extends TestCase
+{
+    // Mirrors monolog's MongoDBFormatterTest: a class-level requirement that is
+    // NOT met, on a method WITH a multi-row data provider.
+    public static function rows(): array { return [[1], [2], [3]]; }
+    #[DataProvider('rows')]
+    public function testGated(int $x): void { $this->assertTrue(true); }
+}
+
 final class TestExecutorTest extends TestCase
 {
     public function testPassingTestProducesPassOutcome(): void
@@ -134,6 +144,23 @@ final class TestExecutorTest extends TestCase
         // empty-provider methods, e.g. ProviderOverrideTest with no locale dirs).
         $outcomes = TestExecutor::runClass(_ExecEmptyProvider::class, ['testNoData']);
         $this->assertCount(1, $outcomes);
+        $this->assertSame('skipped', $outcomes[0]['status'], var_export($outcomes[0], true));
+    }
+
+    public function testUnmetClassRequirementCollapsesDataProviderToOneSkip(): void
+    {
+        // Regression (monolog MongoDBFormatterTest): when a class-level
+        // #[RequiresPhpExtension] is unmet, vanilla skips the whole method as
+        // ONE test WITHOUT invoking the data provider. We must not expand the
+        // provider and emit one skip PER ROW — that over-counts by N-1 per
+        // gated method (monolog: +1 on testConstruct's 2-row provider).
+        $outcomes = TestExecutor::runClass(_ExecRequiresUnmet::class, ['testGated']);
+        $this->assertCount(
+            1,
+            $outcomes,
+            'a requirement-unmet data-provider method must collapse to ONE skip; got: '
+            . var_export($outcomes, true)
+        );
         $this->assertSame('skipped', $outcomes[0]['status'], var_export($outcomes[0], true));
     }
 

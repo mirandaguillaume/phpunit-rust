@@ -70,6 +70,7 @@ final class TestExecutor
 
         $outcomes = [];
         $passedReturns = [];  // method -> return value, for @depends injection
+        $reqSkipped = [];     // method -> true once its requirement-skip is emitted
 
         foreach ($steps as $step) {
             $method  = $step['method'];
@@ -138,22 +139,25 @@ final class TestExecutor
                 ?: self::checkRequires((string) $methodRef->getDocComment())
                 ?: self::checkRequiresAttributes($methodRef->getAttributes());
             if ($skipReason !== null) {
-                $outcomes[] = OutcomeBuilder::build(
-                    $class, $method, $dataset, 0.0,
-                    new \PHPUnit\Framework\IncompleteTestError($skipReason)
-                );
-                // Actually we want this as "skipped", not "incomplete". Build
-                // the outcome array manually to ensure the right status.
-                array_pop($outcomes);
-                $outcomes[] = [
-                    'class'       => $class,
-                    'method'      => $method,
-                    'dataset'     => $dataset,
-                    'status'      => 'skipped',
-                    'message'     => $skipReason,
-                    'trace'       => null,
-                    'duration_ms' => 0.0,
-                ];
+                // Vanilla skips a requirement-gated method as ONE test WITHOUT
+                // invoking its data provider. The skip reason is identical for
+                // every row (it derives from class/method @requires, not the
+                // dataset), so emit a single dataset-less skip per method and
+                // drop the remaining expanded rows — otherwise we over-count by
+                // N-1 per gated data-provider method (monolog's MongoDBFormatterTest
+                // testConstruct: rust 2 vs vanilla 1).
+                if (!isset($reqSkipped[$method])) {
+                    $reqSkipped[$method] = true;
+                    $outcomes[] = [
+                        'class'       => $class,
+                        'method'      => $method,
+                        'dataset'     => null,
+                        'status'      => 'skipped',
+                        'message'     => $skipReason,
+                        'trace'       => null,
+                        'duration_ms' => 0.0,
+                    ];
+                }
                 continue;
             }
 
