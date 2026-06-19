@@ -17,6 +17,7 @@ docs/
 .claude/
 ROADMAP.md
 PLAN_isolated_tests.md
+AUDIT.md
 
 # Benchmark output (machine-dependent, not committed)
 bench/results.md
