@@ -429,6 +429,45 @@ fn find_enclosing_namespace(class_node: Node, bytes: &[u8]) -> Option<String> {
         .map(String::from)
 }
 
+/// For the semicolon form (`namespace Foo;`), a class belongs to the most recent
+/// such declaration that PRECEDES it in source order — PHP applies a semicolon
+/// namespace to all following top-level code until the next one. Braced blocks
+/// (`namespace Foo { ... }`) are handled by [`find_enclosing_namespace`]; this
+/// covers the sequential form, where a second `namespace Bar;` must NOT inherit
+/// the file's first namespace (the bug behind monolog's co-located `Acme` helper
+/// + the real test under `Monolog\Processor`).
+fn find_preceding_semicolon_namespace(
+    root: Node,
+    bytes: &[u8],
+    class_start: usize,
+) -> Option<String> {
+    let mut cursor = root.walk();
+    let mut best: Option<(usize, String)> = None;
+    for child in root.children(&mut cursor) {
+        if child.kind() != "namespace_definition" || child.start_byte() >= class_start {
+            continue;
+        }
+        // Semicolon form only: the braced form carries a declaration_list /
+        // compound_statement body and is resolved by enclosure, not by position.
+        let mut body = child.walk();
+        let braced = child
+            .children(&mut body)
+            .any(|c| matches!(c.kind(), "declaration_list" | "compound_statement"));
+        if braced {
+            continue;
+        }
+        if let Some(name) = child
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+        {
+            if best.as_ref().is_none_or(|(b, _)| child.start_byte() > *b) {
+                best = Some((child.start_byte(), name.to_string()));
+            }
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 fn collect_parsed_classes(
     root: Node,
     bytes: &[u8],
@@ -477,8 +516,9 @@ fn collect_parsed_classes(
         // For multi-namespace files (namespace Foo { ... } braced form), each
         // class lives in the namespace of its own enclosing block, not the
         // first namespace encountered in the file.
-        let class_ns: Option<String> =
-            find_enclosing_namespace(decl, bytes).or_else(|| namespace.map(String::from));
+        let class_ns: Option<String> = find_enclosing_namespace(decl, bytes)
+            .or_else(|| find_preceding_semicolon_namespace(root, bytes, decl.start_byte()))
+            .or_else(|| namespace.map(String::from));
         let fqcn = match class_ns.as_deref() {
             Some(ns) => format!("{ns}\\{name}"),
             None => name.to_string(),
@@ -2563,6 +2603,43 @@ mod tests {
         assert!(
             !b.needs_db,
             "a class with no DB method stays needs_db=false"
+        );
+    }
+
+    #[test]
+    fn multi_semicolon_namespace_attributes_classes_to_their_own_namespace() {
+        // Regression: a file with TWO semicolon-form `namespace X;` declarations
+        // (PHP's sequential form) must attribute each class to the namespace that
+        // precedes it in source order — not the first namespace in the file.
+        // Real trigger: monolog's IntrospectionProcessorTest.php, which co-locates
+        // an `Acme` helper with the real test under `Monolog\Processor`. The bug
+        // filed the test class under `Acme\…`, a phantom FQCN that fails to
+        // autoload (5 spurious Errors) while the real class was never discovered.
+        let src = r#"<?php
+namespace Acme;
+class Tester {
+    public function whoAmI() {}
+}
+namespace Foo\Bar;
+use PHPUnit\Framework\TestCase;
+class WidgetTest extends TestCase {
+    public function testItWorks() {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let parsed = parse_file_classes(&path).unwrap();
+        let fqcns: Vec<&str> = parsed.iter().map(|c| c.fqcn.as_str()).collect();
+        assert!(
+            fqcns.contains(&"Foo\\Bar\\WidgetTest"),
+            "test class must be attributed to its own (second) namespace; got {fqcns:?}"
+        );
+        assert!(
+            !fqcns.contains(&"Acme\\WidgetTest"),
+            "test class must NOT inherit the first namespace; got {fqcns:?}"
+        );
+        assert!(
+            fqcns.contains(&"Acme\\Tester"),
+            "the helper class stays under the first namespace; got {fqcns:?}"
         );
     }
 
