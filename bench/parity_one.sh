@@ -85,10 +85,18 @@ mkdir -p "$SMOKE"
 # Look up the suite's clone URL / ref / extra_env / composer_args from the manifest.
 row="$(awk -F'\t' -v s="$SUITE" '$1==s{print; exit}' "$MANIFEST")"
 [[ -n "$row" ]] || { echo "parity_one: unknown suite '$SUITE'" >&2; exit 2; }
-# Optional 5th column: extra `composer install` flags (e.g. a candidate suite
-# whose dev deps pull a native extension absent from the CI image — monolog's
-# mongodb/mongodb needs ext-mongodb, so it sets --ignore-platform-req=ext-mongodb).
-IFS=$'\t' read -r name git_url ref extra_env composer_args <<<"$row"
+# Split with cut, NOT `IFS=$'\t' read`: tab is an IFS-whitespace char, so read
+# COLLAPSES consecutive tabs and would drop an empty middle field (a suite with
+# composer_args but no extra_env: name\turl\tref\t\t--flag). cut -f preserves
+# empty fields and yields "" for a missing trailing field on shorter rows.
+# Field 4 = extra_env (env var, e.g. CALCULATOR=GMP); field 5 = optional extra
+# `composer install` flags (e.g. monolog's --ignore-platform-req=ext-mongodb,
+# whose mongodb/mongodb dev dep needs an extension absent from the CI image).
+name="$(printf '%s' "$row" | cut -f1)"
+git_url="$(printf '%s' "$row" | cut -f2)"
+ref="$(printf '%s' "$row" | cut -f3)"
+extra_env="$(printf '%s' "$row" | cut -f4)"
+composer_args="$(printf '%s' "$row" | cut -f5)"
 
 suite_dir="${SMOKE}/${name}"
 if [[ ! -d "${suite_dir}" ]]; then
