@@ -410,6 +410,15 @@ impl PhpForkPool {
         let _ = self.master.wait();
         self.reaped = true;
     }
+    /// True if the PHP master process is still running (best-effort, non-reaping).
+    /// Lets the dispatcher tell a master crash (pipes EOF with work left) from a
+    /// normal end-of-work EOF.
+    pub fn master_alive(&mut self) -> bool {
+        if self.reaped {
+            return false;
+        }
+        matches!(self.master.try_wait(), Ok(None))
+    }
 }
 
 impl Drop for PhpForkPool {

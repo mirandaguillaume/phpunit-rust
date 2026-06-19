@@ -396,18 +396,24 @@ pub fn matches_filter(class: &str, method: &str, filter: Option<&str>) -> bool {
 /// Same as [`run`] but accepts a [`Profiler`] so the caller can record
 /// per-batch wall time and the build-queue / dispatch / drain breakdown.
 /// When `profiler.enabled() == false`, every span call is a noop branch.
-pub fn run_with_profiler(
+///
+/// Returns `(Report, unfinished)` where `unfinished` is non-empty only when
+/// the PHP master died abnormally with work still left. The back-compat
+/// wrapper [`run_with_profiler`] synth-errors those and returns a plain
+/// `Report`.
+pub fn run_resumable(
     pool: &mut PhpForkPool,
     cases: Vec<TestCase>,
     cfg: &RunConfig,
     row_counts: &RowCounts,
     on_progress: impl Fn(&TestOutcome) + Sync,
     profiler: &crate::profiler::Profiler,
-) -> Result<Report> {
+) -> Result<(Report, Vec<TestCase>)> {
     let filtered: Vec<TestCase> = cases
         .into_iter()
         .filter(|c| matches_filter(&c.class, &c.method, cfg.filter.as_deref()))
         .collect();
+    let all_cases: Vec<TestCase> = filtered.clone();
 
     // Class -> ordered method list, so requeue_unrun can resolve "all methods" batches.
     let mut class_methods: std::collections::HashMap<String, Vec<String>> =
@@ -557,6 +563,7 @@ pub fn run_with_profiler(
     let mut live_readers = n;
     let mut stopping = false;
     let mut watchdog_fired = false;
+    let mut master_died = false;
     while live_readers > 0 {
         let ev = match cfg.worker_timeout {
             Some(timeout) => match rx.recv_timeout(timeout) {
@@ -709,20 +716,34 @@ pub fn run_with_profiler(
                 // outcome (real or `<class>` row) that already streamed back
                 // from a partially-processed batch on the dying worker.
                 if live_readers == 0 {
-                    let cause = "worker process crashed before reporting this test";
-                    for in_flight in slot_in_flight.iter_mut() {
-                        if let Some(lost) = in_flight.take() {
+                    let has_unfinished =
+                        !queue.is_empty() || slot_in_flight.iter().any(|s| s.is_some());
+                    if has_unfinished && !pool.master_alive() {
+                        // Master died abnormally with work left — don't synth-error; signal the
+                        // caller (boundary respawn) to re-run the unfinished tests on a fresh pool.
+                        master_died = true;
+                    } else {
+                        let cause = "worker process crashed before reporting this test";
+                        for in_flight in slot_in_flight.iter_mut() {
+                            if let Some(lost) = in_flight.take() {
+                                synth_error_outcomes(
+                                    &lost,
+                                    cause,
+                                    &received,
+                                    &on_progress,
+                                    &mut outcomes,
+                                );
+                            }
+                        }
+                        while let Some(plan) = queue.pop_front() {
                             synth_error_outcomes(
-                                &lost,
+                                &plan,
                                 cause,
                                 &received,
                                 &on_progress,
                                 &mut outcomes,
                             );
                         }
-                    }
-                    while let Some(plan) = queue.pop_front() {
-                        synth_error_outcomes(&plan, cause, &received, &on_progress, &mut outcomes);
                     }
                 }
             }
@@ -759,10 +780,49 @@ pub fn run_with_profiler(
     }
     pool.wait();
 
-    Ok(Report {
+    let unfinished: Vec<TestCase> = if master_died {
+        all_cases
+            .into_iter()
+            .filter(|c| !received.covers(&c.class, &c.method))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let report = Report {
         outcomes,
         total_duration_ms: total,
-    })
+    };
+    Ok((report, unfinished))
+}
+
+/// Same as [`run`] but accepts a [`Profiler`]. Back-compat wrapper around
+/// [`run_resumable`]: if the master died with unfinished tests, synth-errors
+/// them so callers that expect a plain `Report` see the same behaviour as
+/// before.
+pub fn run_with_profiler(
+    pool: &mut PhpForkPool,
+    cases: Vec<TestCase>,
+    cfg: &RunConfig,
+    row_counts: &RowCounts,
+    on_progress: impl Fn(&TestOutcome) + Sync,
+    profiler: &crate::profiler::Profiler,
+) -> Result<Report> {
+    let (mut report, unfinished) =
+        run_resumable(pool, cases, cfg, row_counts, &on_progress, profiler)?;
+    for c in unfinished {
+        let o = TestOutcome {
+            class: c.class,
+            method: c.method,
+            dataset: None,
+            status: TestStatus::Error,
+            message: Some("worker process crashed before reporting this test".to_string()),
+            trace: None,
+            duration_ms: 0.0,
+        };
+        on_progress(&o);
+        report.outcomes.push(o);
+    }
+    Ok(report)
 }
 
 /// Static weight of one test method for LPT cost estimation.
