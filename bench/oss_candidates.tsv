@@ -8,5 +8,5 @@
 #                  enumeration hits "Cannot switch fibers" so N-row providers
 #                  collapse to 1 (rust 12093 vs vanilla 12586).
 name	git_url	ref	extra_env
-monolog	https://github.com/Seldaek/monolog	3.10.0
+monolog	https://github.com/Seldaek/monolog	3.10.0		--ignore-platform-req=ext-mongodb
 phpstan-src	https://github.com/phpstan/phpstan-src	2.2.2

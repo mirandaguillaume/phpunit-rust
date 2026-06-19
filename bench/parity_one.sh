@@ -82,10 +82,13 @@ SMOKE="${SMOKE:-/tmp/phpunit-rust-smoke}"
 BINARY="${BINARY:-${SCRIPT_DIR}/../target/release/phpunit-rust}"
 mkdir -p "$SMOKE"
 
-# Look up the suite's clone URL / ref / extra_env from the manifest.
+# Look up the suite's clone URL / ref / extra_env / composer_args from the manifest.
 row="$(awk -F'\t' -v s="$SUITE" '$1==s{print; exit}' "$MANIFEST")"
 [[ -n "$row" ]] || { echo "parity_one: unknown suite '$SUITE'" >&2; exit 2; }
-IFS=$'\t' read -r name git_url ref extra_env <<<"$row"
+# Optional 5th column: extra `composer install` flags (e.g. a candidate suite
+# whose dev deps pull a native extension absent from the CI image — monolog's
+# mongodb/mongodb needs ext-mongodb, so it sets --ignore-platform-req=ext-mongodb).
+IFS=$'\t' read -r name git_url ref extra_env composer_args <<<"$row"
 
 suite_dir="${SMOKE}/${name}"
 if [[ ! -d "${suite_dir}" ]]; then
@@ -94,7 +97,7 @@ if [[ ! -d "${suite_dir}" ]]; then
         echo "parity_one: clone failed for ${name}" >&2; exit 2
     fi
     if ! ( cd "${suite_dir}" && COMPOSER_NO_INTERACTION=1 \
-           composer install --no-interaction --prefer-dist --no-progress 2>&1 ); then
+           composer install --no-interaction --prefer-dist --no-progress ${composer_args} 2>&1 ); then
         echo "parity_one: composer install failed for ${name}" >&2; exit 2
     fi
 fi
