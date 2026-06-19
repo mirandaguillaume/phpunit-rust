@@ -8,3 +8,4 @@ php-parser	https://github.com/nikic/PHP-Parser	v5.7.0
 phpunit-itself	https://github.com/sebastianbergmann/phpunit	11.5.55
 commonmark	https://github.com/thephpleague/commonmark	2.8.2
 rector	https://github.com/rectorphp/rector-src	2.4.6
+monolog	https://github.com/Seldaek/monolog	3.10.0		--ignore-platform-req=ext-mongodb

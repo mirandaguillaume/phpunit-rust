@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [monolog, phpstan-src]
+        suite: [phpstan-src]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
