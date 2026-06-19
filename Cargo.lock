@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "discovery"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "rayon",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "mock_baker"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1229,7 +1229,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "phpunit-rust"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "analyzer",
  "anyhow",

@@ -9,7 +9,7 @@ and mocks — but driven by a thin in-house lifecycle shim (`TestExecutor`),
 **not** PHPUnit's own `TestRunner`/`Facade`. That re-implementation is why a
 handful of behavioural edges differ from vanilla (see [COMPATIBILITY.md](COMPATIBILITY.md)).
 
-## Status: v0.8.0 — exact test-count parity with vanilla PHPUnit on all 8 benchmarked suites
+## Status: v0.9.0 — exact test-count parity with vanilla PHPUnit on all 8 benchmarked suites
 
 The runner spawns one PHP master, forks N children, then streams test
 classes (and individual data-provider rows for heavy providers) over
