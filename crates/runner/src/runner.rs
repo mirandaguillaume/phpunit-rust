@@ -169,6 +169,131 @@ fn synth_error_outcomes(
     }
 }
 
+/// Max executions of a single test across worker-death re-queues. Reaching it means the test
+/// deterministically kills its worker even when isolated → report it `Error` (poison pill) and
+/// stop re-queuing. The single bound that guarantees every retry path terminates.
+#[allow(dead_code)]
+const MAX_ATTEMPTS: u8 = 2;
+
+/// Re-queue the *un-reported* tests of a dead worker's batch onto fresh workers instead of
+/// erroring them. The first un-reported test (it was running at death) is peeled into its own
+/// isolated batch so the actual crasher repeats alone while its innocent batch-mates run clean.
+/// A test that reaches `MAX_ATTEMPTS` is emitted as `Error` and not re-queued.
+///
+/// `class_methods` resolves a `BatchClass` with empty `methods` ("all methods") to its method
+/// list; explicit-method batches ignore it. Already-`received` tests are skipped.
+#[allow(clippy::too_many_arguments, dead_code)]
+fn requeue_unrun(
+    lost: &BatchPlan,
+    received: &mut ReceivedOutcomes,
+    class_methods: &std::collections::HashMap<String, Vec<String>>,
+    attempts: &mut std::collections::HashMap<(String, String), u8>,
+    on_progress: &impl Fn(&TestOutcome),
+    outcomes: &mut Vec<TestOutcome>,
+    queue: &mut std::collections::VecDeque<BatchPlan>,
+) {
+    let mut unrun: Vec<(usize, String)> = Vec::new();
+    for (ci, bc) in lost.classes.iter().enumerate() {
+        let methods: Vec<String> = if bc.methods.is_empty() {
+            match class_methods.get(&bc.class) {
+                Some(ms) => ms.clone(),
+                None => {
+                    // Can't reconstruct the method list → can't re-queue cleanly. Synthesise a
+                    // class-level Error (matching synth_error_outcomes) rather than re-queue a
+                    // garbage method name. Record it so a later synth pass won't double-count.
+                    if !received.covers(&bc.class, "<class>") {
+                        let o = TestOutcome {
+                            class: bc.class.clone(),
+                            method: "<class>".to_string(),
+                            dataset: None,
+                            status: TestStatus::Error,
+                            message: Some(
+                                "worker died; method list unavailable for re-queue".to_string(),
+                            ),
+                            trace: None,
+                            duration_ms: 0.0,
+                        };
+                        on_progress(&o);
+                        received.record(&o);
+                        outcomes.push(o);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            bc.methods.clone()
+        };
+        for m in methods {
+            if !received.covers(&bc.class, &m) {
+                unrun.push((ci, m));
+            }
+        }
+    }
+    if unrun.is_empty() {
+        return;
+    }
+
+    let mut suspect: Option<(usize, String)> = None;
+    let mut rest: Vec<(usize, String)> = Vec::new();
+    for (idx, (ci, m)) in unrun.into_iter().enumerate() {
+        let key = (lost.classes[ci].class.clone(), m.clone());
+        let next = attempts.get(&key).copied().unwrap_or(0) + 1;
+        if next >= MAX_ATTEMPTS {
+            let o = TestOutcome {
+                class: lost.classes[ci].class.clone(),
+                method: m,
+                dataset: None,
+                status: TestStatus::Error,
+                message: Some(format!(
+                    "worker died re-running this test {MAX_ATTEMPTS} times (poison pill)"
+                )),
+                trace: None,
+                duration_ms: 0.0,
+            };
+            on_progress(&o);
+            received.record(&o);
+            outcomes.push(o);
+            continue;
+        }
+        attempts.insert(key, next);
+        if idx == 0 {
+            suspect = Some((ci, m));
+        } else {
+            rest.push((ci, m));
+        }
+    }
+
+    if !rest.is_empty() {
+        let mut by_class: std::collections::BTreeMap<usize, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (ci, m) in rest {
+            by_class.entry(ci).or_default().push(m);
+        }
+        let classes: Vec<BatchClass> = by_class
+            .into_iter()
+            .map(|(ci, ms)| {
+                let mut bc = lost.classes[ci].clone();
+                bc.methods = ms;
+                bc
+            })
+            .collect();
+        queue.push_front(BatchPlan {
+            classes,
+            force_exit_after: false,
+            ..lost.clone()
+        });
+    }
+    if let Some((ci, m)) = suspect {
+        let mut bc = lost.classes[ci].clone();
+        bc.methods = vec![m];
+        queue.push_front(BatchPlan {
+            classes: vec![bc],
+            force_exit_after: true,
+            ..lost.clone()
+        });
+    }
+}
+
 #[derive(Debug)]
 pub struct Report {
     pub outcomes: Vec<TestOutcome>,
@@ -283,6 +408,19 @@ pub fn run_with_profiler(
         .into_iter()
         .filter(|c| matches_filter(&c.class, &c.method, cfg.filter.as_deref()))
         .collect();
+
+    // Class -> ordered method list, so requeue_unrun can resolve "all methods" batches.
+    let mut class_methods: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for c in &filtered {
+        class_methods
+            .entry(c.class.clone())
+            .or_default()
+            .push(c.method.clone());
+    }
+    // Per-test execution attempts across worker-death re-queues (the MAX_ATTEMPTS cap).
+    let mut attempts: std::collections::HashMap<(String, String), u8> =
+        std::collections::HashMap::new();
 
     let n = pool.len();
     let (mut queue, synthetic) = profiler.span_with(
@@ -518,22 +656,18 @@ pub fn run_with_profiler(
                 // row (which carries the fatal text) — we keep that row and
                 // suppress our redundant per-method synth for it.
                 if let Some(lost) = slot_in_flight[slot].take() {
-                    let cause = if signal != 0 {
-                        format!("worker process died: signal {signal}")
-                    } else if exit_code == 0 {
-                        // Forensic breadcrumb: exit code 0 with a batch still
-                        // in flight means a test/provider/teardown called
-                        // exit(0)/die() mid-batch (a clean recycle exits with
-                        // the reserved code 6 and never lands here, because it
-                        // emits batch_done first so in_flight is None). Name
-                        // the cause so the report explains the lost batch.
-                        "worker process died: exit code 0 (test code called \
-                         exit/die mid-batch)"
-                            .to_string()
-                    } else {
-                        format!("worker process died: exit code {exit_code}")
-                    };
-                    synth_error_outcomes(&lost, &cause, &received, &on_progress, &mut outcomes);
+                    // Re-queue the dead worker's un-run tests onto a fresh child (the master has
+                    // already forked a replacement) instead of erroring them; the per-test
+                    // MAX_ATTEMPTS cap turns a deterministic crasher into a single Error.
+                    requeue_unrun(
+                        &lost,
+                        &mut received,
+                        &class_methods,
+                        &mut attempts,
+                        &on_progress,
+                        &mut outcomes,
+                        &mut queue,
+                    );
                 }
                 // Record the failed batch's span too — useful for spotting
                 // worker crashes in the timeline view.
@@ -1984,6 +2118,82 @@ mod tests {
         assert!(
             outcomes.is_empty(),
             "a received `<class>` row must cover every method of that class; got: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn requeue_unrun_peels_suspect_and_caps_attempts() {
+        use crate::types::{BatchClass, BatchPlan};
+        use std::collections::{HashMap, VecDeque};
+
+        let bc = |class: &str, methods: Vec<&str>| BatchClass {
+            file: std::path::PathBuf::from("/x.php"),
+            class: class.to_string(),
+            methods: methods.into_iter().map(|s| s.to_string()).collect(),
+            row_filter: None,
+            required_files: vec![],
+            is_isolated: false,
+        };
+        let lost = BatchPlan {
+            autoload: std::path::PathBuf::from("/a.php"),
+            bootstrap: None,
+            defines: vec![],
+            classes: vec![bc("C", vec!["a", "b", "c"])],
+            fingerprint: std::collections::HashSet::new(),
+            force_exit_after: false,
+        };
+        let mut received = ReceivedOutcomes::default();
+        received.record(&TestOutcome {
+            class: "C".into(),
+            method: "a".into(),
+            dataset: None,
+            status: TestStatus::Pass,
+            message: None,
+            trace: None,
+            duration_ms: 0.0,
+        });
+        let class_methods: HashMap<String, Vec<String>> = HashMap::new();
+        let mut attempts: HashMap<(String, String), u8> = HashMap::new();
+        let mut queue: VecDeque<BatchPlan> = VecDeque::new();
+        let mut outcomes: Vec<TestOutcome> = Vec::new();
+
+        requeue_unrun(
+            &lost,
+            &mut received,
+            &class_methods,
+            &mut attempts,
+            &|_o| {},
+            &mut outcomes,
+            &mut queue,
+        );
+
+        assert!(
+            outcomes.is_empty(),
+            "no Errors on first attempt; got {outcomes:?}"
+        );
+        assert_eq!(queue.len(), 2, "suspect batch + rest batch");
+        let suspect = &queue[0];
+        assert_eq!(suspect.classes[0].methods, vec!["b".to_string()]);
+        assert!(suspect.force_exit_after, "isolated suspect recycles after");
+        assert_eq!(queue[1].classes[0].methods, vec!["c".to_string()]);
+        assert_eq!(attempts[&("C".into(), "b".into())], 1);
+
+        let mut queue2: VecDeque<BatchPlan> = VecDeque::new();
+        let mut outcomes2: Vec<TestOutcome> = Vec::new();
+        requeue_unrun(
+            &lost,
+            &mut received,
+            &class_methods,
+            &mut attempts,
+            &|_o| {},
+            &mut outcomes2,
+            &mut queue2,
+        );
+        assert!(
+            outcomes2
+                .iter()
+                .any(|o| o.method == "b" && o.status == TestStatus::Error),
+            "b must be Error at the cap; got {outcomes2:?}"
         );
     }
 }
