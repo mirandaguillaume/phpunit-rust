@@ -9,7 +9,7 @@ and mocks — but driven by a thin in-house lifecycle shim (`TestExecutor`),
 **not** PHPUnit's own `TestRunner`/`Facade`. That re-implementation is why a
 handful of behavioural edges differ from vanilla (see [COMPATIBILITY.md](COMPATIBILITY.md)).
 
-## Status: v0.8.0 — exact test-count parity on PHPUnit's own suite + 5 OSS projects
+## Status: v0.8.0 — exact test-count parity with vanilla PHPUnit on all 8 benchmarked suites
 
 The runner spawns one PHP master, forks N children, then streams test
 classes (and individual data-provider rows for heavy providers) over
@@ -20,8 +20,8 @@ concurrently instead of stranding one at the end.
 ## Highlights
 
 - **Work-stealing + LPT scheduling** — heavy classes start on all workers concurrently; fork-pool startup is ~50 ms.
-- **Exact parity on 3 of 7 OSS suites** (brick-math, guzzle-psr7, doctrine-orm); near-parity on the rest (see [COMPATIBILITY.md](COMPATIBILITY.md)).
-- **2–4× speedup** on CPU-bound suites (carbon, doctrine-orm, brick-math); sub-second suites are faster with vanilla.
+- **Exact test-count parity** with vanilla PHPUnit on all 8 benchmarked suites (brick-math, carbon, commonmark, doctrine-orm, faker, guzzle-psr7, php-parser, and PHPUnit's own `unit` testsuite) — see [BENCHMARKS.md](BENCHMARKS.md).
+- **Up to 2.9× faster** on CPU-bound suites at 4 workers (brick-math; carbon 1.6×, more at higher worker counts); DB-less functional suites (doctrine-orm) are about tied, and sub-second suites run faster with vanilla.
 - **Static coverage** via the `analyzer` crate (mago AST + per-test attribution; no Xdebug / PCOV needed).
 - **Reliable shutdown** — SIGINT kills the PHP master and every forked child via `PR_SET_PDEATHSIG`; no orphan workers.
 
@@ -38,10 +38,14 @@ concurrently instead of stranding one at the end.
 ```bash
 cargo build --release
 
-# auto-detect phpunit.xml, use 4 workers
+# one-time: install the PHP worker shim's autoloader
+# (the forked workers `require` php/vendor/autoload.php at startup)
+composer install --no-dev --working-dir=php
+
+# auto-detect phpunit.xml; workers default to the number of detected CPU cores
 ./target/release/phpunit-rust --project /path/to/php/project
 
-# explicit worker count (default 4)
+# explicit worker count (honored verbatim; default = detected CPU cores)
 ./target/release/phpunit-rust --project /path/to/php/project --workers 8
 
 # sequential (no parallelism overhead — best for tiny suites)
@@ -66,4 +70,7 @@ cargo build --release
 - [Architecture](ARCHITECTURE.md) — the fork-server / worker-pool design
 - [Compatibility](COMPATIBILITY.md) — supported PHPUnit features & what's deferred
 - [Benchmarks](BENCHMARKS.md) — performance vs vanilla PHPUnit + how to run the bench
-- [Roadmap](ROADMAP.md) — open optimisation opportunities
+
+## License
+
+[MIT](LICENSE) © 2026 Guillaume Miranda

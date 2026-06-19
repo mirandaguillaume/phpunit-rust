@@ -2,8 +2,8 @@
 
 ## Performance
 
-Benchmarked on Linux/PHP 8.1.33 against real OSS suites. Median of 3
-runs each. "vanilla" is `./vendor/bin/phpunit` (one process); `1w` /
+Benchmarked on Linux against real OSS suites; median of 3 runs each
+unless noted. "vanilla" is `./vendor/bin/phpunit` (one process); `1w` /
 `2w` / `4w` / `8w` are our fork pool at that worker count.
 
 ### Reference run — June 2026
@@ -24,12 +24,12 @@ median of 3 runs; vanilla = single-process PHPUnit.
 | commonmark | 4168 / 4168 | 1421 ms | 911 ms | 1.6× |
 <!-- BENCH:TABLE:END -->
 
-Test counts match vanilla on most suites (faker −14 / php-parser −9 are
-pre-existing discovery edges); phpunit-itself has a known parity gap (see
-[COMPATIBILITY.md](COMPATIBILITY.md) / [ROADMAP.md §4](ROADMAP.md)).
-Small fast suites (guzzle-psr7, php-parser) are approximately par because
-fork-pool overhead exceeds the gain when a suite already finishes
-sub-second.
+Test counts match vanilla exactly on all eight suites above.
+`phpunit-itself` is compared against vanilla's `--testsuite unit`; its
+~1000 `.phpt` end-to-end files are out of scope for both runners (see
+[COMPATIBILITY.md](COMPATIBILITY.md)). Small fast suites (guzzle-psr7,
+php-parser) are approximately par because fork-pool overhead exceeds the
+gain when a suite already finishes sub-second.
 
 #### Reading the trade-off in actual money
 
@@ -58,24 +58,28 @@ Salary anchor: [Senior PHP Developer 2026 — Salary.com](https://www.salary.com
 
 The PHPUnit project's own test suite was attempted as an eighth
 data point (PHP 8.4, Docker, `bench/Dockerfile.php84` + `--tmpfs /tmp`).
-Vanilla median: **133.66 s** (3 runs: 132.31, 133.66, 141.10 s), ~108 MB
-RSS. phpunit-rust did **not** complete: a worker hangs partway
-through, our reader thread blocks on its (still-open) stdout pipe,
-no `SIGCHLD` ever fires because the child is alive — just stuck.
+Vanilla median on the **full** suite (unit + ~1000 `.phpt` end-to-end
+files): **133.66 s** (3 runs: 132.31, 133.66, 141.10 s), ~108 MB RSS.
+phpunit-rust cannot reach parity on the full suite by construction — it
+discovers `*Test.php` **classes**, so the `.phpt` files are invisible to
+it (see [COMPATIBILITY.md](COMPATIBILITY.md)). Historically it also
+**hung** partway through: PHPUnit's own `@runInSeparateProcess` /
+end-to-end fixtures spawn a sub-PHP process via `proc_open`, and if that
+sub-process never returns the parent worker stayed in `read()`
+indefinitely (the child is alive, so no `SIGCHLD` fires and the
+lost-batch recovery — which triggers on death, not on a stuck-but-alive
+worker — never kicked in).
 
-The root cause is PHPUnit's own `@runInSeparateProcess` / end-to-end
-fixtures: a test spawns a sub-PHP process via `proc_open`, and if
-that sub-process never returns (e.g. waiting on input the worker
-never produces), the parent worker stays in `read()` indefinitely.
-The lost-batch recovery added in `feat(runner): recover lost
-batches when a worker dies mid-run` only triggers on actual death
-(non-zero exit / signal), not on a stuck-but-alive worker.
-
-Fix is straightforward but unwritten: a per-slot inactivity
-watchdog. If a slot has an in-flight batch and hasn't emitted any
-outcome for N seconds, the dispatcher SIGKILLs the worker, treats
-the batch as crashed (lost-batch path takes over), and the master's
-SIGCHLD handler respawns a clean child. Tracked as a follow-up.
+That hang is now **bounded** by the inactivity watchdog
+(`--worker-timeout`, default 600 s): a slot that emits nothing for the
+timeout is killed, every in-flight and still-queued test is reported as
+an `Error`, and the run is terminated — so a stuck sub-process aborts the
+run cleanly instead of hanging forever. (The watchdog *bounds* the run;
+it does not recover the batch or respawn a child — that lost-batch
+requeue path applies only to actual worker **death**, not to the
+stuck-but-alive case the watchdog handles.) For an apples-to-apples count
+the benchmark and parity gate compare against vanilla's `.phpt`-free
+`--testsuite unit` (4153 == 4153).
 
 ### Worker scaling
 
@@ -104,9 +108,13 @@ What this says:
   For these, run vanilla.
 
 The rule of thumb: **use `--workers N` where N is between 2 and the
-number of physical cores you have, capped at half the test class
-count.** Default is 4. If a 1-second suite slows down at 4 workers,
-drop to 1 — the parallelism overhead isn't free.
+number of cores you have.** When `--workers` is omitted the default is
+the number of detected CPU cores (not a fixed 4); in that default mode
+the PHP fork-pool count is additionally capped by suite size to
+`ceil(test_cases / 16)`, so tiny suites use fewer workers automatically.
+An explicit `--workers N` is honored verbatim and never size-clamped. If
+a fast suite slows down, drop to `--workers 1` — the parallelism
+overhead isn't free.
 
 ### Docker (PHP 8.4 projects)
 
@@ -138,11 +146,10 @@ Wall and RSS captured by `/usr/bin/time` inside the container.
 allocate the analyzer in-memory per case. Default 128 MB makes vanilla
 crash within 3 s.
 
-Rector + phpstan exercise three of the runner's bug-class repairs at
-once: per-class state isolation (stream wrappers, error handlers),
-in-flight batch recovery when a child fatal kills a worker mid-run,
-and skipping opcache pre-warm for the fixture-style files those
-suites pack into the test roots.
+Rector + phpstan exercise two of the runner's bug-class repairs at
+once: per-class state isolation (stream wrappers, error handlers) and
+in-flight batch recovery when a child fatal kills a worker mid-run, on
+the fixture-style files those suites pack into the test roots.
 
 #### Running inside Docker or CI
 
@@ -166,24 +173,30 @@ Two flags matter when running the runner inside a container:
 Memory-heavy suites (phpstan-src needs ≥ 2 GB resident, rector ~700 MB)
 need `--worker-memory-limit 4G` to keep the fork children from being
 killed by their own self-imposed cap. The master process always runs
-with `memory_limit=-1` because it pre-warms opcache for every test
-file before forking.
+with `memory_limit=-1` because it loads the project autoloader,
+bootstrap, and the discovered class-file index in one short-lived
+process before forking — on large suites the default 128 MB cap would
+fatal the master mid-startup. (It no longer pre-warms opcache; that loop
+was removed — `opcache_compile_file` early-binding leaked ghost classes
+into every fork and caused "Cannot redeclare class" worker deaths, with
+zero measured benefit on PHP 8.4 CLI.)
 
 #### Environment variables
 
-Three opt-in knobs surface from the PHP master, useful for debugging
-and A/B benchmarking:
+A few opt-in knobs are useful for debugging and A/B benchmarking:
 
 - `PHPUNIT_RUST_TIMING=1` — log master phase timings to stderr
-  (autoload, bootstrap, opcache pre-warm, fork) as `[TIMING]` lines.
-- `PHPUNIT_RUST_OPCACHE_THRESHOLD=N` — override the default
-  50-test-file threshold for pre-warming opcache. Pass `99999` to
-  disable pre-warm entirely (useful when investigating master crashes
-  on very large suites).
+  (autoload, bootstrap, fork, …) as `[TIMING]` lines.
 - `PHPUNIT_RUST_NO_ISOLATION=1` — disable the per-batch fresh-fork
   applied to stateful test classes (those calling
   `stream_wrapper_register`, `set_error_handler`, …). Costs ~14 % on
   state-sensitive suites but exposes their pollution for diagnosis.
+- `PHPUNIT_RUST_TRACE_BATCHES=1` — write per-class `START`/`END` markers
+  to a per-slot file under `/tmp`; the slot file whose last line is a
+  `START` with no `END` names a hanging class.
+- `PHPUNIT_RUST_DUMP_TESTS=<path>` — dump one
+  `Class::method|status|message` line per executed test (per data row)
+  to `<path>`, for parity forensics.
 
 ## Benchmarking
 
