@@ -116,3 +116,30 @@ jobs:
       # Tests/Assertions summary counts for the bundled sample project.
       - name: Parity check against sample_project
         run: bash scripts/parity_check.sh crates/runner/fixtures/sample_project
+
+  php-tests:
+    name: php worker-shim tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pdo_sqlite is requested explicitly so the per-test DB-isolation test
+      # actually RUNS here (it markTestSkipped's without a PDO driver). It uses a
+      # temp-file sqlite DB, not a real server, so no service container is needed.
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          extensions: pdo_sqlite, sqlite3
+
+      # WITH dev deps (PHPUnit ^10.5) — unlike the other jobs which install
+      # --no-dev. This is the ONLY automated check of the hand-rolled
+      # TestExecutor isolation semantics (per-test transaction rollback,
+      # backupGlobals parity, build-once shared fixture) — the run-bare bypass
+      # the worker relies on. Without this job a regression there ships unseen.
+      - name: Install worker shim dependencies (composer, with dev)
+        run: composer install --no-interaction --no-progress --working-dir=php
+
+      - name: Run php/tests (PhpunitRust shim suite)
+        run: php php/vendor/bin/phpunit --bootstrap php/vendor/autoload.php php/tests
