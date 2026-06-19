@@ -14,6 +14,9 @@
 # Plan/spec docs and tooling caches stay local (do not commit)
 docs/
 .serena/
+.claude/
+ROADMAP.md
+PLAN_isolated_tests.md
 
 # Benchmark output (machine-dependent, not committed)
 bench/results.md
