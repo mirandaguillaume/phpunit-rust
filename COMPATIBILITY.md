@@ -60,6 +60,17 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 - `#[Depends('method')]` and `@depends method`
 - Topological sort + return-value injection within a class
 
+**Process isolation:**
+
+- `@runInSeparateProcess` / `#[RunInSeparateProcess]` (plus
+  `@runTestsInSeparateProcesses` / `@runClassInSeparateProcess` and
+  their attribute forms): detected at discovery; each annotated method
+  runs in its own fresh fork of the warm master, recycled before the
+  next method, so process-global state from one isolated test never
+  reaches the next. The runner clears PHPUnit's own
+  `runTestInSeparateProcess` flag, so no nested `proc_open` sub-process
+  is spawned inside the worker.
+
 **phpunit.xml:**
 
 - `bootstrap` attribute
@@ -75,15 +86,31 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 
 **CLI flags:**
 
-- `--project`, `--bootstrap`, `--filter`, `--workers`, `--configuration`
-- `--group <name>`, `--exclude-group <name>` (filter by `#[Group]` / `@group`)
-- `--testsuite <name>` (run a named suite from `phpunit.xml`)
-- `--stop-on-failure` (halt after the first failing test)
-- `--list-tests` (print `Class::method` lines then exit, no tests run)
-- `--bake-mocks` (rewrite `createMock()` calls to anonymous-class stubs
-  before execution; requires PSR-4 resolvable interfaces)
-- `--coverage-format clover|json --coverage-out path` (build with
-  `--features coverage`)
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--project <path>` | `.` | Project root (needs `vendor/autoload.php` unless `--report-shared-fixture`). |
+| `--tests-dir <path>` | `tests` | Discovery root, used only when `phpunit.xml` declares no `<testsuite>`. |
+| `--configuration <path>` | auto | Path to `phpunit.xml`; auto-detects `phpunit.xml` then `phpunit.xml.dist`. |
+| `--bootstrap <file>` | from XML | Bootstrap required before tests; overrides the XML `<bootstrap>`. |
+| `--filter <substr>` | — | Substring match against `Class::method`. |
+| `--workers <n>` | CPU cores | Parallel PHP workers; default mode clamps down by suite size. `--workers 1` = sequential. |
+| `--group <name>` | — | Run only these groups (comma-separated or repeated). |
+| `--exclude-group <name>` | — | Skip these groups. |
+| `--testsuite <name>` | all | Run only the named `<testsuite>`. |
+| `--stop-on-failure` | off | Stop after the first failed/errored test. |
+| `--stop-on-defect` | off | Also stop on skipped/incomplete/risky. |
+| `--worker-timeout <secs>` | `600` | Inactivity watchdog; aborts a hung run. `0` disables. |
+| `--list-tests` | off | Print `Class::method` lines then exit (no tests run). |
+| `--report-shared-fixture` | off | Print a SharedTransactionalFixture eligibility advisory then exit (tree-sitter only; no `composer install` needed). |
+| `--dirty` | off | Run only tests impacted by uncommitted git changes (changed source → dependent tests). |
+| `--bake-mocks` | off | Rewrite `createMock()` into anonymous-class stubs; requires PSR-4-resolvable interfaces. |
+| `--provision-db <DSN>` | — | Base DSN for per-worker DB provisioning (also via `PHPUNIT_RUST_DB_DSN`). |
+| `--skip-db` | off | Skip `needs_db` tests instead of aborting when no DB is configured. |
+| `--worker-memory-limit <v>` | `512M` | `memory_limit` inside each worker fork (`256M`, `1G`, `-1`). |
+| `--worker-max-batches <n>` | `20` | Recycle each worker fork after N batches; `0` = long-lived. |
+| `--profile <file>` | — | Write a Chrome Trace Format JSON timing file. |
+| `--coverage-format <fmt>` | — | `clover` \| `json` \| `pcov` \| `pcov-extended` (build with `--features coverage`). |
+| `--coverage-out <file>` | stdout | Coverage output destination (build with `--features coverage`). |
 
 **Robustness:**
 
@@ -103,6 +130,38 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 **Static coverage** via the sibling `analyzer` crate (mago AST + per-test
 attribution; no Xdebug / PCOV needed).
 
+### State isolation (important limitation)
+
+phpunit-rust runs many test classes inside one long-lived worker fork to
+amortise PHP startup, which changes the isolation contract versus vanilla
+PHPUnit:
+
+- **`backupGlobals` is supported (opt-in).** `#[BackupGlobals(true)]` or
+  `@backupGlobals enabled` snapshots `$GLOBALS` before `setUp` and
+  restores it after `tearDown`, honouring
+  `#[ExcludeGlobalVariableFromBackup]`.
+- **`backupStaticAttributes` / `backupStaticProperties` are NOT
+  supported.** Static properties mutated by one test stay visible to
+  every later test sharing the same worker fork.
+- Classes that touch process-global APIs (stream wrappers, error /
+  exception handlers, `ini_set`, `putenv`, `setlocale`, autoload
+  registration, …) are auto-detected and forced into a fresh fork per
+  batch. This detection is **syntactic** and has blind spots: state
+  mutated through a trait method, a free function/helper, a
+  static-property accumulator, or a DI / global registry is not seen.
+- **Escape hatches** when isolation bites: run with `--workers 1`
+  (sequential), annotate the class with `@runInSeparateProcess`, or set
+  `PHPUNIT_RUST_NO_ISOLATION=1` only to *diagnose* pollution (it disables
+  the per-batch fresh-fork). There is no per-class force-isolate flag
+  beyond `@runInSeparateProcess`.
+- **Database isolation** (when `--provision-db` / `PHPUNIT_RUST_DB_DSN`
+  is set) is a runner-managed PDO transaction opened before `setUp` and
+  rolled back after `tearDown`. Because the runner bypasses PHPUnit's
+  `runBare`, framework traits like `RefreshDatabase` /
+  `DatabaseTransactions` never fire; only code routed through the
+  runner's connection is rolled back, and a test that commits or runs
+  DDL emits a loud `DB isolation LEAK` breadcrumb.
+
 ### Not yet supported (deferred)
 
 - **`.phpt` tests.** PHPUnit's file-based test format (a mini-INI with
@@ -118,7 +177,6 @@ attribution; no Xdebug / PCOV needed).
   user listener code — affects projects using Symfony's PhpUnitTestsListener
   for `@group legacy` handling)
 - `<extensions>` (PHPUnit 10+ extension API)
-- `@runInSeparateProcess` / `#[RunInSeparateProcess]`
 - Runtime coverage (PCOV/Xdebug) — static analysis only for now
 - JUnit XML / TAP / TestDox reporters
 - Watch mode
