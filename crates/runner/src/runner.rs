@@ -1008,9 +1008,6 @@ fn build_queue(
             }
         }
         BatchPlan {
-            autoload: cfg.autoload.clone(),
-            bootstrap: cfg.bootstrap.clone(),
-            defines: cfg.defines.clone(),
             classes,
             fingerprint: fp,
             force_exit_after,
@@ -2000,9 +1997,6 @@ mod tests {
     #[test]
     fn synth_skips_classes_already_reported() {
         let plan = BatchPlan {
-            autoload: PathBuf::from("/autoload.php"),
-            bootstrap: None,
-            defines: vec![],
             classes: vec![
                 BatchClass {
                     file: PathBuf::from("/A.php"),
@@ -2071,9 +2065,6 @@ mod tests {
     #[test]
     fn synth_emits_for_classes_never_reported() {
         let plan = BatchPlan {
-            autoload: PathBuf::from("/autoload.php"),
-            bootstrap: None,
-            defines: vec![],
             classes: vec![
                 BatchClass {
                     file: PathBuf::from("/A.php"),
@@ -2142,9 +2133,6 @@ mod tests {
     #[test]
     fn synth_class_row_covers_all_methods_of_that_class() {
         let plan = BatchPlan {
-            autoload: PathBuf::from("/autoload.php"),
-            bootstrap: None,
-            defines: vec![],
             classes: vec![BatchClass {
                 file: PathBuf::from("/B.php"),
                 class: "B".to_string(),
@@ -2195,9 +2183,6 @@ mod tests {
             is_isolated: false,
         };
         let lost = BatchPlan {
-            autoload: std::path::PathBuf::from("/a.php"),
-            bootstrap: None,
-            defines: vec![],
             classes: vec![bc("C", vec!["a", "b", "c"])],
             fingerprint: std::collections::HashSet::new(),
             force_exit_after: false,

@@ -31,11 +31,8 @@ fn drain(reader: &mut impl BufRead, out: &mut Vec<TestOutcome>) {
     }
 }
 
-fn plan_for(file: &std::path::Path, autoload: &std::path::Path) -> BatchPlan {
+fn plan_for(file: &std::path::Path) -> BatchPlan {
     BatchPlan {
-        autoload: autoload.to_path_buf(),
-        bootstrap: None,
-        defines: vec![],
         classes: vec![BatchClass {
             file: file.to_path_buf(),
             class: "WorkerTokenEchoTest".to_string(),
@@ -85,8 +82,8 @@ fn worker_token_is_set_and_distinct_per_slot() {
         None,
     )
     .expect("spawn");
-    pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
-    pool.write_batch(1, &plan_for(&file, &autoload)).unwrap();
+    pool.write_batch(0, &plan_for(&file)).unwrap();
+    pool.write_batch(1, &plan_for(&file)).unwrap();
     pool.close_write_ends();
 
     let mut per_slot: Vec<String> = Vec::new();
@@ -153,7 +150,7 @@ fn worker_token_stable_across_recycle() {
     .expect("spawn");
 
     // Batch 1: write, take reader, block-read ONE outcome (proves child ran).
-    pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
+    pool.write_batch(0, &plan_for(&file)).unwrap();
     let mut reader = pool.take_reader(0).expect("reader for slot 0");
     let mut outs: Vec<TestOutcome> = Vec::new();
     // Read lines until we collect at least one WorkerTokenEchoTest outcome.
@@ -187,7 +184,7 @@ fn worker_token_stable_across_recycle() {
     assert!(!outs.is_empty(), "batch 1 produced no outcome");
 
     // Batch 2: child 0 has already exited and master has respawned child 0b.
-    pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
+    pool.write_batch(0, &plan_for(&file)).unwrap();
     pool.close_write_ends();
 
     // Drain remaining (batch-2 outcome + any trailing lines).

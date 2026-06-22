@@ -67,11 +67,12 @@ pub struct BatchClass {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BatchPlan {
-    pub autoload: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bootstrap: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub defines: Vec<[String; 2]>,
+    // NOTE: autoload / bootstrap / defines are intentionally NOT here. The PHP
+    // master applies them ONCE at startup (via the --autoload/--bootstrap/--defines
+    // CLI args, before pcntl_fork), so every forked child already has them through
+    // copy-on-write. The worker reads only `classes` (+ `force_exit_after`) per
+    // batch — re-sending identical config in every BatchPlan was dead, redundant
+    // per-batch payload (serialized and transmitted, never read). Do not re-add.
     pub classes: Vec<BatchClass>,
     /// Union of FQCNs statically referenced by this batch's methods. Used
     /// by the runner's slot-affinity dispatcher for warm-cache routing.
@@ -133,11 +134,8 @@ mod batch_plan_tests {
     use super::*;
 
     #[test]
-    fn batch_plan_serializes_correctly() {
+    fn batch_plan_serializes_classes_and_omits_init_only_config() {
         let plan = BatchPlan {
-            autoload: PathBuf::from("/proj/vendor/autoload.php"),
-            bootstrap: Some(PathBuf::from("/proj/bootstrap.php")),
-            defines: vec![["FOO".to_string(), "bar".to_string()]],
             classes: vec![BatchClass {
                 file: PathBuf::from("/proj/tests/FooTest.php"),
                 class: "App\\FooTest".to_string(),
@@ -150,11 +148,13 @@ mod batch_plan_tests {
             force_exit_after: false,
         };
         let v = serde_json::to_value(&plan).unwrap();
-        assert_eq!(v["autoload"], "/proj/vendor/autoload.php");
-        assert_eq!(v["bootstrap"], "/proj/bootstrap.php");
-        assert_eq!(v["defines"][0][0], "FOO");
         assert_eq!(v["classes"][0]["class"], "App\\FooTest");
         assert_eq!(v["classes"][0]["methods"][0], "testA");
+        // autoload/bootstrap/defines are master-init-only (CLI args); they must
+        // NOT bloat every per-batch payload.
+        assert!(v.get("autoload").is_none(), "{v}");
+        assert!(v.get("bootstrap").is_none(), "{v}");
+        assert!(v.get("defines").is_none(), "{v}");
     }
 
     #[test]
@@ -183,20 +183,5 @@ mod batch_plan_tests {
         };
         let v = serde_json::to_value(&bc).unwrap();
         assert_eq!(v["required_files"][0], "/t/Provider.php");
-    }
-
-    #[test]
-    fn batch_plan_omits_bootstrap_when_none() {
-        let plan = BatchPlan {
-            autoload: PathBuf::from("/p/vendor/autoload.php"),
-            bootstrap: None,
-            defines: vec![],
-            classes: vec![],
-            fingerprint: std::collections::HashSet::new(),
-            force_exit_after: false,
-        };
-        let v = serde_json::to_value(&plan).unwrap();
-        assert!(v.get("bootstrap").is_none());
-        assert!(v.get("defines").is_none(), "empty defines must be omitted");
     }
 }

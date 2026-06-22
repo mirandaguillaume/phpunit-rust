@@ -36,11 +36,8 @@ class DsnEchoTest extends TestCase {\n\
     file
 }
 
-fn plan_for(file: &std::path::Path, autoload: &std::path::Path) -> BatchPlan {
+fn plan_for(file: &std::path::Path) -> BatchPlan {
     BatchPlan {
-        autoload: autoload.to_path_buf(),
-        bootstrap: None,
-        defines: vec![],
         classes: vec![BatchClass {
             file: file.to_path_buf(),
             class: "DsnEchoTest".to_string(),
@@ -98,8 +95,8 @@ fn per_slot_dsn_is_injected_and_distinct() {
     )
     .expect("spawn");
 
-    pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
-    pool.write_batch(1, &plan_for(&file, &autoload)).unwrap();
+    pool.write_batch(0, &plan_for(&file)).unwrap();
+    pool.write_batch(1, &plan_for(&file)).unwrap();
     pool.close_write_ends();
 
     let mut per_slot: Vec<String> = Vec::new();
@@ -167,7 +164,7 @@ fn per_slot_dsn_absent_when_none() {
     )
     .expect("spawn");
 
-    pool.write_batch(0, &plan_for(&file, &autoload)).unwrap();
+    pool.write_batch(0, &plan_for(&file)).unwrap();
     pool.close_write_ends();
 
     let mut outs = Vec::new();

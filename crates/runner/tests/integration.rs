@@ -86,9 +86,6 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     pool.write_batch(
         0,
         &BatchPlan {
-            autoload: autoload.clone(),
-            bootstrap: None,
-            defines: vec![],
             classes: vec![BatchClass {
                 file: project.join("tests/SampleTest.php"),
                 class: "SampleTest".to_string(),
@@ -106,9 +103,6 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     pool.write_batch(
         1,
         &BatchPlan {
-            autoload: autoload.clone(),
-            bootstrap: None,
-            defines: vec![],
             classes: vec![],
             fingerprint: std::collections::HashSet::new(),
             force_exit_after: false,
