@@ -139,25 +139,30 @@ final class TestExecutor
                 ?: self::checkRequires((string) $methodRef->getDocComment())
                 ?: self::checkRequiresAttributes($methodRef->getAttributes());
             if ($skipReason !== null) {
-                // Vanilla skips a requirement-gated method as ONE test WITHOUT
-                // invoking its data provider. The skip reason is identical for
-                // every row (it derives from class/method @requires, not the
-                // dataset), so emit a single dataset-less skip per method and
-                // drop the remaining expanded rows — otherwise we over-count by
-                // N-1 per gated data-provider method (monolog's MongoDBFormatterTest
-                // testConstruct: rust 2 vs vanilla 1).
-                if (!isset($reqSkipped[$method])) {
+                // How a requirement-gated data-provider method is counted DIFFERS
+                // by PHPUnit major, so match the project's PHPUnit:
+                //   >= 10: ONE skipped test per method; the provider is not
+                //          expanded (monolog @ PHPUnit 11: testConstruct = 1).
+                //   <= 9 : the provider IS expanded and EACH row is skipped
+                //          (faker @ PHPUnit 9.6: testLastNameFemale = 6 skips).
+                // Collapsing 9.x to 1 (or expanding >=10 to N) diverges from
+                // vanilla's count. The skip reason is identical for every row.
+                if (self::phpunitMajor() >= 10) {
+                    if (isset($reqSkipped[$method])) {
+                        continue;  // already emitted this method's single skip
+                    }
                     $reqSkipped[$method] = true;
-                    $outcomes[] = [
-                        'class'       => $class,
-                        'method'      => $method,
-                        'dataset'     => null,
-                        'status'      => 'skipped',
-                        'message'     => $skipReason,
-                        'trace'       => null,
-                        'duration_ms' => 0.0,
-                    ];
+                    $dataset = null;  // collapsed: a single dataset-less skip
                 }
+                $outcomes[] = [
+                    'class'       => $class,
+                    'method'      => $method,
+                    'dataset'     => $dataset,
+                    'status'      => 'skipped',
+                    'message'     => $skipReason,
+                    'trace'       => null,
+                    'duration_ms' => 0.0,
+                ];
                 continue;
             }
 
@@ -569,6 +574,23 @@ final class TestExecutor
             }
         }
         return null;
+    }
+
+    /**
+     * Major version of the PROJECT's loaded PHPUnit (e.g. 9, 10, 11), or 0 if
+     * it cannot be determined. Used to match version-specific behavior such as
+     * how a requirement-gated data-provider method is counted (9.x expands and
+     * skips each row; >=10 reports the method as a single skipped test).
+     */
+    private static function phpunitMajor(): int
+    {
+        static $major = null;
+        if ($major === null) {
+            $major = class_exists('\\PHPUnit\\Runner\\Version')
+                ? (int) \PHPUnit\Runner\Version::id()
+                : 0;
+        }
+        return $major;
     }
 
     /**
