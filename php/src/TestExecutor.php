@@ -536,6 +536,36 @@ final class TestExecutor
     }
 
     /**
+     * Method-level skip reason: the class-level requirements PLUS the method's
+     * own `@requires` / `#[Requires*]`, or null if nothing gates it. Mirrors the
+     * precedence runClass applies per step (class gate first, then the method's
+     * docblock, then its attributes). Shared with enumerate_providers.php, which
+     * uses it to refuse stride-splitting a heavy provider whose consuming test
+     * method is itself gated — on PHPUnit >=10 vanilla emits a single collapsed
+     * skip, so a split would over-count by chunks-1. An absent method (or class)
+     * yields null rather than throwing.
+     *
+     * @param class-string $class
+     */
+    public static function methodSkipReason(string $class, string $method): ?string
+    {
+        if (!class_exists($class)) {
+            return null;
+        }
+        $classSkip = self::classSkipReason($class);
+        if ($classSkip !== null) {
+            return $classSkip;
+        }
+        $ref = new \ReflectionClass($class);
+        if (!$ref->hasMethod($method)) {
+            return null;
+        }
+        $methodRef = $ref->getMethod($method);
+        return self::checkRequires((string) $methodRef->getDocComment())
+            ?? self::checkRequiresAttributes($methodRef->getAttributes());
+    }
+
+    /**
      * Evaluate `@requires` annotations in a PHPDoc block. Returns null if all
      * requirements are satisfied (or there are none), or a human-readable
      * "skip" message if any requirement fails.

@@ -84,6 +84,21 @@ final class _ExecRequiresUnmet extends TestCase
     public function testGated(int $x): void { $this->assertTrue(true); }
 }
 
+final class _ExecMethodRequiresUnmet extends TestCase
+{
+    // The METHOD-level residual of the class-level gate: no class requirement,
+    // but one test method's OWN #[RequiresPhpExtension] is unmet, while a
+    // sibling method (sharing the same provider) is NOT gated.
+    public static function rows(): array { return [[1], [2], [3]]; }
+
+    #[DataProvider('rows')]
+    #[\PHPUnit\Framework\Attributes\RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+    public function testGatedMethod(int $x): void { $this->assertTrue(true); }
+
+    #[DataProvider('rows')]
+    public function testOpenMethod(int $x): void { $this->assertTrue(true); }
+}
+
 final class TestExecutorTest extends TestCase
 {
     public function testPassingTestProducesPassOutcome(): void
@@ -177,6 +192,33 @@ final class TestExecutorTest extends TestCase
         $this->assertNull(
             TestExecutor::classSkipReason(_ExecPass::class),
             'a class with no requirement must yield null'
+        );
+    }
+
+    public function testMethodSkipReasonReflectsUnmetMethodRequirement(): void
+    {
+        // methodSkipReason is the method-level sibling of classSkipReason: it
+        // honors the class gate PLUS the method's own @requires/#[Requires*].
+        // The provider enumerator uses it to refuse stride-splitting a heavy
+        // provider whose consuming test method is itself gated — the residual
+        // a (class, provider) pair alone can't reveal.
+        $this->assertNotNull(
+            TestExecutor::methodSkipReason(_ExecMethodRequiresUnmet::class, 'testGatedMethod'),
+            'an unmet method-level requirement must yield a skip reason'
+        );
+        $this->assertNull(
+            TestExecutor::methodSkipReason(_ExecMethodRequiresUnmet::class, 'testOpenMethod'),
+            'a method with no requirement on an ungated class must yield null'
+        );
+        // The class-level gate must still propagate through methodSkipReason.
+        $this->assertNotNull(
+            TestExecutor::methodSkipReason(_ExecRequiresUnmet::class, 'testGated'),
+            'a class-level gate must also surface via methodSkipReason'
+        );
+        // An absent method on a real, ungated class is null — never an error.
+        $this->assertNull(
+            TestExecutor::methodSkipReason(_ExecPass::class, 'noSuchMethod'),
+            'an absent method must yield null, not throw'
         );
     }
 

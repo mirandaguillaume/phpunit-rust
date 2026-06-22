@@ -132,10 +132,23 @@ function enumerateRows(string $class, string $method): ?int
         // single dispatch unit; the worker then emits exactly vanilla's skip
         // count (1 on PHPUnit >=10; one per row on 9.x). A split gated method
         // would emit one collapsed skip PER chunk on >=10 — over-counting by
-        // chunks-1. (Class-level only — a method-level @requires on a heavy
-        // provider is a rarer, separate case the enumerator can't see here.)
+        // chunks-1.
         if (\PhpunitRust\TestExecutor::classSkipReason($class) !== null) {
             return null;
+        }
+
+        // Method-level residual of the class gate: the requirement may sit on the
+        // TEST method, not the class. We receive only (class, provider), so find
+        // the test method(s) consuming this provider by reflection and, if ANY is
+        // itself gated, return null. The choice is conservative on purpose: a
+        // non-gated sibling sharing the provider merely loses its stride-split (a
+        // little parallelism), but the gated method is kept whole so it emits
+        // vanilla's single collapsed skip on >=10 instead of one-per-chunk.
+        // Parity outranks the lost split.
+        foreach (providerConsumers($class, $method) as $consumer) {
+            if (\PhpunitRust\TestExecutor::methodSkipReason($class, $consumer) !== null) {
+                return null;
+            }
         }
 
         $reflMethod = new \ReflectionMethod($class, $method);
@@ -168,4 +181,45 @@ function enumerateRows(string $class, string $method): ?int
     } catch (\Throwable) {
         return null;
     }
+}
+
+/**
+ * Test methods on $class that consume the data provider $providerMethod, via
+ * #[DataProvider('providerMethod')] or the legacy `@dataProvider providerMethod`
+ * annotation. Only the SAME-class forms are matched — collect_provider_pairs
+ * (Rust) never emits cross-class providers into the enumerate input, so the
+ * consumer always lives on $class. Used to detect a method-level @requires gate
+ * the (class, provider) pair alone can't reveal.
+ *
+ * @return list<string>
+ */
+function providerConsumers(string $class, string $providerMethod): array
+{
+    try {
+        $ref = new \ReflectionClass($class);
+    } catch (\Throwable) {
+        return [];
+    }
+    $consumers = [];
+    foreach ($ref->getMethods(\ReflectionMethod::IS_PUBLIC) as $m) {
+        // PHPUnit 10+ attribute: #[DataProvider('providerMethod')].
+        foreach ($m->getAttributes(\PHPUnit\Framework\Attributes\DataProvider::class) as $attr) {
+            if ($attr->newInstance()->methodName() === $providerMethod) {
+                $consumers[] = $m->getName();
+                continue 2;
+            }
+        }
+        // PHPUnit 9 / legacy PHPDoc: `@dataProvider providerMethod` (same-class
+        // form, no `::`; cross-class providers aren't in the enumerate input).
+        $doc = $m->getDocComment();
+        if (is_string($doc) && preg_match_all('/@dataProvider\s+(\S+)/', $doc, $mm)) {
+            foreach ($mm[1] as $name) {
+                if ($name === $providerMethod) {
+                    $consumers[] = $m->getName();
+                    continue 2;
+                }
+            }
+        }
+    }
+    return $consumers;
 }
