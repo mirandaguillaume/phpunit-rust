@@ -74,6 +74,13 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+      # Bench-helper shell logic is gating (the parity death-scan and the
+      # auto-PR count-gate), so its self-tests run here instead of only locally.
+      - name: bench shell self-tests
+        run: |
+          bash bench/parity_death_scan_test.sh
+          bash bench/bench_table_counts_test.sh
+
       # Blocking: the workspace is fmt- and clippy-clean, so any new warning
       # (or unformatted code) fails CI.
       - name: cargo clippy --workspace --all-targets -D warnings
