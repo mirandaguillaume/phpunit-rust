@@ -75,4 +75,32 @@ final class EnumerateProvidersTest extends TestCase
         $this->assertArrayHasKey('PhpunitRust\\Tests\\Fixtures\\EnumPoison::poison', $out);
         $this->assertNull($out['PhpunitRust\\Tests\\Fixtures\\EnumPoison::poison']);
     }
+
+    public function testGatedClassProviderIsNotEnumerated(): void
+    {
+        // A class gated by an UNMET #[RequiresPhpExtension] is skipped wholesale,
+        // so its heavy (20-row) provider must NOT be enumerated → null (= single
+        // dispatch unit, no stride-split). Without this, a >=15-row gated method
+        // would be split and emit one collapsed skip per chunk on PHPUnit >=10,
+        // over-counting vs vanilla's single skip.
+        $pairs = json_encode([
+            ['PhpunitRust\\Tests\\Fixtures\\EnumGated', 'rows'],
+            ['PhpunitRust\\Tests\\Fixtures\\EnumPoison', 'good'],
+        ]);
+
+        $r = $this->runEnumerator($pairs);
+        $this->assertSame(0, $r['exit'], "enumerate must exit 0.\nstderr:\n{$r['stderr']}");
+
+        $out = json_decode(trim($r['stdout']), true);
+        $this->assertIsArray($out, "stdout must be JSON; got: {$r['stdout']}");
+
+        // Gated class → null even though rows() returns 20 entries.
+        $this->assertArrayHasKey('PhpunitRust\\Tests\\Fixtures\\EnumGated::rows', $out);
+        $this->assertNull(
+            $out['PhpunitRust\\Tests\\Fixtures\\EnumGated::rows'],
+            "a gated class's provider must not be enumerated (so it is never split)"
+        );
+        // Sanity: a non-gated provider in the same batch still enumerates.
+        $this->assertSame(3, $out['PhpunitRust\\Tests\\Fixtures\\EnumPoison::good'] ?? 'MISSING');
+    }
 }

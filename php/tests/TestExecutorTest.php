@@ -164,6 +164,22 @@ final class TestExecutorTest extends TestCase
         $this->assertSame('skipped', $outcomes[0]['status'], var_export($outcomes[0], true));
     }
 
+    public function testClassSkipReasonReflectsUnmetClassRequirement(): void
+    {
+        // classSkipReason is the shared gate used by both runClass and the
+        // provider enumerator (so a gated class's heavy data provider isn't
+        // stride-split). _ExecRequiresUnmet carries an unmet
+        // #[RequiresPhpExtension]; _ExecPass has no requirement.
+        $this->assertNotNull(
+            TestExecutor::classSkipReason(_ExecRequiresUnmet::class),
+            'an unmet class-level requirement must yield a skip reason'
+        );
+        $this->assertNull(
+            TestExecutor::classSkipReason(_ExecPass::class),
+            'a class with no requirement must yield null'
+        );
+    }
+
     public function testDependsOnVoidReturningDependencyStillRuns(): void
     {
         // Regression: a passing dependency that returns void/null must still

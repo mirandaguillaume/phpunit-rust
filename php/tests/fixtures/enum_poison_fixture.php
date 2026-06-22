@@ -4,6 +4,24 @@ declare(strict_types=1);
 
 namespace PhpunitRust\Tests\Fixtures;
 
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+
+/**
+ * A class gated by an UNMET requirement, with a heavy (>=15-row) data provider.
+ * Its whole suite will be SKIPPED, so the enumerator must return null for the
+ * provider (= do not stride-split): a split would emit one skip per chunk and
+ * over-count vs vanilla's single skip on PHPUnit >=10.
+ */
+#[RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+final class EnumGated
+{
+    /** @return list<array{0: int}> */
+    public static function rows(): array
+    {
+        return array_map(static fn (int $i): array => [$i], range(1, 20));
+    }
+}
+
 /**
  * A provider value whose __destruct() throws unless explicitly "consumed" —
  * mirrors php-parser's NodeVisitorForTesting, which asserts in __destruct that

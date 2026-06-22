@@ -40,8 +40,7 @@ final class TestExecutor
         // critical: some test classes load PHP-version-specific entity files
         // inside setUpBeforeClass, which causes E_COMPILE_ERROR if we're on
         // the wrong PHP version (uncatchable — kills the worker process).
-        $classSkipReason = self::checkRequires((string) $ref->getDocComment())
-            ?? self::checkRequiresAttributes($ref->getAttributes());
+        $classSkipReason = self::classSkipReason($class);
 
         // Collect PHPUnit 10 lifecycle attribute methods once for the class.
         // Order of invocation, per PHPUnit docs, around each test:
@@ -516,6 +515,24 @@ final class TestExecutor
             }
         }
         return $hooks;
+    }
+
+    /**
+     * Class-level skip reason from `@requires` (docblock) and `#[Requires*]`
+     * (attributes), or null if all the class's requirements are satisfied.
+     * Shared by runClass and by enumerate_providers.php — the enumerator uses
+     * it to avoid stride-splitting a gated class's heavy data-provider method
+     * (each split emits its own skip; on PHPUnit >=10 vanilla emits exactly one,
+     * so a split would over-count by chunks-1).
+     */
+    public static function classSkipReason(string $class): ?string
+    {
+        if (!class_exists($class)) {
+            return null;
+        }
+        $ref = new \ReflectionClass($class);
+        return self::checkRequires((string) $ref->getDocComment())
+            ?? self::checkRequiresAttributes($ref->getAttributes());
     }
 
     /**
