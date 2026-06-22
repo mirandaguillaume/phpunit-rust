@@ -127,6 +127,17 @@ function enumerateRows(string $class, string $method): ?int
         if (!class_exists($class)) return null;
         if (!method_exists($class, $method)) return null;
 
+        // A class gated by an UNMET @requires / #[Requires*] will be SKIPPED, not
+        // run. Return null (= "do not stride-split this method") so it stays a
+        // single dispatch unit; the worker then emits exactly vanilla's skip
+        // count (1 on PHPUnit >=10; one per row on 9.x). A split gated method
+        // would emit one collapsed skip PER chunk on >=10 — over-counting by
+        // chunks-1. (Class-level only — a method-level @requires on a heavy
+        // provider is a rarer, separate case the enumerator can't see here.)
+        if (\PhpunitRust\TestExecutor::classSkipReason($class) !== null) {
+            return null;
+        }
+
         $reflMethod = new \ReflectionMethod($class, $method);
         if (!$reflMethod->isStatic()) {
             // Pre-10 style instance providers. We don't have a configured
