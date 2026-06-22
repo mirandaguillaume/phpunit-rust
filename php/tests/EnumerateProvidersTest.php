@@ -103,4 +103,34 @@ final class EnumerateProvidersTest extends TestCase
         // Sanity: a non-gated provider in the same batch still enumerates.
         $this->assertSame(3, $out['PhpunitRust\\Tests\\Fixtures\\EnumPoison::good'] ?? 'MISSING');
     }
+
+    public function testMethodGatedProviderIsNotEnumerated(): void
+    {
+        // Residual of the class-level gate: a class with NO class requirement
+        // but whose test method's OWN #[RequiresPhpExtension] is unmet, consuming
+        // a heavy (20-row) provider. The enumerator receives only
+        // (class, provider) — it must find the consuming test method by
+        // reflection and, seeing it gated, return null (no stride-split) so the
+        // method emits vanilla's single collapsed skip on PHPUnit >=10 instead of
+        // one-per-chunk.
+        $pairs = json_encode([
+            ['PhpunitRust\\Tests\\Fixtures\\EnumMethodGated', 'rows'],
+            ['PhpunitRust\\Tests\\Fixtures\\EnumPoison', 'good'],
+        ]);
+
+        $r = $this->runEnumerator($pairs);
+        $this->assertSame(0, $r['exit'], "enumerate must exit 0.\nstderr:\n{$r['stderr']}");
+
+        $out = json_decode(trim($r['stdout']), true);
+        $this->assertIsArray($out, "stdout must be JSON; got: {$r['stdout']}");
+
+        // Method-level gated → null even though rows() returns 20 entries.
+        $this->assertArrayHasKey('PhpunitRust\\Tests\\Fixtures\\EnumMethodGated::rows', $out);
+        $this->assertNull(
+            $out['PhpunitRust\\Tests\\Fixtures\\EnumMethodGated::rows'],
+            "a provider whose consuming test method is method-level gated must not be enumerated"
+        );
+        // Sanity: a non-gated provider in the same batch still enumerates.
+        $this->assertSame(3, $out['PhpunitRust\\Tests\\Fixtures\\EnumPoison::good'] ?? 'MISSING');
+    }
 }
