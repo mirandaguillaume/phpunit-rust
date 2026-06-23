@@ -369,11 +369,7 @@ use proust::runner::RunConfig;
 use proust::types::{TestOutcome, TestStatus};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "proust",
-    version,
-    about = "PHPUnit-compatible test runner"
-)]
+#[command(name = "proust", version, about = "PHPUnit-compatible test runner")]
 struct Cli {
     #[arg(long, default_value = ".")]
     project: PathBuf,
@@ -1101,9 +1097,7 @@ fn real_main() -> Result<ExitCode> {
                     &template,
                     base,
                 )?;
-                lease.register(proust::resource_lease::clone_name(
-                    base, &run_uuid, slot,
-                ));
+                lease.register(proust::resource_lease::clone_name(base, &run_uuid, slot));
                 per_slot_dsn.push(dsn);
             }
             eprintln!(
@@ -1673,8 +1667,7 @@ return array(
         let supp = vec![proj.join("tests"), proj.join("fixtures")];
 
         let (_c1, fallback_index) = build_cases_and_index(proj, &roots, &[], &supp, false).unwrap();
-        let (_c2, full_index) =
-            proust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+        let (_c2, full_index) = proust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
         assert_eq!(
             fallback_index, full_index,
             "fallback index must byte-match discover_with_index"

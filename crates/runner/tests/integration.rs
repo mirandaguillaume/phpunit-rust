@@ -575,8 +575,7 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
         return;
     }
     let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir =
-        std::env::temp_dir().join(format!("proust_inline_crash_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_inline_crash_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // An uncatchable E_ERROR (undefined function) kills the inline master process mid-batch.
     let fatal_file = dir.join("InlineFatalTest.php");
@@ -689,10 +688,7 @@ fn inline_runs_all_batches_without_voluntary_recycle() {
         return;
     }
     let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir = std::env::temp_dir().join(format!(
-        "proust_inline_norecycle_{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("proust_inline_norecycle_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut files = Vec::new();
@@ -829,8 +825,7 @@ fn forked_salvage_via_sigkill_proves_requeue() {
         return;
     }
     let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir =
-        std::env::temp_dir().join(format!("proust_salvage_kill_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_salvage_kill_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // testOk1 passes, testPoison SIGKILLs the forked child (uncatchable — unlike an undefined fn),
     // testOk2 must still run after the master forks a replacement child and re-queues it.
@@ -981,8 +976,7 @@ fn master_death_transient_recovered_by_respawn() {
         return;
     }
     let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir =
-        std::env::temp_dir().join(format!("proust_p2_transient_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_p2_transient_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let marker = dir.join("killed_once");
 
@@ -1043,50 +1037,49 @@ fn master_death_transient_recovered_by_respawn() {
 
     // Helper: spawn a fresh inline pool, run run_resumable, return (outcomes, unfinished).
     // Guarded by a 25 s wall-clock deadline so a hang fails the test instead of blocking the suite.
-    let run_once =
-        |cases: Vec<TestCase>| -> (Vec<proust::types::TestOutcome>, Vec<TestCase>) {
-            let script = script.clone();
-            let autoload = autoload.clone();
-            let handle = std::thread::spawn(move || {
-                let cfg = RunConfig {
-                    autoload: autoload.clone(),
-                    bootstrap: None,
-                    filter: None,
-                    defines: vec![],
-                    stop_on: Default::default(),
-                    class_file_index: std::collections::HashMap::new(),
-                    n_workers: 1,
-                    worker_timeout: None,
-                };
-                let prof = Profiler::new(false);
-                let mut pool = PhpForkPool::spawn_inline(
-                    &script,
-                    &autoload,
-                    None,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    1,
-                    &std::collections::HashMap::new(),
-                    "512M",
-                    0,
-                    None,
-                )
-                .expect("spawn_inline failed");
-                let noop: fn(&proust::types::TestOutcome) = |_o| {};
-                run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
-                    .map(|(r, u)| (r.outcomes, u))
-                    .expect("run_resumable returned Err")
-            });
-            let deadline = Instant::now() + Duration::from_secs(25);
-            while !handle.is_finished() {
-                assert!(Instant::now() < deadline, "run_resumable hung");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            handle.join().expect("thread panicked")
-        };
+    let run_once = |cases: Vec<TestCase>| -> (Vec<proust::types::TestOutcome>, Vec<TestCase>) {
+        let script = script.clone();
+        let autoload = autoload.clone();
+        let handle = std::thread::spawn(move || {
+            let cfg = RunConfig {
+                autoload: autoload.clone(),
+                bootstrap: None,
+                filter: None,
+                defines: vec![],
+                stop_on: Default::default(),
+                class_file_index: std::collections::HashMap::new(),
+                n_workers: 1,
+                worker_timeout: None,
+            };
+            let prof = Profiler::new(false);
+            let mut pool = PhpForkPool::spawn_inline(
+                &script,
+                &autoload,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                1,
+                &std::collections::HashMap::new(),
+                "512M",
+                0,
+                None,
+            )
+            .expect("spawn_inline failed");
+            let noop: fn(&proust::types::TestOutcome) = |_o| {};
+            run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
+                .map(|(r, u)| (r.outcomes, u))
+                .expect("run_resumable returned Err")
+        });
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "run_resumable hung");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        handle.join().expect("thread panicked")
+    };
 
     // Run 1: P2TransientKillTest sends SIGKILL → master dies → no shutdown handler → both A and
     // B had no outcomes received → both come back as unfinished.
