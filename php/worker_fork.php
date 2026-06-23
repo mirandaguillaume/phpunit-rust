@@ -336,10 +336,15 @@ if ($__cfgPath !== null
     && class_exists(\PHPUnit\TextUI\XmlConfiguration\Loader::class)) {
     try {
         $__xml = (new \PHPUnit\TextUI\XmlConfiguration\Loader())->load($__cfgPath);
-        \PHPUnit\TextUI\Configuration\Registry::init(
-            (new \PHPUnit\TextUI\CliArguments\Builder())->fromParameters([]),
-            $__xml,
-        );
+        // Cross-version: CliArguments\Builder::fromParameters() takes one array
+        // on PHPUnit 11 but two on some other lines. Build the empty CLI config
+        // with the arity this PHPUnit actually wants instead of assuming one.
+        $__cliReq = (new \ReflectionMethod(\PHPUnit\TextUI\CliArguments\Builder::class, 'fromParameters'))
+            ->getNumberOfRequiredParameters();
+        $__cli = $__cliReq >= 2
+            ? (new \PHPUnit\TextUI\CliArguments\Builder())->fromParameters([], [])
+            : (new \PHPUnit\TextUI\CliArguments\Builder())->fromParameters([]);
+        \PHPUnit\TextUI\Configuration\Registry::init($__cli, $__xml);
         $__cfg = \PHPUnit\TextUI\Configuration\Registry::get();
         $__bootstrappers = $__cfg->extensionBootstrappers();
         if (count($__bootstrappers) > 0) {
@@ -356,11 +361,20 @@ if ($__cfgPath !== null
             // StaticDriver::setKeepStaticConnections(true) (a static), which the
             // forked children inherit via COW — that flag is what actually arms
             // the per-test transaction wrapping. Without it, the per-test
-            // PreparationStarted events are no-ops. (Per-test rollback happens at
-            // the NEXT test's PreparationStarted; the last test's writes are
-            // rolled back when the worker's DB connection closes on exit, so the
-            // suite-level TestRunner\Finished is not required for isolation.)
+            // PreparationStarted events are no-ops.
             \PHPUnit\Event\Facade::instance()->emitter()->testRunnerStarted();
+            // Emit TestRunner\Finished on process exit (inherited by every forked
+            // child via COW; fires once per process). DAMA does its final
+            // rollback + StaticDriver::setKeepStaticConnections(false) here. A
+            // SIGKILLed child skips this, but the DB connection-close rollback
+            // still isolates its last test, so correctness holds either way.
+            register_shutdown_function(static function (): void {
+                try {
+                    \PHPUnit\Event\Facade::instance()->emitter()->testRunnerFinished();
+                } catch (\Throwable) {
+                    // shutdown is best-effort; nothing actionable here.
+                }
+            });
             putenv('PRUST_EVENT_BRIDGE=1');
             $_ENV['PRUST_EVENT_BRIDGE'] = '1';
             fwrite(STDERR, 'worker_fork.php: event bridge active (' . count($__bootstrappers) . " extension(s))\n");

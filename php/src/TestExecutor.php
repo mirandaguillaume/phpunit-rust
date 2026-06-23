@@ -346,12 +346,20 @@ final class TestExecutor
                 }
             }
 
-            // Event bridge: Finished is where DAMADoctrineTestBundle rolls back
-            // its per-test transaction, so it MUST fire after tearDown and after
-            // every DB write the test made. (Outcome events — Passed/Failed/etc.
-            // — are intentionally not emitted in this prototype: they require a
-            // PHPUnit\Event\Code\Throwable VO and DAMA does not consume them.)
+            // Event bridge: emit the outcome, then Finished. Finished is where
+            // DAMADoctrineTestBundle rolls back its per-test transaction, so it
+            // MUST fire after tearDown and after every DB write the test made.
             if ($eventVo !== null) {
+                if ($error === null) {
+                    self::emitTest('passed', $eventVo);
+                } elseif ($error instanceof \PHPUnit\Framework\SkippedWithMessageException
+                    || $error instanceof \PHPUnit\Framework\IncompleteTestError) {
+                    self::emitTest('skipped', $eventVo, $error->getMessage());
+                } elseif ($error instanceof \PHPUnit\Framework\AssertionFailedError) {
+                    self::emitTest('failed', $eventVo, $error);
+                } else {
+                    self::emitTest('errored', $eventVo, $error);
+                }
                 self::emitTest('finished', $eventVo, \PHPUnit\Framework\Assert::getCount());
             }
 
@@ -445,7 +453,15 @@ final class TestExecutor
     {
         static $active = null;
         if ($active === null) {
-            $active = class_exists(\PHPUnit\Event\Facade::class)
+            // PRUST_EVENT_BRIDGE is set by worker_fork.php ONLY after it has
+            // bootstrapped >=1 <extensions> and sealed the Event\Facade. Gating
+            // on it is load-bearing: without it we would emit events for EVERY
+            // run (incl. suites with no extensions, and — fatally — when prust's
+            // OWN unit tests invoke TestExecutor::runClass, polluting the outer
+            // PHPUnit run's already-sealed facade). class_exists alone is not
+            // enough because the Event API is always present on PHPUnit >=10.
+            $active = getenv('PRUST_EVENT_BRIDGE') === '1'
+                && class_exists(\PHPUnit\Event\Facade::class)
                 && class_exists(\PHPUnit\Event\Code\TestMethodBuilder::class);
         }
         return $active;
@@ -475,8 +491,10 @@ final class TestExecutor
                 case 'finished':    $em->testFinished($vo, is_int($arg) ? $arg : 0); break;
                 case 'passed':      $em->testPassed($vo); break;
                 case 'skipped':     $em->testSkipped($vo, is_string($arg) ? $arg : ''); break;
-                case 'errored':     $em->testErrored($vo, $arg); break;
-                case 'failed':      $em->testFailed($vo, $arg, null); break;
+                // Outcome events carrying an error need PHPUnit's Throwable VO,
+                // not the raw \Throwable — build it via ThrowableBuilder::from().
+                case 'errored':     $em->testErrored($vo, \PHPUnit\Event\Code\ThrowableBuilder::from($arg)); break;
+                case 'failed':      $em->testFailed($vo, \PHPUnit\Event\Code\ThrowableBuilder::from($arg), null); break;
             }
         } catch (\Throwable $e) {
             fwrite(STDERR, "event bridge emit($kind) failed: " . $e->getMessage() . "\n");
