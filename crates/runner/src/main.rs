@@ -385,8 +385,8 @@ struct Cli {
     /// <bootstrap> attribute if both are present.
     #[arg(long)]
     bootstrap: Option<PathBuf>,
-    /// Path to phpunit.xml. Defaults to <project>/phpunit.xml or
-    /// phpunit.xml.dist if found. We extract: the `bootstrap` attribute,
+    /// Path to phpunit.xml. Defaults to <project>/phpunit.xml, then
+    /// phpunit.dist.xml, then phpunit.xml.dist if found. We extract: the `bootstrap` attribute,
     /// `<testsuite><directory>` entries (used as additional discovery roots),
     /// and `<php><const>` declarations (passed to the worker as `define()`s).
     #[arg(long)]
@@ -518,6 +518,22 @@ fn clamp_php_workers(requested: usize, explicit: bool, cases_len: usize, k: usiz
 /// bound explicit so an EXPLICIT `--workers 1` on a large suite does NOT inline.
 const INLINE_MAX_CASES: usize = 16;
 
+/// Locate a PHPUnit config under `project` by PHPUnit's filename precedence: a
+/// committed `phpunit.xml` wins over a distributed template, and BOTH dist
+/// spellings are recognized — `phpunit.dist.xml` (modern PHPUnit / Symfony Flex)
+/// and the legacy `phpunit.xml.dist`. Returns the first that exists.
+///
+/// Recognizing `phpunit.dist.xml` is load-bearing for framework apps: Symfony's
+/// standard layout ships that name, and missing it means the whole `<php>` block
+/// is skipped — so `APP_ENV=test` never reaches the bootstrap and a Dotenv-driven
+/// `KERNEL_CLASS`/`DATABASE_URL` is never loaded, failing every functional test.
+fn autodetect_config_path(project: &std::path::Path) -> Option<PathBuf> {
+    ["phpunit.xml", "phpunit.dist.xml", "phpunit.xml.dist"]
+        .iter()
+        .map(|name| project.join(name))
+        .find(|p| p.is_file())
+}
+
 /// True when the suite should take the single-process (no-fork) fast path: exactly one PHP worker,
 /// a tiny suite (≤ [`INLINE_MAX_CASES`]), AND every class is pure-CPU dispatch-safe — no
 /// global-state mutation (is_stateful), no `@runInSeparateProcess` (is_isolated), no DB (needs_db).
@@ -559,19 +575,7 @@ fn real_main() -> Result<ExitCode> {
 
     let xml_path = match cli.configuration {
         Some(p) => Some(if p.is_absolute() { p } else { project.join(p) }),
-        None => {
-            let auto = project.join("phpunit.xml");
-            if auto.is_file() {
-                Some(auto)
-            } else {
-                let dist = project.join("phpunit.xml.dist");
-                if dist.is_file() {
-                    Some(dist)
-                } else {
-                    None
-                }
-            }
-        }
+        None => autodetect_config_path(&project),
     };
 
     // Read the phpunit.xml once; reuse for bootstrap + testsuites + constants.
@@ -1450,6 +1454,47 @@ mod gate_tests {
             .map(|_| mk(false, false, false))
             .collect();
         assert!(single_process_eligible(1, &at_cap)); // ==16 -> inline
+    }
+
+    #[test]
+    fn autodetect_recognizes_symfony_phpunit_dist_xml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Only the modern Symfony Flex spelling is present.
+        std::fs::write(tmp.path().join("phpunit.dist.xml"), "<phpunit/>").unwrap();
+        assert_eq!(
+            autodetect_config_path(tmp.path()),
+            Some(tmp.path().join("phpunit.dist.xml")),
+            "phpunit.dist.xml (Symfony's layout) must be auto-detected"
+        );
+    }
+
+    #[test]
+    fn autodetect_config_precedence_committed_then_dist_spellings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Legacy dist only.
+        std::fs::write(tmp.path().join("phpunit.xml.dist"), "<phpunit/>").unwrap();
+        assert_eq!(
+            autodetect_config_path(tmp.path()),
+            Some(tmp.path().join("phpunit.xml.dist"))
+        );
+        // Modern dist outranks legacy dist.
+        std::fs::write(tmp.path().join("phpunit.dist.xml"), "<phpunit/>").unwrap();
+        assert_eq!(
+            autodetect_config_path(tmp.path()),
+            Some(tmp.path().join("phpunit.dist.xml"))
+        );
+        // A committed phpunit.xml outranks every dist template.
+        std::fs::write(tmp.path().join("phpunit.xml"), "<phpunit/>").unwrap();
+        assert_eq!(
+            autodetect_config_path(tmp.path()),
+            Some(tmp.path().join("phpunit.xml"))
+        );
+    }
+
+    #[test]
+    fn autodetect_returns_none_when_no_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(autodetect_config_path(tmp.path()), None);
     }
 
     #[test]
