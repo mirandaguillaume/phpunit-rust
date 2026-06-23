@@ -35,6 +35,7 @@ use mago_span::Span;
 use mago_syntax::ast::Program;
 use mago_syntax::parser::parse_file;
 use mago_word::Word;
+use rayon::prelude::*;
 
 /// Decode an interned `Word` (byte-string) into a Rust `String` (lossy).
 pub(crate) fn word_to_string(w: &Word) -> String {
@@ -98,31 +99,45 @@ impl MagoProject {
             .map(|e| e.path().to_path_buf())
             .collect();
 
-        // Read each file into a mago `File`, then scan into the accumulator.
-        // Each file gets a scratch arena that is dropped right after scanning —
-        // the resulting CodebaseMetadata is owned, so nothing escapes the arena.
+        // Read each file into a mago `File` SERIALLY: `File::read` assigns the
+        // `FileId`, which must stay deterministic and collision-free, so id
+        // assignment order is unchanged from the original serial loop.
+        let files: Vec<File> = paths
+            .iter()
+            .map(|path| {
+                File::read(root, path, FileType::Host).map_err(|e| BridgeError::Io {
+                    path: path.display().to_string(),
+                    source: std::io::Error::other(e.to_string()),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Parse + resolve + scan each file IN PARALLEL: the CPU-heavy phase. Each
+        // file gets its own scratch arena (dropped at the end of the closure) and
+        // produces an OWNED `CodebaseMetadata` (byte-string keys, does not borrow
+        // the arena), so nothing crosses thread boundaries by reference. `par_iter`
+        // preserves order, so the resulting `metas` align with `files` index-for-
+        // index — the merge below stays byte-identical to the serial extend order.
+        let metas: Vec<CodebaseMetadata> = files
+            .par_iter()
+            .map(|file| {
+                let arena = Bump::new();
+                let program = parse_file(&arena, file);
+                let resolved = NameResolver::new(&arena).resolve(program);
+                scan_program(&arena, file, program, &resolved, version)
+                // `arena`, `program`, `resolved` dropped here — meta is owned.
+            })
+            .collect();
+
+        // Merge SERIALLY in `paths` order: extend order and id→index maps are
+        // identical to the original loop.
         let mut codebase = CodebaseMetadata::default();
-        let mut files = Vec::with_capacity(paths.len());
-        let mut file_index = HashMap::with_capacity(paths.len());
-        let mut by_file_id = HashMap::with_capacity(paths.len());
-
-        for path in paths {
-            let file = File::read(root, &path, FileType::Host).map_err(|e| BridgeError::Io {
-                path: path.display().to_string(),
-                source: std::io::Error::other(e.to_string()),
-            })?;
-
-            let arena = Bump::new();
-            let program = parse_file(&arena, &file);
-            let resolved = NameResolver::new(&arena).resolve(program);
-            let meta = scan_program(&arena, &file, program, &resolved, version);
+        let mut file_index = HashMap::with_capacity(files.len());
+        let mut by_file_id = HashMap::with_capacity(files.len());
+        for (idx, (file, meta)) in files.iter().zip(metas).enumerate() {
             codebase.extend(meta);
-
-            let idx = files.len();
             file_index.insert(String::from_utf8_lossy(&file.name).to_lowercase(), idx);
             by_file_id.insert(file.id, idx);
-            files.push(file);
-            // `arena`, `program`, `resolved` dropped here — `meta` was owned.
         }
 
         // Finalize cross-file references (inheritance, etc.).
@@ -235,5 +250,57 @@ mod tests {
         let project = MagoProject::load(dir.path()).expect("load should succeed");
         assert_eq!(project.module_count(), 3, "expected 3 modules");
         assert!(project.class_like_count() >= 3, "expected >=3 class-likes");
+    }
+
+    // Guards the parallel-parse / serial-finalize load: files are parsed
+    // concurrently (each in its own arena) but cross-file inheritance is wired up
+    // afterwards by `populate_codebase`. A spread-out inheritance chain must still
+    // resolve, and repeated loads must be byte-stable (no thread-order leakage).
+    #[test]
+    fn parallel_load_resolves_cross_file_inheritance_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        // Enough files (across subdirs) to actually exercise the rayon parse.
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(
+            dir.path().join("Base.php"),
+            "<?php\nabstract class Base { public function tag(): string { return 'b'; } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("Mid.php"),
+            "<?php\nabstract class Mid extends Base {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("sub/Leaf.php"),
+            "<?php\nclass Leaf extends Mid {}\n",
+        )
+        .unwrap();
+        for i in 0..12 {
+            std::fs::write(
+                dir.path().join(format!("Filler{i}.php")),
+                format!("<?php\nclass Filler{i} {{}}\n"),
+            )
+            .unwrap();
+        }
+
+        let project = MagoProject::load(dir.path()).expect("load should succeed");
+        assert_eq!(project.module_count(), 15, "expected 15 modules");
+        // Cross-file inheritance resolved by the post-parse finalize step.
+        let leaf = project.find_class("Leaf").expect("Leaf class not found");
+        assert!(
+            leaf.all_parent_classes
+                .iter()
+                .any(|p| word_to_string(p).eq_ignore_ascii_case("base")),
+            "Leaf should resolve Base as an ancestor across files"
+        );
+
+        // Determinism: a second load yields the same class-like population.
+        let again = MagoProject::load(dir.path()).expect("reload should succeed");
+        assert_eq!(
+            project.class_like_count(),
+            again.class_like_count(),
+            "repeated parallel loads must produce identical class-like counts"
+        );
     }
 }

@@ -9,11 +9,6 @@ pub fn find_fork_script() -> Result<PathBuf> {
     find_script_named("worker_fork.php")
 }
 
-/// Find `enumerate_providers.php` — same search path as the fork script.
-pub fn find_enumerate_script() -> Result<PathBuf> {
-    find_script_named("enumerate_providers.php")
-}
-
 /// Find `provision_db.php` — same search path as the fork script.
 pub fn find_provision_script() -> Result<PathBuf> {
     find_script_named("provision_db.php")
