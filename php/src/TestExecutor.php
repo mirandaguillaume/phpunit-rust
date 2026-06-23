@@ -240,6 +240,9 @@ final class TestExecutor
                 );
             }
 
+            // Event bridge: build the lifecycle VO once (null when unsupported).
+            $eventVo = self::eventVo($test);
+
             // BODY try: setUp + before/precondition hooks + the test body only.
             // Crucially this try does NOT contain the after-hooks/tearDown —
             // vanilla runs those in a SEPARATE try so they fire even when the
@@ -248,6 +251,12 @@ final class TestExecutor
                 // P3: open this test's own output buffer just before the body.
                 ob_start();
                 $obStarted = true;
+
+                // Event bridge: PreparationStarted fires BEFORE setUp — this is
+                // where DAMADoctrineTestBundle arms its per-test DB transaction.
+                if ($eventVo !== null) {
+                    self::emitTest('prepStarted', $eventVo);
+                }
 
                 // P2: resolve the per-slot handle and begin a transaction
                 // before setUp, so every write made by setUp / the test /
@@ -262,6 +271,10 @@ final class TestExecutor
                 self::invokeOptional($test, 'setUp');
                 foreach ($hooks['before'] as $name)         self::invokeInstanceByName($test, $name);
                 foreach ($hooks['pre_condition'] as $name)  self::invokeInstanceByName($test, $name);
+                // Event bridge: Prepared fires after setUp/before-hooks.
+                if ($eventVo !== null) {
+                    self::emitTest('prepared', $eventVo);
+                }
                 $returnValue = $test->{$method}(...$args);
                 foreach ($hooks['post_condition'] as $name) self::invokeInstanceByName($test, $name);
 
@@ -331,6 +344,15 @@ final class TestExecutor
                 if ($error === null) {
                     $error = $teardownEx;
                 }
+            }
+
+            // Event bridge: Finished is where DAMADoctrineTestBundle rolls back
+            // its per-test transaction, so it MUST fire after tearDown and after
+            // every DB write the test made. (Outcome events — Passed/Failed/etc.
+            // — are intentionally not emitted in this prototype: they require a
+            // PHPUnit\Event\Code\Throwable VO and DAMA does not consume them.)
+            if ($eventVo !== null) {
+                self::emitTest('finished', $eventVo, \PHPUnit\Framework\Assert::getCount());
             }
 
             // P2: roll back unconditionally. Microsecond cost. Reset, not
@@ -408,6 +430,57 @@ final class TestExecutor
         }
 
         return $outcomes;
+    }
+
+    // --- Event bridge (option A) -------------------------------------------
+    // prust hand-rolls the lifecycle and never runs PHPUnit's TestRunner, so
+    // <extensions> (which subscribe to events) never fire. To make event-based
+    // extensions like DAMADoctrineTestBundle work, worker_fork.php bootstraps
+    // the configured extensions + seals the Event\Facade, and we emit the test
+    // lifecycle events around each test here. All guarded + best-effort: when no
+    // Event API is present (PHPUnit <10) or no extensions are configured this is
+    // a no-op, and a subscriber that throws must never take down the runner.
+
+    private static function eventBridgeActive(): bool
+    {
+        static $active = null;
+        if ($active === null) {
+            $active = class_exists(\PHPUnit\Event\Facade::class)
+                && class_exists(\PHPUnit\Event\Code\TestMethodBuilder::class);
+        }
+        return $active;
+    }
+
+    /** Build the event value object from a live TestCase, or null if unsupported. */
+    private static function eventVo(TestCase $test): ?object
+    {
+        if (!self::eventBridgeActive()) {
+            return null;
+        }
+        try {
+            return \PHPUnit\Event\Code\TestMethodBuilder::fromTestCase($test);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /** Emit one PHPUnit lifecycle event; swallows subscriber errors. */
+    private static function emitTest(string $kind, object $vo, mixed $arg = null): void
+    {
+        try {
+            $em = \PHPUnit\Event\Facade::instance()->emitter();
+            switch ($kind) {
+                case 'prepStarted': $em->testPreparationStarted($vo); break;
+                case 'prepared':    $em->testPrepared($vo); break;
+                case 'finished':    $em->testFinished($vo, is_int($arg) ? $arg : 0); break;
+                case 'passed':      $em->testPassed($vo); break;
+                case 'skipped':     $em->testSkipped($vo, is_string($arg) ? $arg : ''); break;
+                case 'errored':     $em->testErrored($vo, $arg); break;
+                case 'failed':      $em->testFailed($vo, $arg, null); break;
+            }
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "event bridge emit($kind) failed: " . $e->getMessage() . "\n");
+        }
     }
 
     private static function invokeOptional(TestCase $test, string $name): void

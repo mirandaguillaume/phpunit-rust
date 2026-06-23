@@ -314,6 +314,64 @@ if ($bootstrap !== null && is_file($bootstrap)) {
 $__log_phase('bootstrap');
 
 // ---------------------------------------------------------------------------
+// 3b. Event bridge (option A): bootstrap the configured PHPUnit <extensions>
+// and seal the Event\Facade, so the per-test lifecycle events emitted by
+// TestExecutor reach event subscribers (e.g. DAMADoctrineTestBundle's per-test
+// DB transaction wrapping). Done in the master so all forked children inherit
+// the sealed facade + registered subscribers via COW; the subscribers only
+// open DB connections lazily per-test inside each child, so nothing is shared.
+// PRUST_EVENT_BRIDGE is exported ONLY when >=1 extension is present, so suites
+// without <extensions> (every OSS lib) pay zero per-test emission overhead.
+// ---------------------------------------------------------------------------
+$__cfgPath = null;
+if (is_string($autoload)) {
+    $__root = dirname($autoload, 2);
+    foreach (['phpunit.xml', 'phpunit.dist.xml', 'phpunit.xml.dist'] as $__n) {
+        if (is_file("$__root/$__n")) { $__cfgPath = "$__root/$__n"; break; }
+    }
+}
+if ($__cfgPath !== null
+    && class_exists(\PHPUnit\Event\Facade::class)
+    && class_exists(\PHPUnit\Runner\Extension\ExtensionBootstrapper::class)
+    && class_exists(\PHPUnit\TextUI\XmlConfiguration\Loader::class)) {
+    try {
+        $__xml = (new \PHPUnit\TextUI\XmlConfiguration\Loader())->load($__cfgPath);
+        \PHPUnit\TextUI\Configuration\Registry::init(
+            (new \PHPUnit\TextUI\CliArguments\Builder())->fromParameters([]),
+            $__xml,
+        );
+        $__cfg = \PHPUnit\TextUI\Configuration\Registry::get();
+        $__bootstrappers = $__cfg->extensionBootstrappers();
+        if (count($__bootstrappers) > 0) {
+            $__bs = new \PHPUnit\Runner\Extension\ExtensionBootstrapper(
+                $__cfg,
+                new \PHPUnit\Runner\Extension\Facade(),
+            );
+            foreach ($__bootstrappers as $__b) {
+                // extensionBootstrappers() yields arrays: {className, parameters}.
+                $__bs->bootstrap($__b['className'], $__b['parameters']);
+            }
+            \PHPUnit\Event\Facade::instance()->seal();
+            // Emit TestRunner\Started ONCE in the master: DAMA's subscriber sets
+            // StaticDriver::setKeepStaticConnections(true) (a static), which the
+            // forked children inherit via COW — that flag is what actually arms
+            // the per-test transaction wrapping. Without it, the per-test
+            // PreparationStarted events are no-ops. (Per-test rollback happens at
+            // the NEXT test's PreparationStarted; the last test's writes are
+            // rolled back when the worker's DB connection closes on exit, so the
+            // suite-level TestRunner\Finished is not required for isolation.)
+            \PHPUnit\Event\Facade::instance()->emitter()->testRunnerStarted();
+            putenv('PRUST_EVENT_BRIDGE=1');
+            $_ENV['PRUST_EVENT_BRIDGE'] = '1';
+            fwrite(STDERR, 'worker_fork.php: event bridge active (' . count($__bootstrappers) . " extension(s))\n");
+        }
+    } catch (\Throwable $__e) {
+        fwrite(STDERR, 'worker_fork.php: event bridge skipped: ' . $__e->getMessage() . "\n");
+    }
+}
+$__log_phase('event_bridge');
+
+// ---------------------------------------------------------------------------
 // 4. NO opcache pre-warm — deliberately. The master used to
 //    opcache_compile_file() every classmap file here so children would
 //    inherit compiled opcodes. Root-caused and removed after it was proven
