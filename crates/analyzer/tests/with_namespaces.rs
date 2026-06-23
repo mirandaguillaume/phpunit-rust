@@ -11,13 +11,16 @@
 
 use assert_cmd::Command;
 
-const FIXTURE: &str = "tests/fixtures/with_namespaces";
+mod common;
+
+const FIXTURE_NAME: &str = "with_namespaces";
 
 #[test]
 fn namespaces_fixture_runs_clean() {
+    let wd = common::isolated_fixture(FIXTURE_NAME);
     Command::cargo_bin("pcov-rs")
         .unwrap()
-        .current_dir(FIXTURE)
+        .current_dir(wd.path())
         .args(["analyze", "--format", "pcov-extended"])
         .assert()
         .success();
@@ -25,9 +28,10 @@ fn namespaces_fixture_runs_clean() {
 
 #[test]
 fn namespaced_service_method_is_covered() {
+    let wd = common::isolated_fixture(FIXTURE_NAME);
     let output = Command::cargo_bin("pcov-rs")
         .unwrap()
-        .current_dir(FIXTURE)
+        .current_dir(wd.path())
         .args(["analyze", "--format", "pcov-extended"])
         .output()
         .unwrap();

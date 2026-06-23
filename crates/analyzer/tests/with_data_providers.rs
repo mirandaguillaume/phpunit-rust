@@ -7,13 +7,16 @@
 
 use assert_cmd::Command;
 
-const FIXTURE: &str = "tests/fixtures/with_data_providers";
+mod common;
+
+const FIXTURE_NAME: &str = "with_data_providers";
 
 #[test]
 fn data_provider_fixture_runs_clean() {
+    let wd = common::isolated_fixture(FIXTURE_NAME);
     Command::cargo_bin("pcov-rs")
         .unwrap()
-        .current_dir(FIXTURE)
+        .current_dir(wd.path())
         .args(["analyze", "--format", "pcov-extended"])
         .assert()
         .success();
@@ -21,9 +24,10 @@ fn data_provider_fixture_runs_clean() {
 
 #[test]
 fn data_provider_expands_to_three_cases() {
+    let wd = common::isolated_fixture(FIXTURE_NAME);
     let output = Command::cargo_bin("pcov-rs")
         .unwrap()
-        .current_dir(FIXTURE)
+        .current_dir(wd.path())
         .args(["analyze", "--format", "pcov-extended"])
         .output()
         .unwrap();

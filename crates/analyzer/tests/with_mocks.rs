@@ -9,35 +9,28 @@
 
 use assert_cmd::Command;
 
-const FIXTURE: &str = "tests/fixtures/with_mocks";
+mod common;
 
-/// Run `pcov-rs analyze` on the fixture, retrying a few times.
-///
-/// The analyze output is deterministic and 240 back-to-back local runs were
-/// clean, so this is NOT a logic bug — but `pcov-rs analyze` has flaked with a
-/// non-zero exit on CI under full-workspace test load (a rare environmental
-/// transient). Retry so a transient doesn't fail the suite; the final attempt's
-/// output is returned either way, so a genuine failure still surfaces its stderr.
-fn run_analyze() -> std::process::Output {
-    let mut last = None;
-    for _ in 0..3 {
-        let out = Command::cargo_bin("pcov-rs")
-            .unwrap()
-            .current_dir(FIXTURE)
-            .args(["analyze", "--format", "pcov-extended"])
-            .output()
-            .unwrap();
-        if out.status.success() {
-            return out;
-        }
-        last = Some(out);
-    }
-    last.unwrap()
+const FIXTURE_NAME: &str = "with_mocks";
+
+/// Run `pcov-rs analyze` in `work_dir`. Each caller passes a private
+/// `isolated_fixture` copy so the analyzer's `.pcov-rs/` cache is per-test.
+/// This used to retry 3× to paper over a shared-cache flake (two tests running
+/// in the same tracked fixture dir raced on that cache); isolating the working
+/// directory removes the root cause, so the retry is gone.
+fn run_analyze(work_dir: &std::path::Path) -> std::process::Output {
+    Command::cargo_bin("pcov-rs")
+        .unwrap()
+        .current_dir(work_dir)
+        .args(["analyze", "--format", "pcov-extended"])
+        .output()
+        .unwrap()
 }
 
 #[test]
 fn mocks_fixture_runs_clean() {
-    let out = run_analyze();
+    let wd = common::isolated_fixture(FIXTURE_NAME);
+    let out = run_analyze(wd.path());
     assert!(
         out.status.success(),
         "pcov-rs analyze failed: {}",
@@ -47,7 +40,8 @@ fn mocks_fixture_runs_clean() {
 
 #[test]
 fn mocks_do_not_cover_interface_methods() {
-    let output = run_analyze();
+    let wd = common::isolated_fixture(FIXTURE_NAME);
+    let output = run_analyze(wd.path());
     assert!(
         output.status.success(),
         "stderr: {}",
