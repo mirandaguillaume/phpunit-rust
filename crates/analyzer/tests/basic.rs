@@ -2,12 +2,15 @@
 
 use assert_cmd::Command;
 
-const FIXTURE: &str = "tests/fixtures/value_objects";
+mod common;
+
+const FIXTURE_NAME: &str = "value_objects";
 
 #[test]
 fn analyze_value_objects_succeeds() {
+    let wd = common::isolated_fixture(FIXTURE_NAME);
     let mut cmd = Command::cargo_bin("pcov-rs").unwrap();
-    cmd.current_dir(FIXTURE)
+    cmd.current_dir(wd.path())
         .arg("analyze")
         .arg("--format")
         .arg("pcov-extended")
@@ -17,9 +20,10 @@ fn analyze_value_objects_succeeds() {
 
 #[test]
 fn analyze_reports_test_method_lines() {
+    let wd = common::isolated_fixture(FIXTURE_NAME);
     let output = Command::cargo_bin("pcov-rs")
         .unwrap()
-        .current_dir(FIXTURE)
+        .current_dir(wd.path())
         .args(["analyze", "--format", "pcov-extended"])
         .output()
         .unwrap();
