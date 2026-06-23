@@ -460,14 +460,14 @@ pub fn bake_test_cases(
         .collect()
 }
 
-/// Persistent bake cache directory: `~/.cache/phpunit-rust/bake/`.
+/// Persistent bake cache directory: `~/.cache/proust/bake/`.
 /// Each entry is `<blake3-of-source>.php` → the pre-baked anonymous-class file.
 /// Uses the source file content as the cache key — vendor interface changes
 /// invalidate the cache only if they also change the test file (good enough
 /// for the common dev workflow where tests change more often than vendor).
 fn bake_cache_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".cache/phpunit-rust/bake");
+    let dir = PathBuf::from(home).join(".cache/proust/bake");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }

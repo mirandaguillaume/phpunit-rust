@@ -30,8 +30,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build phpunit-rust (release)
-        run: cargo build --release -p phpunit-rust
+      - name: Build proust (release)
+        run: cargo build --release -p proust
       # PHP+composer on the runner ONLY to generate the worker-shim autoloader
       # (php/vendor); the suites themselves are cloned + run inside the container.
       - uses: shivammathur/setup-php@v2
@@ -41,12 +41,12 @@ jobs:
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
       - name: Build CI-faithful PHP image
-        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+        run: docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
       - name: Parity (workers=4, in container)
         env:
-          IMAGE: prust-ci:php84
+          IMAGE: proust-ci:php84
           WORKERS: "4"
           # Resolve candidate suites from the evaluation-only registry, NOT the
           # gated oss_suites.tsv (run_in_container.sh forwards this into the box).

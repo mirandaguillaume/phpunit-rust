@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use phpunit_rust::discovery::{
+use proust::discovery::{
     discover_cases_and_test_index, discover_nontest_class_index, discover_with_index,
 };
 
@@ -137,7 +137,7 @@ fn build_cases_and_index(
     supplement_dirs: &[PathBuf],
     need_full_index: bool,
 ) -> anyhow::Result<(
-    Vec<phpunit_rust::types::TestCase>,
+    Vec<proust::types::TestCase>,
     std::collections::HashMap<String, PathBuf>,
 )> {
     if !need_full_index {
@@ -311,7 +311,7 @@ pub(crate) fn db_preflight(
 /// Returns `true` iff at least one of the FINAL selected test cases (after all
 /// filters including `--filter`, `--group`, and `--dirty`) has `needs_db = true`.
 /// When `false` the gate is a zero-cost no-op; no provisioning logic runs.
-fn selected_needs_db(cases: &[phpunit_rust::types::TestCase]) -> bool {
+fn selected_needs_db(cases: &[proust::types::TestCase]) -> bool {
     cases.iter().any(|c| c.needs_db)
 }
 
@@ -358,22 +358,18 @@ mod dirty_tests {
     }
 }
 
-use phpunit_rust::fork_pool::PhpForkPool;
-use phpunit_rust::php_worker::{check_php_version, find_fork_script};
-use phpunit_rust::phpunit_xml::{
+use proust::fork_pool::PhpForkPool;
+use proust::php_worker::{check_php_version, find_fork_script};
+use proust::phpunit_xml::{
     parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_block, parse_testsuites,
 };
-use phpunit_rust::provider_enum::RowCounts;
-use phpunit_rust::reporter::{print_progress, print_summary};
-use phpunit_rust::runner::RunConfig;
-use phpunit_rust::types::{TestOutcome, TestStatus};
+use proust::provider_enum::RowCounts;
+use proust::reporter::{print_progress, print_summary};
+use proust::runner::RunConfig;
+use proust::types::{TestOutcome, TestStatus};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "phpunit-rust",
-    version,
-    about = "PHPUnit-compatible test runner"
-)]
+#[command(name = "proust", version, about = "PHPUnit-compatible test runner")]
 struct Cli {
     #[arg(long, default_value = ".")]
     project: PathBuf,
@@ -546,7 +542,7 @@ fn autodetect_config_path(project: &std::path::Path) -> Option<PathBuf> {
 /// must use the fork pool, whose children are isolated and recycled, so a crash is contained to one
 /// batch and the worker respawns. Matches vanilla's single-process model only for the tiny suites
 /// where vanilla wins today.
-fn single_process_eligible(workers: usize, cases: &[phpunit_rust::types::TestCase]) -> bool {
+fn single_process_eligible(workers: usize, cases: &[proust::types::TestCase]) -> bool {
     workers == 1
         && cases.len() <= INLINE_MAX_CASES
         && cases
@@ -558,7 +554,7 @@ fn real_main() -> Result<ExitCode> {
     let cli = Cli::parse();
     // Profiler clock starts at the earliest opportunity so wall-clock
     // accounting includes config parsing, not just test execution.
-    let profiler = phpunit_rust::profiler::Profiler::new(cli.profile.is_some());
+    let profiler = proust::profiler::Profiler::new(cli.profile.is_some());
     let project = cli
         .project
         .canonicalize()
@@ -907,7 +903,7 @@ fn real_main() -> Result<ExitCode> {
     // exactly one filter application and which tests run is unchanged.
     if let Some(f) = cli.filter.as_deref() {
         let before = cases.len();
-        cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(f)));
+        cases.retain(|c| proust::runner::matches_filter(&c.class, &c.method, Some(f)));
         eprintln!(
             "--filter {:?}: {} of {} test method(s) match.",
             f,
@@ -925,7 +921,7 @@ fn real_main() -> Result<ExitCode> {
     // the detection is wired up if we later add generic <listeners>
     // dispatch.
     let _listeners: Vec<String> = xml_str.as_deref().map(parse_listeners).unwrap_or_default();
-    let synthetic_legacy_skips: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
+    let synthetic_legacy_skips: Vec<proust::types::TestOutcome> = Vec::new();
 
     eprintln!(
         "Found {} test methods across {} classes.",
@@ -943,7 +939,7 @@ fn real_main() -> Result<ExitCode> {
     let _bake_temp_dir: Option<tempfile::TempDir>;
     if cli.bake_mocks {
         let td = tempfile::TempDir::new().context("creating temp dir for baked test files")?;
-        let rewritten = phpunit_rust::mock_bake::bake_test_cases(&cases, &project, &td);
+        let rewritten = proust::mock_bake::bake_test_cases(&cases, &project, &td);
         let baked_count = rewritten
             .iter()
             .zip(cases.iter())
@@ -975,12 +971,12 @@ fn real_main() -> Result<ExitCode> {
     if cli.report_shared_fixture {
         let mut report = Vec::new();
         for root in &test_roots {
-            report.extend(phpunit_rust::discovery::shared_fixture_report_in_dir(root)?);
+            report.extend(proust::discovery::shared_fixture_report_in_dir(root)?);
         }
         report.sort_by(|a, b| a.fqcn.cmp(&b.fqcn));
         print!(
             "{}",
-            phpunit_rust::discovery::format_shared_fixture_report(&report)
+            proust::discovery::format_shared_fixture_report(&report)
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -1043,7 +1039,7 @@ fn real_main() -> Result<ExitCode> {
 
     // Data-provider row enumeration was removed. In production it produced no
     // usable data anyway — the standalone enumerator could not load
-    // \PhpunitRust\TestExecutor, so its skip-reason guard always threw and every
+    // \Proust\TestExecutor, so its skip-reason guard always threw and every
     // provider degraded to null (= single-bucket dispatch). And once made to
     // work, stride-splitting measured net-SLOWER on every OSS suite (the
     // per-chunk dispatch overhead outweighs the parallelism gain for fast
@@ -1059,9 +1055,9 @@ fn real_main() -> Result<ExitCode> {
     let mut per_slot_dsn_opt: Option<Vec<String>> = None;
     let _lease_guard = if let Some(base) = &cli.provision_db {
         if needs_db {
-            let provision_script = phpunit_rust::php_worker::find_provision_script()?;
+            let provision_script = proust::php_worker::find_provision_script()?;
             // P4 startup GC sweep: best-effort, never aborts the run.
-            match phpunit_rust::resource_lease::gc_stale_clones(
+            match proust::resource_lease::gc_stale_clones(
                 &provision_script,
                 &autoload,
                 bootstrap.as_deref(),
@@ -1075,14 +1071,14 @@ fn real_main() -> Result<ExitCode> {
                 Err(e) => eprintln!("Resource provisioning: GC sweep skipped ({e})"),
             }
             let run_uuid = format!("pr{}", std::process::id());
-            let template = phpunit_rust::resource_lease::build_template(
+            let template = proust::resource_lease::build_template(
                 &provision_script,
                 &autoload,
                 bootstrap.as_deref(),
                 &defines,
                 base,
             )?;
-            let mut lease = phpunit_rust::resource_lease::ResourceLease::new(
+            let mut lease = proust::resource_lease::ResourceLease::new(
                 provision_script.clone(),
                 autoload.clone(),
                 bootstrap.clone(),
@@ -1091,7 +1087,7 @@ fn real_main() -> Result<ExitCode> {
             );
             let mut per_slot_dsn: Vec<String> = Vec::with_capacity(worker_count);
             for slot in 0..worker_count {
-                let dsn = phpunit_rust::resource_lease::clone_for_slot(
+                let dsn = proust::resource_lease::clone_for_slot(
                     &provision_script,
                     &autoload,
                     bootstrap.as_deref(),
@@ -1101,9 +1097,7 @@ fn real_main() -> Result<ExitCode> {
                     &template,
                     base,
                 )?;
-                lease.register(phpunit_rust::resource_lease::clone_name(
-                    base, &run_uuid, slot,
-                ));
+                lease.register(proust::resource_lease::clone_name(base, &run_uuid, slot));
                 per_slot_dsn.push(dsn);
             }
             eprintln!(
@@ -1111,7 +1105,7 @@ fn real_main() -> Result<ExitCode> {
                 per_slot_dsn.len()
             );
             per_slot_dsn_opt = Some(per_slot_dsn);
-            Some(phpunit_rust::resource_lease::LeaseGuard::new(lease))
+            Some(proust::resource_lease::LeaseGuard::new(lease))
         } else {
             eprintln!(
                 "--provision-db: no selected test needs a DB; skipping provisioning (zero cost)."
@@ -1162,11 +1156,11 @@ fn real_main() -> Result<ExitCode> {
     )?;
 
     let stop_on = if cli.stop_on_defect {
-        phpunit_rust::runner::StopOn::on_defect()
+        proust::runner::StopOn::on_defect()
     } else if cli.stop_on_failure {
-        phpunit_rust::runner::StopOn::on_failure()
+        proust::runner::StopOn::on_failure()
     } else {
-        phpunit_rust::runner::StopOn::default()
+        proust::runner::StopOn::default()
     };
     // Keep clones for pool respawns; cfg takes ownership of the originals.
     let autoload_respawn = autoload.clone();
@@ -1187,11 +1181,11 @@ fn real_main() -> Result<ExitCode> {
     let n_cases = cases.len();
     profiler.mark("run_start", "main");
     const MAX_MASTER_RESPAWNS: u32 = 3;
-    let mut all_outcomes: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
+    let mut all_outcomes: Vec<proust::types::TestOutcome> = Vec::new();
     let mut pending = cases;
     let mut master_respawns = 0u32;
     loop {
-        let (partial, unfinished) = phpunit_rust::runner::run_resumable(
+        let (partial, unfinished) = proust::runner::run_resumable(
             &mut pool,
             pending,
             &cfg,
@@ -1206,16 +1200,16 @@ fn real_main() -> Result<ExitCode> {
         master_respawns += 1;
         if master_respawns > MAX_MASTER_RESPAWNS {
             eprintln!(
-                "phpunit-rust: PHP master died {} times; giving up on {} unfinished test(s)",
+                "proust: PHP master died {} times; giving up on {} unfinished test(s)",
                 master_respawns,
                 unfinished.len()
             );
             for c in unfinished {
-                let o = phpunit_rust::types::TestOutcome {
+                let o = proust::types::TestOutcome {
                     class: c.class,
                     method: c.method,
                     dataset: None,
-                    status: phpunit_rust::types::TestStatus::Error,
+                    status: proust::types::TestStatus::Error,
                     message: Some("worker process crashed repeatedly; giving up".to_string()),
                     trace: None,
                     duration_ms: 0.0,
@@ -1226,7 +1220,7 @@ fn real_main() -> Result<ExitCode> {
             break;
         }
         eprintln!(
-            "phpunit-rust: PHP master died; respawning ({}/{}) for {} unfinished test(s)",
+            "proust: PHP master died; respawning ({}/{}) for {} unfinished test(s)",
             master_respawns,
             MAX_MASTER_RESPAWNS,
             unfinished.len()
@@ -1250,7 +1244,7 @@ fn real_main() -> Result<ExitCode> {
     }
     profiler.mark("run_end", "main");
     let total_duration_ms: f64 = all_outcomes.iter().map(|o| o.duration_ms).sum();
-    let mut report = phpunit_rust::runner::Report {
+    let mut report = proust::runner::Report {
         outcomes: all_outcomes,
         total_duration_ms,
     };
@@ -1316,7 +1310,7 @@ fn real_main() -> Result<ExitCode> {
 
     #[cfg(feature = "coverage")]
     if let Some(fmt) = &cli.coverage_format {
-        use phpunit_rust::coverage::{emit, passed_set};
+        use proust::coverage::{emit, passed_set};
         let allowed = passed_set(&report);
         let xml_path = xml_path.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--coverage-format requires a phpunit.xml; use --configuration or place phpunit.xml in the project root")
@@ -1354,7 +1348,7 @@ fn real_main() -> Result<ExitCode> {
 #[cfg(test)]
 mod gate_tests {
     use super::*;
-    use phpunit_rust::types::TestCase;
+    use proust::types::TestCase;
     use std::path::PathBuf;
 
     fn case(class: &str, method: &str, needs_db: bool) -> TestCase {
@@ -1414,7 +1408,7 @@ mod gate_tests {
             case("DbTest", "testSave", true),
             case("OtherTest", "testFoo", false),
         ];
-        cases.retain(|c| phpunit_rust::runner::matches_filter(&c.class, &c.method, Some(filter)));
+        cases.retain(|c| proust::runner::matches_filter(&c.class, &c.method, Some(filter)));
         assert_eq!(cases.len(), 1);
         assert!(selected_needs_db(&cases), "filtered set still needs DB");
     }
@@ -1587,7 +1581,7 @@ return array(
 
         let (cases, index) = build_cases_and_index(&proj, &roots, &[], &supp, false).unwrap();
         let (full_cases, _full_index) =
-            phpunit_rust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+            proust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
         assert_eq!(cases.len(), full_cases.len());
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].class, "App\\Tests\\FooTest");
@@ -1601,7 +1595,7 @@ return array(
 
         let (cases, index) = build_cases_and_index(&proj, &roots, &[], &supp, true).unwrap();
         let (full_cases, full_index) =
-            phpunit_rust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+            proust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
         assert_eq!(cases.len(), full_cases.len());
         assert_eq!(index, full_index);
         assert!(index.contains_key("App\\Helper"));
@@ -1673,8 +1667,7 @@ return array(
         let supp = vec![proj.join("tests"), proj.join("fixtures")];
 
         let (_c1, fallback_index) = build_cases_and_index(proj, &roots, &[], &supp, false).unwrap();
-        let (_c2, full_index) =
-            phpunit_rust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
+        let (_c2, full_index) = proust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
         assert_eq!(
             fallback_index, full_index,
             "fallback index must byte-match discover_with_index"

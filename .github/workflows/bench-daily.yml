@@ -3,7 +3,7 @@
 # container (bench/Dockerfile.ci) rather than on the bare runner.
 #
 # Why the container: the bare GitHub Actions runner's PHP build produces a
-# per-suite test-count quirk for phpunit-rust (carbon +3, doctrine +152,
+# per-suite test-count quirk for proust (carbon +3, doctrine +152,
 # php-parser -64) that does NOT reproduce in ANY controlled environment — host
 # PHP, this container, or a leaner one all show EXACT parity on every suite
 # (including the 4168-test commonmark). Running in the container makes the gate
@@ -48,8 +48,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build phpunit-rust (release)
-        run: cargo build --release -p phpunit-rust
+      - name: Build proust (release)
+        run: cargo build --release -p proust
       # PHP+composer on the runner ONLY to generate the worker-shim autoloader
       # (php/vendor); the tests themselves run inside the container.
       - uses: shivammathur/setup-php@v2
@@ -59,12 +59,12 @@ jobs:
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
       - name: Build CI-faithful PHP image
-        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+        run: docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
       - name: Parity (workers=4, in container)
         env:
-          IMAGE: prust-ci:php84
+          IMAGE: proust-ci:php84
           WORKERS: "4"
         run: bench/run_in_container.sh bash /work/bench/parity_one.sh "${{ matrix.suite }}"
 
@@ -80,8 +80,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build phpunit-rust (release)
-        run: cargo build --release -p phpunit-rust
+      - name: Build proust (release)
+        run: cargo build --release -p proust
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
@@ -89,12 +89,12 @@ jobs:
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
       - name: Build CI-faithful PHP image
-        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+        run: docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
       - name: Parity (workers=1, diagnosis)
         env:
-          IMAGE: prust-ci:php84
+          IMAGE: proust-ci:php84
           WORKERS: "1"
         run: bench/run_in_container.sh bash /work/bench/parity_one.sh "${{ matrix.suite }}"
 
@@ -107,8 +107,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build phpunit-rust (release)
-        run: cargo build --release -p phpunit-rust
+      - name: Build proust (release)
+        run: cargo build --release -p proust
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
@@ -116,13 +116,13 @@ jobs:
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
       - name: Build CI-faithful PHP image
-        run: docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+        run: docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
       - name: Make bench scripts executable
         run: chmod +x bench/*.sh
 
       - name: Run OSS benchmark (speed, workers=4, in container)
         env:
-          IMAGE: prust-ci:php84
+          IMAGE: proust-ci:php84
           RUNS: "3"
           WORKERS: "4"
           OUT_DIR: ${{ runner.temp }}

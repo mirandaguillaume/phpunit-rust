@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\MethodPlanner;
+use Proust\MethodPlanner;
 use PHPUnit\Framework\Attributes\Depends;
 use PHPUnit\Framework\TestCase;
 

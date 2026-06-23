@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\TestExecutor;
+use Proust\TestExecutor;
 use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;

@@ -39,9 +39,9 @@
 const fs = require('fs');
 
 const SRC = process.argv[2] ||
-  '/tmp/phpunit-rust-smoke/carbon/tests/Carbon/DiffTest.php';
+  '/tmp/proust-smoke/carbon/tests/Carbon/DiffTest.php';
 const OUT = process.argv[3] ||
-  '/tmp/phpunit-rust-smoke/carbon/tests/Carbon/DiffCompiledTest.php';
+  '/tmp/proust-smoke/carbon/tests/Carbon/DiffCompiledTest.php';
 
 const s = fs.readFileSync(SRC, 'utf8');
 const RELATIVE = /\b(now|today|tomorrow|yesterday|next|last|ago|\+|first day|this )\b/i;

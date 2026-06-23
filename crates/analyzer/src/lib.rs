@@ -15,7 +15,7 @@ pub mod report;
 pub mod test_discovery;
 pub mod types;
 
-// Convenience re-exports for external callers (e.g. phpunit-rust).
+// Convenience re-exports for external callers (e.g. proust).
 pub use analyzer::Coverage;
 pub use cli::analyze::analyze_filtered;
 pub use config::{parse as parse_config, ProjectConfig};

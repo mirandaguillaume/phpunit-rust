@@ -1,7 +1,7 @@
 # CI-faithful PHP 8.4 image for the daily parity gate.
 #
 # Why: the bare GitHub Actions runner's PHP build produces a per-suite test-count
-# quirk for phpunit-rust (carbon +3, doctrine +152, php-parser -64) that does NOT
+# quirk for proust (carbon +3, doctrine +152, php-parser -64) that does NOT
 # reproduce in any controlled environment — host PHP, this container, or a leaner
 # one all show EXACT parity on every suite (including the 4168-test commonmark).
 # So the gate runs INSIDE this image: it measures code parity in a reproducible,
@@ -10,7 +10,7 @@
 # The runner-built binary runs here without rebuilding: it needs at most
 # GLIBC_2.39 and php:8.4-cli (Debian 13) ships glibc 2.41.
 #
-# Build:  docker build -f bench/Dockerfile.ci -t prust-ci:php84 .
+# Build:  docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
 FROM php:8.4-cli
 
 # CI installs gmp, pdo_sqlite, pcntl; the OSS suites additionally need
@@ -30,7 +30,7 @@ RUN echo "opcache.enable_cli=1" >> /usr/local/etc/php/conf.d/opcache-cli.ini
 # No memory cap: this is a bench image. The default 128M makes vanilla PHPUnit
 # OOM near the end of large suites (carbon's 6169 tests, faker's 2462) and die
 # before printing its summary, so the parsed count becomes "?" and the parity
-# gate fails spuriously. phpunit-rust's workers already self-limit; vanilla
+# gate fails spuriously. proust's workers already self-limit; vanilla
 # needs the cap lifted so the comparison is apples-to-apples.
 RUN echo "memory_limit=-1" >> /usr/local/etc/php/conf.d/zz-memory-limit.ini
 

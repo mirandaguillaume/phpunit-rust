@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\MethodPlanner;
+use Proust\MethodPlanner;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Depends;
 use PHPUnit\Framework\TestCase;
@@ -127,7 +127,7 @@ final class _MpExternalProviderSource extends TestCase
 final class _MpLegacyExternalProvider extends TestCase
 {
     /**
-     * @dataProvider \PhpunitRust\Tests\_MpExternalProviderSource::rows
+     * @dataProvider \Proust\Tests\_MpExternalProviderSource::rows
      */
     public function testParam(int $a, int $b): void {}
 }

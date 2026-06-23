@@ -1,15 +1,15 @@
 {
-    "name": "phpunit-rust/worker",
+    "name": "proust/worker",
     "type": "project",
-    "description": "FrankenPHP worker that executes PHPUnit tests on behalf of phpunit-rust",
+    "description": "FrankenPHP worker that executes PHPUnit tests on behalf of proust",
     "autoload": {
         "psr-4": {
-            "PhpunitRust\\": "src/"
+            "Proust\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "PhpunitRust\\Tests\\": "tests/"
+            "Proust\\Tests\\": "tests/"
         }
     },
     "require": {

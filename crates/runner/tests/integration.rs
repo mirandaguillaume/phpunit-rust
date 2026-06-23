@@ -4,8 +4,8 @@ use std::path::PathBuf;
 #[cfg(feature = "coverage")]
 #[test]
 fn coverage_clover_smoke() {
-    let bin = env!("CARGO_BIN_EXE_phpunit-rust");
-    let out = std::env::temp_dir().join("phpunit_rust_cov_smoke.json");
+    let bin = env!("CARGO_BIN_EXE_proust");
+    let out = std::env::temp_dir().join("proust_cov_smoke.json");
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     // Debug builds may overflow the default 8 MB stack during coverage
     // serialisation.  64 MB is safe for both debug and release.
@@ -22,7 +22,7 @@ fn coverage_clover_smoke() {
             out.to_str().unwrap(),
         ])
         .status()
-        .expect("failed to spawn phpunit-rust");
+        .expect("failed to spawn proust");
     // The fixture intentionally contains a failing test, so the runner exits
     // with code 1.  We only require that coverage was still written.
     let _ = status;
@@ -59,12 +59,12 @@ fn fork_worker_php_script_exists_and_is_valid_syntax() {
 
 #[test]
 fn fork_pool_runs_fixture_and_streams_outcomes() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::types::{BatchClass, BatchPlan};
+    use proust::fork_pool::PhpForkPool;
+    use proust::types::{BatchClass, BatchPlan};
 
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
 
     let mut pool = PhpForkPool::spawn(
         &script,
@@ -113,14 +113,14 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
     pool.close_write_ends();
 
     let readers = pool.into_readers();
-    let mut all_outcomes: Vec<phpunit_rust::types::TestOutcome> = Vec::new();
+    let mut all_outcomes: Vec<proust::types::TestOutcome> = Vec::new();
     for mut reader in readers {
         use std::io::BufRead;
         let mut line = String::new();
         while reader.read_line(&mut line).unwrap_or(0) > 0 {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                if let Ok(o) = serde_json::from_str::<phpunit_rust::types::TestOutcome>(trimmed) {
+                if let Ok(o) = serde_json::from_str::<proust::types::TestOutcome>(trimmed) {
                     all_outcomes.push(o);
                 }
             }
@@ -150,18 +150,18 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
 /// the deadline rather than hanging the suite forever.
 #[test]
 fn worker_timeout_aborts_stuck_run() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
 
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
 
     // A test that blocks far longer than both the watchdog and the deadline.
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_hang_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_hang_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let test_file = dir.join("HangTest.php");
     std::fs::write(
@@ -256,18 +256,18 @@ fn worker_timeout_aborts_stuck_run() {
 /// parity-preserving SlotDied recovery path in the dispatcher.
 #[test]
 fn worker_crash_is_recovered_as_error() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
 
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
 
     // A test that hard-kills its own worker process mid-run.
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_crash_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_crash_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let test_file = dir.join("CrashTest.php");
     std::fs::write(
@@ -371,17 +371,17 @@ fn worker_crash_is_recovered_as_error() {
 /// and it executes — and reports — before B triggers the uncatchable fatal.
 #[test]
 fn multi_class_bin_crash_counts_each_test_once() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
 
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
 
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_bin_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_bin_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Helper: build a lifecycle-flagged case (forces the class-level batching
@@ -443,7 +443,7 @@ fn multi_class_bin_crash_counts_each_test_once() {
     let b_file = dir.join("FatalTest.php");
     std::fs::write(
         &b_file,
-        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass FatalTest extends TestCase {\n    public function testFatal(): void { __phpunit_rust_no_such_function_xyz(); }\n}\n",
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass FatalTest extends TestCase {\n    public function testFatal(): void { __proust_no_such_function_xyz(); }\n}\n",
     )
     .unwrap();
     cases.push(mk(&b_file, "FatalTest", "testFatal"));
@@ -560,10 +560,10 @@ fn multi_class_bin_crash_counts_each_test_once() {
 
 #[test]
 fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
     // L3 crash-safety: in the single-process (no-fork) path the master IS the worker, so a fatal in
     // a test kills the master itself — there is NO surviving master to emit slot_died. The run loop's
@@ -574,15 +574,14 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
         eprintln!("SKIP: sample_project vendor not installed");
         return;
     }
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir =
-        std::env::temp_dir().join(format!("phpunit_rust_inline_crash_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("proust_inline_crash_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // An uncatchable E_ERROR (undefined function) kills the inline master process mid-batch.
     let fatal_file = dir.join("InlineFatalTest.php");
     std::fs::write(
         &fatal_file,
-        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass InlineFatalTest extends TestCase {\n    public function testFatal(): void { __phpunit_rust_inline_no_such_fn_xyz(); }\n}\n",
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass InlineFatalTest extends TestCase {\n    public function testFatal(): void { __proust_inline_no_such_fn_xyz(); }\n}\n",
     )
     .unwrap();
 
@@ -672,10 +671,10 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
 
 #[test]
 fn inline_runs_all_batches_without_voluntary_recycle() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
     // Regression: the inline (no-fork) path must NOT honour the K-batch voluntary recycle. There is
     // no master to fork a warm replacement, so a recycle would orphan every batch past K — the
@@ -688,11 +687,8 @@ fn inline_runs_all_batches_without_voluntary_recycle() {
         eprintln!("SKIP: sample_project vendor not installed");
         return;
     }
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir = std::env::temp_dir().join(format!(
-        "phpunit_rust_inline_norecycle_{}",
-        std::process::id()
-    ));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("proust_inline_norecycle_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut files = Vec::new();
@@ -816,10 +812,10 @@ fn inline_runs_all_batches_without_voluntary_recycle() {
 /// mechanism is therefore exercised ONLY when the runner runs the master as a fork-server.
 #[test]
 fn forked_salvage_via_sigkill_proves_requeue() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
 
     let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -828,9 +824,8 @@ fn forked_salvage_via_sigkill_proves_requeue() {
         eprintln!("SKIP: sample_project vendor not installed");
         return;
     }
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir =
-        std::env::temp_dir().join(format!("phpunit_rust_salvage_kill_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("proust_salvage_kill_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // testOk1 passes, testPoison SIGKILLs the forked child (uncatchable — unlike an undefined fn),
     // testOk2 must still run after the master forks a replacement child and re-queues it.
@@ -967,11 +962,11 @@ fn forked_salvage_via_sigkill_proves_requeue() {
 /// On the second run (respawn) both pass — this is the core "transient recovery" proof.
 #[test]
 fn master_death_transient_recovered_by_respawn() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::profiler::Profiler;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run_resumable, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::profiler::Profiler;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run_resumable, RunConfig};
+    use proust::types::{TestCase, TestStatus};
     use std::time::{Duration, Instant};
 
     let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -980,9 +975,8 @@ fn master_death_transient_recovered_by_respawn() {
         eprintln!("SKIP: sample_project vendor not installed");
         return;
     }
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir =
-        std::env::temp_dir().join(format!("phpunit_rust_p2_transient_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("proust_p2_transient_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let marker = dir.join("killed_once");
 
@@ -1043,50 +1037,49 @@ fn master_death_transient_recovered_by_respawn() {
 
     // Helper: spawn a fresh inline pool, run run_resumable, return (outcomes, unfinished).
     // Guarded by a 25 s wall-clock deadline so a hang fails the test instead of blocking the suite.
-    let run_once =
-        |cases: Vec<TestCase>| -> (Vec<phpunit_rust::types::TestOutcome>, Vec<TestCase>) {
-            let script = script.clone();
-            let autoload = autoload.clone();
-            let handle = std::thread::spawn(move || {
-                let cfg = RunConfig {
-                    autoload: autoload.clone(),
-                    bootstrap: None,
-                    filter: None,
-                    defines: vec![],
-                    stop_on: Default::default(),
-                    class_file_index: std::collections::HashMap::new(),
-                    n_workers: 1,
-                    worker_timeout: None,
-                };
-                let prof = Profiler::new(false);
-                let mut pool = PhpForkPool::spawn_inline(
-                    &script,
-                    &autoload,
-                    None,
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    &[],
-                    1,
-                    &std::collections::HashMap::new(),
-                    "512M",
-                    0,
-                    None,
-                )
-                .expect("spawn_inline failed");
-                let noop: fn(&phpunit_rust::types::TestOutcome) = |_o| {};
-                run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
-                    .map(|(r, u)| (r.outcomes, u))
-                    .expect("run_resumable returned Err")
-            });
-            let deadline = Instant::now() + Duration::from_secs(25);
-            while !handle.is_finished() {
-                assert!(Instant::now() < deadline, "run_resumable hung");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            handle.join().expect("thread panicked")
-        };
+    let run_once = |cases: Vec<TestCase>| -> (Vec<proust::types::TestOutcome>, Vec<TestCase>) {
+        let script = script.clone();
+        let autoload = autoload.clone();
+        let handle = std::thread::spawn(move || {
+            let cfg = RunConfig {
+                autoload: autoload.clone(),
+                bootstrap: None,
+                filter: None,
+                defines: vec![],
+                stop_on: Default::default(),
+                class_file_index: std::collections::HashMap::new(),
+                n_workers: 1,
+                worker_timeout: None,
+            };
+            let prof = Profiler::new(false);
+            let mut pool = PhpForkPool::spawn_inline(
+                &script,
+                &autoload,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                1,
+                &std::collections::HashMap::new(),
+                "512M",
+                0,
+                None,
+            )
+            .expect("spawn_inline failed");
+            let noop: fn(&proust::types::TestOutcome) = |_o| {};
+            run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
+                .map(|(r, u)| (r.outcomes, u))
+                .expect("run_resumable returned Err")
+        });
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "run_resumable hung");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        handle.join().expect("thread panicked")
+    };
 
     // Run 1: P2TransientKillTest sends SIGKILL → master dies → no shutdown handler → both A and
     // B had no outcomes received → both come back as unfinished.
@@ -1136,11 +1129,11 @@ fn master_death_transient_recovered_by_respawn() {
 /// stops — the key invariant is NO HANG and bounded iteration count.
 #[test]
 fn master_death_always_is_bounded_no_hang() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::profiler::Profiler;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run_resumable, RunConfig};
-    use phpunit_rust::types::TestCase;
+    use proust::fork_pool::PhpForkPool;
+    use proust::profiler::Profiler;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run_resumable, RunConfig};
+    use proust::types::TestCase;
     use std::time::{Duration, Instant};
 
     let autoload = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1149,8 +1142,8 @@ fn master_death_always_is_bounded_no_hang() {
         eprintln!("SKIP: sample_project vendor not installed");
         return;
     }
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_p2_always_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let dir = std::env::temp_dir().join(format!("proust_p2_always_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Class A: always sends SIGKILL to itself — kills the master every time, no recovery.
@@ -1246,7 +1239,7 @@ fn master_death_always_is_bounded_no_hang() {
                 None,
             )
             .expect("spawn_inline failed");
-            let noop: fn(&phpunit_rust::types::TestOutcome) = |_o| {};
+            let noop: fn(&proust::types::TestOutcome) = |_o| {};
             run_resumable(&mut pool, cases, &cfg, &RowCounts::new(), noop, &prof)
                 .map(|(r, u)| (r.outcomes, u))
                 .expect("run_resumable returned Err")

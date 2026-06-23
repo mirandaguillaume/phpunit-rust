@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
 use PHPUnit\Framework\TestCase;
 
@@ -16,7 +16,7 @@ use PHPUnit\Framework\TestCase;
  * at every worker exit — silent data loss outside the sandbox.
  *
  * The fix lifts the recursion logic into a standalone, side-effect-free helper
- * `phpunit_rust_rmtree()` defined in worker_fork.php (guarded so that requiring
+ * `proust_rmtree()` defined in worker_fork.php (guarded so that requiring
  * the file for the function definition does NOT run the fork-pool master), and
  * gives it lstat semantics: a symlink is @unlink'd as a link (never followed),
  * a real directory is recursed into, everything else is @unlink'd.
@@ -33,11 +33,11 @@ final class WorkerForkRmtreeTest extends TestCase
         require_once __DIR__ . '/../worker_fork.php';
 
         self::assertTrue(
-            function_exists('phpunit_rust_rmtree'),
-            'worker_fork.php must expose phpunit_rust_rmtree() for cleanup'
+            function_exists('proust_rmtree'),
+            'worker_fork.php must expose proust_rmtree() for cleanup'
         );
 
-        $this->root = sys_get_temp_dir() . '/phpunit-rust-rmtree-test-' . getmypid() . '-' . uniqid();
+        $this->root = sys_get_temp_dir() . '/proust-rmtree-test-' . getmypid() . '-' . uniqid();
         @mkdir($this->root, 0700, true);
     }
 
@@ -46,7 +46,7 @@ final class WorkerForkRmtreeTest extends TestCase
         // Defensive: remove anything the assertions left behind. Uses the same
         // lstat-safe helper so this teardown can't itself follow a stray link.
         if (is_dir($this->root)) {
-            phpunit_rust_rmtree($this->root);
+            proust_rmtree($this->root);
         }
     }
 
@@ -74,7 +74,7 @@ final class WorkerForkRmtreeTest extends TestCase
         self::assertTrue(is_dir($link), 'precondition: is_dir follows the symlink');
         self::assertTrue(is_link($link), 'precondition: the entry is a symlink');
 
-        phpunit_rust_rmtree($workerTmp);
+        proust_rmtree($workerTmp);
 
         // The worker temp dir is gone…
         self::assertDirectoryDoesNotExist($workerTmp, 'worker tmp must be removed');
@@ -98,7 +98,7 @@ final class WorkerForkRmtreeTest extends TestCase
         $link = $workerTmp . '/file_link';
         self::assertTrue(symlink($externalFile, $link), 'failed to create file symlink');
 
-        phpunit_rust_rmtree($workerTmp);
+        proust_rmtree($workerTmp);
 
         self::assertDirectoryDoesNotExist($workerTmp);
         self::assertFileExists($externalFile, 'symlinked external file must survive');
@@ -119,7 +119,7 @@ final class WorkerForkRmtreeTest extends TestCase
         $topLink = $this->root . '/top_link';
         self::assertTrue(symlink($external, $topLink), 'failed to create top symlink');
 
-        phpunit_rust_rmtree($topLink);
+        proust_rmtree($topLink);
 
         self::assertFalse(is_link($topLink), 'the top symlink must be removed');
         self::assertDirectoryExists($external, 'top symlink target dir must survive');
@@ -138,7 +138,7 @@ final class WorkerForkRmtreeTest extends TestCase
         file_put_contents($tmp . '/a/mid.txt', '2');
         file_put_contents($tmp . '/a/b/c/deep.txt', '3');
 
-        phpunit_rust_rmtree($tmp);
+        proust_rmtree($tmp);
 
         self::assertDirectoryDoesNotExist($tmp, 'the whole real tree must be removed');
     }

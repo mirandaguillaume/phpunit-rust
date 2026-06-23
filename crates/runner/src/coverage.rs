@@ -20,7 +20,7 @@ mod inner {
 
     /// Run pcov-rs coverage for passing tests and write output.
     ///
-    /// `config_path` — path to phpunit.xml (same one phpunit-rust used).
+    /// `config_path` — path to phpunit.xml (same one proust used).
     /// `allowed`     — set of (class, method) pairs that passed; `None` = all tests.
     /// `format`      — output format string ("clover", "json", "pcov", "pcov-extended").
     /// `out`         — output file path; `None` = write to stdout.

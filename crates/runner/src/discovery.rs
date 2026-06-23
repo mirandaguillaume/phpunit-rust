@@ -3,7 +3,7 @@
 //! The runner originally owned a 750+ line tree-sitter discovery module;
 //! it now lives in `crates/discovery` so the analyzer can consume the
 //! same parsing surface. This module preserves the historical import
-//! path (`phpunit_rust::discovery::*`) so external callers and tests
+//! path (`proust::discovery::*`) so external callers and tests
 //! don't have to switch their use-statements.
 
 pub use discovery::{

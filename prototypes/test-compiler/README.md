@@ -61,7 +61,7 @@ rule above then excludes.
   naming `egraph.rs` materialises (`call_node` → `C::method`, `literal_node` →
   `str:'…'`), so the two agree on what "the same sub-tree" is.
 
-## Measured results (php8.4, docker `phpunit-rust-bench:php84`, median of runs)
+## Measured results (php8.4, docker `proust-bench:php84`, median of runs)
 
 ### 1. Controlled fixture (`controlled/`) — proves compile→gain when sharing is expensive
 

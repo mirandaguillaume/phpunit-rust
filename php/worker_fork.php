@@ -44,7 +44,7 @@ const WORKER_EXIT_VOLUNTARY_RECYCLE = 6; // K-batch / force_exit_after recycle
 const WORKER_EXIT_STDIN_EOF         = 7; // Rust closed our stdin; slot is done
 
 // Main-body guard. The top-level `function` declarations below (write_line,
-// phpunit_rust_rmtree, runChild, emitError) are hoisted at compile time and so
+// proust_rmtree, runChild, emitError) are hoisted at compile time and so
 // remain callable even though we `return` here — which lets the PHP unit tests
 // `require` this file purely to exercise those helpers WITHOUT spawning the
 // fork-pool master. The master only runs when this file is the entry script
@@ -78,8 +78,8 @@ $__log_phase('start');
 require_once __DIR__ . '/vendor/autoload.php';
 $__log_phase('worker_vendor_autoload');
 
-use PhpunitRust\OutcomeBuilder;
-use PhpunitRust\TestExecutor;
+use Proust\OutcomeBuilder;
+use Proust\TestExecutor;
 
 /**
  * Write one worker payload to $stream as a newline-delimited JSON line.
@@ -119,7 +119,7 @@ function write_line($stream, array $payload): void
  * Best-effort: every removal is silenced; a child exiting can't afford to
  * fatal on a cleanup race, and tmpfs reclaims the rest when the container ends.
  */
-function phpunit_rust_rmtree(string $path): void
+function proust_rmtree(string $path): void
 {
     // Guard the top path with lstat semantics: a symlink (even one whose
     // target is a directory) is unlinked as a link, never traversed.
@@ -141,7 +141,7 @@ function phpunit_rust_rmtree(string $path): void
             // load-bearing branch — is_dir($sub) would have followed the link.
             @unlink($sub);
         } elseif (is_dir($sub)) {
-            phpunit_rust_rmtree($sub);
+            proust_rmtree($sub);
         } else {
             @unlink($sub);
         }
@@ -314,6 +314,85 @@ if ($bootstrap !== null && is_file($bootstrap)) {
 $__log_phase('bootstrap');
 
 // ---------------------------------------------------------------------------
+// 3b. Event bridge (option A): bootstrap the configured PHPUnit <extensions>
+// and seal the Event\Facade, so the per-test lifecycle events emitted by
+// TestExecutor reach event subscribers (e.g. DAMADoctrineTestBundle's per-test
+// DB transaction wrapping). Done in the master so all forked children inherit
+// the sealed facade + registered subscribers via COW; the subscribers only
+// open DB connections lazily per-test inside each child, so nothing is shared.
+// PRUST_EVENT_BRIDGE is exported ONLY when >=1 extension is present, so suites
+// without <extensions> (every OSS lib) pay zero per-test emission overhead.
+// ---------------------------------------------------------------------------
+$__cfgPath = null;
+if (is_string($autoload)) {
+    $__root = dirname($autoload, 2);
+    foreach (['phpunit.xml', 'phpunit.dist.xml', 'phpunit.xml.dist'] as $__n) {
+        if (is_file("$__root/$__n")) { $__cfgPath = "$__root/$__n"; break; }
+    }
+}
+// Cheap pre-check: only attempt the (version-sensitive) full config load when
+// the config actually declares <extensions>. Suites without any (every OSS lib)
+// skip silently and pay nothing — and we avoid tripping over PHPUnit-version
+// differences in the config loader for projects that don't need the bridge.
+if ($__cfgPath !== null && !str_contains((string) @file_get_contents($__cfgPath), '<extensions')) {
+    $__cfgPath = null;
+}
+if ($__cfgPath !== null
+    && class_exists(\PHPUnit\Event\Facade::class)
+    && class_exists(\PHPUnit\Runner\Extension\ExtensionBootstrapper::class)
+    && class_exists(\PHPUnit\TextUI\XmlConfiguration\Loader::class)) {
+    try {
+        $__xml = (new \PHPUnit\TextUI\XmlConfiguration\Loader())->load($__cfgPath);
+        // Cross-version: CliArguments\Builder::fromParameters() takes one array
+        // on PHPUnit 11 but two on some other lines. Build the empty CLI config
+        // with the arity this PHPUnit actually wants instead of assuming one.
+        $__cliReq = (new \ReflectionMethod(\PHPUnit\TextUI\CliArguments\Builder::class, 'fromParameters'))
+            ->getNumberOfRequiredParameters();
+        $__cli = $__cliReq >= 2
+            ? (new \PHPUnit\TextUI\CliArguments\Builder())->fromParameters([], [])
+            : (new \PHPUnit\TextUI\CliArguments\Builder())->fromParameters([]);
+        \PHPUnit\TextUI\Configuration\Registry::init($__cli, $__xml);
+        $__cfg = \PHPUnit\TextUI\Configuration\Registry::get();
+        $__bootstrappers = $__cfg->extensionBootstrappers();
+        if (count($__bootstrappers) > 0) {
+            $__bs = new \PHPUnit\Runner\Extension\ExtensionBootstrapper(
+                $__cfg,
+                new \PHPUnit\Runner\Extension\Facade(),
+            );
+            foreach ($__bootstrappers as $__b) {
+                // extensionBootstrappers() yields arrays: {className, parameters}.
+                $__bs->bootstrap($__b['className'], $__b['parameters']);
+            }
+            \PHPUnit\Event\Facade::instance()->seal();
+            // Emit TestRunner\Started ONCE in the master: DAMA's subscriber sets
+            // StaticDriver::setKeepStaticConnections(true) (a static), which the
+            // forked children inherit via COW — that flag is what actually arms
+            // the per-test transaction wrapping. Without it, the per-test
+            // PreparationStarted events are no-ops.
+            \PHPUnit\Event\Facade::instance()->emitter()->testRunnerStarted();
+            // Emit TestRunner\Finished on process exit (inherited by every forked
+            // child via COW; fires once per process). DAMA does its final
+            // rollback + StaticDriver::setKeepStaticConnections(false) here. A
+            // SIGKILLed child skips this, but the DB connection-close rollback
+            // still isolates its last test, so correctness holds either way.
+            register_shutdown_function(static function (): void {
+                try {
+                    \PHPUnit\Event\Facade::instance()->emitter()->testRunnerFinished();
+                } catch (\Throwable) {
+                    // shutdown is best-effort; nothing actionable here.
+                }
+            });
+            putenv('PRUST_EVENT_BRIDGE=1');
+            $_ENV['PRUST_EVENT_BRIDGE'] = '1';
+            fwrite(STDERR, 'worker_fork.php: event bridge active (' . count($__bootstrappers) . " extension(s))\n");
+        }
+    } catch (\Throwable $__e) {
+        fwrite(STDERR, 'worker_fork.php: event bridge skipped: ' . $__e->getMessage() . "\n");
+    }
+}
+$__log_phase('event_bridge');
+
+// ---------------------------------------------------------------------------
 // 4. NO opcache pre-warm — deliberately. The master used to
 //    opcache_compile_file() every classmap file here so children would
 //    inherit compiled opcodes. Root-caused and removed after it was proven
@@ -361,7 +440,7 @@ for ($i = 0; $i < $n; $i++) {
 //   - Rust's Drop sending SIGTERM during normal shutdown
 //   - The kernel's PR_SET_PDEATHSIG firing SIGTERM when Rust dies of any
 //     other cause (SIGKILL, panic before Drop, OOM, …)
-//   - User hitting Ctrl-C on phpunit-rust (SIGINT propagates to the
+//   - User hitting Ctrl-C on proust (SIGINT propagates to the
 //     process group)
 // We SIGKILL every forked child immediately so a child stuck in setUp or
 // an infinite-loop test can't outlive its parent.
@@ -578,7 +657,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
     // directly rather than the env var). The dir is best-effort cleaned by
     // a shutdown hook; tmpfs takes care of the rest when the container ends.
     $childPid = getmypid();
-    $childTmp = sys_get_temp_dir() . "/phpunit-rust-worker-" . $childPid;
+    $childTmp = sys_get_temp_dir() . "/proust-worker-" . $childPid;
     if (@mkdir($childTmp, 0700, true) || is_dir($childTmp)) {
         putenv("TMPDIR={$childTmp}");
         putenv("TMP={$childTmp}");
@@ -588,10 +667,10 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         @ini_set('sys_temp_dir', $childTmp);
         register_shutdown_function(static function () use ($childTmp): void {
             // Recursive rmdir — best effort, ignore failures. Uses lstat
-            // semantics (see phpunit_rust_rmtree): a symlink a test wrote into
+            // semantics (see proust_rmtree): a symlink a test wrote into
             // its TMPDIR is unlinked as a link, NEVER followed, so an external
             // target's contents are never deleted at worker exit.
-            phpunit_rust_rmtree($childTmp);
+            proust_rmtree($childTmp);
         });
     }
 
@@ -628,14 +707,14 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
             // declared into the master without any include-registry entry,
             // which every fork then inherits.
             if (str_contains($fatal['message'], 'Cannot redeclare')) {
-                $prewarm = $GLOBALS['__phpunit_rust_prewarm_count'] ?? 'off';
-                $leaked  = $GLOBALS['__phpunit_rust_prewarm_leaked'] ?? 'off';
+                $prewarm = $GLOBALS['__proust_prewarm_count'] ?? 'off';
+                $leaked  = $GLOBALS['__proust_prewarm_leaked'] ?? 'off';
                 // The surgical bit: is the class we died redeclaring one the
                 // master's pre-warm leaked? yes = mechanism confirmed.
                 $thisLeaked = 'n/a';
                 if (preg_match('/Cannot redeclare class (\S+)/', $fatal['message'], $m)) {
                     $thisLeaked = in_array(ltrim($m[1], '\\'),
-                        $GLOBALS['__phpunit_rust_prewarm_leaked_list'] ?? [], true)
+                        $GLOBALS['__proust_prewarm_leaked_list'] ?? [], true)
                         ? 'yes' : 'no';
                 }
                 $suffix .= " [prewarm={$prewarm} leaked={$leaked} this-class-leaked={$thisLeaked}]";
@@ -774,7 +853,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                         $dir = '/tmp';
                     }
                     $traceFile = ($dir && is_dir($dir))
-                        ? rtrim($dir, '/') . '/phpunit-rust-trace-' . getmypid() . '.txt'
+                        ? rtrim($dir, '/') . '/proust-trace-' . getmypid() . '.txt'
                         : false;
                 }
                 if ($traceFile !== false) {

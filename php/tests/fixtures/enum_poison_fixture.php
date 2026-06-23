@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests\Fixtures;
+namespace Proust\Tests\Fixtures;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
@@ -13,7 +13,7 @@ use PHPUnit\Framework\Attributes\RequiresPhpExtension;
  * provider (= do not stride-split): a split would emit one skip per chunk and
  * over-count vs vanilla's single skip on PHPUnit >=10.
  */
-#[RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+#[RequiresPhpExtension('proust_no_such_ext_xyz')]
 final class EnumGated
 {
     /** @return list<array{0: int}> */
@@ -39,7 +39,7 @@ final class EnumMethodGated
         return array_map(static fn (int $i): array => [$i], range(1, 20));
     }
 
-    #[RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+    #[RequiresPhpExtension('proust_no_such_ext_xyz')]
     #[DataProvider('rows')]
     public function testGated(int $i): void {}
 }

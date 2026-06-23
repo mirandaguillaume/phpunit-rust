@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust;
+namespace Proust;
 
 /**
  * Build-once, reset-per-test fixture isolation — the "transactional test" pattern,

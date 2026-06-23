@@ -1,5 +1,5 @@
 {
-    "name": "phpunit-rust/bake-fixture",
+    "name": "proust/bake-fixture",
     "type": "project",
     "autoload": {
         "psr-4": {

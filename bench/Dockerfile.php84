@@ -1,11 +1,11 @@
-# PHP 8.4 image with pcntl, used to bench phpunit-rust against projects that
+# PHP 8.4 image with pcntl, used to bench proust against projects that
 # require PHP >= 8.4 (currently phpunit-itself).
 #
 # The official php:N-cli images DON'T compile pcntl, so we build it. Without
 # pcntl, worker_fork.php can't fork — every benchmark would show 0 tests.
 #
-# Build:    docker build -f bench/Dockerfile.php84 -t phpunit-rust-bench:php84 .
-# Run:      docker run --rm -v "$PWD":/work -w /work phpunit-rust-bench:php84 \
+# Build:    docker build -f bench/Dockerfile.php84 -t proust-bench:php84 .
+# Run:      docker run --rm -v "$PWD":/work -w /work proust-bench:php84 \
 #               bench/bench_host.sh phpunit-itself
 FROM php:8.4-cli
 

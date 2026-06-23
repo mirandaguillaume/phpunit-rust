@@ -9,7 +9,7 @@ Workspace (Cargo)
   │                     · #[Test], @test, #[DataProvider], @dataProvider,
   │                       #[TestWith], @testWith, #[Group], @group
   │                     · custom-framework TestCase bases
-  ├─ crates/runner      phpunit-rust binary
+  ├─ crates/runner      proust binary
   │   ├─ phpunit_xml    bootstrap, <testsuites>, <php><const/env/server/ini>,
   │   │                 <groups><exclude>, <listeners>
   │   ├─ provider_enum  pre-fork PHP pass to count provider rows

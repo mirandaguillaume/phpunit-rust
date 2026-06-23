@@ -104,7 +104,7 @@ fn has_syntax_errors(tree: &tree_sitter::Tree) -> bool {
 fn warn_on_syntax_errors(tree: &tree_sitter::Tree, context: &str) {
     if has_syntax_errors(tree) {
         eprintln!(
-            "phpunit-rust: warning: tree-sitter found syntax errors while {context} \u{2014} mock baking may be incomplete"
+            "proust: warning: tree-sitter found syntax errors while {context} \u{2014} mock baking may be incomplete"
         );
     }
 }

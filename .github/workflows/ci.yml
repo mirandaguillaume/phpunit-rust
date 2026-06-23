@@ -53,7 +53,7 @@ jobs:
         run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
 
       # The fork-pool worker (php/worker_fork.php) require_once's php/vendor/autoload.php
-      # to load the PhpunitRust\ shim classes (TestExecutor/OutcomeBuilder). That vendor/
+      # to load the Proust\ shim classes (TestExecutor/OutcomeBuilder). That vendor/
       # is gitignored too — without it every worker fatals at startup, which silently
       # drops outcomes and breaks data-provider row enumeration (the parity count drift).
       # --no-dev: the worker needs only the shim autoloader; PHPUnit itself comes from the
@@ -68,8 +68,8 @@ jobs:
         run: cargo build --workspace
 
       # Build the optional coverage feature so it can't bit-rot unnoticed.
-      - name: cargo build -p phpunit-rust --features coverage
-        run: cargo build -p phpunit-rust --features coverage
+      - name: cargo build -p proust --features coverage
+        run: cargo build -p proust --features coverage
 
       - name: cargo test --workspace
         run: cargo test --workspace
@@ -87,7 +87,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   parity:
-    name: parity regression (vanilla phpunit vs phpunit-rust)
+    name: parity regression (vanilla phpunit vs proust)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -108,7 +108,7 @@ jobs:
         run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
 
       # The fork-pool worker (php/worker_fork.php) require_once's php/vendor/autoload.php
-      # to load the PhpunitRust\ shim classes (TestExecutor/OutcomeBuilder). That vendor/
+      # to load the Proust\ shim classes (TestExecutor/OutcomeBuilder). That vendor/
       # is gitignored too — without it every worker fatals at startup, which silently
       # drops outcomes and breaks data-provider row enumeration (the parity count drift).
       # --no-dev: the worker needs only the shim autoloader; PHPUnit itself comes from the
@@ -116,10 +116,10 @@ jobs:
       - name: Install worker shim dependencies (composer)
         run: composer install --no-dev --no-interaction --no-progress --working-dir=php
 
-      - name: Build phpunit-rust binary
-        run: cargo build -p phpunit-rust
+      - name: Build proust binary
+        run: cargo build -p proust
 
-      # Fails CI if vanilla PHPUnit and phpunit-rust disagree on the
+      # Fails CI if vanilla PHPUnit and proust disagree on the
       # Tests/Assertions summary counts for the bundled sample project.
       - name: Parity check against sample_project
         run: bash scripts/parity_check.sh crates/runner/fixtures/sample_project
@@ -148,5 +148,5 @@ jobs:
       - name: Install worker shim dependencies (composer, with dev)
         run: composer install --no-interaction --no-progress --working-dir=php
 
-      - name: Run php/tests (PhpunitRust shim suite)
+      - name: Run php/tests (Proust shim suite)
         run: php php/vendor/bin/phpunit --bootstrap php/vendor/autoload.php php/tests

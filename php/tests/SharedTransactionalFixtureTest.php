@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\SharedTransactionalFixture;
-use PhpunitRust\TestExecutor;
+use Proust\SharedTransactionalFixture;
+use Proust\TestExecutor;
 use PHPUnit\Framework\TestCase;
 
 /**

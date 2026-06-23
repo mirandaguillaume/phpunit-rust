@@ -13,7 +13,7 @@ PROJECT="${2:-$(pwd)}"
 shift 2 || true
 EXTRA_ARGS=("$@")
 
-BIN=/home/gumiranda/PHPUnit_rust/target/release/phpunit-rust
+BIN=/home/gumiranda/PHPUnit_rust/target/release/proust
 PHP_SCRIPTS=/home/gumiranda/PHPUnit_rust/php
 
 if [[ ! -f "$BIN" ]]; then
@@ -25,9 +25,9 @@ echo "=== PHP $PHP_IMAGE | $PROJECT ==="
 
 docker run --rm \
     --tmpfs "/tmp:rw,exec,nosuid,size=${TMPFS_SIZE:-4g}" \
-    -v "${BIN}:/phpunit-rust/target/release/phpunit-rust:ro" \
-    -v "${PHP_SCRIPTS}:/phpunit-rust/php:ro" \
+    -v "${BIN}:/proust/target/release/proust:ro" \
+    -v "${PHP_SCRIPTS}:/proust/php:ro" \
     -v "${PROJECT}:/app" \
     -w /app \
-    "phpunit-rust-test:${PHP_IMAGE}" \
-    /phpunit-rust/target/release/phpunit-rust --bake-mocks "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+    "proust-test:${PHP_IMAGE}" \
+    /proust/target/release/proust --bake-mocks "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"

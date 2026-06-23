@@ -6,10 +6,10 @@
 #   bench/run_oss_bench.sh /tmp/bench-table.md
 #
 # Env (all optional):
-#   BINARY   — path to phpunit-rust binary (default: target/release/phpunit-rust)
-#   SMOKE    — parent directory for cloned suites (default: /tmp/phpunit-rust-smoke)
+#   BINARY   — path to proust binary (default: target/release/proust)
+#   SMOKE    — parent directory for cloned suites (default: /tmp/proust-smoke)
 #   RUNS     — bench runs per suite (default: 3)
-#   WORKERS  — worker count passed to phpunit-rust (default: 4)
+#   WORKERS  — worker count passed to proust (default: 4)
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="${SCRIPT_DIR}/oss_suites.tsv"
 OUTPUT_FILE="${1:?Usage: $0 <output-file>}"
 
-BINARY="${BINARY:-${SCRIPT_DIR}/../target/release/phpunit-rust}"
-SMOKE="${SMOKE:-/tmp/phpunit-rust-smoke}"
+BINARY="${BINARY:-${SCRIPT_DIR}/../target/release/proust}"
+SMOKE="${SMOKE:-/tmp/proust-smoke}"
 RUNS="${RUNS:-3}"
 WORKERS="${WORKERS:-4}"
 
@@ -136,7 +136,7 @@ done
 # ---------------------------------------------------------------------------
 # raw rows look like:
 #   | carbon          | vanilla-phpunit |       1 |  6169 |    23281 ms |
-#   | carbon          | phpunit-rust    |       4 |  6169 |    10753 ms |
+#   | carbon          | proust    |       4 |  6169 |    10753 ms |
 #
 # Target format:
 #   | <name> | <vanTests> / <rustTests> | <van> ms | <rust> ms | <speedup>× |
@@ -163,14 +163,14 @@ foreach (file($rawFile, FILE_IGNORE_NEW_LINES) ?: [] as $line) {
     if (str_contains($runner, 'vanilla')) {
         $rows[$name]['van_tests'] = $tests;
         $rows[$name]['van_ms']    = $ms;
-    } elseif (str_contains($runner, 'phpunit-rust')) {
+    } elseif (str_contains($runner, 'proust')) {
         $rows[$name]['rust_tests'] = $tests;
         $rows[$name]['rust_ms']    = $ms;
     }
 }
 
 $lines = [
-    '| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |',
+    '| Project | Tests (vanilla / rust) | vanilla | proust | speedup |',
     '|---|---|---|---|---|',
 ];
 

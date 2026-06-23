@@ -20,7 +20,7 @@ read any ambient context. HOIST iff **no** ambient context is (re)established at
 per-test scope; otherwise REFUSE. This statically refuses exactly the hoists the
 earlier `clone`-refinement's *runtime* identity gate caught as failures.
 
-## Three measured cases (php8.4, PHPUnit 11.5.55, docker `phpunit-rust-bench:php84`)
+## Three measured cases (php8.4, PHPUnit 11.5.55, docker `proust-bench:php84`)
 
 The shared sub-tree is `Heavy::parseExpensive('2024-01-15 10:00:00')`: it parses the
 string in the **ambient** timezone, seeds a deterministic 31-bit mixing loop with the
@@ -75,7 +75,7 @@ node way3_compile.js --naive  tests/PerTestCtxTest.php  out/PerTestCtxNaiveTest.
 node way3_compile.js  <carbon>/tests/Carbon/DiffTest.php  out/DiffCompiledTest.php  <carbon>/tests/AbstractTestCase.php
 
 # gate + measure under php8.4 (mount a clean phpunit vendor, e.g. brick-math's):
-docker run --rm -v $PWD:/p -v <clean-vendor>:/p/vendor:ro -w /p phpunit-rust-bench:php84 \
+docker run --rm -v $PWD:/p -v <clean-vendor>:/p/vendor:ro -w /p proust-bench:php84 \
   sh -c "php vendor/bin/phpunit -c phpunit.xml <file>"
 ```
 

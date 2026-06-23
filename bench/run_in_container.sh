@@ -2,7 +2,7 @@
 #
 # bench/run_in_container.sh — run a bench command INSIDE the CI-faithful PHP
 # container (bench/Dockerfile.ci), so counts and timings come from a
-# reproducible environment where phpunit-rust is at parity on every suite,
+# reproducible environment where proust is at parity on every suite,
 # rather than from the bare runner's PHP build (which produces a count quirk).
 #
 # The runner-built release binary, php/ (with its installed vendor/), and bench/
@@ -10,7 +10,7 @@
 # A writable /out lets the command hand a results file back to the host.
 #
 # Usage:
-#   IMAGE=prust-ci:php84 WORKERS=4 bench/run_in_container.sh bash /work/bench/parity_one.sh carbon
+#   IMAGE=proust-ci:php84 WORKERS=4 bench/run_in_container.sh bash /work/bench/parity_one.sh carbon
 #   OUT_DIR=/tmp RUNS=3 WORKERS=4 bench/run_in_container.sh bash /work/bench/run_oss_bench.sh /out/bench-table.md
 #
 # Env: IMAGE, RUNS, WORKERS, OUT_DIR (host dir mounted at /out), TMPFS_SIZE.
@@ -18,7 +18,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${IMAGE:-prust-ci:php84}"
+IMAGE="${IMAGE:-proust-ci:php84}"
 OUT_DIR="${OUT_DIR:-/tmp}"
 mkdir -p "$OUT_DIR"
 
@@ -28,10 +28,10 @@ mkdir -p "$OUT_DIR"
 exec docker run --rm --init \
     --tmpfs "/tmp:rw,exec,nosuid,size=${TMPFS_SIZE:-6g}" \
     -v "${REPO}/bench":/work/bench:ro \
-    -v "${REPO}/target/release/phpunit-rust":/opt/phpunit-rust/bin/phpunit-rust:ro \
+    -v "${REPO}/target/release/proust":/opt/proust/bin/proust:ro \
     -v "${REPO}/php":/opt/php:ro \
     -v "${OUT_DIR}":/out \
-    -e BINARY=/opt/phpunit-rust/bin/phpunit-rust \
+    -e BINARY=/opt/proust/bin/proust \
     -e SMOKE=/tmp/smoke \
     -e RUNS="${RUNS:-1}" \
     -e WORKERS="${WORKERS:-4}" \

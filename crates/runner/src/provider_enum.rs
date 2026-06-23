@@ -3,7 +3,7 @@
 //! Historically the runner ran `enumerate_providers.php` before forking to
 //! learn each provider's row count and stride-split the heavy ones across
 //! workers. That enumerator was removed (see `main.rs`): in production it
-//! produced no usable counts (it could not load `\PhpunitRust\TestExecutor`, so
+//! produced no usable counts (it could not load `\Proust\TestExecutor`, so
 //! every provider degraded to `null`), and once made to work, stride-splitting
 //! measured net-slower on every OSS suite. The `RowCounts` map remains as the
 //! (now always empty) input to `build_queue`, which dispatches every method as
