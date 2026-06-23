@@ -330,6 +330,13 @@ if (is_string($autoload)) {
         if (is_file("$__root/$__n")) { $__cfgPath = "$__root/$__n"; break; }
     }
 }
+// Cheap pre-check: only attempt the (version-sensitive) full config load when
+// the config actually declares <extensions>. Suites without any (every OSS lib)
+// skip silently and pay nothing — and we avoid tripping over PHPUnit-version
+// differences in the config loader for projects that don't need the bridge.
+if ($__cfgPath !== null && !str_contains((string) @file_get_contents($__cfgPath), '<extensions')) {
+    $__cfgPath = null;
+}
 if ($__cfgPath !== null
     && class_exists(\PHPUnit\Event\Facade::class)
     && class_exists(\PHPUnit\Runner\Extension\ExtensionBootstrapper::class)
