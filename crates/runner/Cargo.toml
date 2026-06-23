@@ -1,12 +1,12 @@
 [package]
-name = "phpunit-rust"
+name = "proust"
 version = "0.9.0"
 edition = "2021"
 description = "A fast PHPUnit-compatible test runner orchestrating PHP workers from Rust"
 license = "MIT"
 
 [[bin]]
-name = "phpunit-rust"
+name = "proust"
 path = "src/main.rs"
 
 [lib]

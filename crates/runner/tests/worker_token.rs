@@ -1,5 +1,5 @@
-use phpunit_rust::fork_pool::PhpForkPool;
-use phpunit_rust::types::{BatchClass, BatchPlan, TestOutcome};
+use proust::fork_pool::PhpForkPool;
+use proust::types::{BatchClass, BatchPlan, TestOutcome};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -61,8 +61,8 @@ fn token_in(outcomes: &[TestOutcome]) -> String {
 fn worker_token_is_set_and_distinct_per_slot() {
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_token_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php");
+    let dir = std::env::temp_dir().join(format!("proust_token_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = write_echo_test(&dir);
 
@@ -125,8 +125,8 @@ fn worker_token_is_set_and_distinct_per_slot() {
 fn worker_token_stable_across_recycle() {
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_token_rcy_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php");
+    let dir = std::env::temp_dir().join(format!("proust_token_rcy_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = write_echo_test(&dir);
 

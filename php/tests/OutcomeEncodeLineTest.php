@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\OutcomeBuilder;
+use Proust\OutcomeBuilder;
 use PHPUnit\Framework\TestCase;
 
 /**

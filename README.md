@@ -1,4 +1,4 @@
-# phpunit-rust
+# proust
 
 A Rust orchestrator that runs PHPUnit tests in parallel using forked PHP
 workers — no FrankenPHP, no HTTP, no daemon. One PHP master loads the
@@ -43,22 +43,22 @@ cargo build --release
 composer install --no-dev --working-dir=php
 
 # auto-detect phpunit.xml; workers default to the number of detected CPU cores
-./target/release/phpunit-rust --project /path/to/php/project
+./target/release/proust --project /path/to/php/project
 
 # explicit worker count (honored verbatim; default = detected CPU cores)
-./target/release/phpunit-rust --project /path/to/php/project --workers 8
+./target/release/proust --project /path/to/php/project --workers 8
 
 # sequential (no parallelism overhead — best for tiny suites)
-./target/release/phpunit-rust --project /path/to/php/project --workers 1
+./target/release/proust --project /path/to/php/project --workers 1
 
 # filter by class or method name
-./target/release/phpunit-rust --project /path/to/php/project --filter MyClass
+./target/release/proust --project /path/to/php/project --filter MyClass
 
 # explicit bootstrap
-./target/release/phpunit-rust --project /path/to/php/project --bootstrap tests/bootstrap.php
+./target/release/proust --project /path/to/php/project --bootstrap tests/bootstrap.php
 
 # static coverage (requires --features coverage at build time)
-./target/release/phpunit-rust --project /path/to/php/project \
+./target/release/proust --project /path/to/php/project \
     --coverage-format clover --coverage-out coverage.xml
 ```
 

@@ -21,8 +21,8 @@
 // per-test target via setUp/wrapWithTestNow, so now() is NOT a fixed deterministic value).
 
 const fs = require('fs');
-const SRC = process.argv[2] || '/tmp/phpunit-rust-smoke/carbon/tests/Carbon/DiffTest.php';
-const OUT = process.argv[3] || '/tmp/phpunit-rust-smoke/carbon/tests/Carbon/DiffCloneTest.php';
+const SRC = process.argv[2] || '/tmp/proust-smoke/carbon/tests/Carbon/DiffTest.php';
+const OUT = process.argv[3] || '/tmp/proust-smoke/carbon/tests/Carbon/DiffCloneTest.php';
 
 const s = fs.readFileSync(SRC, 'utf8');
 const RELATIVE = /\b(now|today|tomorrow|yesterday|next|last|ago|\+|first day|this )\b/i;

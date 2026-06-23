@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Host benchmark for phpunit-rust vs vanilla PHPUnit (and optionally ParaTest).
+# Host benchmark for proust vs vanilla PHPUnit (and optionally ParaTest).
 # Runs each project N times and reports the median wall time.
 #
 # Requires: PHP with pcntl extension, composer-installed project deps.
@@ -16,8 +16,8 @@
 
 set -euo pipefail
 
-BINARY="${BINARY:-/home/gumiranda/PHPUnit_rust/target/release/phpunit-rust}"
-SMOKE="${SMOKE:-/tmp/phpunit-rust-smoke}"
+BINARY="${BINARY:-/home/gumiranda/PHPUnit_rust/target/release/proust}"
+SMOKE="${SMOKE:-/tmp/proust-smoke}"
 RUNS="${RUNS:-3}"
 WORKERS="${WORKERS:-4}"
 SKIP_VANILLA="${SKIP_VANILLA:-0}"
@@ -52,7 +52,7 @@ fi
 #
 # phpunit-itself: restrict vanilla to the `unit` testsuite. PHPUnit's own suite
 # splits into `unit` (regular *Test.php classes) and `end-to-end` (1000+ `.phpt`
-# files). phpunit-rust discovers tests by reflecting *Test.php CLASSES, so it
+# files). proust discovers tests by reflecting *Test.php CLASSES, so it
 # cannot run the file-based `.phpt` format at all — comparing against vanilla's
 # full run (unit + .phpt) would be apples-to-oranges. `--testsuite unit` makes
 # the comparison like-for-like. The `.phpt` gap is documented in COMPATIBILITY.md
@@ -131,7 +131,7 @@ for name in "${PROJECTS[@]}"; do
             "$name" "vanilla-phpunit" "1" "$tests" "$median_ms"
     fi
 
-    # phpunit-rust. `--worker-memory-limit=-1` so the comparison is
+    # proust. `--worker-memory-limit=-1` so the comparison is
     # apples-to-apples: vanilla above runs with `-d memory_limit=-1` (and the
     # bench image lifts the cap globally). At the default 512M, memory-heavy
     # suites (doctrine's SecondLevelCache*, php-parser's 47-row
@@ -141,7 +141,7 @@ for name in "${PROJECTS[@]}"; do
     # drift the forensics pinned (exit code 255 worker deaths, CI-only).
     read median_ms tests < <(bench_runs "$BINARY" --project "$path" --workers "$WORKERS" --worker-memory-limit=-1)
     printf "| %-22s | %-15s | %7s | %6s | %7s ms |\n" \
-        "$name" "phpunit-rust" "$WORKERS" "$tests" "$median_ms"
+        "$name" "proust" "$WORKERS" "$tests" "$median_ms"
 
     # ParaTest (optional, must be installed at $PARATEST_BIN)
     if [ "$PARATEST" = "1" ] && [ -x "$PARATEST_BIN" ]; then

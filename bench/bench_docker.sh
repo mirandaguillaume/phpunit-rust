@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Docker benchmark wrapper: runs phpunit-rust + vanilla PHPUnit inside a
+# Docker benchmark wrapper: runs proust + vanilla PHPUnit inside a
 # container that has PHP 8.4 + pcntl. Use this for projects that require a
 # newer PHP than the host (phpunit-itself currently requires >= 8.4).
 #
 # Build the image once:
-#   docker build -f bench/Dockerfile.php84 -t phpunit-rust-bench:php84 .
+#   docker build -f bench/Dockerfile.php84 -t proust-bench:php84 .
 #
 # Then run a single-project bench (composer install runs on first use):
 #   bench/bench_docker.sh phpunit-itself
@@ -16,11 +16,11 @@
 set -euo pipefail
 
 PROJECT="${1:-phpunit-itself}"
-SMOKE="${SMOKE:-/tmp/phpunit-rust-smoke}"
-IMAGE="${IMAGE:-phpunit-rust-bench:php84}"
+SMOKE="${SMOKE:-/tmp/proust-smoke}"
+IMAGE="${IMAGE:-proust-bench:php84}"
 RUNS="${RUNS:-3}"
 WORKERS="${WORKERS:-4}"
-BINARY="${BINARY:-/home/gumiranda/PHPUnit_rust/target/release/phpunit-rust}"
+BINARY="${BINARY:-/home/gumiranda/PHPUnit_rust/target/release/proust}"
 PHP_SCRIPTS="${PHP_SCRIPTS:-/home/gumiranda/PHPUnit_rust/php}"
 
 PROJ_DIR="$SMOKE/$PROJECT"
@@ -34,7 +34,7 @@ PROJ_DIR="$SMOKE/$PROJECT"
 # `-d memory_limit=-1`: the bench image ships PHP's default 128M limit, which
 # carbon's full 6169-test suite blows through near the end (Fatal error:
 # Allowed memory size exhausted), so vanilla dies before printing a summary
-# and the count shows "?". phpunit-rust never hit this because each forked
+# and the count shows "?". proust never hit this because each forked
 # worker gets --worker-memory-limit. Lift the cap for vanilla so the
 # comparison is apples-to-apples.
 PHP_VANILLA="php -d memory_limit=-1"
@@ -96,7 +96,7 @@ DOCKER_FLAGS=(
     --init
     --tmpfs "/tmp:rw,exec,nosuid,size=${TMPFS_SIZE:-4g}"
     -v "$PROJ_DIR":/proj
-    -v "$BINARY":/opt/phpunit-rust/bin/phpunit-rust:ro
+    -v "$BINARY":/opt/proust/bin/proust:ro
     -v "$PHP_SCRIPTS":/opt/php:ro
     -w /proj
 )
@@ -104,8 +104,8 @@ DOCKER_FLAGS=(
 # Some suites read configuration from the environment in their bootstrap.
 # brick-math's phpunit.php hard-`exit(1)`s unless CALCULATOR is set
 # (GMP|BCMath|Native) — without it vanilla aborts before any test runs and
-# every forked phpunit-rust worker crashes (265 errored). The container must
-# pass these through to BOTH vanilla and phpunit-rust so the comparison is
+# every forked proust worker crashes (265 errored). The container must
+# pass these through to BOTH vanilla and proust so the comparison is
 # faithful. Per-project defaults below; override via `ENV_VARS="FOO=bar BAZ=1"`.
 declare -A PROJECT_ENV=(
     [brick-math]="CALCULATOR=GMP"
@@ -175,7 +175,7 @@ read median_ms tests < <(bench_runs sh -c "$VANILLA")
 printf "| %-22s | %-15s | %7s | %6s | %7s ms |\n" \
     "$PROJECT" "vanilla-phpunit" "1" "$tests" "$median_ms"
 
-# phpunit-rust
-read median_ms tests < <(bench_runs /opt/phpunit-rust/bin/phpunit-rust --project /proj --workers "$WORKERS")
+# proust
+read median_ms tests < <(bench_runs /opt/proust/bin/proust --project /proj --workers "$WORKERS")
 printf "| %-22s | %-15s | %7s | %6s | %7s ms |\n" \
-    "$PROJECT" "phpunit-rust" "$WORKERS" "$tests" "$median_ms"
+    "$PROJECT" "proust" "$WORKERS" "$tests" "$median_ms"

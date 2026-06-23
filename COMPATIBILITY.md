@@ -1,6 +1,6 @@
 # Compatibility
 
-Lists the PHPUnit features that phpunit-rust supports today, and the ones that are explicitly deferred.
+Lists the PHPUnit features that proust supports today, and the ones that are explicitly deferred.
 
 ### Supported
 
@@ -114,7 +114,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 
 **Robustness:**
 
-- SIGINT / SIGKILL on `phpunit-rust` reliably kills the PHP master and
+- SIGINT / SIGKILL on `proust` reliably kills the PHP master and
   every forked child via kernel `PR_SET_PDEATHSIG` + PHP signal handlers
   — no orphan workers, no zombie 100%-CPU PHP processes after a Ctrl-C
 - Each forked child becomes its own process-group leader (`posix_setpgid`);
@@ -132,7 +132,7 @@ attribution; no Xdebug / PCOV needed).
 
 ### State isolation (important limitation)
 
-phpunit-rust runs many test classes inside one long-lived worker fork to
+proust runs many test classes inside one long-lived worker fork to
 amortise PHP startup, which changes the isolation contract versus vanilla
 PHPUnit:
 
@@ -166,7 +166,7 @@ PHPUnit:
 
 - **`.phpt` tests.** PHPUnit's file-based test format (a mini-INI with
   `--TEST--` / `--FILE--` / `--EXPECT--` sections) is not a PHP class, and
-  phpunit-rust discovers tests by reflecting `*Test.php` **classes** — so
+  proust discovers tests by reflecting `*Test.php` **classes** — so
   `.phpt` files are invisible to it by construction. This is a structural gap,
   not a bug: supporting it means teaching the runner a second execution model.
   It mainly affects PHPUnit's own suite (`sebastianbergmann/phpunit`), whose

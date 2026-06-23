@@ -1,8 +1,8 @@
 export TOKEN_WARNING_DISABLED=1
 set -e
-CARBON=/tmp/phpunit-rust-smoke/carbon
+CARBON=/tmp/proust-smoke/carbon
 RUNS=9
-docker run --rm -v "$CARBON":/p -w /p phpunit-rust-bench:php84 sh -c '
+docker run --rm -v "$CARBON":/p -w /p proust-bench:php84 sh -c '
 PHPUNIT_BIN=vendor/bin/phpunit
 RUNS='"$RUNS"'
 # Warm caches first (one untimed run each).

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust;
+namespace Proust;
 
 use PHPUnit\Framework\AssertionFailedError;
 use PHPUnit\Framework\ExpectationFailedException;
@@ -11,7 +11,7 @@ use PHPUnit\Framework\SkippedWithMessageException;
 
 /**
  * Classifies a (possibly null) exception thrown during a test run into the
- * canonical phpunit-rust outcome shape. Pure / side-effect-free.
+ * canonical proust outcome shape. Pure / side-effect-free.
  */
 final class OutcomeBuilder
 {
@@ -81,22 +81,22 @@ final class OutcomeBuilder
                 'method'      => self::asciiScalar($payload['method'] ?? ''),
                 'dataset'     => null,
                 'status'      => self::asciiScalar($payload['status'] ?? 'error'),
-                'message'     => '[phpunit-rust: outcome message dropped — json_encode failed (invalid UTF-8 or unencodable value)]',
+                'message'     => '[proust: outcome message dropped — json_encode failed (invalid UTF-8 or unencodable value)]',
                 'trace'       => null,
                 'duration_ms' => is_numeric($payload['duration_ms'] ?? null)
                     ? (float) $payload['duration_ms']
                     : 0.0,
             ]
             : [
-                'phpunit_rust_encode_error' => true,
-                'message' => '[phpunit-rust: worker payload dropped — json_encode failed (invalid UTF-8 or unencodable value)]',
+                'proust_encode_error' => true,
+                'message' => '[proust: worker payload dropped — json_encode failed (invalid UTF-8 or unencodable value)]',
             ];
 
         $json = json_encode($fallback, $flags);
         if (!is_string($json) || $json === '') {
             // Absolute last resort: a hand-built constant ASCII line that is
             // guaranteed valid JSON. Should be unreachable.
-            $json = '{"phpunit_rust_encode_error":true}';
+            $json = '{"proust_encode_error":true}';
         }
         return $json . "\n";
     }

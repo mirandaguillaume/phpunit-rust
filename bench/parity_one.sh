@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # bench/parity_one.sh — clone + run ONE OSS suite at workers=1 and assert that
-# phpunit-rust executed the SAME number of tests as vanilla PHPUnit.
+# proust executed the SAME number of tests as vanilla PHPUnit.
 #
 # Designed to run as one matrix job per suite:
 #   * isolation — a crash or resource spike in one suite can't corrupt another,
@@ -13,7 +13,7 @@
 #     parity, not the runner's scheduling.
 #
 # Usage: bench/parity_one.sh <suite-name>
-# Env:   SMOKE (clone parent dir), BINARY (phpunit-rust path)
+# Env:   SMOKE (clone parent dir), BINARY (proust path)
 # Exit:  0 = parity; 1 = count mismatch / crash / no data; 2 = usage / setup error.
 
 set -uo pipefail
@@ -78,8 +78,8 @@ gate_verdict() {
 [[ "${PARITY_ONE_SOURCED:-0}" == "1" ]] && return 0
 
 SUITE="${1:?Usage: $0 <suite-name>}"
-SMOKE="${SMOKE:-/tmp/phpunit-rust-smoke}"
-BINARY="${BINARY:-${SCRIPT_DIR}/../target/release/phpunit-rust}"
+SMOKE="${SMOKE:-/tmp/proust-smoke}"
+BINARY="${BINARY:-${SCRIPT_DIR}/../target/release/proust}"
 mkdir -p "$SMOKE"
 
 # Look up the suite's clone URL / ref / extra_env / composer_args from the manifest.
@@ -129,7 +129,7 @@ echo "${out}"
 
 # bench_host rows: | name | runner | workers | tests | wall ms |  → tests is field 5.
 van="$(awk -F'|'  '/vanilla-phpunit/ {gsub(/[^0-9?]/,"",$5); print $5; exit}' <<<"${out}")"
-rust="$(awk -F'|' '/phpunit-rust/    {gsub(/[^0-9?]/,"",$5); print $5; exit}' <<<"${out}")"
+rust="$(awk -F'|' '/proust/    {gsub(/[^0-9?]/,"",$5); print $5; exit}' <<<"${out}")"
 
 # Forensics: collapse BOTH sides to per-method row counts and print only the
 # divergent methods, so a red gate's CI log pinpoints exactly which tests

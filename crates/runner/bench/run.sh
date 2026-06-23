@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Multi-PHP-version benchmark for phpunit-rust via Docker.
+# Multi-PHP-version benchmark for proust via Docker.
 #
 # Runs each (PHP_VERSION × PROJECT × WORKERS) combination inside the
 # matching `php:VERSION-cli` Docker container and captures wall-clock,
 # max-RSS, and CPU%. Writes a markdown table to stdout.
 #
 # Assumes:
-#   - phpunit-rust release binary is built (./target/release/phpunit-rust)
-#   - Projects are cloned + composer-installed under /tmp/phpunit-rust-smoke/
+#   - proust release binary is built (./target/release/proust)
+#   - Projects are cloned + composer-installed under /tmp/proust-smoke/
 #   - Docker is on $PATH
 #
 # Usage:
@@ -17,8 +17,8 @@
 set -euo pipefail
 
 REPO=/home/gumiranda/PHPUnit_rust
-SMOKE=/tmp/phpunit-rust-smoke
-BINARY="$REPO/target/release/phpunit-rust"
+SMOKE=/tmp/proust-smoke
+BINARY="$REPO/target/release/proust"
 
 # Project entries: "name|host_path|min_php_ver|extra_env|phpunit_args|php_flags|phpunit_bin"
 #
@@ -130,7 +130,7 @@ run_in_container() {
     [ -z "${cpu_raw:-}" ] && cpu_raw="?"
     G_CPU="$cpu_raw"
 
-    # Test count: phpunit-rust   → "Tests: N total, P passed, ..."
+    # Test count: proust   → "Tests: N total, P passed, ..."
     #             vanilla PHPUnit → "Tests: N, Assertions: ..."  or
     #                               "OK (N tests, ...)"
     #             PHPUnit 9 verbose → "N / M (P%)" progress lines (Symfony
@@ -179,11 +179,11 @@ for php_ver in "${PHP_VERSIONS[@]}"; do
             "${env_prefix}php ${php_flags:-} ${bin} ${phpunit_args:-}"
         echo "| $php_ver | $name | vanilla-phpunit | 1 | $G_TESTS | $G_WALL | $G_RSS_MB | $G_CPU |"
 
-        # --- phpunit-rust at each worker count ---
+        # --- proust at each worker count ---
         for workers in "${WORKERS[@]}"; do
             run_in_container "$php_ver" "$path" \
-                "${env_prefix}/work/target/release/phpunit-rust --project /proj --workers $workers"
-            echo "| $php_ver | $name | phpunit-rust | $workers | $G_TESTS | $G_WALL | $G_RSS_MB | $G_CPU |"
+                "${env_prefix}/work/target/release/proust --project /proj --workers $workers"
+            echo "| $php_ver | $name | proust | $workers | $G_TESTS | $G_WALL | $G_RSS_MB | $G_CPU |"
         done
     done
 done

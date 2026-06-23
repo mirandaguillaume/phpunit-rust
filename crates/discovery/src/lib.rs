@@ -6,7 +6,7 @@
 //! `#[Test]` attribute, plus `#[DataProvider]` / `@dataProvider` markers
 //! per method.
 //!
-//! Used by both the phpunit-rust runner (for dispatch) and the analyzer
+//! Used by both the proust runner (for dispatch) and the analyzer
 //! (for coverage tracing entry points).
 
 use anyhow::{anyhow, Context, Result};
@@ -278,7 +278,7 @@ fn parse_file_classes(path: &Path) -> Result<Vec<ParsedClass>> {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "phpunit-rust: warning: {} contains non-UTF-8 bytes \u{2014} decoding lossily; some characters may be replaced",
+                "proust: warning: {} contains non-UTF-8 bytes \u{2014} decoding lossily; some characters may be replaced",
                 path.display()
             );
             String::from_utf8_lossy(e.as_bytes()).into_owned()
@@ -299,7 +299,7 @@ fn parse_file_classes(path: &Path) -> Result<Vec<ParsedClass>> {
     // discrepancy is observable rather than silent.
     if has_syntax_errors(&tree) {
         eprintln!(
-            "phpunit-rust: warning: tree-sitter found syntax errors in {} \u{2014} some tests may be missed",
+            "proust: warning: tree-sitter found syntax errors in {} \u{2014} some tests may be missed",
             path.display()
         );
     }
@@ -2464,7 +2464,7 @@ mod tests {
     fn shared_fixture_use_marker_reported_file_scope_not() {
         // In-class `use SharedTransactionalFixture;` is the opt-in marker.
         let (_d1, p1) = write_tmp(
-            "<?php\nuse PhpunitRust\\SharedTransactionalFixture;\n\
+            "<?php\nuse Proust\\SharedTransactionalFixture;\n\
              class FooTest extends \\PHPUnit\\Framework\\TestCase {\n\
                  use SharedTransactionalFixture;\n\
                  public function testA() { $this->assertTrue(true); }\n\
@@ -2479,7 +2479,7 @@ mod tests {
 
         // A file-scope import WITHOUT an in-class use must NOT be reported.
         let (_d2, p2) = write_tmp(
-            "<?php\nuse PhpunitRust\\SharedTransactionalFixture;\n\
+            "<?php\nuse Proust\\SharedTransactionalFixture;\n\
              class BarTest extends \\PHPUnit\\Framework\\TestCase {\n\
                  public function testA() { $this->assertTrue(true); }\n\
              }\n",

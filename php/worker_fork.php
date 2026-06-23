@@ -44,7 +44,7 @@ const WORKER_EXIT_VOLUNTARY_RECYCLE = 6; // K-batch / force_exit_after recycle
 const WORKER_EXIT_STDIN_EOF         = 7; // Rust closed our stdin; slot is done
 
 // Main-body guard. The top-level `function` declarations below (write_line,
-// phpunit_rust_rmtree, runChild, emitError) are hoisted at compile time and so
+// proust_rmtree, runChild, emitError) are hoisted at compile time and so
 // remain callable even though we `return` here — which lets the PHP unit tests
 // `require` this file purely to exercise those helpers WITHOUT spawning the
 // fork-pool master. The master only runs when this file is the entry script
@@ -78,8 +78,8 @@ $__log_phase('start');
 require_once __DIR__ . '/vendor/autoload.php';
 $__log_phase('worker_vendor_autoload');
 
-use PhpunitRust\OutcomeBuilder;
-use PhpunitRust\TestExecutor;
+use Proust\OutcomeBuilder;
+use Proust\TestExecutor;
 
 /**
  * Write one worker payload to $stream as a newline-delimited JSON line.
@@ -119,7 +119,7 @@ function write_line($stream, array $payload): void
  * Best-effort: every removal is silenced; a child exiting can't afford to
  * fatal on a cleanup race, and tmpfs reclaims the rest when the container ends.
  */
-function phpunit_rust_rmtree(string $path): void
+function proust_rmtree(string $path): void
 {
     // Guard the top path with lstat semantics: a symlink (even one whose
     // target is a directory) is unlinked as a link, never traversed.
@@ -141,7 +141,7 @@ function phpunit_rust_rmtree(string $path): void
             // load-bearing branch — is_dir($sub) would have followed the link.
             @unlink($sub);
         } elseif (is_dir($sub)) {
-            phpunit_rust_rmtree($sub);
+            proust_rmtree($sub);
         } else {
             @unlink($sub);
         }
@@ -433,7 +433,7 @@ for ($i = 0; $i < $n; $i++) {
 //   - Rust's Drop sending SIGTERM during normal shutdown
 //   - The kernel's PR_SET_PDEATHSIG firing SIGTERM when Rust dies of any
 //     other cause (SIGKILL, panic before Drop, OOM, …)
-//   - User hitting Ctrl-C on phpunit-rust (SIGINT propagates to the
+//   - User hitting Ctrl-C on proust (SIGINT propagates to the
 //     process group)
 // We SIGKILL every forked child immediately so a child stuck in setUp or
 // an infinite-loop test can't outlive its parent.
@@ -650,7 +650,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
     // directly rather than the env var). The dir is best-effort cleaned by
     // a shutdown hook; tmpfs takes care of the rest when the container ends.
     $childPid = getmypid();
-    $childTmp = sys_get_temp_dir() . "/phpunit-rust-worker-" . $childPid;
+    $childTmp = sys_get_temp_dir() . "/proust-worker-" . $childPid;
     if (@mkdir($childTmp, 0700, true) || is_dir($childTmp)) {
         putenv("TMPDIR={$childTmp}");
         putenv("TMP={$childTmp}");
@@ -660,10 +660,10 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         @ini_set('sys_temp_dir', $childTmp);
         register_shutdown_function(static function () use ($childTmp): void {
             // Recursive rmdir — best effort, ignore failures. Uses lstat
-            // semantics (see phpunit_rust_rmtree): a symlink a test wrote into
+            // semantics (see proust_rmtree): a symlink a test wrote into
             // its TMPDIR is unlinked as a link, NEVER followed, so an external
             // target's contents are never deleted at worker exit.
-            phpunit_rust_rmtree($childTmp);
+            proust_rmtree($childTmp);
         });
     }
 
@@ -700,14 +700,14 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
             // declared into the master without any include-registry entry,
             // which every fork then inherits.
             if (str_contains($fatal['message'], 'Cannot redeclare')) {
-                $prewarm = $GLOBALS['__phpunit_rust_prewarm_count'] ?? 'off';
-                $leaked  = $GLOBALS['__phpunit_rust_prewarm_leaked'] ?? 'off';
+                $prewarm = $GLOBALS['__proust_prewarm_count'] ?? 'off';
+                $leaked  = $GLOBALS['__proust_prewarm_leaked'] ?? 'off';
                 // The surgical bit: is the class we died redeclaring one the
                 // master's pre-warm leaked? yes = mechanism confirmed.
                 $thisLeaked = 'n/a';
                 if (preg_match('/Cannot redeclare class (\S+)/', $fatal['message'], $m)) {
                     $thisLeaked = in_array(ltrim($m[1], '\\'),
-                        $GLOBALS['__phpunit_rust_prewarm_leaked_list'] ?? [], true)
+                        $GLOBALS['__proust_prewarm_leaked_list'] ?? [], true)
                         ? 'yes' : 'no';
                 }
                 $suffix .= " [prewarm={$prewarm} leaked={$leaked} this-class-leaked={$thisLeaked}]";
@@ -846,7 +846,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                         $dir = '/tmp';
                     }
                     $traceFile = ($dir && is_dir($dir))
-                        ? rtrim($dir, '/') . '/phpunit-rust-trace-' . getmypid() . '.txt'
+                        ? rtrim($dir, '/') . '/proust-trace-' . getmypid() . '.txt'
                         : false;
                 }
                 if ($traceFile !== false) {

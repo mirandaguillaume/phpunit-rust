@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust;
+namespace Proust;
 
 use PHPUnit\Framework\TestCase;
 
@@ -441,7 +441,7 @@ final class TestExecutor
     }
 
     // --- Event bridge (option A) -------------------------------------------
-    // prust hand-rolls the lifecycle and never runs PHPUnit's TestRunner, so
+    // proust hand-rolls the lifecycle and never runs PHPUnit's TestRunner, so
     // <extensions> (which subscribe to events) never fire. To make event-based
     // extensions like DAMADoctrineTestBundle work, worker_fork.php bootstraps
     // the configured extensions + seals the Event\Facade, and we emit the test
@@ -456,7 +456,7 @@ final class TestExecutor
             // PRUST_EVENT_BRIDGE is set by worker_fork.php ONLY after it has
             // bootstrapped >=1 <extensions> and sealed the Event\Facade. Gating
             // on it is load-bearing: without it we would emit events for EVERY
-            // run (incl. suites with no extensions, and — fatally — when prust's
+            // run (incl. suites with no extensions, and — fatally — when proust's
             // OWN unit tests invoke TestExecutor::runClass, polluting the outer
             // PHPUnit run's already-sealed facade). class_exists alone is not
             // enough because the Event API is always present on PHPUnit >=10.

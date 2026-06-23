@@ -25,18 +25,18 @@ use std::time::{Duration, Instant};
 /// recovered as an Error within a bounded time — never hang the run.
 #[test]
 fn voluntary_exit0_midbatch_is_recovered_not_clean_recycle() {
-    use phpunit_rust::fork_pool::PhpForkPool;
-    use phpunit_rust::provider_enum::RowCounts;
-    use phpunit_rust::runner::{run, RunConfig};
-    use phpunit_rust::types::{TestCase, TestStatus};
+    use proust::fork_pool::PhpForkPool;
+    use proust::provider_enum::RowCounts;
+    use proust::runner::{run, RunConfig};
+    use proust::types::{TestCase, TestStatus};
 
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php not found");
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php not found");
 
     // A test method that calls exit(0) — exactly what a misbehaving
     // provider/teardown/test does. PHPUnit never gets to emit an outcome.
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_die_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("proust_die_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let test_file = dir.join("DieTest.php");
     std::fs::write(

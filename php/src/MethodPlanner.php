@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust;
+namespace Proust;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\DataProviderExternal;

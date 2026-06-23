@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\TestExecutor;
+use Proust\TestExecutor;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -24,7 +24,7 @@ final class _TxFixture extends TestCase
         // Use the SAME connection the runner wraps in begin/rollback. A local
         // `new \PDO(...)` would be a separate connection that autocommits
         // independently, so the runner's rollback would isolate nothing.
-        $pdo = \PhpunitRust\TestExecutor::connection();
+        $pdo = \Proust\TestExecutor::connection();
         \PHPUnit\Framework\Assert::assertNotNull(
             $pdo,
             'TestExecutor::connection() returned null; PHPUNIT_RUST_DB_DSN must be set for this fixture'
@@ -67,7 +67,7 @@ final class _TxCommitLeakFixture extends TestCase
 {
     public function testCommitsInsideTransaction(): void
     {
-        $pdo = \PhpunitRust\TestExecutor::connection();
+        $pdo = \Proust\TestExecutor::connection();
         \PHPUnit\Framework\Assert::assertNotNull($pdo);
         // Explicit commit ends the runner-opened transaction. The finally guard
         // sees inTransaction()===false and must emit the leak breadcrumb.
@@ -87,7 +87,7 @@ final class TransactionResetTest extends TestCase
         if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
             $this->markTestSkipped('pdo_sqlite driver not available; P2 isolation test needs a per-worker DB');
         }
-        $this->dbFile = sys_get_temp_dir() . '/phpunit_rust_p2_' . getmypid() . '.sqlite';
+        $this->dbFile = sys_get_temp_dir() . '/proust_p2_' . getmypid() . '.sqlite';
         @unlink($this->dbFile);
         putenv('PHPUNIT_RUST_DB_DSN=sqlite:' . $this->dbFile);
     }
@@ -134,8 +134,8 @@ final class TransactionResetTest extends TestCase
             require %s;
             putenv('PHPUNIT_RUST_DB_DSN=sqlite:' . %s);
             putenv('PHPUNIT_RUST_SLOT=3');
-            \PhpunitRust\TestExecutor::runClass(
-                \PhpunitRust\Tests\_TxCommitLeakFixture::class,
+            \Proust\TestExecutor::runClass(
+                \Proust\Tests\_TxCommitLeakFixture::class,
                 ['testCommitsInsideTransaction']
             );
             PHP;

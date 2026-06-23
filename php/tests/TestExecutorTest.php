@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace PhpunitRust\Tests;
+namespace Proust\Tests;
 
-use PhpunitRust\TestExecutor;
+use Proust\TestExecutor;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Depends;
 use PHPUnit\Framework\TestCase;
@@ -74,7 +74,7 @@ final class _ExecEmptyProvider extends TestCase
     public function testNoData(int $x): void { $this->fail('must never run'); }
 }
 
-#[\PHPUnit\Framework\Attributes\RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+#[\PHPUnit\Framework\Attributes\RequiresPhpExtension('proust_no_such_ext_xyz')]
 final class _ExecRequiresUnmet extends TestCase
 {
     // Mirrors monolog's MongoDBFormatterTest: a class-level requirement that is
@@ -92,7 +92,7 @@ final class _ExecMethodRequiresUnmet extends TestCase
     public static function rows(): array { return [[1], [2], [3]]; }
 
     #[DataProvider('rows')]
-    #[\PHPUnit\Framework\Attributes\RequiresPhpExtension('phpunit_rust_no_such_ext_xyz')]
+    #[\PHPUnit\Framework\Attributes\RequiresPhpExtension('proust_no_such_ext_xyz')]
     public function testGatedMethod(int $x): void { $this->assertTrue(true); }
 
     #[DataProvider('rows')]

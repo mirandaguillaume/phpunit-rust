@@ -1,14 +1,14 @@
 # Benchmark harness
 
-`run.sh` runs phpunit-rust + vanilla PHPUnit against the cloned smoke projects
+`run.sh` runs proust + vanilla PHPUnit against the cloned smoke projects
 inside Docker containers for each supported PHP version. Lets us measure
 correctly across PHP 8.1-8.5 without modifying the host system.
 
 ## Prereqs
 
 - Docker on `$PATH`
-- `./target/release/phpunit-rust` built (`cargo build --release` from repo root)
-- Smoke projects cloned + composer-installed under `/tmp/phpunit-rust-smoke/`:
+- `./target/release/proust` built (`cargo build --release` from repo root)
+- Smoke projects cloned + composer-installed under `/tmp/proust-smoke/`:
   - `brick-math/` (https://github.com/brick/math)
   - `doctrine-collections/` (https://github.com/doctrine/collections)
   - `guzzle-psr7/` (https://github.com/guzzle/psr7)
@@ -35,5 +35,5 @@ Performance section.
 - `/usr/bin/time -v` (GNU time) is bundled with the official `php:VERSION-cli`
   images so we don't need to install anything extra in the container.
 - The script skips a project silently if its path does not exist under
-  `/tmp/phpunit-rust-smoke/` — only the `fixture` project (bundled in the
+  `/tmp/proust-smoke/` — only the `fixture` project (bundled in the
   repo) is always present.

@@ -2,7 +2,7 @@
 name = "discovery"
 version = "0.9.0"
 edition = "2021"
-description = "Shared PHPUnit test discovery: tree-sitter-based class + method + data-provider extraction. Used by phpunit-rust runner and analyzer."
+description = "Shared PHPUnit test discovery: tree-sitter-based class + method + data-provider extraction. Used by proust runner and analyzer."
 license = "MIT"
 
 [lib]

@@ -1,8 +1,8 @@
-# PHP 8.2 image with pcntl, used to bench phpunit-rust against projects that
+# PHP 8.2 image with pcntl, used to bench proust against projects that
 # require PHP >= 8.2 (monolog, twig, php-cs-fixer).
 #
-# Build:  docker build -f bench/Dockerfile.php82 -t phpunit-rust-bench:php82 .
-# Run:    bench/bench_docker.sh <project>  IMAGE=phpunit-rust-bench:php82
+# Build:  docker build -f bench/Dockerfile.php82 -t proust-bench:php82 .
+# Run:    bench/bench_docker.sh <project>  IMAGE=proust-bench:php82
 FROM php:8.2-cli
 
 RUN docker-php-ext-install pcntl \

@@ -1228,29 +1228,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "phpunit-rust"
-version = "0.9.0"
-dependencies = [
- "analyzer",
- "anyhow",
- "blake3",
- "clap",
- "colored",
- "discovery",
- "libc",
- "mock_baker",
- "num_cpus",
- "quick-xml",
- "rayon",
- "serde",
- "serde_json",
- "tempfile",
- "tree-sitter",
- "tree-sitter-php",
- "walkdir",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,6 +1308,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proust"
+version = "0.9.0"
+dependencies = [
+ "analyzer",
+ "anyhow",
+ "blake3",
+ "clap",
+ "colored",
+ "discovery",
+ "libc",
+ "mock_baker",
+ "num_cpus",
+ "quick-xml",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-php",
+ "walkdir",
 ]
 
 [[package]]

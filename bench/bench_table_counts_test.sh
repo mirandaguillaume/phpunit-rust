@@ -38,7 +38,7 @@ trap 'rm -rf "${tmp}"' EXIT
 cat > "${tmp}/base.md" <<'EOF'
 # Benchmarks
 <!-- BENCH:TABLE:START (auto-generated) -->
-| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |
+| Project | Tests (vanilla / rust) | vanilla | proust | speedup |
 |---|---|---|---|---|
 | brick-math | 20392 / 20392 | 3022 ms | 1042 ms | 2.9× |
 | carbon | 6145 / 6145 | 34646 ms | 20021 ms | 1.7× |
@@ -50,7 +50,7 @@ EOF
 cat > "${tmp}/jitter.md" <<'EOF'
 # Benchmarks
 <!-- BENCH:TABLE:START (auto-generated) -->
-| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |
+| Project | Tests (vanilla / rust) | vanilla | proust | speedup |
 |---|---|---|---|---|
 | brick-math | 20392 / 20392 | 2596 ms | 562 ms | 4.6× |
 | carbon | 6145 / 6145 | 28871 ms | 17952 ms | 1.6× |
@@ -62,7 +62,7 @@ EOF
 cat > "${tmp}/countchange.md" <<'EOF'
 # Benchmarks
 <!-- BENCH:TABLE:START (auto-generated) -->
-| Project | Tests (vanilla / rust) | vanilla | phpunit-rust | speedup |
+| Project | Tests (vanilla / rust) | vanilla | proust | speedup |
 |---|---|---|---|---|
 | brick-math | 20392 / 20392 | 3022 ms | 1042 ms | 2.9× |
 | carbon | 6145 / 6148 | 34646 ms | 20021 ms | 1.7× |

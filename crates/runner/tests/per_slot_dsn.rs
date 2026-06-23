@@ -1,5 +1,5 @@
-use phpunit_rust::fork_pool::PhpForkPool;
-use phpunit_rust::types::{BatchClass, BatchPlan, TestOutcome};
+use proust::fork_pool::PhpForkPool;
+use proust::types::{BatchClass, BatchPlan, TestOutcome};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -66,8 +66,8 @@ fn dsn_in(outcomes: &[TestOutcome]) -> String {
 fn per_slot_dsn_is_injected_and_distinct() {
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_dsn_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php");
+    let dir = std::env::temp_dir().join(format!("proust_dsn_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = write_echo_test(&dir);
 
@@ -142,8 +142,8 @@ fn per_slot_dsn_is_injected_and_distinct() {
 fn per_slot_dsn_absent_when_none() {
     let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/sample_project");
     let autoload = project.join("vendor/autoload.php");
-    let script = phpunit_rust::php_worker::find_fork_script().expect("worker_fork.php");
-    let dir = std::env::temp_dir().join(format!("phpunit_rust_dsn_none_{}", std::process::id()));
+    let script = proust::php_worker::find_fork_script().expect("worker_fork.php");
+    let dir = std::env::temp_dir().join(format!("proust_dsn_none_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = write_echo_test(&dir);
 

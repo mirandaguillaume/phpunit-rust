@@ -2,7 +2,7 @@
 #
 # bench/check_parity.sh — strict parity gate for the daily OSS benchmark.
 #
-# An unattended bench must NEVER publish numbers from a run where phpunit-rust
+# An unattended bench must NEVER publish numbers from a run where proust
 # and vanilla PHPUnit executed a DIFFERENT number of tests. A worker crash that
 # silently drops outcomes is indistinguishable from a blazing-fast run — the
 # wall-time cannot detect its own corruption, only the test COUNT can. (See the
@@ -11,7 +11,7 @@
 #
 # Policy (chosen deliberately): STRICT equality, KEEP all suites. Suites with a
 # known parity gap — faker / php-parser (data-provider row enumeration) and
-# phpunit-itself (`.phpt` tests phpunit-rust does not run) — WILL fail this gate
+# phpunit-itself (`.phpt` tests proust does not run) — WILL fail this gate
 # until their gap is closed. That is by design: a parity gap is a loud, blocking
 # failure rather than silently dropped coverage.
 #
@@ -107,7 +107,7 @@ if [[ "$checked" -eq 0 ]]; then
     exit 1
 fi
 if [[ "$fail" -ne 0 ]]; then
-    echo "check_parity: FAIL — at least one suite ran a different number of tests under vanilla vs phpunit-rust (or worker deaths were detected in the dumps)." >&2
+    echo "check_parity: FAIL — at least one suite ran a different number of tests under vanilla vs proust (or worker deaths were detected in the dumps)." >&2
     echo "check_parity: refusing to publish — these numbers are not a like-for-like comparison." >&2
     exit 1
 fi
