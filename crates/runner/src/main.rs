@@ -359,11 +359,11 @@ mod dirty_tests {
 }
 
 use phpunit_rust::fork_pool::PhpForkPool;
-use phpunit_rust::php_worker::{check_php_version, find_enumerate_script, find_fork_script};
+use phpunit_rust::php_worker::{check_php_version, find_fork_script};
 use phpunit_rust::phpunit_xml::{
     parse_bootstrap, parse_excluded_groups, parse_listeners, parse_php_block, parse_testsuites,
 };
-use phpunit_rust::provider_enum::{collect_provider_pairs, enumerate, RowCounts};
+use phpunit_rust::provider_enum::RowCounts;
 use phpunit_rust::reporter::{print_progress, print_summary};
 use phpunit_rust::runner::RunConfig;
 use phpunit_rust::types::{TestOutcome, TestStatus};
@@ -1028,11 +1028,6 @@ fn real_main() -> Result<ExitCode> {
         check_php_version(80100).context("PHP version check failed (need ≥ 8.1 on PATH)")?;
     eprintln!("PHP version id: {php_id}");
 
-    // Enumerate data-provider row counts BEFORE forking workers.
-    // The runner uses these to decide whether to split a heavy provider
-    // method into multiple stride-partitioned plans (see build_queue).
-    // A failed enumeration is non-fatal: missing entries fall back to
-    // single-bucket dispatch.
     // L1: clamp the PHP fork-pool worker count by suite size (default only). The discovery rayon
     // pool above already used the unclamped count; from here, `worker_count` is the clamped value,
     // so a tiny suite spawns 1 worker instead of num_cpus (kills the small-suite fork-storm).
@@ -1042,37 +1037,17 @@ fn real_main() -> Result<ExitCode> {
     // single-process timing for the tiny suites where vanilla wins.
     let single_process = single_process_eligible(worker_count, &cases);
 
-    let provider_pairs = collect_provider_pairs(&cases);
-    let row_counts: RowCounts = profiler.span_with(
-        "enumerate_providers",
-        "main",
-        serde_json::json!({"pairs": provider_pairs.len()}),
-        || -> Result<_> {
-            // L2: the row counts only inform stride-splitting heavy providers ACROSS workers; at a
-            // single worker they are inert, so skip the whole extra PHP-interpreter boot.
-            if provider_pairs.is_empty() || worker_count <= 1 {
-                return Ok(RowCounts::new());
-            }
-            let enum_script = find_enumerate_script()?;
-            Ok(
-                match enumerate(
-                    &enum_script,
-                    &autoload,
-                    bootstrap.as_deref(),
-                    &defines,
-                    &provider_pairs,
-                ) {
-                    Ok(counts) => counts,
-                    Err(e) => {
-                        eprintln!(
-                            "Provider enumeration failed (continuing with no row data): {e:#}"
-                        );
-                        RowCounts::new()
-                    }
-                },
-            )
-        },
-    )?;
+    // Data-provider row enumeration was removed. In production it produced no
+    // usable data anyway — the standalone enumerator could not load
+    // \PhpunitRust\TestExecutor, so its skip-reason guard always threw and every
+    // provider degraded to null (= single-bucket dispatch). And once made to
+    // work, stride-splitting measured net-SLOWER on every OSS suite (the
+    // per-chunk dispatch overhead outweighs the parallelism gain for fast
+    // provider rows: faker +18%, doctrine +8%). Dropping the enumerator removes
+    // a whole PHP process (boot + autoload + ~45ms) from the startup floor.
+    // `row_counts` stays an empty map: build_queue then dispatches every method
+    // as a single bucket, exactly matching the prior production behavior.
+    let row_counts = RowCounts::new();
 
     // Task 8: demand-gated lease build. Declared here so `_lease_guard` is in
     // scope BEFORE `pool` — Rust drops in reverse declaration order, so the
