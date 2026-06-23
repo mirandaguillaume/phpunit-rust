@@ -2,8 +2,16 @@
 # (parity_one.sh via OSS_MANIFEST). NOT in oss_suites.tsv, so the daily
 # gate/table never touch them. Promote to oss_suites.tsv once a suite
 # reaches exact parity at workers=4.
-#   phpstan-src -- real gap: data providers use PHP Fibers; rust pre-fork
-#                  enumeration hits "Cannot switch fibers" so N-row providers
-#                  collapse to 1 (rust 12093 vs vanilla 12586).
+#   phpstan-src -- ~493-test gap (rust 12093 vs vanilla 12586). The earlier
+#                  "providers use Fibers / Cannot switch fibers" note was WRONG:
+#                  a PHP-8.4 repro disproved every obvious cause. Confirmed at
+#                  parity: discovery (3751 == 3751 methods, none missed) and
+#                  provider expansion (the TypeInferenceTestCase gatherAssertTypes
+#                  providers, which run PHPStan's analyser, enumerate the exact
+#                  vanilla row counts in isolation AND survive MethodPlanner's
+#                  keyed merge). The residual is an execution-level divergence
+#                  that only manifests in the faithful CI container; localizing
+#                  it per-method needs a per-test reporter (JUnit/TAP) we don't
+#                  have yet. Kept as a known-gap candidate, not gated.
 name	git_url	ref	extra_env
 phpstan-src	https://github.com/phpstan/phpstan-src	2.2.2
