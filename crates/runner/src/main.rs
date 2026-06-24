@@ -1053,64 +1053,70 @@ fn real_main() -> Result<ExitCode> {
     // guard (and its destroy_all) runs AFTER the pool is dropped.
     let mut per_slot_dsn_opt: Option<Vec<String>> = None;
     let _lease_guard = if let Some(base) = &cli.provision_db {
-        if needs_db {
-            let provision_script = proust::php_worker::find_provision_script()?;
-            // P4 startup GC sweep: best-effort, never aborts the run.
-            match proust::resource_lease::gc_stale_clones(
+        // Explicit --provision-db is a request to give each worker its OWN
+        // database, so we always provision here — never gate on the marker-based
+        // `needs_db` detection. Framework apps that isolate via a PHPUnit
+        // <extensions> bootstrap (e.g. DAMADoctrineTestBundle, which wraps the
+        // app's own Doctrine connection per test) genuinely need per-worker DBs
+        // but carry NO RefreshDatabase/DatabaseTransactions trait, so `needs_db`
+        // is false for them; skipping would silently drop parallel isolation and
+        // the app would contend on one shared DB ("database is locked" at >1 worker).
+        if !needs_db {
+            eprintln!(
+                "--provision-db: provisioning per-worker DBs on request (no marker-detected DB test; an <extensions> DB bridge may still need them)."
+            );
+        }
+        let provision_script = proust::php_worker::find_provision_script()?;
+        // P4 startup GC sweep: best-effort, never aborts the run.
+        match proust::resource_lease::gc_stale_clones(
+            &provision_script,
+            &autoload,
+            bootstrap.as_deref(),
+            &defines,
+            base,
+        ) {
+            Ok(n) if n > 0 => eprintln!(
+                "Resource provisioning: GC reclaimed {n} stale clone(s) from a prior crashed run."
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("Resource provisioning: GC sweep skipped ({e})"),
+        }
+        let run_uuid = format!("pr{}", std::process::id());
+        let template = proust::resource_lease::build_template(
+            &provision_script,
+            &autoload,
+            bootstrap.as_deref(),
+            &defines,
+            base,
+        )?;
+        let mut lease = proust::resource_lease::ResourceLease::new(
+            provision_script.clone(),
+            autoload.clone(),
+            bootstrap.clone(),
+            defines.clone(),
+            base.clone(),
+        );
+        let mut per_slot_dsn: Vec<String> = Vec::with_capacity(worker_count);
+        for slot in 0..worker_count {
+            let dsn = proust::resource_lease::clone_for_slot(
                 &provision_script,
                 &autoload,
                 bootstrap.as_deref(),
                 &defines,
-                base,
-            ) {
-                Ok(n) if n > 0 => eprintln!(
-                    "Resource provisioning: GC reclaimed {n} stale clone(s) from a prior crashed run."
-                ),
-                Ok(_) => {}
-                Err(e) => eprintln!("Resource provisioning: GC sweep skipped ({e})"),
-            }
-            let run_uuid = format!("pr{}", std::process::id());
-            let template = proust::resource_lease::build_template(
-                &provision_script,
-                &autoload,
-                bootstrap.as_deref(),
-                &defines,
+                slot,
+                &run_uuid,
+                &template,
                 base,
             )?;
-            let mut lease = proust::resource_lease::ResourceLease::new(
-                provision_script.clone(),
-                autoload.clone(),
-                bootstrap.clone(),
-                defines.clone(),
-                base.clone(),
-            );
-            let mut per_slot_dsn: Vec<String> = Vec::with_capacity(worker_count);
-            for slot in 0..worker_count {
-                let dsn = proust::resource_lease::clone_for_slot(
-                    &provision_script,
-                    &autoload,
-                    bootstrap.as_deref(),
-                    &defines,
-                    slot,
-                    &run_uuid,
-                    &template,
-                    base,
-                )?;
-                lease.register(proust::resource_lease::clone_name(base, &run_uuid, slot));
-                per_slot_dsn.push(dsn);
-            }
-            eprintln!(
-                "Resource provisioning: built template '{template}' and {} per-slot clone(s).",
-                per_slot_dsn.len()
-            );
-            per_slot_dsn_opt = Some(per_slot_dsn);
-            Some(proust::resource_lease::LeaseGuard::new(lease))
-        } else {
-            eprintln!(
-                "--provision-db: no selected test needs a DB; skipping provisioning (zero cost)."
-            );
-            None
+            lease.register(proust::resource_lease::clone_name(base, &run_uuid, slot));
+            per_slot_dsn.push(dsn);
         }
+        eprintln!(
+            "Resource provisioning: built template '{template}' and {} per-slot clone(s).",
+            per_slot_dsn.len()
+        );
+        per_slot_dsn_opt = Some(per_slot_dsn);
+        Some(proust::resource_lease::LeaseGuard::new(lease))
     } else {
         None
     };

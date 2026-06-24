@@ -492,9 +492,36 @@ $forkChildForSlot = static function (int $slot) use (
         // Mirror the existing <env> convention (putenv + $_ENV + $_SERVER).
         // Only injected when a DSN exists for this slot (empty list = no-op).
         if (isset($perSlotDsn[$slot]) && is_string($perSlotDsn[$slot]) && $perSlotDsn[$slot] !== '') {
-            putenv("PROUST_DB_DSN={$perSlotDsn[$slot]}");
-            $_ENV['PROUST_DB_DSN']    = $perSlotDsn[$slot];
-            $_SERVER['PROUST_DB_DSN'] = $perSlotDsn[$slot];
+            $__dsn = $perSlotDsn[$slot];
+            putenv("PROUST_DB_DSN={$__dsn}");
+            $_ENV['PROUST_DB_DSN']    = $__dsn;
+            $_SERVER['PROUST_DB_DSN'] = $__dsn;
+            // Parallel functional tests: when the event bridge is active, the
+            // framework extension (e.g. DAMADoctrineTestBundle) wraps the APP's
+            // OWN Doctrine connection, which reads DATABASE_URL — not our
+            // PROUST_DB_DSN. Point that connection at THIS worker's per-slot
+            // clone too, so each worker isolates on its own database (no
+            // cross-worker "database is locked"). Derive the URL form from the
+            // PDO DSN. Gated on PROUST_EVENT_BRIDGE so the marker-based
+            // SharedTransactionalFixture path (our own PDO) is untouched, and
+            // DATABASE_URL is never overridden unless an app extension needs it.
+            if (getenv('PROUST_EVENT_BRIDGE') === '1'
+                && preg_match('/^pgsql:host=([^;]+);port=(\d+);dbname=([^;]+);user=([^;]+);password=(.*)$/', $__dsn, $__m)) {
+                // Preserve the query string (e.g. ?serverVersion=16&charset=utf8)
+                // of the app's existing DATABASE_URL: Doctrine DBAL 4 REQUIRES
+                // serverVersion for PostgreSQL, and it lives in the URL query,
+                // not in the PDO DSN we derive the host/db from.
+                $__prev = getenv('DATABASE_URL');
+                $__q = (is_string($__prev) && ($__qp = strpos($__prev, '?')) !== false)
+                    ? substr($__prev, $__qp) : '';
+                $__url = sprintf(
+                    'postgresql://%s:%s@%s:%s/%s%s',
+                    rawurlencode($__m[4]), rawurlencode($__m[5]), $__m[1], $__m[2], $__m[3], $__q
+                );
+                putenv("DATABASE_URL={$__url}");
+                $_ENV['DATABASE_URL']    = $__url;
+                $_SERVER['DATABASE_URL'] = $__url;
+            }
         }
         for ($j = 0; $j < $n; $j++) {
             if ($j !== $slot) {
