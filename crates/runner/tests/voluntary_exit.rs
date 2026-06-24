@@ -60,6 +60,7 @@ fn voluntary_exit0_midbatch_is_recovered_not_clean_recycle() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
 
     let autoload_t = autoload.clone();

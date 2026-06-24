@@ -68,6 +68,11 @@ pub struct TestCase {
     /// Disjoint from `is_stateful` / `is_isolated` — never contributes to
     /// `must_force_exit`.
     pub needs_db: bool,
+    /// True when this test's class or any ancestor extends a known functional
+    /// base class (Symfony `KernelTestCase`/`WebTestCase`, etc.). A DECLARED
+    /// marker, OR-folded down the inheritance chain. Used ONLY to tune the
+    /// default worker count and suggest `--warmup` — never a correctness gate.
+    pub is_functional: bool,
 }
 
 /// One class discovered during the pass-1 scan: enough information to build
@@ -107,6 +112,12 @@ struct ParsedClass {
     /// True when the class (or its trait/inheritance chain) requires a
     /// database clone. OR-folded down the chain in [`emit_test_cases`].
     needs_db: bool,
+    /// True when THIS class's immediate parent matches a functional base-class
+    /// marker (KernelTestCase/WebTestCase/…). OR-folded down the chain so a
+    /// concrete test extending a non-functional-named intermediate that itself
+    /// extends a functional base is still flagged. Perf/UX only (worker clamp +
+    /// `--warmup` hint); never a correctness gate.
+    is_functional: bool,
     /// In-class `use SharedTransactionalFixture;` (the opt-in marker). Folded across the
     /// inheritance chain in [`shared_fixture_report`]. Advisory only — no runtime effect.
     uses_shared_fixture: bool,
@@ -491,6 +502,11 @@ fn collect_parsed_classes(
     let base_idx = captures.iter().position(|n| *n == "base").unwrap();
     let body_idx = captures.iter().position(|n| *n == "body").unwrap();
 
+    // Functional base-class markers (defaults + PROUST_FUNCTIONAL_BASE_CLASSES),
+    // built once per file. `reference_matches_marker` wants &[&str].
+    let functional_markers = functional_base_markers();
+    let functional_refs: Vec<&str> = functional_markers.iter().map(String::as_str).collect();
+
     for m in cursor.matches(&query, root, bytes) {
         let mut class_node: Option<Node> = None;
         let mut class_name: Option<&str> = None;
@@ -525,6 +541,11 @@ fn collect_parsed_classes(
         };
         let parent_fqcn =
             base_name.map(|b| resolve_class_reference(b, class_ns.as_deref(), aliases));
+        // Functional iff THIS class's immediate parent matches a marker; the
+        // chain-fold in emit_test_cases propagates it through intermediates.
+        let is_functional = parent_fqcn
+            .as_deref()
+            .is_some_and(|p| reference_matches_marker(p, &functional_refs));
         let test_methods = collect_test_methods(body, bytes, class_ns.as_deref(), aliases);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
@@ -563,6 +584,7 @@ fn collect_parsed_classes(
             is_stateful,
             is_isolated,
             needs_db,
+            is_functional,
             uses_shared_fixture,
             setup_builds_fixture,
             has_tx_disqualifier,
@@ -1002,6 +1024,53 @@ const DEFAULT_DB_MARKER_TRAITS: &[&str] = &["RefreshDatabase", "DatabaseTransact
 /// not actually need a DB. Users opt in by adding their own functional-test
 /// base class to this list.
 const DEFAULT_DB_MARKER_BASE_CLASSES: &[&str] = &[];
+
+/// Base classes whose presence anywhere in a test's `extends` chain marks the
+/// suite as "functional": it boots a framework kernel, so each parallel worker
+/// pays a high one-time fixed cost (a cold container/kernel boot ~90ms, plus a
+/// per-worker DB clone when provisioned). The runner uses this — a DECLARED
+/// MARKER, never type-reference inference — only to pick a more conservative
+/// default worker count and to suggest `--warmup`; it has NO correctness effect,
+/// so (unlike the deliberately-empty DB base-class list) a default list is safe.
+const DEFAULT_FUNCTIONAL_BASE_CLASSES: &[&str] = &[
+    "KernelTestCase",
+    "WebTestCase",
+    "ApiTestCase",
+    "PantherTestCase",
+];
+
+/// Active functional base-class markers: the defaults plus any names in the
+/// comma-separated `PROUST_FUNCTIONAL_BASE_CLASSES` env var, so a project with a
+/// custom functional base (e.g. its own `IntegrationTestCase`) can opt in with
+/// no code change. Read once per file-parse (env is process-global; tests
+/// exercise the pure [`merge_functional_markers`] core instead of mutating it).
+fn functional_base_markers() -> Vec<String> {
+    merge_functional_markers(
+        std::env::var("PROUST_FUNCTIONAL_BASE_CLASSES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`functional_base_markers`]: defaults + comma-separated extras
+/// (trimmed, blanks dropped). Order is defaults-first; duplicates are harmless
+/// because matching is membership, not position.
+fn merge_functional_markers(env: Option<&str>) -> Vec<String> {
+    let mut v: Vec<String> = DEFAULT_FUNCTIONAL_BASE_CLASSES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(extra) = env {
+        v.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
+    }
+    v
+}
 
 /// Whole-token / last-segment match of one identifier reference (a trait name
 /// or a base-class name pulled from a tree-sitter node — never comment or
@@ -1863,6 +1932,27 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
             }
             acc
         };
+        // Same chain walk for is_functional: a concrete test extending a
+        // non-functional-named intermediate that itself extends a functional
+        // base (e.g. AbstractCommandTestCase -> KernelTestCase) is still flagged.
+        let chain_is_functional = {
+            let mut visit = class.fqcn.as_str();
+            let mut d = 0;
+            let mut acc = false;
+            while d < 32 {
+                if let Some(c) = by_fqcn.get(visit) {
+                    acc = acc || c.is_functional;
+                    match c.parent_fqcn.as_deref() {
+                        Some(p) => visit = p,
+                        None => break,
+                    }
+                } else {
+                    break;
+                }
+                d += 1;
+            }
+            acc
+        };
         let mut visit = class.fqcn.as_str();
         let mut depth = 0;
         while depth < 32 {
@@ -1892,6 +1982,7 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
                             is_stateful: chain_is_stateful,
                             is_isolated: chain_is_isolated,
                             needs_db: chain_needs_db,
+                            is_functional: chain_is_functional,
                         });
                     }
                 }
@@ -2587,6 +2678,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db,
+            is_functional: false,
         };
         let cases = vec![
             mk("A", "testOne", false),
@@ -2669,6 +2761,72 @@ class ConcreteDbTest extends DbBaseTest {
         assert!(
             cases[0].needs_db,
             "needs_db must OR-fold up the inheritance chain like is_stateful"
+        );
+    }
+
+    #[test]
+    fn is_functional_detects_symfony_base_and_folds_chain() {
+        // Direct `extends WebTestCase` is flagged; the chain fold also catches a
+        // concrete test reaching a functional base through a non-functional-named
+        // intermediate; a plain PHPUnit `TestCase` must NOT be flagged.
+        let src = r#"<?php
+namespace App\Tests;
+use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
+use Symfony\Bundle\FrameworkBundle\Test\KernelTestCase;
+use PHPUnit\Framework\TestCase;
+
+class HomeControllerTest extends WebTestCase {
+    public function testIndex(): void {}
+}
+
+abstract class AbstractKernelTest extends KernelTestCase {}
+class ServiceTest extends AbstractKernelTest {
+    public function testService(): void {}
+}
+
+class PlainUnitTest extends TestCase {
+    public function testPure(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let func = |c: &str| cases.iter().find(|x| x.class == c).unwrap().is_functional;
+        assert!(
+            func("App\\Tests\\HomeControllerTest"),
+            "direct extends WebTestCase → functional"
+        );
+        assert!(
+            func("App\\Tests\\ServiceTest"),
+            "KernelTestCase via a non-functional-named intermediate → functional (chain fold)"
+        );
+        assert!(
+            !func("App\\Tests\\PlainUnitTest"),
+            "plain PHPUnit TestCase → NOT functional"
+        );
+    }
+
+    #[test]
+    fn merge_functional_markers_appends_trimmed_env_extras() {
+        let base = merge_functional_markers(None);
+        assert!(base.iter().any(|m| m == "WebTestCase"));
+        assert!(base.iter().any(|m| m == "KernelTestCase"));
+        let extended = merge_functional_markers(Some("IntegrationTestCase, , MyBaseTest "));
+        assert!(
+            extended.iter().any(|m| m == "IntegrationTestCase"),
+            "env extra appended"
+        );
+        assert!(
+            extended.iter().any(|m| m == "MyBaseTest"),
+            "whitespace-trimmed env extra appended"
+        );
+        assert!(
+            !extended.iter().any(|m| m.is_empty()),
+            "blank entries dropped"
+        );
+        assert_eq!(
+            extended.len(),
+            base.len() + 2,
+            "only the two non-blank extras are appended"
         );
     }
 
@@ -3205,6 +3363,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 is_stateful: false,
                 is_isolated: false,
                 needs_db: false,
+                is_functional: false,
             },
             TestCase {
                 file: PathBuf::from("/p/A.php"),
@@ -3221,6 +3380,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 is_stateful: false,
                 is_isolated: false,
                 needs_db: false,
+                is_functional: false,
             },
             TestCase {
                 file: PathBuf::from("/p/B.php"),
@@ -3237,6 +3397,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 is_stateful: false,
                 is_isolated: false,
                 needs_db: false,
+                is_functional: false,
             },
         ];
         let grouped = group_by_class(cases);
@@ -3272,6 +3433,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 is_stateful: false,
                 is_isolated: false,
                 needs_db: false,
+                is_functional: false,
             },
             TestCase {
                 file: PathBuf::from("/invalid-class/IssueTriggerResolverTest.php"),
@@ -3288,6 +3450,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 is_stateful: false,
                 is_isolated: false,
                 needs_db: false,
+                is_functional: false,
             },
             TestCase {
                 file: PathBuf::from("/nonexistent-class/IssueTriggerResolverTest.php"),
@@ -3304,6 +3467,7 @@ final class ConcreteTest extends AbstractBaseTest {
                 is_stateful: false,
                 is_isolated: false,
                 needs_db: false,
+                is_functional: false,
             },
         ];
         let grouped = group_by_class(cases);
