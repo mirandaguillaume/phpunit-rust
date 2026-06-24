@@ -1,6 +1,6 @@
 # Compatibility
 
-Lists the PHPUnit features that proust supports today, and the ones that are explicitly deferred.
+Lists the PHPUnit features that Proust supports today, and the ones that are explicitly deferred.
 
 ### Supported
 
@@ -104,7 +104,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 | `--report-shared-fixture` | off | Print a SharedTransactionalFixture eligibility advisory then exit (tree-sitter only; no `composer install` needed). |
 | `--dirty` | off | Run only tests impacted by uncommitted git changes (changed source → dependent tests). |
 | `--bake-mocks` | off | Rewrite `createMock()` into anonymous-class stubs; requires PSR-4-resolvable interfaces. |
-| `--provision-db <DSN>` | — | Base DSN for per-worker DB provisioning (also via `PHPUNIT_RUST_DB_DSN`). |
+| `--provision-db <DSN>` | — | Base DSN for per-worker DB provisioning (also via `PROUST_DB_DSN`). |
 | `--skip-db` | off | Skip `needs_db` tests instead of aborting when no DB is configured. |
 | `--worker-memory-limit <v>` | `512M` | `memory_limit` inside each worker fork (`256M`, `1G`, `-1`). |
 | `--worker-max-batches <n>` | `20` | Recycle each worker fork after N batches; `0` = long-lived. |
@@ -132,7 +132,7 @@ attribution; no Xdebug / PCOV needed).
 
 ### State isolation (important limitation)
 
-proust runs many test classes inside one long-lived worker fork to
+Proust runs many test classes inside one long-lived worker fork to
 amortise PHP startup, which changes the isolation contract versus vanilla
 PHPUnit:
 
@@ -151,10 +151,10 @@ PHPUnit:
   static-property accumulator, or a DI / global registry is not seen.
 - **Escape hatches** when isolation bites: run with `--workers 1`
   (sequential), annotate the class with `@runInSeparateProcess`, or set
-  `PHPUNIT_RUST_NO_ISOLATION=1` only to *diagnose* pollution (it disables
+  `PROUST_NO_ISOLATION=1` only to *diagnose* pollution (it disables
   the per-batch fresh-fork). There is no per-class force-isolate flag
   beyond `@runInSeparateProcess`.
-- **Database isolation** (when `--provision-db` / `PHPUNIT_RUST_DB_DSN`
+- **Database isolation** (when `--provision-db` / `PROUST_DB_DSN`
   is set) is a runner-managed PDO transaction opened before `setUp` and
   rolled back after `tearDown`. Because the runner bypasses PHPUnit's
   `runBare`, framework traits like `RefreshDatabase` /
@@ -166,7 +166,7 @@ PHPUnit:
 
 - **`.phpt` tests.** PHPUnit's file-based test format (a mini-INI with
   `--TEST--` / `--FILE--` / `--EXPECT--` sections) is not a PHP class, and
-  proust discovers tests by reflecting `*Test.php` **classes** — so
+  Proust discovers tests by reflecting `*Test.php` **classes** — so
   `.phpt` files are invisible to it by construction. This is a structural gap,
   not a bug: supporting it means teaching the runner a second execution model.
   It mainly affects PHPUnit's own suite (`sebastianbergmann/phpunit`), whose

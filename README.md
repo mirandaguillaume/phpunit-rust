@@ -1,4 +1,4 @@
-# proust
+# Proust
 
 A Rust orchestrator that runs PHPUnit tests in parallel using forked PHP
 workers — no FrankenPHP, no HTTP, no daemon. One PHP master loads the

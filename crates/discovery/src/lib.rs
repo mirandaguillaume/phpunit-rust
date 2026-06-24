@@ -900,7 +900,7 @@ const STATEFUL_GLOBAL_APIS: &[&str] = &[
 /// DI-container / global registry. A class that pollutes global state only
 /// through one of those is not flagged `is_stateful`, so it can still leak
 /// across a recycled worker — force isolation explicitly when that bites
-/// (`PHPUNIT_RUST_NO_ISOLATION`, or run such a suite with `--workers 1`).
+/// (`PROUST_NO_ISOLATION`, or run such a suite with `--workers 1`).
 fn class_has_stateful_calls(class_body: Node, bytes: &[u8]) -> bool {
     let mut cursor = class_body.walk();
     for member in class_body.children(&mut cursor) {

@@ -27,7 +27,7 @@ final class _TxFixture extends TestCase
         $pdo = \Proust\TestExecutor::connection();
         \PHPUnit\Framework\Assert::assertNotNull(
             $pdo,
-            'TestExecutor::connection() returned null; PHPUNIT_RUST_DB_DSN must be set for this fixture'
+            'TestExecutor::connection() returned null; PROUST_DB_DSN must be set for this fixture'
         );
         return $pdo;
     }
@@ -89,12 +89,12 @@ final class TransactionResetTest extends TestCase
         }
         $this->dbFile = sys_get_temp_dir() . '/proust_p2_' . getmypid() . '.sqlite';
         @unlink($this->dbFile);
-        putenv('PHPUNIT_RUST_DB_DSN=sqlite:' . $this->dbFile);
+        putenv('PROUST_DB_DSN=sqlite:' . $this->dbFile);
     }
 
     protected function tearDown(): void
     {
-        putenv('PHPUNIT_RUST_DB_DSN');
+        putenv('PROUST_DB_DSN');
         if ($this->dbFile !== '') {
             @unlink($this->dbFile);
         }
@@ -132,8 +132,8 @@ final class TransactionResetTest extends TestCase
         $php = <<<'PHP'
             require %s;
             require %s;
-            putenv('PHPUNIT_RUST_DB_DSN=sqlite:' . %s);
-            putenv('PHPUNIT_RUST_SLOT=3');
+            putenv('PROUST_DB_DSN=sqlite:' . %s);
+            putenv('PROUST_SLOT=3');
             \Proust\TestExecutor::runClass(
                 \Proust\Tests\_TxCommitLeakFixture::class,
                 ['testCommitsInsideTransaction']

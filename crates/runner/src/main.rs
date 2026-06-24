@@ -294,7 +294,7 @@ pub(crate) enum DbPreflight {
 }
 
 /// Pure decision helper: no I/O, no side effects.
-/// `db_configured` = `--provision-db` set OR PHPUNIT_RUST_DB_DSN present.
+/// `db_configured` = `--provision-db` set OR PROUST_DB_DSN present.
 pub(crate) fn db_preflight(
     selected_needs_db: bool,
     db_configured: bool,
@@ -988,9 +988,8 @@ fn real_main() -> Result<ExitCode> {
 
     // DB preflight: fail-fast (or skip) when needs_db tests are selected but
     // no database is configured. "configured" = --provision-db set OR
-    // PHPUNIT_RUST_DB_DSN present. The gate is zero-cost when needs_db = false.
-    let db_configured =
-        cli.provision_db.is_some() || std::env::var_os("PHPUNIT_RUST_DB_DSN").is_some();
+    // PROUST_DB_DSN present. The gate is zero-cost when needs_db = false.
+    let db_configured = cli.provision_db.is_some() || std::env::var_os("PROUST_DB_DSN").is_some();
     let db_case_count = cases.iter().filter(|c| c.needs_db).count();
     let mut synthetic_db_skips: Vec<TestOutcome> = Vec::new();
     match db_preflight(needs_db, db_configured, cli.skip_db) {
@@ -1265,7 +1264,7 @@ fn real_main() -> Result<ExitCode> {
         report.outcomes.extend(synthetic_legacy_skips);
     }
 
-    // Diagnostic: when PHPUNIT_RUST_DUMP_TESTS is set, write one line per
+    // Diagnostic: when PROUST_DUMP_TESTS is set, write one line per
     // executed test — one line PER DATA ROW — as `Class::method|Status|message`
     // (message: first 200 chars, newlines/pipes flattened; empty for passes).
     // This is the runner's exact expanded test list, which `--list-tests`
@@ -1275,7 +1274,7 @@ fn real_main() -> Result<ExitCode> {
     // both WHICH tests diverge and WHY, on the machine where they diverge (the
     // CI-only parity drift). An env var rather than a CLI flag so wrappers
     // (bench_host.sh) pass it through without interface changes.
-    if let Ok(dump_path) = std::env::var("PHPUNIT_RUST_DUMP_TESTS") {
+    if let Ok(dump_path) = std::env::var("PROUST_DUMP_TESTS") {
         if !dump_path.is_empty() {
             use std::fmt::Write as _;
             let mut buf = String::with_capacity(report.outcomes.len() * 64);
@@ -1301,7 +1300,7 @@ fn real_main() -> Result<ExitCode> {
                 let _ = writeln!(buf, "{}::{}|{:?}|{}", o.class, o.method, o.status, msg);
             }
             if let Err(e) = std::fs::write(&dump_path, buf) {
-                eprintln!("warning: PHPUNIT_RUST_DUMP_TESTS write to {dump_path} failed: {e}");
+                eprintln!("warning: PROUST_DUMP_TESTS write to {dump_path} failed: {e}");
             }
         }
     }

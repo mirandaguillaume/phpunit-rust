@@ -115,7 +115,7 @@ function dbNameFromBase(string $base): string {
 }
 
 function dsnForClone(string $base, string $clone): string {
-    // The returned DSN is injected as PHPUNIT_RUST_DB_DSN and consumed by
+    // The returned DSN is injected as PROUST_DB_DSN and consumed by
     // TestExecutor via `new \PDO($dsn)` with NO separate user/pass args, so it
     // MUST be a PDO connection string (pgsql:...) with credentials embedded —
     // not the URL-style form (`postgres://...`), which PDO rejects with

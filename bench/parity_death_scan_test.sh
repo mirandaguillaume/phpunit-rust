@@ -104,7 +104,7 @@ assert "count mismatch => exit 1 (gate fails)" "1" "${rc}"
 
 # --- check_parity.sh opportunistic dump scan ---------------------------------
 # A counts table where every suite matches MUST still FAIL when the caller
-# supplies death dumps via PHPUNIT_RUST_DEATH_DUMPS, and PASS without them.
+# supplies death dumps via PROUST_DEATH_DUMPS, and PASS without them.
 table="${tmp}/bench-table.md"
 cat > "${table}" <<'EOF'
 | Project | vanilla / rust | speedup |
@@ -120,12 +120,12 @@ assert "check_parity matching table, no dumps => exit 0" "0" "${rc}"
 
 # Clean dumps supplied => still PASS (no death markers present).
 rc=0
-( PHPUNIT_RUST_DEATH_DUMPS="${clean}" "${SCRIPT_DIR}/check_parity.sh" "${table}" ) >/dev/null 2>&1 || rc=$?
+( PROUST_DEATH_DUMPS="${clean}" "${SCRIPT_DIR}/check_parity.sh" "${table}" ) >/dev/null 2>&1 || rc=$?
 assert "check_parity matching table + clean dump => exit 0" "0" "${rc}"
 
 # Death dump supplied => FAIL (exit 1) despite the table's matching counts.
 rc=0
-( PHPUNIT_RUST_DEATH_DUMPS="${died}" "${SCRIPT_DIR}/check_parity.sh" "${table}" ) >/dev/null 2>&1 || rc=$?
+( PROUST_DEATH_DUMPS="${died}" "${SCRIPT_DIR}/check_parity.sh" "${table}" ) >/dev/null 2>&1 || rc=$?
 assert "check_parity matching table + death dump => exit 1" "1" "${rc}"
 
 # Glob form across a dir (the parity_one.sh /tmp/rust-tests-*.txt shape).
@@ -134,7 +134,7 @@ mkdir -p "${globdir}"
 cp "${clean}" "${globdir}/rust-tests-a.txt"
 cp "${died}"  "${globdir}/rust-tests-b.txt"
 rc=0
-( PHPUNIT_RUST_DEATH_DUMPS="${globdir}/rust-tests-*.txt" "${SCRIPT_DIR}/check_parity.sh" "${table}" ) >/dev/null 2>&1 || rc=$?
+( PROUST_DEATH_DUMPS="${globdir}/rust-tests-*.txt" "${SCRIPT_DIR}/check_parity.sh" "${table}" ) >/dev/null 2>&1 || rc=$?
 assert "check_parity matching table + glob with one death dump => exit 1" "1" "${rc}"
 
 echo

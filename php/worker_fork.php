@@ -61,11 +61,11 @@ if ($__entryScript === '' || realpath($__entryScript) !== realpath(__FILE__)) {
 }
 
 // POC instrumentation: write phase timings to STDERR. Turn on with
-// PHPUNIT_RUST_TIMING=1 in the env. Output format:
+// PROUST_TIMING=1 in the env. Output format:
 //   [TIMING] phase=name delta_ms=X total_ms=Y
 $__t0 = microtime(true);
 $__tprev = $__t0;
-$__timing_enabled = getenv('PHPUNIT_RUST_TIMING') === '1';
+$__timing_enabled = getenv('PROUST_TIMING') === '1';
 $__log_phase = function(string $name) use (&$__tprev, $__t0, $__timing_enabled): void {
     if (!$__timing_enabled) return;
     $now = microtime(true);
@@ -320,7 +320,7 @@ $__log_phase('bootstrap');
 // DB transaction wrapping). Done in the master so all forked children inherit
 // the sealed facade + registered subscribers via COW; the subscribers only
 // open DB connections lazily per-test inside each child, so nothing is shared.
-// PRUST_EVENT_BRIDGE is exported ONLY when >=1 extension is present, so suites
+// PROUST_EVENT_BRIDGE is exported ONLY when >=1 extension is present, so suites
 // without <extensions> (every OSS lib) pay zero per-test emission overhead.
 // ---------------------------------------------------------------------------
 $__cfgPath = null;
@@ -382,8 +382,8 @@ if ($__cfgPath !== null
                     // shutdown is best-effort; nothing actionable here.
                 }
             });
-            putenv('PRUST_EVENT_BRIDGE=1');
-            $_ENV['PRUST_EVENT_BRIDGE'] = '1';
+            putenv('PROUST_EVENT_BRIDGE=1');
+            $_ENV['PROUST_EVENT_BRIDGE'] = '1';
             fwrite(STDERR, 'worker_fork.php: event bridge active (' . count($__bootstrappers) . " extension(s))\n");
         }
     } catch (\Throwable $__e) {
@@ -484,17 +484,17 @@ $forkChildForSlot = static function (int $slot) use (
         // K-batch/force_exit recycle because both re-enter this closure
         // with the same $slot. Mirror the existing <env> convention
         // (putenv + $_ENV + $_SERVER) so getenv()/$_ENV/$_SERVER all see it.
-        putenv("PHPUNIT_RUST_WORKER_ID={$slot}");
-        $_ENV['PHPUNIT_RUST_WORKER_ID']    = (string) $slot;
-        $_SERVER['PHPUNIT_RUST_WORKER_ID'] = (string) $slot;
+        putenv("PROUST_WORKER_ID={$slot}");
+        $_ENV['PROUST_WORKER_ID']    = (string) $slot;
+        $_SERVER['PROUST_WORKER_ID'] = (string) $slot;
         // Per-slot DB clone DSN (P3). Injected on the child only, keyed by
         // $slot, so a respawned/recycled child re-attaches to the SAME clone.
         // Mirror the existing <env> convention (putenv + $_ENV + $_SERVER).
         // Only injected when a DSN exists for this slot (empty list = no-op).
         if (isset($perSlotDsn[$slot]) && is_string($perSlotDsn[$slot]) && $perSlotDsn[$slot] !== '') {
-            putenv("PHPUNIT_RUST_DB_DSN={$perSlotDsn[$slot]}");
-            $_ENV['PHPUNIT_RUST_DB_DSN']    = $perSlotDsn[$slot];
-            $_SERVER['PHPUNIT_RUST_DB_DSN'] = $perSlotDsn[$slot];
+            putenv("PROUST_DB_DSN={$perSlotDsn[$slot]}");
+            $_ENV['PROUST_DB_DSN']    = $perSlotDsn[$slot];
+            $_SERVER['PROUST_DB_DSN'] = $perSlotDsn[$slot];
         }
         for ($j = 0; $j < $n; $j++) {
             if ($j !== $slot) {
@@ -839,13 +839,13 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
                     continue;
                 }
                 $isolated = !empty($entry['is_isolated']);
-                // Optional per-batch tracing — set PHPUNIT_RUST_TRACE_BATCHES=1
+                // Optional per-batch tracing — set PROUST_TRACE_BATCHES=1
                 // to write START/END markers to a per-slot file. After a
                 // hang, the slot file whose last line is `START …` (no
                 // matching END) names the class that froze the worker.
                 static $traceFile;
                 if (!isset($traceFile)) {
-                    $dir = getenv('PHPUNIT_RUST_TRACE_BATCHES');
+                    $dir = getenv('PROUST_TRACE_BATCHES');
                     // Accept "1" / "true" → default to /tmp; otherwise treat
                     // the env value as the destination directory so the
                     // caller can point traces at a bind-mounted host dir.
@@ -900,7 +900,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // immediately regardless of $batchesProcessed. The master forks
         // a fresh child for the next batch, guaranteeing zero cross-batch
         // pollution from this class's global side effects.
-        // PHPUNIT_RUST_NO_ISOLATION=1 disables the per-batch fresh-fork
+        // PROUST_NO_ISOLATION=1 disables the per-batch fresh-fork
         // for stateful classes — used only for A/B benchmarks to quantify
         // the parity-vs-perf trade-off.
         // NOTE: both recycle exits below fire AFTER the batch_done write above,
@@ -909,7 +909,7 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
         // warm replacement WITHOUT emitting slot_died. A bare exit(0)/die()
         // from test code mid-batch never reaches here (it fires inside the
         // foreach above, before batch_done), so it correctly reads as a crash.
-        if (!empty($plan['force_exit_after']) && !getenv('PHPUNIT_RUST_NO_ISOLATION')) {
+        if (!empty($plan['force_exit_after']) && !getenv('PROUST_NO_ISOLATION')) {
             exit(WORKER_EXIT_VOLUNTARY_RECYCLE);
         }
         if ($maxBatches > 0) {

@@ -25,12 +25,12 @@
 # rendered counts table. A worker death on single-row methods synthesises
 # EXACTLY one Error per lost method, so the COUNT is preserved and a run where
 # tests never executed still reads as parity. parity_one.sh closes that hole by
-# scanning the runner's expanded dump (PHPUNIT_RUST_DUMP_TESTS) — but the daily
+# scanning the runner's expanded dump (PROUST_DUMP_TESTS) — but the daily
 # bench path (bench_host.sh → run_oss_bench.sh) never enables that dump and
 # hands this script the formatted table alone, with no per-test rows. There is
 # therefore nothing here to scan by default; the count-equality verdict is the
 # strongest signal the table exposes. To let this gate ALSO refuse death runs,
-# set PHPUNIT_RUST_DEATH_DUMPS to a glob of dump files (e.g. the per-suite
+# set PROUST_DEATH_DUMPS to a glob of dump files (e.g. the per-suite
 # /tmp/rust-tests-*.txt parity_one.sh writes); when present and non-empty, any
 # worker-death marker found across them fails the gate regardless of counts.
 
@@ -80,13 +80,13 @@ echo
 # when the caller hands us the runner's expanded dumps via the env glob. When
 # it does, a single death marker fails the gate even if every count matched —
 # the same death-despite-matching-counts guarantee parity_one.sh enforces.
-if [[ -n "${PHPUNIT_RUST_DEATH_DUMPS:-}" ]]; then
+if [[ -n "${PROUST_DEATH_DUMPS:-}" ]]; then
     death_rows=0
     # Word-split the glob deliberately; each token may itself be a glob.
     # nullglob keeps an unmatched pattern from being scanned as a literal name.
     shopt -s nullglob
     # shellcheck disable=SC2086
-    for dump in ${PHPUNIT_RUST_DEATH_DUMPS}; do
+    for dump in ${PROUST_DEATH_DUMPS}; do
         [[ -s "$dump" ]] || continue
         n=$(awk -F'|' -v re="${WORKER_DEATH_RE}" \
             'index($3, re) > 0 { c++ } END { print c+0 }' "$dump")
