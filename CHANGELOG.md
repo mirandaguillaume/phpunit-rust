@@ -42,3 +42,14 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   the old URL keeps redirecting).
 - Hard-coded developer checkout paths (`/home/.../PHPUnit_rust/...`) in a few
   bench scripts — these point at a local directory, not the project identity.
+
+### Performance
+
+- `--provision-db` now provisions every per-worker database clone in a **single**
+  `provision_db.php` invocation (a new batched `provision_run` action) instead of
+  spawning one PHP process per step (`gc` + `build_template` + one `clone` per
+  worker = N+2 spawns). The PHP boot + project-autoload + admin-connect cost is
+  paid once rather than N+2 times. Measured on Symfony Demo + PostgreSQL: the
+  provisioning phase drops from 529 ms to 257 ms at `--workers 4` (−272 ms) and
+  from 1019 ms to 485 ms at `--workers 8` (−534 ms), with identical test
+  outcomes. Per-worker DSNs and crash-cleanup semantics are unchanged.

@@ -84,15 +84,20 @@ pub fn clone_name(base: &str, run_uuid: &str, slot: usize) -> String {
     format!("{prefix}{tail}")
 }
 
-/// Wire shape returned by provision_db.php for build/clone/drop/gc actions.
+/// Wire shape returned by provision_db.php for build/clone/drop/gc/provision_run.
 /// `dsn` is the connection string the worker should use (null for `drop`/`gc`);
-/// `dropped` is the list of clone names reclaimed by the `gc` action;
-/// `error` is set (and the process exits non-zero) on hard failure.
+/// `dropped` is the list of clone names reclaimed by `gc`/`provision_run`;
+/// `dsns`/`template` are the batched per-slot DSNs + template name returned by
+/// `provision_run`; `error` is set (and the process exits non-zero) on hard failure.
 #[derive(Debug, Deserialize)]
 struct ProvisionResult {
     dsn: Option<String>,
     #[serde(default)]
     dropped: Vec<String>,
+    #[serde(default)]
+    dsns: Vec<String>,
+    #[serde(default)]
+    template: Option<String>,
     #[allow(dead_code)]
     error: Option<String>,
 }
@@ -205,6 +210,54 @@ pub fn gc_stale_clones(
     let req = serde_json::json!({"action": "gc", "base": base});
     let res = run_helper(script, autoload, bootstrap, defines, &req)?;
     Ok(res.dropped.len())
+}
+
+/// Result of the batched `provision_run` action: every per-slot DSN (aligned
+/// 1:1 with the requested clone names, in order), the template name, and the
+/// count of stale clones the embedded GC sweep reclaimed.
+pub struct ProvisionRun {
+    pub dsns: Vec<String>,
+    pub template: String,
+    pub gc_dropped: usize,
+}
+
+/// Batched provisioning: GC sweep + build-template + every per-slot clone in
+/// ONE `php provision_db.php` invocation (a single process spawn over a single
+/// admin connection), replacing the N+2 separate spawns of `gc` +
+/// `build_template` + N×`clone`. PHP boot + autoload + connect are paid ONCE
+/// instead of N+2 times; the underlying `CREATE DATABASE ... TEMPLATE` SQL is
+/// unchanged. `clone_names` are the pre-computed, sanitized names (one per slot,
+/// in order); the returned `dsns` align 1:1 with them. Hard-fails on error or
+/// any arity mismatch.
+pub fn provision_run(
+    script: &Path,
+    autoload: &Path,
+    bootstrap: Option<&Path>,
+    defines: &[[String; 2]],
+    base: &str,
+    clone_names: &[String],
+) -> Result<ProvisionRun> {
+    let req = serde_json::json!({
+        "action": "provision_run",
+        "base": base,
+        "clone_names": clone_names,
+    });
+    let res = run_helper(script, autoload, bootstrap, defines, &req)?;
+    if res.dsns.len() != clone_names.len() {
+        return Err(anyhow!(
+            "provision_db.php provision_run returned {} DSN(s) for {} requested clone(s)",
+            res.dsns.len(),
+            clone_names.len()
+        ));
+    }
+    let template = res
+        .template
+        .ok_or_else(|| anyhow!("provision_db.php provision_run returned no template name"))?;
+    Ok(ProvisionRun {
+        dsns: res.dsns,
+        template,
+        gc_dropped: res.dropped.len(),
+    })
 }
 
 /// Pre-fork registry of every clone name created for this run. Built BEFORE
@@ -435,6 +488,26 @@ mod tests {
         assert!(
             res.is_err(),
             "gc_stale_clones must Err when the helper binary is missing"
+        );
+    }
+
+    #[test]
+    fn provision_run_hard_fails_without_helper() {
+        // The batched path must hard-fail (never degrade to a partial/empty
+        // provision) when the helper cannot be spawned — same contract as the
+        // individual build_template/clone_for_slot calls it replaces.
+        use std::path::Path;
+        let res = provision_run(
+            Path::new("/does/not/exist/provision_db.php"),
+            Path::new("/does/not/exist/autoload.php"),
+            None,
+            &[],
+            "postgres://u@h/app",
+            &["app_pr1_w0".to_string(), "app_pr1_w1".to_string()],
+        );
+        assert!(
+            res.is_err(),
+            "provision_run must hard-fail without a usable helper"
         );
     }
 
