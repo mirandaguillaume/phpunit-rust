@@ -161,6 +161,23 @@ PHPUnit:
   `DatabaseTransactions` never fire; only code routed through the
   runner's connection is rolled back, and a test that commits or runs
   DDL emits a loud `DB isolation LEAK` breadcrumb.
+- **Parallel functional tests (framework DB extensions).** When the
+  project configures a PHPUnit `<extensions>` bootstrap that isolates the
+  app's OWN connection per test — e.g. DAMADoctrineTestBundle wrapping
+  Doctrine in a transaction — Proust drives it end-to-end: the event
+  bridge dispatches the extension (it arms on `TestRunner\Started` and
+  begins/rolls back on `Test\PreparationStarted`), and `--provision-db`
+  gives each worker its own database clone with the app's `DATABASE_URL`
+  repointed at that clone (preserving the URL query, so `serverVersion`
+  survives). The suite then runs in parallel at parity — on the Symfony
+  Demo functional suite, `--workers 4` matched vanilla exactly with zero
+  cross-worker contention. Requirements: **PostgreSQL** (the clone
+  primitive is `CREATE DATABASE … TEMPLATE`; the PHP runtime needs
+  `pdo_pgsql`); the app's `DATABASE_URL` must carry the platform version
+  Doctrine DBAL requires (`?serverVersion=…`); and the app must NOT also
+  apply its own per-worker dbname suffix (e.g. Symfony's
+  `dbname_suffix: '_test%env(TEST_TOKEN)%'`) — disable it so Proust's
+  per-worker clone DSN is authoritative.
 
 ### Not yet supported (deferred)
 
