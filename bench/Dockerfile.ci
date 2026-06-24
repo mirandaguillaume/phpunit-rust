@@ -15,12 +15,15 @@ FROM php:8.4-cli
 
 # CI installs gmp, pdo_sqlite, pcntl; the OSS suites additionally need
 # intl/mbstring/bcmath to actually run (so a missing extension can't masquerade
-# as a parity gap). pcntl is required by the fork-pool worker.
+# as a parity gap). pcntl is required by the fork-pool worker. pdo_pgsql/pgsql
+# (libpq-dev) are required by the --provision-db per-worker clone path used for
+# parallel functional tests — without them that path can only run from a custom
+# image, so it would never be exercised in CI.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git unzip ca-certificates \
-        libgmp-dev libicu-dev libonig-dev libsqlite3-dev libxml2-dev libzip-dev \
+        libgmp-dev libicu-dev libonig-dev libsqlite3-dev libxml2-dev libzip-dev libpq-dev \
     && docker-php-ext-install -j"$(nproc)" \
-        pcntl gmp pdo_sqlite intl mbstring bcmath opcache \
+        pcntl gmp pdo_sqlite pdo_pgsql pgsql intl mbstring bcmath opcache \
     && docker-php-ext-enable opcache \
     && rm -rf /var/lib/apt/lists/*
 
