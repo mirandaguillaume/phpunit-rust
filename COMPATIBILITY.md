@@ -94,7 +94,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 | `--bootstrap <file>` | from XML | Bootstrap required before tests; overrides the XML `<bootstrap>`. |
 | `--warmup <file>` | — | PHP file `require`d ONCE in the fork master before workers fork (also via `PROUST_WARMUP`); workers inherit its warm state via COW. See [Warmup hook](#warmup-hook-kernel-pre-boot). |
 | `--filter <substr>` | — | Substring match against `Class::method`. |
-| `--workers <n>` | CPU cores | Parallel PHP workers; default clamps by suite size — 1 worker per 16 cases, or per 32 for `--provision-db` suites (each functional worker's fixed cost is higher), so small functional suites don't over-fork. `--workers 1` = sequential; an explicit count is never clamped. |
+| `--workers <n>` | CPU cores | Parallel PHP workers; default clamps by suite size — 1 worker per 16 cases, or per 32 for **functional** suites (each such worker's fixed cost is higher), so small functional suites don't over-fork. A suite is functional when `--provision-db` is set OR a selected test extends a framework base class (`KernelTestCase`/`WebTestCase`/…). `--workers 1` = sequential; an explicit count is never clamped. |
 | `--group <name>` | — | Run only these groups (comma-separated or repeated). |
 | `--exclude-group <name>` | — | Skip these groups. |
 | `--testsuite <name>` | all | Run only the named `<testsuite>`. |
@@ -155,6 +155,18 @@ if (class_exists(\App\Kernel::class)) {
     $k->shutdown();
 }
 ```
+
+**Automatic functional-suite detection.** proust flags a suite as *functional*
+when any selected test extends a known framework base class — by default
+`KernelTestCase`, `WebTestCase`, `ApiTestCase`, `PantherTestCase` (extend the
+list with the comma-separated `PROUST_FUNCTIONAL_BASE_CLASSES` env var for a
+custom base). Detection is a DECLARED marker (the resolved `extends` chain),
+never type-reference inference, and matches the suffix so
+`App\Tests\WebTestCase` and the vendor `WebTestCase` both count. It has NO
+correctness effect — it only (1) applies the conservative worker clamp above
+even without `--provision-db`, and (2) prints a one-line suggestion to use
+`--warmup` when you haven't. A plain `PHPUnit\Framework\TestCase` (pure unit
+test) is never flagged.
 
 Notes:
 - **Opt-in and best-effort.** Without the flag nothing changes. A warmup error

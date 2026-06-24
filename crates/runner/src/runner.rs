@@ -1315,6 +1315,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db: false,
+            is_functional: false,
         }
     }
 
@@ -1373,6 +1374,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db: false,
+            is_functional: false,
         }
     }
 
@@ -1453,6 +1455,7 @@ mod tests {
             is_stateful: false,
             is_isolated: true,
             needs_db: false,
+            is_functional: false,
         }
     }
 
@@ -1559,6 +1562,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db: false,
+            is_functional: false,
         }
     }
 
@@ -1615,6 +1619,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db: false,
+            is_functional: false,
         }
     }
 
@@ -1791,6 +1796,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db: false,
+            is_functional: false,
         }
     }
 
@@ -1931,6 +1937,7 @@ mod tests {
             is_stateful: false,
             is_isolated: false,
             needs_db: false,
+            is_functional: false,
         }
     }
 

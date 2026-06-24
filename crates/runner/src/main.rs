@@ -315,6 +315,16 @@ fn selected_needs_db(cases: &[proust::types::TestCase]) -> bool {
     cases.iter().any(|c| c.needs_db)
 }
 
+/// True when ANY selected test extends a known functional framework base class
+/// (Symfony `KernelTestCase`/`WebTestCase`, …) — a high per-worker fixed cost
+/// (cold kernel boot) even without `--provision-db`. Drives the conservative
+/// worker clamp and the `--warmup` suggestion. Marker-based (declared `extends`),
+/// never type-reference inference; affects only worker count + a hint, never
+/// correctness.
+fn selected_is_functional(cases: &[proust::types::TestCase]) -> bool {
+    cases.iter().any(|c| c.is_functional)
+}
+
 #[cfg(test)]
 mod dirty_tests {
     use super::*;
@@ -1057,11 +1067,16 @@ fn real_main() -> Result<ExitCode> {
     // L1: clamp the PHP fork-pool worker count by suite size (default only). The discovery rayon
     // pool above already used the unclamped count; from here, `worker_count` is the clamped value,
     // so a tiny suite spawns 1 worker instead of num_cpus (kills the small-suite fork-storm).
+    // A functional suite (framework kernel boot) carries the same high
+    // per-worker fixed cost as a provisioned one even without --provision-db, so
+    // it gets the same conservative clamp. Marker-based detection (declared
+    // `extends KernelTestCase/WebTestCase/…`); reused below for the warmup hint.
+    let is_functional_suite = selected_is_functional(&cases);
     let worker_count = clamp_php_workers(
         worker_count,
         cli.workers.is_some(),
         cases.len(),
-        worker_clamp_k(cli.provision_db.is_some()),
+        worker_clamp_k(cli.provision_db.is_some() || is_functional_suite),
     );
     // L3: single-process (no-fork) fast path when we'd use exactly one worker AND every class is
     // pure-CPU dispatch-safe. The master runs the per-batch loop itself, matching vanilla's
@@ -1164,6 +1179,15 @@ fn real_main() -> Result<ExitCode> {
         if !w.is_file() {
             return Err(anyhow!("--warmup file not found: {}", w.display()));
         }
+    }
+    // Surface the warmup lever when it would help but isn't set: a functional
+    // suite pays a cold framework-kernel boot per worker that --warmup elides.
+    if is_functional_suite && warmup_script.is_none() {
+        eprintln!(
+            "proust: functional test suite detected (framework kernel boot). Consider \
+             --warmup <file> to boot the kernel once in the master and cut the \
+             per-worker cold-boot cost — see COMPATIBILITY.md \"Warmup hook\"."
+        );
     }
     // L3: pick the no-fork master-inline spawn for an eligible tiny suite; identical 13-arg signature.
     let spawn_fn = if single_process {
@@ -1408,6 +1432,7 @@ mod gate_tests {
             is_stateful: false,
             is_isolated: false,
             needs_db,
+            is_functional: false,
         }
     }
 
@@ -1481,6 +1506,28 @@ mod gate_tests {
         assert_eq!(clamp_php_workers(22, false, 320, worker_clamp_k(true)), 10);
         // Explicit --workers always wins, regardless of provisioning.
         assert_eq!(clamp_php_workers(8, true, 53, worker_clamp_k(true)), 8);
+    }
+
+    #[test]
+    fn functional_suite_triggers_the_conservative_clamp_without_provision_db() {
+        // A suite flagged functional (kernel boot) takes the same conservative
+        // divisor as a provisioned one, even with no --provision-db.
+        let unit = [case("A", "t", false)];
+        assert!(!selected_is_functional(&unit));
+        let mut fc = case("B", "t", false);
+        fc.is_functional = true;
+        let functional = [fc];
+        assert!(selected_is_functional(&functional));
+        // provision_db is absent here; the functional flag alone selects the
+        // conservative divisor (the real call site ORs the two).
+        assert_eq!(
+            worker_clamp_k(selected_is_functional(&functional)),
+            CLAMP_K_PROVISIONED
+        );
+        assert_eq!(
+            worker_clamp_k(selected_is_functional(&unit)),
+            CLAMP_K_DEFAULT
+        );
     }
 
     #[test]

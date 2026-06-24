@@ -64,8 +64,17 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   warns and the run continues unwarmed); zero cost when unused. See
   COMPATIBILITY.md "Warmup hook" for a Symfony example and fork-safety notes.
 - The default worker-count clamp now scales the cases-per-worker divisor by
-  per-worker fixed cost: `--provision-db` (functional/DB) suites clamp at 1
-  worker per 32 cases instead of 16, since each such worker pays a DB clone plus
-  a cold kernel boot. A small functional suite no longer over-forks — a 53-test
-  Symfony suite picks 2 workers instead of 4, going from +5% vs vanilla to −5%
-  (parity). Unit suites and explicit `--workers N` are unchanged.
+  per-worker fixed cost: functional suites clamp at 1 worker per 32 cases instead
+  of 16, since each such worker pays a cold kernel boot (plus a DB clone when
+  provisioned). A small functional suite no longer over-forks — a 53-test Symfony
+  suite picks 2 workers instead of 4, going from +5% vs vanilla to −5% (parity).
+  Unit suites and explicit `--workers N` are unchanged.
+- A suite is now recognised as functional automatically — not only via
+  `--provision-db`, but when any selected test extends a known framework base
+  class (`KernelTestCase`, `WebTestCase`, `ApiTestCase`, `PantherTestCase`;
+  extend with `PROUST_FUNCTIONAL_BASE_CLASSES`). Detection is a declared marker
+  (the resolved `extends` chain), never type-reference inference, and has no
+  correctness effect: it applies the conservative worker clamp and prints a
+  one-line `--warmup` suggestion. So a functional suite run *without*
+  `--provision-db` no longer over-forks (the +5%-on-many-cores regime), and users
+  who'd benefit from `--warmup` are told about it.

@@ -185,6 +185,7 @@ fn worker_timeout_aborts_stuck_run() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
 
     let autoload_t = autoload.clone();
@@ -292,6 +293,7 @@ fn worker_crash_is_recovered_as_error() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
 
     let autoload_t = autoload.clone();
@@ -404,6 +406,7 @@ fn multi_class_bin_crash_counts_each_test_once() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
 
     let mut cases: Vec<TestCase> = Vec::new();
@@ -604,6 +607,7 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
     let cases = vec![mk(&fatal_file, "InlineFatalTest", "testFatal")];
 
@@ -725,6 +729,7 @@ fn inline_runs_all_batches_without_voluntary_recycle() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
     let cases: Vec<TestCase> = files.iter().map(|(f, c)| mk(f, c)).collect();
 
@@ -857,6 +862,7 @@ fn forked_salvage_via_sigkill_proves_requeue() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
     let cases = vec![mk("testOk1"), mk("testPoison"), mk("testOk2")];
 
@@ -1024,6 +1030,7 @@ fn master_death_transient_recovered_by_respawn() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
     let mk_innocent = || TestCase {
         file: innocent_file.clone(),
@@ -1040,6 +1047,7 @@ fn master_death_transient_recovered_by_respawn() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
 
     // Helper: spawn a fresh inline pool, run run_resumable, return (outcomes, unfinished).
@@ -1185,6 +1193,7 @@ fn master_death_always_is_bounded_no_hang() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
     let mk_innocent = || TestCase {
         file: innocent_file.clone(),
@@ -1201,6 +1210,7 @@ fn master_death_always_is_bounded_no_hang() {
         is_stateful: false,
         is_isolated: false,
         needs_db: false,
+        is_functional: false,
     };
 
     const MAX_RESPAWNS: usize = 3;
