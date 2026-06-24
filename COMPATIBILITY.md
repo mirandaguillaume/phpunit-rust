@@ -92,8 +92,9 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 | `--tests-dir <path>` | `tests` | Discovery root, used only when `phpunit.xml` declares no `<testsuite>`. |
 | `--configuration <path>` | auto | Path to `phpunit.xml`; auto-detects `phpunit.xml` then `phpunit.xml.dist`. |
 | `--bootstrap <file>` | from XML | Bootstrap required before tests; overrides the XML `<bootstrap>`. |
+| `--warmup <file>` | — | PHP file `require`d ONCE in the fork master before workers fork (also via `PROUST_WARMUP`); workers inherit its warm state via COW. See [Warmup hook](#warmup-hook-kernel-pre-boot). |
 | `--filter <substr>` | — | Substring match against `Class::method`. |
-| `--workers <n>` | CPU cores | Parallel PHP workers; default mode clamps down by suite size. `--workers 1` = sequential. |
+| `--workers <n>` | CPU cores | Parallel PHP workers; default clamps by suite size — 1 worker per 16 cases, or per 32 for `--provision-db` suites (each functional worker's fixed cost is higher), so small functional suites don't over-fork. `--workers 1` = sequential; an explicit count is never clamped. |
 | `--group <name>` | — | Run only these groups (comma-separated or repeated). |
 | `--exclude-group <name>` | — | Skip these groups. |
 | `--testsuite <name>` | all | Run only the named `<testsuite>`. |
@@ -129,6 +130,48 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 
 **Static coverage** via the sibling `analyzer` crate (mago AST + per-test
 attribution; no Xdebug / PCOV needed).
+
+### Warmup hook (kernel pre-boot)
+
+A framework functional test pays a one-time **cold kernel boot** the first time
+it boots the app (≈90 ms on Symfony: loading + compiling the compiled container
+and service classes). Every later boot in the *same* process is ~0.1 ms. Vanilla
+PHPUnit pays this once for the whole suite; proust forks N workers, so each
+worker pays it once — N cold boots instead of one.
+
+`--warmup <file>` (or `PROUST_WARMUP=<file>`) closes that gap. proust `require`s
+the file **once in the fork master**, after `--bootstrap` and just before the
+fork. Forked workers inherit its warm state (loaded classes + the shared opcache
+populated by a real `require`) via copy-on-write, so each worker's first kernel
+boot drops from ~90 ms to ~1 ms. A typical Symfony warmup:
+
+```php
+<?php // tests/proust_warmup.php — run with: proust --warmup tests/proust_warmup.php
+// Boot then SHUT DOWN the kernel: this loads the classes (inherited by every
+// forked worker) without leaving a live DB connection open for them to share.
+if (class_exists(\App\Kernel::class)) {
+    $k = new \App\Kernel($_SERVER['APP_ENV'] ?? 'test', (bool) ($_SERVER['APP_DEBUG'] ?? true));
+    $k->boot();
+    $k->shutdown();
+}
+```
+
+Notes:
+- **Opt-in and best-effort.** Without the flag nothing changes. A warmup error
+  warns and the run continues *unwarmed* — it is a perf optimization, never a
+  correctness gate.
+- **Fork-safety is the warmup's job.** Boot then shut down (above) so no live
+  connection is inherited by every worker. Symfony/Doctrine connections are lazy,
+  so a boot+shutdown opens none.
+- **Put it in `--warmup`, not `--bootstrap`.** `--bootstrap` is also loaded by
+  the provisioning/teardown helpers, which don't fork workers — warming there
+  pays the boot cost in each of those processes for no benefit.
+- **The wall-clock payoff scales with core pressure.** The warmup removes
+  ~90 ms of boot *CPU* per worker. When workers ≤ available cores those boots
+  already overlap, so the wall gain is small (the master's one-time warmup ≈ the
+  parallelized saving). When workers exceed cores — typical CI runners — the
+  boots serialize and the warmup is a clear wall win (measured −5 % at
+  `--workers 4` and −12 % at `--workers 8` on a 2-core box, Symfony Demo).
 
 ### State isolation (important limitation)
 

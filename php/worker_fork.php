@@ -170,6 +170,7 @@ for ($i = 1; $i < $argc; $i++) {
 
 $autoload        = $args['autoload']           ?? null;
 $bootstrap       = $args['bootstrap']          ?? null;
+$warmup          = $args['warmup']             ?? null;
 $definesJson     = $args['defines']            ?? '[]';
 $envJson         = $args['env']                ?? '[]';
 $serverJson      = $args['server']             ?? '[]';
@@ -391,6 +392,37 @@ if ($__cfgPath !== null
     }
 }
 $__log_phase('event_bridge');
+
+// ---------------------------------------------------------------------------
+// 3c. Master-only warmup (--warmup). Run the app-provided warmup file ONCE
+//     here — after autoload+bootstrap, BEFORE the fork — so every forked child
+//     inherits its warm state (loaded classes + the shared opcache populated by
+//     a real include) via copy-on-write. Booting a framework kernel here
+//     collapses each worker's cold first-boot (~90ms on Symfony) to ~1ms, a win
+//     that grows with worker count. This is fundamentally different from the
+//     removed opcache_compile_file pre-warm (section 4): a REAL include defines
+//     classes in process memory (COW-inherited) and never early-binds ghost
+//     classes, so it carries none of that mechanism's redeclare hazard.
+//
+//     Best-effort: a warmup error warns and the run continues UNWARMED — this is
+//     a perf optimization, never a correctness gate. The app's warmup owns
+//     fork-safety: boot then SHUT DOWN the kernel so no live DB connection is
+//     left open for children to share. Run in an isolated scope so the warmup's
+//     locals never leak into the master (and thus into every child).
+// ---------------------------------------------------------------------------
+if ($warmup !== null) {
+    if (is_file($warmup)) {
+        try {
+            (static function (string $__warmupFile): void { require $__warmupFile; })($warmup);
+            fwrite(STDERR, "worker_fork.php: warmup ran ($warmup)\n");
+        } catch (\Throwable $__e) {
+            fwrite(STDERR, 'worker_fork.php: warmup failed (continuing unwarmed): ' . $__e->getMessage() . "\n");
+        }
+    } else {
+        fwrite(STDERR, "worker_fork.php: warmup file not found (continuing unwarmed): $warmup\n");
+    }
+}
+$__log_phase('warmup');
 
 // ---------------------------------------------------------------------------
 // 4. NO opcache pre-warm — deliberately. The master used to

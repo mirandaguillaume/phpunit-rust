@@ -48,6 +48,7 @@ impl PhpForkPool {
         worker_memory_limit: &str,
         max_batches_per_child: u32,
         per_slot_dsn: Option<&[String]>,
+        warmup: Option<&Path>,
     ) -> Result<Self> {
         Self::spawn_inner(
             script,
@@ -63,6 +64,7 @@ impl PhpForkPool {
             worker_memory_limit,
             max_batches_per_child,
             per_slot_dsn,
+            warmup,
             false,
         )
     }
@@ -85,6 +87,7 @@ impl PhpForkPool {
         worker_memory_limit: &str,
         max_batches_per_child: u32,
         per_slot_dsn: Option<&[String]>,
+        warmup: Option<&Path>,
     ) -> Result<Self> {
         Self::spawn_inner(
             script,
@@ -100,6 +103,7 @@ impl PhpForkPool {
             worker_memory_limit,
             max_batches_per_child,
             per_slot_dsn,
+            warmup,
             true,
         )
     }
@@ -119,6 +123,7 @@ impl PhpForkPool {
         worker_memory_limit: &str,
         max_batches_per_child: u32,
         per_slot_dsn: Option<&[String]>,
+        warmup: Option<&Path>,
         inline: bool,
     ) -> Result<Self> {
         if n == 0 {
@@ -236,6 +241,9 @@ impl PhpForkPool {
         }
         if let Some(bs) = bootstrap {
             cmd.arg("--bootstrap").arg(bs);
+        }
+        if let Some(w) = warmup {
+            cmd.arg("--warmup").arg(w);
         }
         if !defines.is_empty() {
             cmd.arg("--defines")

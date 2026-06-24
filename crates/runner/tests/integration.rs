@@ -80,6 +80,7 @@ fn fork_pool_runs_fixture_and_streams_outcomes() {
         "512M",
         0,
         None,
+        None,
     )
     .expect("PhpForkPool::spawn failed");
 
@@ -202,6 +203,7 @@ fn worker_timeout_aborts_stuck_run() {
             "512M",
             0,
             None,
+            None,
         )
         .expect("PhpForkPool::spawn failed");
         let cfg = RunConfig {
@@ -307,6 +309,7 @@ fn worker_crash_is_recovered_as_error() {
             &std::collections::HashMap::new(),
             "512M",
             0,
+            None,
             None,
         )
         .expect("PhpForkPool::spawn failed");
@@ -464,6 +467,7 @@ fn multi_class_bin_crash_counts_each_test_once() {
             "512M",
             0,
             None,
+            None,
         )
         .expect("PhpForkPool::spawn failed");
         // n_workers=1 with 16 total methods → target=4: PadTest dispatches solo,
@@ -620,6 +624,7 @@ fn inline_master_crash_reports_remaining_tests_as_errors_no_hang() {
             "512M",
             0,
             None,
+            None,
         )
         .expect("spawn_inline failed");
         let cfg = RunConfig {
@@ -740,6 +745,7 @@ fn inline_runs_all_batches_without_voluntary_recycle() {
             &std::collections::HashMap::new(),
             "512M",
             1,
+            None,
             None,
         )
         .expect("spawn_inline failed");
@@ -873,6 +879,7 @@ fn forked_salvage_via_sigkill_proves_requeue() {
             &std::collections::HashMap::new(),
             "512M",
             1,
+            None,
             None,
         )
         .expect("spawn failed");
@@ -1066,6 +1073,7 @@ fn master_death_transient_recovered_by_respawn() {
                 "512M",
                 0,
                 None,
+                None,
             )
             .expect("spawn_inline failed");
             let noop: fn(&proust::types::TestOutcome) = |_o| {};
@@ -1236,6 +1244,7 @@ fn master_death_always_is_bounded_no_hang() {
                 &std::collections::HashMap::new(),
                 "512M",
                 0,
+                None,
                 None,
             )
             .expect("spawn_inline failed");

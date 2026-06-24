@@ -53,3 +53,19 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   provisioning phase drops from 529 ms to 257 ms at `--workers 4` (−272 ms) and
   from 1019 ms to 485 ms at `--workers 8` (−534 ms), with identical test
   outcomes. Per-worker DSNs and crash-cleanup semantics are unchanged.
+- New opt-in `--warmup <file>` (or `PROUST_WARMUP`): a PHP file proust `require`s
+  ONCE in the fork master, after `--bootstrap` and before the fork, so workers
+  inherit its warm state via copy-on-write. Booting a framework kernel here
+  collapses each worker's cold first-boot (≈90 ms on Symfony) to ~1 ms — it
+  removes ~90 ms of boot CPU per worker. The wall-clock payoff scales with core
+  pressure: ~neutral when workers ≤ cores (boots already overlap), and a clear
+  win when boots serialize (measured −5 % at `--workers 4` / −12 % at
+  `--workers 8` on a 2-core box, Symfony Demo). Best-effort (a warmup error
+  warns and the run continues unwarmed); zero cost when unused. See
+  COMPATIBILITY.md "Warmup hook" for a Symfony example and fork-safety notes.
+- The default worker-count clamp now scales the cases-per-worker divisor by
+  per-worker fixed cost: `--provision-db` (functional/DB) suites clamp at 1
+  worker per 32 cases instead of 16, since each such worker pays a DB clone plus
+  a cold kernel boot. A small functional suite no longer over-forks — a 53-test
+  Symfony suite picks 2 workers instead of 4, going from +5% vs vanilla to −5%
+  (parity). Unit suites and explicit `--workers N` are unchanged.

@@ -80,6 +80,7 @@ fn worker_token_is_set_and_distinct_per_slot() {
         "512M",
         0,
         None,
+        None,
     )
     .expect("spawn");
     pool.write_batch(0, &plan_for(&file)).unwrap();
@@ -142,6 +143,7 @@ fn worker_token_stable_across_recycle() {
         &HashMap::new(),
         "512M",
         1,
+        None,
         None,
     )
     .expect("spawn");
