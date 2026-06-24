@@ -150,3 +150,68 @@ jobs:
 
       - name: Run php/tests (Proust shim suite)
         run: php php/vendor/bin/phpunit --bootstrap php/vendor/autoload.php php/tests
+
+  parity-functional:
+    # Exercises the --provision-db per-worker-DB path that the unit/parity jobs
+    # can't: a real framework app (Symfony Demo) whose functional suite isolates
+    # each test via DAMADoctrineTestBundle (a PHPUnit <extensions> bootstrap) runs
+    # in PARALLEL against PostgreSQL, and must match vanilla exactly. This is the
+    # only automated check that the event bridge + force-provisioning + per-worker
+    # DATABASE_URL injection actually compose into isolated parallel execution.
+    name: parity (parallel functional tests, pg)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: pg
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # Host PHP is only needed for the composer step below (the worker-shim
+      # vendor that worker_fork.php require_once's); the suite itself runs inside
+      # the CI image. setup-php bundles composer.
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+
+      - name: Build proust binary
+        run: cargo build -p proust
+
+      # The pg path needs pdo_pgsql, which lives in this image (not the bare runner).
+      - name: Build CI image (with pdo_pgsql)
+        run: docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
+
+      # --network host so the docker-run containers reach the pg service on
+      # localhost:5432; the script clones Symfony Demo, loads schema+fixtures,
+      # then gates `proust --workers 4 --provision-db` == vanilla.
+      - name: Parallel functional-test parity (Symfony Demo on Postgres)
+        env:
+          IMAGE: proust-ci:php84
+          BINARY: ${{ github.workspace }}/target/debug/proust
+          DOCKER_NET: host
+          PG_HOST: 127.0.0.1
+          PG_PORT: "5432"
+          PG_USER: postgres
+          PG_PASS: pg
+          PG_DB: app_test
+        run: bash bench/parity_functional_pg.sh
