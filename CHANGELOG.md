@@ -63,3 +63,9 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   `--workers 8` on a 2-core box, Symfony Demo). Best-effort (a warmup error
   warns and the run continues unwarmed); zero cost when unused. See
   COMPATIBILITY.md "Warmup hook" for a Symfony example and fork-safety notes.
+- The default worker-count clamp now scales the cases-per-worker divisor by
+  per-worker fixed cost: `--provision-db` (functional/DB) suites clamp at 1
+  worker per 32 cases instead of 16, since each such worker pays a DB clone plus
+  a cold kernel boot. A small functional suite no longer over-forks — a 53-test
+  Symfony suite picks 2 workers instead of 4, going from +5% vs vanilla to −5%
+  (parity). Unit suites and explicit `--workers N` are unchanged.

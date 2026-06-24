@@ -94,7 +94,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 | `--bootstrap <file>` | from XML | Bootstrap required before tests; overrides the XML `<bootstrap>`. |
 | `--warmup <file>` | — | PHP file `require`d ONCE in the fork master before workers fork (also via `PROUST_WARMUP`); workers inherit its warm state via COW. See [Warmup hook](#warmup-hook-kernel-pre-boot). |
 | `--filter <substr>` | — | Substring match against `Class::method`. |
-| `--workers <n>` | CPU cores | Parallel PHP workers; default mode clamps down by suite size. `--workers 1` = sequential. |
+| `--workers <n>` | CPU cores | Parallel PHP workers; default clamps by suite size — 1 worker per 16 cases, or per 32 for `--provision-db` suites (each functional worker's fixed cost is higher), so small functional suites don't over-fork. `--workers 1` = sequential; an explicit count is never clamped. |
 | `--group <name>` | — | Run only these groups (comma-separated or repeated). |
 | `--exclude-group <name>` | — | Skip these groups. |
 | `--testsuite <name>` | all | Run only the named `<testsuite>`. |

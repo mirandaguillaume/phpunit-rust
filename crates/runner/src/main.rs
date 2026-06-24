@@ -517,6 +517,24 @@ fn clamp_php_workers(requested: usize, explicit: bool, cases_len: usize, k: usiz
     requested.min(by_size).max(1)
 }
 
+/// Cases-per-worker divisor for the default (non-explicit) worker clamp.
+/// A *provisioned* suite (`--provision-db`) is functional: each worker pays a
+/// much larger fixed cost — a per-worker DB clone plus a cold framework-kernel
+/// boot (~90ms unless `--warmup`) — so a worker only pays off over more tests.
+/// We require twice as many cases before forking another worker, which keeps a
+/// small functional suite at a worker count near vanilla instead of over-forking
+/// (a 53-test Symfony suite goes 4→2 workers, lifting a measured +5% regression
+/// to parity). Cheap unit suites keep the lower divisor and full parallelism.
+const CLAMP_K_DEFAULT: usize = 16;
+const CLAMP_K_PROVISIONED: usize = 32;
+fn worker_clamp_k(provisioned: bool) -> usize {
+    if provisioned {
+        CLAMP_K_PROVISIONED
+    } else {
+        CLAMP_K_DEFAULT
+    }
+}
+
 /// Max cases for the single-process (no-fork) fast path. Aligned with `clamp_php_workers`'s
 /// `k=16`: in default mode the worker count only collapses to 1 for suites this small, so the
 /// inline path naturally served exactly the tiny suites it was designed for. The cap makes that
@@ -1039,7 +1057,12 @@ fn real_main() -> Result<ExitCode> {
     // L1: clamp the PHP fork-pool worker count by suite size (default only). The discovery rayon
     // pool above already used the unclamped count; from here, `worker_count` is the clamped value,
     // so a tiny suite spawns 1 worker instead of num_cpus (kills the small-suite fork-storm).
-    let worker_count = clamp_php_workers(worker_count, cli.workers.is_some(), cases.len(), 16);
+    let worker_count = clamp_php_workers(
+        worker_count,
+        cli.workers.is_some(),
+        cases.len(),
+        worker_clamp_k(cli.provision_db.is_some()),
+    );
     // L3: single-process (no-fork) fast path when we'd use exactly one worker AND every class is
     // pure-CPU dispatch-safe. The master runs the per-batch loop itself, matching vanilla's
     // single-process timing for the tiny suites where vanilla wins.
@@ -1440,6 +1463,24 @@ mod gate_tests {
         assert_eq!(clamp_php_workers(22, false, 0, 16), 1); // floor 1
                                                             // Explicit --workers N: honored verbatim, never clamped.
         assert_eq!(clamp_php_workers(8, true, 12, 16), 8);
+    }
+
+    #[test]
+    fn provisioned_suites_clamp_to_fewer_workers_than_unit_suites() {
+        // A provisioned (functional/DB) suite pays a high per-worker fixed cost,
+        // so it uses the larger divisor and forks fewer workers than a unit suite
+        // of the SAME size would.
+        assert_eq!(worker_clamp_k(false), CLAMP_K_DEFAULT);
+        assert_eq!(worker_clamp_k(true), CLAMP_K_PROVISIONED);
+        // The measured case: a 53-test Symfony functional suite on a many-core
+        // box. Default divisor over-forks to 4 (+5% vs vanilla); the provisioned
+        // divisor lands on 2 (parity).
+        assert_eq!(clamp_php_workers(22, false, 53, worker_clamp_k(false)), 4);
+        assert_eq!(clamp_php_workers(22, false, 53, worker_clamp_k(true)), 2);
+        // A large functional suite still scales out (no starvation): 320 cases.
+        assert_eq!(clamp_php_workers(22, false, 320, worker_clamp_k(true)), 10);
+        // Explicit --workers always wins, regardless of provisioning.
+        assert_eq!(clamp_php_workers(8, true, 53, worker_clamp_k(true)), 8);
     }
 
     #[test]
