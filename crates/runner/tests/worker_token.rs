@@ -12,7 +12,7 @@ fn write_echo_test(dir: &std::path::Path) -> PathBuf {
     let file = dir.join("WorkerTokenEchoTest.php");
     std::fs::write(
         &file,
-        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass WorkerTokenEchoTest extends TestCase {\n    public function testEchoToken(): void {\n        $this->fail('TOKEN=' . var_export(getenv('PHPUNIT_RUST_WORKER_ID'), true));\n    }\n}\n",
+        "<?php\nuse PHPUnit\\Framework\\TestCase;\nclass WorkerTokenEchoTest extends TestCase {\n    public function testEchoToken(): void {\n        $this->fail('TOKEN=' . var_export(getenv('PROUST_WORKER_ID'), true));\n    }\n}\n",
     )
     .unwrap();
     file
@@ -99,10 +99,7 @@ fn worker_token_is_set_and_distinct_per_slot() {
 
     assert_eq!(per_slot.len(), 2, "both slots produced an outcome");
     for t in &per_slot {
-        assert_ne!(
-            t, "false",
-            "PHPUNIT_RUST_WORKER_ID must be set (getenv != false)"
-        );
+        assert_ne!(t, "false", "PROUST_WORKER_ID must be set (getenv != false)");
     }
     let distinct: HashSet<&String> = per_slot.iter().collect();
     assert_eq!(

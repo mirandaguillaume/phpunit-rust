@@ -62,7 +62,7 @@ The PHPUnit project's own test suite was attempted as an additional
 data point (PHP 8.4, Docker, `bench/Dockerfile.php84` + `--tmpfs /tmp`).
 Vanilla median on the **full** suite (unit + ~1000 `.phpt` end-to-end
 files): **133.66 s** (3 runs: 132.31, 133.66, 141.10 s), ~108 MB RSS.
-proust cannot reach parity on the full suite by construction — it
+Proust cannot reach parity on the full suite by construction — it
 discovers `*Test.php` **classes**, so the `.phpt` files are invisible to
 it (see [COMPATIBILITY.md](COMPATIBILITY.md)). Historically it also
 **hung** partway through: PHPUnit's own `@runInSeparateProcess` /
@@ -187,16 +187,16 @@ zero measured benefit on PHP 8.4 CLI.)
 
 A few opt-in knobs are useful for debugging and A/B benchmarking:
 
-- `PHPUNIT_RUST_TIMING=1` — log master phase timings to stderr
+- `PROUST_TIMING=1` — log master phase timings to stderr
   (autoload, bootstrap, fork, …) as `[TIMING]` lines.
-- `PHPUNIT_RUST_NO_ISOLATION=1` — disable the per-batch fresh-fork
+- `PROUST_NO_ISOLATION=1` — disable the per-batch fresh-fork
   applied to stateful test classes (those calling
   `stream_wrapper_register`, `set_error_handler`, …). Costs ~14 % on
   state-sensitive suites but exposes their pollution for diagnosis.
-- `PHPUNIT_RUST_TRACE_BATCHES=1` — write per-class `START`/`END` markers
+- `PROUST_TRACE_BATCHES=1` — write per-class `START`/`END` markers
   to a per-slot file under `/tmp`; the slot file whose last line is a
   `START` with no `END` names a hanging class.
-- `PHPUNIT_RUST_DUMP_TESTS=<path>` — dump one
+- `PROUST_DUMP_TESTS=<path>` — dump one
   `Class::method|status|message` line per executed test (per data row)
   to `<path>`, for parity forensics.
 

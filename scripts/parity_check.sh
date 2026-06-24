@@ -26,7 +26,7 @@
 #
 # The proust binary is located, in order of preference:
 #   1. the optional 2nd argument
-#   2. $PHPUNIT_RUST_BIN
+#   2. $PROUST_BIN
 #   3. ./target/debug/proust then ./target/release/proust
 #      (relative to the repo root containing this script)
 #   4. `proust` on $PATH
@@ -55,8 +55,8 @@ resolve_rust_bin() {
     if [ "$#" -ge 2 ] && [ -n "${2:-}" ]; then
         echo "$2"; return 0
     fi
-    if [ -n "${PHPUNIT_RUST_BIN:-}" ]; then
-        echo "$PHPUNIT_RUST_BIN"; return 0
+    if [ -n "${PROUST_BIN:-}" ]; then
+        echo "$PROUST_BIN"; return 0
     fi
     if [ -x "$REPO_ROOT/target/debug/proust" ]; then
         echo "$REPO_ROOT/target/debug/proust"; return 0

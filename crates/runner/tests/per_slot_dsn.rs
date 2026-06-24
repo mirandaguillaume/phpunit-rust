@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::PathBuf;
 
-/// Write a temp TestCase whose constructor captures and clears PHPUNIT_RUST_DB_DSN
+/// Write a temp TestCase whose constructor captures and clears PROUST_DB_DSN
 /// (before TestExecutor's dbHandle() tries to connect) and stores the value in an
 /// instance property. The test then fails with the captured value so it is visible
 /// in TestOutcome.message. Works on machines with no PDO drivers.
@@ -21,11 +21,11 @@ class DsnEchoTest extends TestCase {\n\
     private string $capturedDsn = '';\n\
     public function __construct(?string $name = null, array $data = [], int|string $dataName = '') {\n\
         parent::__construct($name ?? 'testEchoDsn', $data, $dataName);\n\
-        $raw = getenv('PHPUNIT_RUST_DB_DSN');\n\
+        $raw = getenv('PROUST_DB_DSN');\n\
         $this->capturedDsn = $raw === false ? '' : $raw;\n\
         // Clear so TestExecutor's dbHandle() returns null (no PDO connection needed).\n\
-        putenv('PHPUNIT_RUST_DB_DSN=');\n\
-        $_ENV['PHPUNIT_RUST_DB_DSN'] = '';\n\
+        putenv('PROUST_DB_DSN=');\n\
+        $_ENV['PROUST_DB_DSN'] = '';\n\
     }\n\
     public function testEchoDsn(): void {\n\
         $this->fail('DSN=' . var_export($this->capturedDsn, true));\n\
@@ -72,7 +72,7 @@ fn per_slot_dsn_is_injected_and_distinct() {
     let file = write_echo_test(&dir);
 
     // Use arbitrary distinct DSN-like strings. The constructor captures and
-    // clears PHPUNIT_RUST_DB_DSN before dbHandle() fires, so no PDO driver
+    // clears PROUST_DB_DSN before dbHandle() fires, so no PDO driver
     // is needed. Works on any machine.
     let dsns = vec![
         "pgsql:host=localhost;dbname=app_w0".to_string(),
@@ -136,7 +136,7 @@ fn per_slot_dsn_is_injected_and_distinct() {
     );
 }
 
-/// When no DSNs are provided (empty), PHPUNIT_RUST_DB_DSN must NOT be set —
+/// When no DSNs are provided (empty), PROUST_DB_DSN must NOT be set —
 /// behaviour byte-identical to pre-P3.
 #[test]
 fn per_slot_dsn_absent_when_none() {
@@ -190,6 +190,6 @@ fn per_slot_dsn_absent_when_none() {
     // contain any DSN-like content.
     assert!(
         dsn_val.is_empty() || dsn_val == "''" || dsn_val == "false",
-        "PHPUNIT_RUST_DB_DSN must NOT be set when per_slot_dsn is None; got: {dsn_val:?}"
+        "PROUST_DB_DSN must NOT be set when per_slot_dsn is None; got: {dsn_val:?}"
     );
 }

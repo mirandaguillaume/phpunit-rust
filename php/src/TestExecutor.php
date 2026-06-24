@@ -381,7 +381,7 @@ final class TestExecutor
                     // out of scope (resource-provisioning design), so the
                     // documented mitigation is a loud forensic breadcrumb, in the
                     // STDERR style worker_fork.php uses for its own warnings.
-                    $slot = getenv('PHPUNIT_RUST_SLOT');
+                    $slot = getenv('PROUST_SLOT');
                     $slot = ($slot === false || $slot === '') ? '?' : $slot;
                     fwrite(STDERR, sprintf(
                         "TestExecutor: DB isolation LEAK — %s::%s committed inside its "
@@ -453,14 +453,14 @@ final class TestExecutor
     {
         static $active = null;
         if ($active === null) {
-            // PRUST_EVENT_BRIDGE is set by worker_fork.php ONLY after it has
+            // PROUST_EVENT_BRIDGE is set by worker_fork.php ONLY after it has
             // bootstrapped >=1 <extensions> and sealed the Event\Facade. Gating
             // on it is load-bearing: without it we would emit events for EVERY
             // run (incl. suites with no extensions, and — fatally — when proust's
             // OWN unit tests invoke TestExecutor::runClass, polluting the outer
             // PHPUnit run's already-sealed facade). class_exists alone is not
             // enough because the Event API is always present on PHPUnit >=10.
-            $active = getenv('PRUST_EVENT_BRIDGE') === '1'
+            $active = getenv('PROUST_EVENT_BRIDGE') === '1'
                 && class_exists(\PHPUnit\Event\Facade::class)
                 && class_exists(\PHPUnit\Event\Code\TestMethodBuilder::class);
         }
@@ -845,7 +845,7 @@ final class TestExecutor
      * configured to route through it) for the begin/rollback reset to isolate their
      * writes. Code that opens its OWN connection is NOT isolated by the runner and
      * must be marked stateful (#[UsesDatabase] does not make ad-hoc connections
-     * isolated). Returns null when PHPUNIT_RUST_DB_DSN is unset (inert).
+     * isolated). Returns null when PROUST_DB_DSN is unset (inert).
      */
     public static function connection(): ?\PDO
     {
@@ -856,7 +856,7 @@ final class TestExecutor
      * Resolve a single, per-process PDO handle for per-test transaction
      * isolation (P2), or null when no per-slot DSN was injected.
      *
-     * The DSN comes from PHPUNIT_RUST_DB_DSN (the per-slot env var set by the
+     * The DSN comes from PROUST_DB_DSN (the per-slot env var set by the
      * fork-worker master). We memoize the handle per worker process: opening a
      * new PDO per test would cost latency AND, for sqlite::memory:, create a
      * fresh empty DB each time — breaking cross-test visibility. Memoization
@@ -880,7 +880,7 @@ final class TestExecutor
         // harness does in setUp/tearDown — we open a FRESH connection instead
         // of returning a handle to an unlinked-and-recreated sqlite inode.
         // Production never re-injects a DSN, so this only removes a test flake.
-        $dsn = getenv('PHPUNIT_RUST_DB_DSN');
+        $dsn = getenv('PROUST_DB_DSN');
         if ($dsn === false || $dsn === '') {
             $pdo = null;
             $dsnAtConnect = null;

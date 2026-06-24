@@ -1,6 +1,6 @@
 # Benchmark harness
 
-`run.sh` runs proust + vanilla PHPUnit against the cloned smoke projects
+`run.sh` runs Proust + vanilla PHPUnit against the cloned smoke projects
 inside Docker containers for each supported PHP version. Lets us measure
 correctly across PHP 8.1-8.5 without modifying the host system.
 

@@ -17,8 +17,8 @@ final class TransactionResetGuardTest extends TestCase
     public function testNoDsnMeansNoTransactionAndIdenticalOutcome(): void
     {
         // Ensure the env var is absent for this process.
-        putenv('PHPUNIT_RUST_DB_DSN');
-        unset($_ENV['PHPUNIT_RUST_DB_DSN'], $_SERVER['PHPUNIT_RUST_DB_DSN']);
+        putenv('PROUST_DB_DSN');
+        unset($_ENV['PROUST_DB_DSN'], $_SERVER['PROUST_DB_DSN']);
 
         $outcomes = TestExecutor::runClass(_NoDbFixture::class, ['testPlain']);
 

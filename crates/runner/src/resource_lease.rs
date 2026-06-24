@@ -162,7 +162,7 @@ pub fn build_template(
 }
 
 /// Clone the template for one worker slot via `CREATE DATABASE ..._w{slot}
-/// TEMPLATE template`. Returns the clone's DSN to inject as PHPUNIT_RUST_DB_DSN
+/// TEMPLATE template`. Returns the clone's DSN to inject as PROUST_DB_DSN
 /// for that slot. Hard-fails on error.
 #[allow(clippy::too_many_arguments)]
 pub fn clone_for_slot(

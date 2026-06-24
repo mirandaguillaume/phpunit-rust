@@ -114,14 +114,14 @@ fi
 # bench_host handles the per-suite vanilla quirks (phpunit-itself's
 # ./phpunit --testsuite unit, mockery's bootstrap, etc.).
 #
-# PHPUNIT_RUST_DUMP_TESTS makes the runner write its exact EXPANDED test list
+# PROUST_DUMP_TESTS makes the runner write its exact EXPANDED test list
 # (one line per data row: Class::method|Status) — the forensic input that
 # --list-tests can't provide. Costs one file write; only read on failure.
 WORKERS="${WORKERS:-4}"
 DUMP="${TMPDIR:-/tmp}/rust-tests-${name}.txt"
 out="$(
     export BINARY SMOKE RUNS="${RUNS:-1}" WORKERS
-    export PHPUNIT_RUST_DUMP_TESTS="${DUMP}"
+    export PROUST_DUMP_TESTS="${DUMP}"
     [[ -n "${extra_env}" ]] && export "${extra_env?}"
     "${SCRIPT_DIR}/bench_host.sh" "${name}"
 )"
@@ -189,7 +189,7 @@ forensics() {
     # swallowed — so grepping the run output is useless. Two instruments DO
     # name the killer: (1) the dump already attributes the IN-FLIGHT victim
     # ("worker process died" on a concrete test), and (2) the per-slot batch
-    # traces (PHPUNIT_RUST_TRACE_BATCHES): a trace whose last line is START
+    # traces (PROUST_TRACE_BATCHES): a trace whose last line is START
     # with no matching END is the batch that took its worker down.
     if grep -q 'worker process' "${DUMP}"; then
         echo "[forensics] in-flight victims (test running when its worker died):"
@@ -201,7 +201,7 @@ forensics() {
         mkdir -p "${tracedir}"
         (
             [[ -n "${extra_env}" ]] && export "${extra_env?}"
-            export PHPUNIT_RUST_TRACE_BATCHES="${tracedir}"
+            export PROUST_TRACE_BATCHES="${tracedir}"
             "${BINARY}" --project "${suite_dir}" --workers "${WORKERS}" --worker-memory-limit=-1 \
                 > "${rerun}" 2>&1
         ) || true
