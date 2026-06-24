@@ -146,6 +146,33 @@ function assertSafeIdent(string $id, string $what): void {
     }
 }
 
+/**
+ * Drop stale `<base>_pr<digits>_w<digits>` clone DBs with ZERO active backends
+ * (a non-zero count means a live concurrent run owns it — never touch it).
+ * Shared by the standalone `gc` action and the batched `provision_run`.
+ *
+ * @return list<string> the clone names reclaimed
+ */
+function gcSweep(\PDO $pdo, string $base): array {
+    $baseName = dbNameFromBase($base);
+    $reBase = preg_replace('/[.^$*+?()\\[\\]{}|\\\\]/', '\\\\$0', $baseName);
+    $pat = '^' . $reBase . '_pr[0-9]+_w[0-9]+$';
+    $stmt = $pdo->prepare('SELECT datname FROM pg_database WHERE datname ~ :pat AND datname <> :base');
+    $stmt->execute([':pat' => $pat, ':base' => $baseName]);
+    $dropped = [];
+    foreach ($stmt->fetchAll(\PDO::FETCH_COLUMN) as $name) {
+        $bStmt = $pdo->prepare('SELECT count(*) FROM pg_stat_activity WHERE datname = ?');
+        $bStmt->execute([$name]);
+        if ((int) $bStmt->fetchColumn() > 0) {
+            continue; // live run owns this clone — do not touch
+        }
+        assertSafeIdent($name, 'gc clone');
+        $pdo->exec('DROP DATABASE IF EXISTS ' . qid($name));
+        $dropped[] = $name;
+    }
+    return $dropped;
+}
+
 try {
     $pdo = connectAdmin($base);
     switch ($action) {
@@ -182,50 +209,40 @@ try {
             echo json_encode(['dsn' => null]), "\n";
             exit(0);
 
-        /**
-         * Best-effort crash cleanup: drop clone databases left by a prior run
-         * that was killed before its LeaseGuard could run destroy_all().
-         *
-         * Safety rule: only drop clones with ZERO active backends. A non-zero
-         * count means a live concurrent run owns that clone — we must not touch
-         * it. This relies on the assumption that no two runs provision against
-         * the SAME base DSN concurrently (use isolated base DBs for that; CI
-         * service containers give each job its own Postgres instance).
-         *
-         * Match exactly `<base>_pr<digits>_w<digits>` with a POSIX regex (the `~`
-         * operator) — precise, and free of the LIKE ESCAPE-string pitfalls (a
-         * malformed multi-char escape errors the whole sweep out). Clones the
-         * Rust side hash-splices for >63-byte base names (rare) won't match and
-         * are left for a later run; the common short-name case is covered.
-         */
+        // Best-effort crash cleanup: drop stale clones from a prior killed run.
+        // See gcSweep() for the zero-backend safety rule + pattern matching.
         case 'gc':
-            $baseName = dbNameFromBase($base);
-            // Escape POSIX-ERE metacharacters in the base name; the clone suffix
-            // is the fixed shape `_pr<digits>_w<digits>`.
-            $reBase = preg_replace('/[.^$*+?()\\[\\]{}|\\\\]/', '\\\\$0', $baseName);
-            $pat = '^' . $reBase . '_pr[0-9]+_w[0-9]+$';
-            $stmt = $pdo->prepare(
-                'SELECT datname FROM pg_database WHERE datname ~ :pat AND datname <> :base'
-            );
-            $stmt->execute([':pat' => $pat, ':base' => $baseName]);
-            $candidates = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+            echo json_encode(['dsn' => null, 'dropped' => gcSweep($pdo, $base)]), "\n";
+            exit(0);
 
-            $dropped = [];
-            foreach ($candidates as $name) {
-                // Count active backends — skip any clone still in use.
-                $bStmt = $pdo->prepare(
-                    'SELECT count(*) FROM pg_stat_activity WHERE datname = ?'
-                );
-                $bStmt->execute([$name]);
-                $backends = (int) $bStmt->fetchColumn();
-                if ($backends > 0) {
-                    continue; // live run owns this clone — do not touch
-                }
-                assertSafeIdent($name, 'gc clone');
-                $pdo->exec('DROP DATABASE IF EXISTS ' . qid($name));
-                $dropped[] = $name;
+        // Batched provisioning: GC + every per-slot clone in ONE invocation over
+        // a single admin connection, replacing the gc + build_template +
+        // N×clone fan-out that spawned N+2 separate PHP processes per run. The
+        // template is the base DB itself (already migrated/seeded); clone names
+        // are computed + sanitized by the Rust lease and passed in order.
+        case 'provision_run':
+            $template = dbNameFromBase($base);
+            assertSafeIdent($template, 'template');
+            // GC is best-effort (mirrors the standalone `gc` path, which the Rust
+            // caller swallowed on error): a sweep failure — e.g. a concurrent run
+            // grabbing a clone between the zero-backend check and the DROP — must
+            // NOT abort a fresh provision. Clone creation below still hard-fails.
+            try {
+                $dropped = gcSweep($pdo, $base);
+            } catch (\Throwable $e) {
+                fwrite(STDERR, "provision_db.php: gc sweep skipped ({$e->getMessage()})\n");
+                $dropped = [];
             }
-            echo json_encode(['dsn' => null, 'dropped' => $dropped]), "\n";
+            $dsns = [];
+            foreach (($req['clone_names'] ?? []) as $clone) {
+                $clone = (string) $clone;
+                assertSafeIdent($clone, 'clone_name');
+                // Idempotent: drop any stale clone of this exact name first.
+                $pdo->exec('DROP DATABASE IF EXISTS ' . qid($clone));
+                $pdo->exec('CREATE DATABASE ' . qid($clone) . ' TEMPLATE ' . qid($template));
+                $dsns[] = dsnForClone($base, $clone);
+            }
+            echo json_encode(['template' => $template, 'dsns' => $dsns, 'dropped' => $dropped]), "\n";
             exit(0);
 
         default:

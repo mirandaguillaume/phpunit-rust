@@ -1067,28 +1067,13 @@ fn real_main() -> Result<ExitCode> {
             );
         }
         let provision_script = proust::php_worker::find_provision_script()?;
-        // P4 startup GC sweep: best-effort, never aborts the run.
-        match proust::resource_lease::gc_stale_clones(
-            &provision_script,
-            &autoload,
-            bootstrap.as_deref(),
-            &defines,
-            base,
-        ) {
-            Ok(n) if n > 0 => eprintln!(
-                "Resource provisioning: GC reclaimed {n} stale clone(s) from a prior crashed run."
-            ),
-            Ok(_) => {}
-            Err(e) => eprintln!("Resource provisioning: GC sweep skipped ({e})"),
-        }
         let run_uuid = format!("pr{}", std::process::id());
-        let template = proust::resource_lease::build_template(
-            &provision_script,
-            &autoload,
-            bootstrap.as_deref(),
-            &defines,
-            base,
-        )?;
+        // Compute every per-slot clone name up front and register them in the
+        // lease BEFORE provisioning, so teardown (DROP IF EXISTS per name) stays
+        // authoritative even if the batched provision crashes mid-CREATE.
+        let clone_names: Vec<String> = (0..worker_count)
+            .map(|slot| proust::resource_lease::clone_name(base, &run_uuid, slot))
+            .collect();
         let mut lease = proust::resource_lease::ResourceLease::new(
             provision_script.clone(),
             autoload.clone(),
@@ -1096,26 +1081,31 @@ fn real_main() -> Result<ExitCode> {
             defines.clone(),
             base.clone(),
         );
-        let mut per_slot_dsn: Vec<String> = Vec::with_capacity(worker_count);
-        for slot in 0..worker_count {
-            let dsn = proust::resource_lease::clone_for_slot(
-                &provision_script,
-                &autoload,
-                bootstrap.as_deref(),
-                &defines,
-                slot,
-                &run_uuid,
-                &template,
-                base,
-            )?;
-            lease.register(proust::resource_lease::clone_name(base, &run_uuid, slot));
-            per_slot_dsn.push(dsn);
+        for name in &clone_names {
+            lease.register(name.clone());
+        }
+        // Batched provisioning: GC sweep + template + every per-slot clone in ONE
+        // php spawn (was N+2 separate spawns: gc + build_template + N×clone).
+        let provisioned = proust::resource_lease::provision_run(
+            &provision_script,
+            &autoload,
+            bootstrap.as_deref(),
+            &defines,
+            base,
+            &clone_names,
+        )?;
+        if provisioned.gc_dropped > 0 {
+            eprintln!(
+                "Resource provisioning: GC reclaimed {} stale clone(s) from a prior crashed run.",
+                provisioned.gc_dropped
+            );
         }
         eprintln!(
-            "Resource provisioning: built template '{template}' and {} per-slot clone(s).",
-            per_slot_dsn.len()
+            "Resource provisioning: built template '{}' and {} per-slot clone(s).",
+            provisioned.template,
+            provisioned.dsns.len()
         );
-        per_slot_dsn_opt = Some(per_slot_dsn);
+        per_slot_dsn_opt = Some(provisioned.dsns);
         Some(proust::resource_lease::LeaseGuard::new(lease))
     } else {
         None
