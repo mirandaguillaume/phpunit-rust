@@ -92,6 +92,7 @@ fn per_slot_dsn_is_injected_and_distinct() {
         "512M",
         0,
         Some(&dsns),
+        None,
     )
     .expect("spawn");
 
@@ -161,6 +162,7 @@ fn per_slot_dsn_absent_when_none() {
         "512M",
         0,
         None, // no DSNs
+        None,
     )
     .expect("spawn");
 

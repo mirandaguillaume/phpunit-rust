@@ -381,6 +381,15 @@ struct Cli {
     /// <bootstrap> attribute if both are present.
     #[arg(long)]
     bootstrap: Option<PathBuf>,
+    /// Optional warmup PHP file run ONCE in the fork master before any worker is
+    /// forked (after --bootstrap, just before the fork). Forked workers inherit
+    /// its warm state via copy-on-write — e.g. a file that boots your framework
+    /// kernel so each worker skips the cold ~90ms first-boot. Best-effort: a
+    /// warmup error warns and the run continues unwarmed. Unlike --bootstrap it
+    /// is NOT loaded by the provisioning/teardown helpers, so its cost is paid
+    /// exactly once. Overrides the PROUST_WARMUP environment variable.
+    #[arg(long)]
+    warmup: Option<PathBuf>,
     /// Path to phpunit.xml. Defaults to <project>/phpunit.xml, then
     /// phpunit.dist.xml, then phpunit.xml.dist if found. We extract: the `bootstrap` attribute,
     /// `<testsuite><directory>` entries (used as additional discovery roots),
@@ -1121,6 +1130,18 @@ fn real_main() -> Result<ExitCode> {
         );
     }
     let fork_script = find_fork_script()?;
+    // Optional master-only warmup script (CLI --warmup wins over PROUST_WARMUP).
+    // proust `require`s it ONCE in the fork master before forking; workers inherit
+    // its warm state (loaded classes + shared opcache) via copy-on-write.
+    let warmup_script: Option<PathBuf> = cli
+        .warmup
+        .clone()
+        .or_else(|| std::env::var_os("PROUST_WARMUP").map(PathBuf::from));
+    if let Some(w) = &warmup_script {
+        if !w.is_file() {
+            return Err(anyhow!("--warmup file not found: {}", w.display()));
+        }
+    }
     // L3: pick the no-fork master-inline spawn for an eligible tiny suite; identical 13-arg signature.
     let spawn_fn = if single_process {
         PhpForkPool::spawn_inline
@@ -1146,6 +1167,7 @@ fn real_main() -> Result<ExitCode> {
                 &cli.worker_memory_limit,
                 cli.worker_max_batches,
                 per_slot_dsn_opt.as_deref(),
+                warmup_script.as_deref(),
             )
         },
     )?;
@@ -1234,6 +1256,7 @@ fn real_main() -> Result<ExitCode> {
             &cli.worker_memory_limit,
             cli.worker_max_batches,
             per_slot_dsn_opt.as_deref(),
+            warmup_script.as_deref(),
         )?;
         pending = unfinished;
     }

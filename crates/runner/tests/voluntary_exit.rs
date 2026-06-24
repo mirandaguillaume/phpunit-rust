@@ -82,6 +82,7 @@ fn voluntary_exit0_midbatch_is_recovered_not_clean_recycle() {
             "512M",
             1,
             None,
+            None,
         )
         .expect("PhpForkPool::spawn failed");
         // No watchdog: this must be recovered via the `slot_died` path, NOT the
