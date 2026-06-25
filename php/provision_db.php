@@ -3,8 +3,10 @@
 declare(strict_types=1);
 
 /**
- * Postgres resource provisioner (P3). Spawn-once short-lived helper, mirroring
- * enumerate_providers.php's CLI/stdin/stdout contract.
+ * Per-worker database provisioner (P3). Spawn-once short-lived helper, mirroring
+ * enumerate_providers.php's CLI/stdin/stdout contract. The DBMS is an
+ * implementation detail behind the Proust\Provisioning\Provisioner contract;
+ * the adapter is chosen from the base DSN scheme by ProvisionerFactory.
  *
  * CLI usage:
  *   php provision_db.php --autoload /path/vendor/autoload.php \
@@ -20,13 +22,19 @@ declare(strict_types=1);
  * null for drop/gc), or {"error":"..."} with a non-zero exit on hard failure. The
  * Rust lease gates on the exit code exactly like provider_enum.
  *
- * v1 = PostgreSQL only: `CREATE DATABASE ... TEMPLATE` is the cheap storage-
- * level clone primitive. `DROP DATABASE IF EXISTS` makes teardown idempotent.
- * The base DSN must be URL-style: postgres://user:pass@host:port/db
+ * Adapters: Postgres (`CREATE DATABASE ... TEMPLATE`, base `postgres://user:pass@host:port/db`)
+ * and SQLite (file copy, base `sqlite:/abs/path/app.db`). MySQL is the next
+ * adapter (needs the per-slot credential channel). Each clone is idempotent and
+ * provisioning HARD-FAILS so a required-resource error never degrades the run.
  */
 
 error_reporting(E_ALL & ~E_DEPRECATED);
 @set_time_limit(0);
+
+// proust's own autoload (the Provisioning adapters), independent of the project
+// under test. Loaded BEFORE the project autoload so the DBMS abstraction is
+// always available regardless of the app's classmap.
+require_once __DIR__ . '/vendor/autoload.php';
 
 // ---------------------------------------------------------------------------
 // 1. Parse CLI args (identical loop to enumerate_providers.php).
@@ -91,158 +99,55 @@ if ($base === '') {
     exit(1);
 }
 
-/**
- * Connect to the 'postgres' maintenance DB to run CREATE/DROP DATABASE (those
- * cannot run inside a transaction nor against the target DB itself). The base
- * MUST be a URL-style DSN: postgres://user:pass@host:port/db.
- */
-function connectAdmin(string $base): \PDO {
-    $parts = parse_url($base);
-    if ($parts === false || !isset($parts['host'])) {
-        throw new \RuntimeException("unparseable --provision-db base DSN (expected postgres://user:pass@host:port/db): $base");
-    }
-    $host = $parts['host'];
-    $port = $parts['port'] ?? 5432;
-    $user = $parts['user'] ?? (getenv('PGUSER') ?: 'postgres');
-    $pass = $parts['pass'] ?? (getenv('PGPASSWORD') ?: '');
-    $dsn  = sprintf('pgsql:host=%s;port=%d;dbname=postgres', $host, $port);
-    return new \PDO($dsn, $user, $pass, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
-}
-
-function dbNameFromBase(string $base): string {
-    $path = parse_url($base, PHP_URL_PATH) ?: '';
-    return ltrim($path, '/') ?: 'app';
-}
-
-function dsnForClone(string $base, string $clone): string {
-    // The returned DSN is injected as PROUST_DB_DSN and consumed by
-    // TestExecutor via `new \PDO($dsn)` with NO separate user/pass args, so it
-    // MUST be a PDO connection string (pgsql:...) with credentials embedded —
-    // not the URL-style form (`postgres://...`), which PDO rejects with
-    // "could not find driver".
-    $parts = parse_url($base);
-    $host  = $parts['host'] ?? '127.0.0.1';
-    $port  = $parts['port'] ?? 5432;
-    $user  = $parts['user'] ?? (getenv('PGUSER') ?: 'postgres');
-    $pass  = $parts['pass'] ?? (getenv('PGPASSWORD') ?: '');
-    return sprintf(
-        'pgsql:host=%s;port=%d;dbname=%s;user=%s;password=%s',
-        $host, $port, $clone, $user, $pass
-    );
-}
-
-/** Quote an identifier for Postgres DDL (double-quote, escape embedded quotes). */
-function qid(string $id): string { return '"' . str_replace('"', '""', $id) . '"'; }
-
-/**
- * Defense-in-depth: every identifier interpolated into DDL must already be
- * sanitized by the Rust lease (clone_name maps to [A-Za-z0-9_] and bounds to
- * 63 bytes). Reject anything else hard, BEFORE running DDL, so a malformed
- * request can never reach the database. We keep qid() too (belt + braces).
- */
-function assertSafeIdent(string $id, string $what): void {
-    if ($id === '' || strlen($id) > 63 || !preg_match('/^[A-Za-z0-9_]+$/', $id)) {
-        throw new \RuntimeException("unsafe $what identifier (expected ^[A-Za-z0-9_]+\$, <=63 bytes): $id");
-    }
-}
-
-/**
- * Drop stale `<base>_pr<digits>_w<digits>` clone DBs with ZERO active backends
- * (a non-zero count means a live concurrent run owns it — never touch it).
- * Shared by the standalone `gc` action and the batched `provision_run`.
- *
- * @return list<string> the clone names reclaimed
- */
-function gcSweep(\PDO $pdo, string $base): array {
-    $baseName = dbNameFromBase($base);
-    $reBase = preg_replace('/[.^$*+?()\\[\\]{}|\\\\]/', '\\\\$0', $baseName);
-    $pat = '^' . $reBase . '_pr[0-9]+_w[0-9]+$';
-    $stmt = $pdo->prepare('SELECT datname FROM pg_database WHERE datname ~ :pat AND datname <> :base');
-    $stmt->execute([':pat' => $pat, ':base' => $baseName]);
-    $dropped = [];
-    foreach ($stmt->fetchAll(\PDO::FETCH_COLUMN) as $name) {
-        $bStmt = $pdo->prepare('SELECT count(*) FROM pg_stat_activity WHERE datname = ?');
-        $bStmt->execute([$name]);
-        if ((int) $bStmt->fetchColumn() > 0) {
-            continue; // live run owns this clone — do not touch
-        }
-        assertSafeIdent($name, 'gc clone');
-        $pdo->exec('DROP DATABASE IF EXISTS ' . qid($name));
-        $dropped[] = $name;
-    }
-    return $dropped;
-}
-
 try {
-    $pdo = connectAdmin($base);
+    // The DBMS is an implementation detail: the factory picks the adapter from
+    // the base DSN scheme; every action below talks only to the Provisioner
+    // contract. Postgres / SQLite today; MySQL slots in as another adapter.
+    $prov = \Proust\Provisioning\ProvisionerFactory::fromBaseDsn($base);
     switch ($action) {
         case 'build_template':
-            // The template is the base DB itself (already migrated/seeded by the
-            // project's bootstrap). We return its name; cloning copies from it.
-            $tpl = dbNameFromBase($base);
-            echo json_encode(['dsn' => $tpl]), "\n";
+            // The template IS the base DB/file (already migrated/seeded by the
+            // project's bootstrap); cloning copies from it. Return its identity.
+            echo json_encode(['dsn' => $prov->templateName()]), "\n";
             exit(0);
 
         case 'clone':
-            $template = (string) ($req['template'] ?? dbNameFromBase($base));
-            $clone    = (string) ($req['clone_name'] ?? '');
+            $clone = (string) ($req['clone_name'] ?? '');
             if ($clone === '') { throw new \RuntimeException('clone requires clone_name'); }
-            assertSafeIdent($clone, 'clone_name');
-            assertSafeIdent($template, 'template');
-            // Idempotent: drop any stale clone from a previous crashed run first.
-            $pdo->exec('DROP DATABASE IF EXISTS ' . qid($clone));
-            $pdo->exec('CREATE DATABASE ' . qid($clone) . ' TEMPLATE ' . qid($template));
-            echo json_encode(['dsn' => dsnForClone($base, $clone)]), "\n";
+            echo json_encode(['dsn' => $prov->cloneOne($clone)]), "\n";
             exit(0);
 
         case 'drop':
             $clone = (string) ($req['clone_name'] ?? '');
             if ($clone === '') { throw new \RuntimeException('drop requires clone_name'); }
-            assertSafeIdent($clone, 'clone_name');
-            // Terminate any lingering backends so DROP succeeds even if a
-            // SIGKILLed worker left a connection open, then DROP IF EXISTS.
-            $stmt = $pdo->prepare(
-                'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ?'
-            );
-            $stmt->execute([$clone]);
-            $pdo->exec('DROP DATABASE IF EXISTS ' . qid($clone));
+            $prov->dropClone($clone);
             echo json_encode(['dsn' => null]), "\n";
             exit(0);
 
-        // Best-effort crash cleanup: drop stale clones from a prior killed run.
-        // See gcSweep() for the zero-backend safety rule + pattern matching.
         case 'gc':
-            echo json_encode(['dsn' => null, 'dropped' => gcSweep($pdo, $base)]), "\n";
+            echo json_encode(['dsn' => null, 'dropped' => $prov->gcSweep()]), "\n";
             exit(0);
 
-        // Batched provisioning: GC + every per-slot clone in ONE invocation over
-        // a single admin connection, replacing the gc + build_template +
-        // N×clone fan-out that spawned N+2 separate PHP processes per run. The
-        // template is the base DB itself (already migrated/seeded); clone names
-        // are computed + sanitized by the Rust lease and passed in order.
+        // Batched provisioning (the runner's default path): GC sweep + every
+        // per-slot clone in ONE invocation. GC is best-effort — a sweep failure
+        // (e.g. a concurrent run grabbing a clone) must NOT abort a fresh
+        // provision; clone creation below still HARD-FAILS.
         case 'provision_run':
-            $template = dbNameFromBase($base);
-            assertSafeIdent($template, 'template');
-            // GC is best-effort (mirrors the standalone `gc` path, which the Rust
-            // caller swallowed on error): a sweep failure — e.g. a concurrent run
-            // grabbing a clone between the zero-backend check and the DROP — must
-            // NOT abort a fresh provision. Clone creation below still hard-fails.
             try {
-                $dropped = gcSweep($pdo, $base);
+                $dropped = $prov->gcSweep();
             } catch (\Throwable $e) {
                 fwrite(STDERR, "provision_db.php: gc sweep skipped ({$e->getMessage()})\n");
                 $dropped = [];
             }
             $dsns = [];
             foreach (($req['clone_names'] ?? []) as $clone) {
-                $clone = (string) $clone;
-                assertSafeIdent($clone, 'clone_name');
-                // Idempotent: drop any stale clone of this exact name first.
-                $pdo->exec('DROP DATABASE IF EXISTS ' . qid($clone));
-                $pdo->exec('CREATE DATABASE ' . qid($clone) . ' TEMPLATE ' . qid($template));
-                $dsns[] = dsnForClone($base, $clone);
+                $dsns[] = $prov->cloneOne((string) $clone);
             }
-            echo json_encode(['template' => $template, 'dsns' => $dsns, 'dropped' => $dropped]), "\n";
+            echo json_encode([
+                'template' => $prov->templateName(),
+                'dsns'     => $dsns,
+                'dropped'  => $dropped,
+            ]), "\n";
             exit(0);
 
         default:
