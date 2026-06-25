@@ -78,3 +78,11 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   one-line `--warmup` suggestion. So a functional suite run *without*
   `--provision-db` no longer over-forks (the +5%-on-many-cores regime), and users
   who'd benefit from `--warmup` are told about it.
+- New read-only `--report-hoistable-setup` advisory (tree-sitter only, no
+  `composer install`): for each concrete test class, reports which `setUp`
+  `$this->P = …` fixtures could be hoisted to run ONCE instead of once-per-test
+  (HOIST) vs why not (REFUSE: non-deterministic RHS / per-test ambient context
+  tz·now·locale / mutation by a test), with the per-class test multiplicity. A
+  faithful Rust port of the Way-3 setUp-splitter's two soundness gates (context
+  scope + mutation); the foundation for an eventual warm-master setUp hoist, and
+  a map of where the expensive-shared-fixture shape actually exists.

@@ -88,7 +88,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--project <path>` | `.` | Project root (needs `vendor/autoload.php` unless `--report-shared-fixture`). |
+| `--project <path>` | `.` | Project root (needs `vendor/autoload.php` unless `--report-shared-fixture` / `--report-hoistable-setup`). |
 | `--tests-dir <path>` | `tests` | Discovery root, used only when `phpunit.xml` declares no `<testsuite>`. |
 | `--configuration <path>` | auto | Path to `phpunit.xml`; auto-detects `phpunit.xml` then `phpunit.xml.dist`. |
 | `--bootstrap <file>` | from XML | Bootstrap required before tests; overrides the XML `<bootstrap>`. |
@@ -103,6 +103,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 | `--worker-timeout <secs>` | `600` | Inactivity watchdog; aborts a hung run. `0` disables. |
 | `--list-tests` | off | Print `Class::method` lines then exit (no tests run). |
 | `--report-shared-fixture` | off | Print a SharedTransactionalFixture eligibility advisory then exit (tree-sitter only; no `composer install` needed). |
+| `--report-hoistable-setup` | off | Print a Way-3 setUp-hoist advisory (which `setUp` fixtures could run once vs why not) then exit (tree-sitter only; read-only). |
 | `--dirty` | off | Run only tests impacted by uncommitted git changes (changed source → dependent tests). |
 | `--bake-mocks` | off | Rewrite `createMock()` into anonymous-class stubs; requires PSR-4-resolvable interfaces. |
 | `--provision-db <DSN>` | — | Base DSN for per-worker DB provisioning (also via `PROUST_DB_DSN`). |

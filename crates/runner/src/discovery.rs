@@ -9,7 +9,8 @@
 pub use discovery::{
     discover_cases_and_test_index, discover_class_file_index, discover_class_file_index_targeted,
     discover_in_dir, discover_in_dirs, discover_in_file, discover_nontest_class_index,
-    discover_with_index, format_shared_fixture_report, group_by_class,
-    shared_fixture_report_in_dir, shared_fixture_report_in_file, GroupedMethod,
+    discover_with_index, format_setup_hoist_report, format_shared_fixture_report, group_by_class,
+    setup_hoist_report_in_dir, setup_hoist_report_in_file, shared_fixture_report_in_dir,
+    shared_fixture_report_in_file, GroupedMethod, HoistCandidateVerdict, SetupHoistReport,
     SharedFixtureReport, TestCase, TestClass,
 };
