@@ -18,12 +18,13 @@ FROM php:8.4-cli
 # as a parity gap). pcntl is required by the fork-pool worker. pdo_pgsql/pgsql
 # (libpq-dev) are required by the --provision-db per-worker clone path used for
 # parallel functional tests — without them that path can only run from a custom
-# image, so it would never be exercised in CI.
+# image, so it would never be exercised in CI. pdo_mysql backs the MySQL
+# provisioning adapter (bundled with PHP; no extra apt lib needed).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git unzip ca-certificates \
         libgmp-dev libicu-dev libonig-dev libsqlite3-dev libxml2-dev libzip-dev libpq-dev \
     && docker-php-ext-install -j"$(nproc)" \
-        pcntl gmp pdo_sqlite pdo_pgsql pgsql intl mbstring bcmath opcache \
+        pcntl gmp pdo_sqlite pdo_pgsql pgsql pdo_mysql mysqli intl mbstring bcmath opcache \
     && docker-php-ext-enable opcache \
     && rm -rf /var/lib/apt/lists/*
 

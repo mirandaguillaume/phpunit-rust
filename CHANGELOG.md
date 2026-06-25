@@ -94,5 +94,14 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   (`CREATE DATABASE … TEMPLATE`), extracted into its own adapter with identical
   behaviour. SQLite covers the marker-based per-worker connection
   (`PROUST_DB_DSN`); the DAMA/functional `DATABASE_URL` repointing stays
-  Postgres-only for now. MySQL is the next adapter (needs a per-slot credential
-  channel — PDO MySQL DSNs can't embed credentials).
+  Postgres-only for now.
+- **MySQL/MariaDB** provisioning adapter: MySQL has no `CREATE DATABASE …
+  TEMPLATE`, so a clone is `CREATE DATABASE` + a per-table `CREATE TABLE … LIKE`
+  / `INSERT … SELECT` copy of the base tables (FK checks disabled during the
+  copy so table order can't violate constraints). Because PDO MySQL — unlike
+  pgsql — ignores `user=`/`password=` in the DSN, the credentials are embedded
+  in the clone DSN and `TestExecutor::dbHandle` now extracts any `user=`/
+  `password=` and passes them as PDO constructor args (uniform across drivers;
+  Postgres accepts both forms, SQLite carries none). `pdo_mysql` is added to the
+  CI image. Covers the marker-based per-worker connection (`PROUST_DB_DSN`);
+  the DAMA/functional `DATABASE_URL` repointing stays Postgres-only.

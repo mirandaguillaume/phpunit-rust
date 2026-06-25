@@ -18,13 +18,7 @@ final class ProvisionerFactory
         return match ($scheme) {
             'postgres', 'postgresql', 'pgsql' => new PgProvisioner($base),
             'sqlite', 'sqlite3' => new SqliteProvisioner($base),
-            // MySQL needs the per-slot credential channel (PROUST_DB_USER/PASS +
-            // driver-correct DATABASE_URL) — PDO MySQL DSNs can't embed
-            // credentials, unlike pgsql. Wired in the follow-up slice.
-            'mysql', 'mysqli', 'mariadb' => throw new \RuntimeException(
-                'MySQL provisioning is not yet wired (needs the per-slot credential channel); '
-                . 'use Postgres or SQLite for now.'
-            ),
+            'mysql', 'mysqli', 'mariadb' => new MysqlProvisioner($base),
             '' => throw new \RuntimeException(
                 "--provision-db base DSN has no scheme: $base (expected postgres:// / sqlite: / mysql://)"
             ),
