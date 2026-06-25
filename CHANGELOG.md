@@ -86,3 +86,13 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   faithful Rust port of the Way-3 setUp-splitter's two soundness gates (context
   scope + mutation); the foundation for an eventual warm-master setUp hoist, and
   a map of where the expensive-shared-fixture shape actually exists.
+- `--provision-db` is now DBMS-agnostic behind a `Provisioner` contract
+  (`php/src/Provisioning/`): the adapter is chosen from the base DSN scheme and
+  the database type no longer leaks into the action handlers. **SQLite** is
+  supported (`sqlite:/abs/app.db` → each worker gets a file-copy clone of the
+  template, the cheapest clone of all); **Postgres** is unchanged
+  (`CREATE DATABASE … TEMPLATE`), extracted into its own adapter with identical
+  behaviour. SQLite covers the marker-based per-worker connection
+  (`PROUST_DB_DSN`); the DAMA/functional `DATABASE_URL` repointing stays
+  Postgres-only for now. MySQL is the next adapter (needs a per-slot credential
+  channel — PDO MySQL DSNs can't embed credentials).
