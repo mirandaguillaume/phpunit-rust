@@ -105,3 +105,10 @@ and DB-isolation consumers (e.g. `SharedTransactionalFixture`) read
   Postgres accepts both forms, SQLite carries none). `pdo_mysql` is added to the
   CI image. Covers the marker-based per-worker connection (`PROUST_DB_DSN`);
   the DAMA/functional `DATABASE_URL` repointing stays Postgres-only.
+- The DAMA/functional `DATABASE_URL` repointing is now **per-driver** (`DsnUrl`):
+  worker_fork derives `postgresql://` / `mysql://` (host:port/db with embedded
+  credentials, preserving the existing query like `?serverVersion=`) or
+  `sqlite:///path` from the per-slot clone DSN, replacing the hardcoded
+  Postgres-only regex. The Postgres URL form is byte-identical to before (so the
+  pg functional parity gate is unaffected); MySQL and SQLite functional suites
+  now get the same per-worker `DATABASE_URL` isolation.
