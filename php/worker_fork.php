@@ -510,42 +510,14 @@ $forkChildForSlot = static function (int $slot) use (
         pcntl_signal(SIGTERM, SIG_DFL);
         pcntl_signal(SIGINT,  SIG_DFL);
         pcntl_signal(SIGHUP,  SIG_DFL);
-        // Worker token: stable per-slot identity for resource leases
-        // (per-slot DB clone, Paratest-style TEST_TOKEN parity). Set on
-        // the child only; re-applied automatically on SIGCHLD respawn and
-        // K-batch/force_exit recycle because both re-enter this closure
-        // with the same $slot. Mirror the existing <env> convention
-        // (putenv + $_ENV + $_SERVER) so getenv()/$_ENV/$_SERVER all see it.
-        putenv("PROUST_WORKER_ID={$slot}");
-        $_ENV['PROUST_WORKER_ID']    = (string) $slot;
-        $_SERVER['PROUST_WORKER_ID'] = (string) $slot;
-        // Per-slot DB clone DSN (P3). Injected on the child only, keyed by
-        // $slot, so a respawned/recycled child re-attaches to the SAME clone.
-        // Mirror the existing <env> convention (putenv + $_ENV + $_SERVER).
-        // Only injected when a DSN exists for this slot (empty list = no-op).
-        if (isset($perSlotDsn[$slot]) && is_string($perSlotDsn[$slot]) && $perSlotDsn[$slot] !== '') {
-            $__dsn = $perSlotDsn[$slot];
-            putenv("PROUST_DB_DSN={$__dsn}");
-            $_ENV['PROUST_DB_DSN']    = $__dsn;
-            $_SERVER['PROUST_DB_DSN'] = $__dsn;
-            // Parallel functional tests: when the event bridge is active, the
-            // framework extension (e.g. DAMADoctrineTestBundle) wraps the APP's
-            // OWN Doctrine connection, which reads DATABASE_URL — not our
-            // PROUST_DB_DSN. Point that connection at THIS worker's per-slot
-            // clone too, so each worker isolates on its own database (no
-            // cross-worker "database is locked"). Derive the URL form from the
-            // PDO DSN. Gated on PROUST_EVENT_BRIDGE so the marker-based
-            // SharedTransactionalFixture path (our own PDO) is untouched, and
-            // DATABASE_URL is never overridden unless an app extension needs it.
-            if (getenv('PROUST_EVENT_BRIDGE') === '1') {
-                $__url = \Proust\Provisioning\DsnUrl::frameworkUrl($__dsn, getenv('DATABASE_URL') ?: null);
-                if ($__url !== null) {
-                    putenv("DATABASE_URL={$__url}");
-                    $_ENV['DATABASE_URL']    = $__url;
-                    $_SERVER['DATABASE_URL'] = $__url;
-                }
-            }
-        }
+        // Inject this worker's per-slot environment (worker id + DB clone DSN +
+        // framework DATABASE_URL repoint) behind one contract. Re-applied
+        // automatically on SIGCHLD respawn and K-batch/force_exit recycle —
+        // both re-enter this closure with the same $slot.
+        $__slotDsn = (isset($perSlotDsn[$slot]) && is_string($perSlotDsn[$slot]) && $perSlotDsn[$slot] !== '')
+            ? $perSlotDsn[$slot]
+            : null;
+        (new \Proust\Worker\WorkerContext($slot, $__slotDsn, getenv('PROUST_EVENT_BRIDGE') === '1'))->apply();
         for ($j = 0; $j < $n; $j++) {
             if ($j !== $slot) {
                 @fclose($childStdinStreams[$j]);
