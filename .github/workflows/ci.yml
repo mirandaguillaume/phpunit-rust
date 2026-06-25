@@ -215,3 +215,53 @@ jobs:
           PG_PASS: pg
           PG_DB: app_test
         run: bash bench/parity_functional_pg.sh
+
+  provision-mysql:
+    # The one DBMS provisioning path the jobs above don't cover: the MySQL
+    # adapter (CREATE DATABASE + per-table CREATE TABLE LIKE / INSERT SELECT) and
+    # the dbHandle credential extraction (PDO MySQL can't read user=/password=
+    # from the DSN). Seeds an FK template, clones per worker, and asserts the
+    # clone copies schema+data, stays isolated from the template, is reachable
+    # through dbHandle, and is reclaimed by gc — against a real MySQL.
+    name: provision (mysql adapter)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 -uroot -proot --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Host PHP only for the composer step (the vendor the gate harness autoloads).
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+
+      # The MySQL adapter needs pdo_mysql, which lives in this image.
+      - name: Build CI image (with pdo_mysql)
+        run: docker build -f bench/Dockerfile.ci -t proust-ci:php84 .
+
+      # --network host so the container reaches the mysql service on localhost:3306.
+      - name: MySQL provisioning gate
+        env:
+          IMAGE: proust-ci:php84
+          DOCKER_NET: host
+          MY_HOST: 127.0.0.1
+          MY_PORT: "3306"
+          MY_USER: root
+          MY_PASS: root
+          MY_DB: app_test
+        run: bash bench/provision_mysql_smoke.sh
