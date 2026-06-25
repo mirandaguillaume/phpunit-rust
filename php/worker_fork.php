@@ -537,22 +537,13 @@ $forkChildForSlot = static function (int $slot) use (
             // PDO DSN. Gated on PROUST_EVENT_BRIDGE so the marker-based
             // SharedTransactionalFixture path (our own PDO) is untouched, and
             // DATABASE_URL is never overridden unless an app extension needs it.
-            if (getenv('PROUST_EVENT_BRIDGE') === '1'
-                && preg_match('/^pgsql:host=([^;]+);port=(\d+);dbname=([^;]+);user=([^;]+);password=(.*)$/', $__dsn, $__m)) {
-                // Preserve the query string (e.g. ?serverVersion=16&charset=utf8)
-                // of the app's existing DATABASE_URL: Doctrine DBAL 4 REQUIRES
-                // serverVersion for PostgreSQL, and it lives in the URL query,
-                // not in the PDO DSN we derive the host/db from.
-                $__prev = getenv('DATABASE_URL');
-                $__q = (is_string($__prev) && ($__qp = strpos($__prev, '?')) !== false)
-                    ? substr($__prev, $__qp) : '';
-                $__url = sprintf(
-                    'postgresql://%s:%s@%s:%s/%s%s',
-                    rawurlencode($__m[4]), rawurlencode($__m[5]), $__m[1], $__m[2], $__m[3], $__q
-                );
-                putenv("DATABASE_URL={$__url}");
-                $_ENV['DATABASE_URL']    = $__url;
-                $_SERVER['DATABASE_URL'] = $__url;
+            if (getenv('PROUST_EVENT_BRIDGE') === '1') {
+                $__url = \Proust\Provisioning\DsnUrl::frameworkUrl($__dsn, getenv('DATABASE_URL') ?: null);
+                if ($__url !== null) {
+                    putenv("DATABASE_URL={$__url}");
+                    $_ENV['DATABASE_URL']    = $__url;
+                    $_SERVER['DATABASE_URL'] = $__url;
+                }
             }
         }
         for ($j = 0; $j < $n; $j++) {

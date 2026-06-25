@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Proust\Tests;
 
 use PHPUnit\Framework\TestCase;
+use Proust\Provisioning\DsnUrl;
 use Proust\Provisioning\MysqlProvisioner;
 use Proust\Provisioning\PgProvisioner;
 use Proust\Provisioning\ProvisionerFactory;
@@ -111,5 +112,39 @@ final class ProvisioningTest extends TestCase
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessageMatches('/unsafe/');
         $prov->cloneOne('../../etc/passwd');
+    }
+
+    public function testDsnUrlPostgresPreservesQuery(): void
+    {
+        $this->assertSame(
+            'postgresql://u:p@h:5432/app_pr1_w0?serverVersion=16&charset=utf8',
+            DsnUrl::frameworkUrl(
+                'pgsql:host=h;port=5432;dbname=app_pr1_w0;user=u;password=p',
+                'postgresql://orig:orig@db:5432/app?serverVersion=16&charset=utf8'
+            )
+        );
+    }
+
+    public function testDsnUrlMysql(): void
+    {
+        $this->assertSame(
+            'mysql://root:root@127.0.0.1:3306/app_pr1_w0',
+            DsnUrl::frameworkUrl('mysql:host=127.0.0.1;port=3306;dbname=app_pr1_w0;user=root;password=root', null)
+        );
+    }
+
+    public function testDsnUrlSqliteAndCredentialEncodingAndUnknown(): void
+    {
+        $this->assertSame(
+            'sqlite:///tmp/app_db_pr1_w0.sqlite',
+            DsnUrl::frameworkUrl('sqlite:/tmp/app_db_pr1_w0.sqlite', null)
+        );
+        // special chars in credentials are percent-encoded
+        $this->assertSame(
+            'mysql://u%40h:p%3Aw@h:3306/d',
+            DsnUrl::frameworkUrl('mysql:host=h;port=3306;dbname=d;user=u@h;password=p:w', null)
+        );
+        // unknown scheme -> null (caller leaves DATABASE_URL untouched)
+        $this->assertNull(DsnUrl::frameworkUrl('oracle:host=h;dbname=d', null));
     }
 }

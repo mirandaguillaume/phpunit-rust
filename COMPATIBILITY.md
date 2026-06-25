@@ -243,9 +243,12 @@ PHPUnit:
   template). Credentials for MySQL are embedded in the clone DSN and extracted
   as PDO constructor args by `dbHandle` — PDO MySQL, unlike pgsql, ignores
   `user=`/`password=` in the DSN string. The DAMA/functional path above —
-  repointing the app's `DATABASE_URL` at the clone — is currently
-  **Postgres-only** (the URL derivation is pg-specific); MySQL and SQLite cover
-  the marker-based path. The MySQL runtime needs `pdo_mysql` (in the CI image).
+  repointing the app's `DATABASE_URL` at the clone — derives the URL **per
+  driver** (`DsnUrl`): `postgresql://` / `mysql://` (host:port/db with
+  credentials, preserving the existing query such as `?serverVersion=`) and
+  `sqlite:///path`. The MySQL runtime needs `pdo_mysql` (in the CI image). The
+  Postgres functional path is CI-gated; MySQL/SQLite share the same derivation
+  but aren't yet exercised by a dedicated CI job.
 
 ### Not yet supported (deferred)
 
