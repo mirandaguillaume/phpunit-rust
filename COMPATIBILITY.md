@@ -106,7 +106,7 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 | `--report-hoistable-setup` | off | Print a Way-3 setUp-hoist advisory (which `setUp` fixtures could run once vs why not) then exit (tree-sitter only; read-only). |
 | `--dirty` | off | Run only tests impacted by uncommitted git changes (changed source → dependent tests). |
 | `--bake-mocks` | off | Rewrite `createMock()` into anonymous-class stubs; requires PSR-4-resolvable interfaces. |
-| `--provision-db <DSN>` | — | Base DSN for per-worker DB provisioning; the DBMS is chosen from the scheme — `postgres://…` (clone via `CREATE DATABASE … TEMPLATE`) or `sqlite:/abs/app.db` (clone via file copy). Each worker gets an isolated clone of the migrated/seeded template (also via `PROUST_DB_DSN`). |
+| `--provision-db <DSN>` | — | Base DSN for per-worker DB provisioning; the DBMS is chosen from the scheme — `postgres://…` (`CREATE DATABASE … TEMPLATE`), `mysql://…` (`CREATE DATABASE` + `CREATE TABLE … LIKE`/`INSERT … SELECT`), or `sqlite:/abs/app.db` (file copy). Each worker gets an isolated clone of the migrated/seeded template (also via `PROUST_DB_DSN`). |
 | `--skip-db` | off | Skip `needs_db` tests instead of aborting when no DB is configured. |
 | `--worker-memory-limit <v>` | `512M` | `memory_limit` inside each worker fork (`256M`, `1G`, `-1`). |
 | `--worker-max-batches <n>` | `20` | Recycle each worker fork after N batches; `0` = long-lived. |
@@ -237,12 +237,15 @@ PHPUnit:
 - **Provisioning is DBMS-agnostic behind a `Provisioner` contract** (the
   adapter is chosen from the base DSN scheme). The marker-based per-worker
   connection (`TestExecutor::connection()` / `PROUST_DB_DSN`) supports
-  **Postgres** (`CREATE DATABASE … TEMPLATE`) and **SQLite** (file copy of
-  the template). The DAMA/functional path above — repointing the app's
-  `DATABASE_URL` at the clone — is currently **Postgres-only** (the URL
-  derivation is pg-specific); SQLite covers the marker-based path. MySQL is
-  the next adapter (it needs a per-slot credential channel, since PDO MySQL
-  DSNs can't embed credentials).
+  **Postgres** (`CREATE DATABASE … TEMPLATE`), **MySQL/MariaDB** (`CREATE
+  DATABASE` + per-table `CREATE TABLE … LIKE` / `INSERT … SELECT`, base tables
+  only, FK checks off during the copy), and **SQLite** (file copy of the
+  template). Credentials for MySQL are embedded in the clone DSN and extracted
+  as PDO constructor args by `dbHandle` — PDO MySQL, unlike pgsql, ignores
+  `user=`/`password=` in the DSN string. The DAMA/functional path above —
+  repointing the app's `DATABASE_URL` at the clone — is currently
+  **Postgres-only** (the URL derivation is pg-specific); MySQL and SQLite cover
+  the marker-based path. The MySQL runtime needs `pdo_mysql` (in the CI image).
 
 ### Not yet supported (deferred)
 

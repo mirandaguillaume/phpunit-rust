@@ -897,10 +897,61 @@ final class TestExecutor
         // A DSN IS set: connect. Do NOT swallow a connection failure — let it
         // propagate so the per-test try/catch records a loud, diagnosable
         // Error rather than silently running the test without isolation.
-        $pdo = new \PDO($dsn, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        //
+        // Credentials are passed as constructor ARGS, extracted from the DSN if
+        // the provisioner embedded them (`...;user=U;password=P`). Postgres
+        // accepts creds either in the DSN or as args, but MySQL (PDO) IGNORES
+        // `user=`/`password=` in the DSN — so a uniform extract-and-pass is the
+        // only form that authenticates across drivers. SQLite carries none.
+        [$pdoDsn, $user, $pass] = self::splitDsnCredentials($dsn);
+        $pdo = new \PDO($pdoDsn, $user, $pass, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
         $dsnAtConnect = $dsn;
 
         return $pdo;
+    }
+
+    /**
+     * Split a `scheme:k=v;…` PDO DSN into [dsnWithoutCredentials, user, pass],
+     * pulling out any `user=`/`password=` pairs. A DSN with no `k=v` structure
+     * (e.g. `sqlite:/path`) is returned unchanged with null credentials.
+     *
+     * @return array{0: string, 1: ?string, 2: ?string}
+     */
+    private static function splitDsnCredentials(string $dsn): array
+    {
+        $colon = strpos($dsn, ':');
+        if ($colon === false) {
+            return [$dsn, null, null];
+        }
+        $scheme = substr($dsn, 0, $colon);
+        $rest = substr($dsn, $colon + 1);
+        if (! str_contains($rest, '=')) {
+            return [$dsn, null, null]; // e.g. sqlite:/path — no embedded creds
+        }
+        $user = null;
+        $pass = null;
+        $kept = [];
+        foreach (explode(';', $rest) as $pair) {
+            if ($pair === '') {
+                continue;
+            }
+            $eq = strpos($pair, '=');
+            if ($eq === false) {
+                $kept[] = $pair;
+                continue;
+            }
+            $key = substr($pair, 0, $eq);
+            $val = substr($pair, $eq + 1);
+            if ($key === 'user') {
+                $user = $val;
+            } elseif ($key === 'password') {
+                $pass = $val;
+            } else {
+                $kept[] = $pair;
+            }
+        }
+
+        return [$scheme . ':' . implode(';', $kept), $user, $pass];
     }
 
     /**

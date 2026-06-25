@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Proust\Tests;
 
 use PHPUnit\Framework\TestCase;
+use Proust\Provisioning\MysqlProvisioner;
 use Proust\Provisioning\PgProvisioner;
 use Proust\Provisioning\ProvisionerFactory;
 use Proust\Provisioning\SqliteProvisioner;
@@ -27,11 +28,20 @@ final class ProvisioningTest extends TestCase
         );
     }
 
-    public function testFactoryRejectsMysqlForNowAndUnknownSchemes(): void
+    public function testFactoryDispatchesMysql(): void
     {
-        $this->expectException(\RuntimeException::class);
-        $this->expectExceptionMessageMatches('/MySQL/');
-        ProvisionerFactory::fromBaseDsn('mysql://u:p@h/app');
+        $this->assertInstanceOf(
+            MysqlProvisioner::class,
+            ProvisionerFactory::fromBaseDsn('mysql://u:p@h:3306/app')
+        );
+        $this->assertInstanceOf(
+            MysqlProvisioner::class,
+            ProvisionerFactory::fromBaseDsn('mariadb://u:p@h/app')
+        );
+        $this->assertSame(
+            'app',
+            ProvisionerFactory::fromBaseDsn('mysql://u:p@h/app')->templateName()
+        );
     }
 
     public function testFactoryRejectsUnknownScheme(): void
