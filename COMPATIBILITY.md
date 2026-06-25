@@ -250,6 +250,38 @@ PHPUnit:
   Postgres functional path is CI-gated; MySQL/SQLite share the same derivation
   but aren't yet exercised by a dedicated CI job.
 
+#### Consuming the per-worker clone (framework-agnostic)
+
+Proust provisions the clone and exposes its DSN as `PROUST_DB_DSN` — *how* a
+suite uses it is the app's choice. The framework is the **app's** detail, not
+Proust's; there is no framework adapter to configure. Three ways, in order of
+"no app code needed":
+
+1. **Marker traits (zero app code).** A test using `RefreshDatabase` /
+   `DatabaseTransactions` (or `SharedTransactionalFixture`) gets the runner's own
+   connection via `TestExecutor::connection()` — already pointed at this worker's
+   clone, credentials handled, with per-test transaction reset. Works for any
+   framework or none.
+2. **Doctrine / Symfony (automatic).** With `--provision-db` + a DAMA-style
+   `<extensions>` bootstrap, Proust repoints the app's `DATABASE_URL` at the
+   clone (see above) — the app's own Doctrine connection follows, no code.
+3. **Any other framework / plain app (read it yourself).** Read `PROUST_DB_DSN`
+   in your own config and point your connection at it — Proust never assumes
+   your framework's config convention. For example, Laravel `config/database.php`:
+
+   ```php
+   // PROUST_DB_DSN is a PDO DSN: "<driver>:host=…;port=…;dbname=…;user=…;password=…"
+   // (or "sqlite:/abs/path"). Feed it into Laravel's connection config.
+   if ($dsn = getenv('PROUST_DB_DSN')) {
+       parse_str(strtr(substr($dsn, strpos($dsn, ':') + 1), ';', '&'), $p);
+       $connections['mysql'] = array_merge($connections['mysql'], [
+           'host' => $p['host'] ?? '127.0.0.1', 'port' => $p['port'] ?? '3306',
+           'database' => $p['dbname'] ?? '', 'username' => $p['user'] ?? '',
+           'password' => $p['password'] ?? '',
+       ]);
+   }
+   ```
+
 ### Not yet supported (deferred)
 
 - **`.phpt` tests.** PHPUnit's file-based test format (a mini-INI with
