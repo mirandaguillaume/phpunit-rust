@@ -451,6 +451,13 @@ struct Cli {
     /// summary), then exit without running anything. Read-only; no runtime effect.
     #[arg(long)]
     report_shared_fixture: bool,
+    /// Print a Way-3 setUp-hoist advisory: per concrete test class, which setUp
+    /// `$this->P = …` fixtures could be hoisted to run ONCE (HOIST) vs why not
+    /// (REFUSE: non-determinism / per-test ambient context / mutation), with the
+    /// per-class test multiplicity and a `hoistable: H/total` summary. Read-only,
+    /// tree-sitter-only; then exit without running anything.
+    #[arg(long)]
+    report_hoistable_setup: bool,
     /// Run only tests impacted by uncommitted git changes: a changed source file
     /// maps (via the class graph) to the test classes whose fingerprint references
     /// it, plus changed test files themselves. Like Pest's --dirty but graph-based
@@ -599,7 +606,7 @@ fn real_main() -> Result<ExitCode> {
     let autoload = project.join("vendor/autoload.php");
     // The read-only --report-shared-fixture advisory is tree-sitter-only (no PHP
     // execution), so it must not require `composer install`.
-    if !autoload.is_file() && !cli.report_shared_fixture {
+    if !autoload.is_file() && !cli.report_shared_fixture && !cli.report_hoistable_setup {
         return Err(anyhow!(
             "autoload not found at {}; run `composer install` first",
             autoload.display()
@@ -1015,6 +1022,18 @@ fn real_main() -> Result<ExitCode> {
             "{}",
             proust::discovery::format_shared_fixture_report(&report)
         );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // --report-hoistable-setup: Way-3 setUp-hoist advisory. Verdict each concrete
+    // class's setUp candidates and print, then exit (no tests run, no DB touched).
+    if cli.report_hoistable_setup {
+        let mut report = Vec::new();
+        for root in &test_roots {
+            report.extend(proust::discovery::setup_hoist_report_in_dir(root)?);
+        }
+        report.sort_by(|a, b| a.fqcn.cmp(&b.fqcn));
+        print!("{}", proust::discovery::format_setup_hoist_report(&report));
         return Ok(ExitCode::SUCCESS);
     }
 

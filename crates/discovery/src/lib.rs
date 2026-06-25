@@ -125,6 +125,13 @@ struct ParsedClass {
     setup_builds_fixture: bool,
     /// This class has a test/helper method using a rollback-incompatible construct.
     has_tx_disqualifier: bool,
+    /// Way-3 setUp-hoist signals (advisory; `--report-hoistable-setup`). This class's
+    /// own setUp `$this->P = RHS` candidates (prop, rhs, nondet), the ambient-context
+    /// scopes its setUp establishes, and the properties its per-test methods mutate.
+    /// Folded across the inheritance chain in [`setup_hoist_report`].
+    setup_hoist_candidates: Vec<(String, String, bool)>,
+    setup_ctx_scopes: Vec<String>,
+    mutated_props: Vec<String>,
 }
 
 /// Per-method discovery info collected during the tree-sitter walk.
@@ -572,6 +579,8 @@ fn collect_parsed_classes(
         let uses_shared_fixture = class_uses_shared_fixture(body, bytes);
         let (setup_builds_fixture, has_tx_disqualifier) =
             scan_tx_eligibility_signals(body, bytes, &test_methods);
+        let (setup_hoist_candidates, setup_ctx_scopes, mutated_props) =
+            scan_hoist_signals(body, bytes);
 
         out.push(ParsedClass {
             file: path.to_path_buf(),
@@ -588,6 +597,9 @@ fn collect_parsed_classes(
             uses_shared_fixture,
             setup_builds_fixture,
             has_tx_disqualifier,
+            setup_hoist_candidates,
+            setup_ctx_scopes,
+            mutated_props,
         });
     }
     Ok(())
@@ -1233,6 +1245,222 @@ fn class_uses_shared_fixture(class_body: Node, bytes: &[u8]) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Way-3 setUp-hoist eligibility (read-only advisory; --report-hoistable-setup).
+// Ports prototypes/test-compiler/way3/way3_setup.js: decide whether a class's
+// `setUp` builds a DETERMINISTIC, IMMUTABLE fixture whose construction could be
+// hoisted to run ONCE (setUpBeforeClass) instead of once-per-test. Two gates:
+//   (1) determinism + context: no non-deterministic factory call, and no
+//       per-test ambient-context setter (tz/now/locale) anywhere in the setUp
+//       chain (a context setter at per-test scope would make a once-computed
+//       value silently wrong);
+//   (2) no mutation: no test/teardown method mutates the shared property.
+// String-scanned (no regex dep), matching the existing src-predicate helpers.
+// ---------------------------------------------------------------------------
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// True if `src` calls `name` as a whole identifier (case-insensitive): `name`
+/// preceded by a non-identifier byte (or start) and followed by optional
+/// whitespace then `(`. Catches `name(`, `->name(`, `::name(`, `\name(`, but NOT
+/// `name` embedded in a longer identifier (so `now(` does not match `setTestNow(`).
+fn has_call_ci(src: &str, name: &str) -> bool {
+    let s = src.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    let (sb, nb) = (s.as_bytes(), n.as_bytes());
+    if nb.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while let Some(pos) = s[i..].find(&n) {
+        let at = i + pos;
+        let before_ok = at == 0 || !is_ident_byte(sb[at - 1]);
+        let mut j = at + nb.len();
+        while j < sb.len() && matches!(sb[j], b' ' | b'\t' | b'\n' | b'\r') {
+            j += 1;
+        }
+        if before_ok && j < sb.len() && sb[j] == b'(' {
+            return true;
+        }
+        i = at + 1;
+    }
+    false
+}
+
+/// Per-test ambient-context setters; presence in a setUp body means the hoist
+/// slot would run under a different context → REFUSE every candidate.
+const HOIST_CONTEXT_SETTERS: &[(&str, &str)] = &[
+    ("date_default_timezone_set", "tz"),
+    ("setTestNow", "now"),
+    ("setTestNowAndTimezone", "now"),
+    ("setlocale", "locale"),
+];
+
+/// Non-deterministic factory calls: a setUp RHS calling any of these can't be
+/// hoisted (its value would differ across runs/tests).
+const HOIST_NONDET_CALLS: &[&str] = &[
+    "rand",
+    "mt_rand",
+    "random_int",
+    "time",
+    "microtime",
+    "uniqid",
+    "hrtime",
+    "now",
+    "today",
+];
+
+/// Reader-method name prefixes: a `$this->P->reader(...)` call does NOT mutate P.
+const HOIST_READER_PREFIXES: &[&str] = &[
+    "get",
+    "is",
+    "has",
+    "to",
+    "as",
+    "with",
+    "count",
+    "equals",
+    "compare",
+    "fingerprint",
+    "tables",
+    "tablecount",
+    "toarray",
+    "jsonserialize",
+];
+
+/// The ambient-context scopes (tz/now/locale) a setUp body establishes.
+fn setup_ctx_scopes(setup_src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (needle, label) in HOIST_CONTEXT_SETTERS {
+        if has_call_ci(setup_src, needle) && !out.iter().any(|x| x == label) {
+            out.push((*label).to_string());
+        }
+    }
+    out
+}
+
+/// Extract `$this->PROP = RHS;` direct assignments from a method body source,
+/// returning (prop, rhs_excerpt, nondet). Skips `==`, compound assigns, and
+/// indirect targets (`$this->P->x =`, `$this->P[...] =`) — only a bare
+/// `$this->PROP =` is a candidate (matches the prototype's reAssign).
+fn setup_hoist_candidates_src(setup_src: &str) -> Vec<(String, String, bool)> {
+    let bytes = setup_src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(pos) = setup_src[i..].find("$this->") {
+        let start = i + pos;
+        let mut j = start + "$this->".len();
+        let prop_start = j;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        let prop = &setup_src[prop_start..j];
+        i = start + 1;
+        if prop.is_empty() {
+            continue;
+        }
+        // skip whitespace after the property
+        let mut k = j;
+        while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
+            k += 1;
+        }
+        // must be a bare `=` (not `==`, not `=>`, not part of `->`/`[`)
+        if k >= bytes.len() || bytes[k] != b'=' {
+            continue;
+        }
+        if k + 1 < bytes.len() && matches!(bytes[k + 1], b'=' | b'>') {
+            continue;
+        }
+        // RHS up to the next `;`
+        let rhs_start = k + 1;
+        let Some(semi) = setup_src[rhs_start..].find(';') else {
+            continue;
+        };
+        let rhs = setup_src[rhs_start..rhs_start + semi].trim();
+        let nondet = HOIST_NONDET_CALLS.iter().any(|c| has_call_ci(rhs, c));
+        out.push((prop.to_string(), rhs.to_string(), nondet));
+    }
+    out
+}
+
+/// Property names `$this->P` that a (test/teardown) method body MUTATES: a
+/// non-reader call `$this->P->m(...)`, or a write/reassign (`$this->P =`,
+/// `$this->P->x =`, `$this->P[...] =`). Mirrors the prototype's `mutates()`.
+fn body_mutated_props_src(src: &str) -> Vec<String> {
+    let bytes = src.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let push = |p: &str, out: &mut Vec<String>| {
+        if !p.is_empty() && !out.iter().any(|x| x == p) {
+            out.push(p.to_string());
+        }
+    };
+    let mut i = 0;
+    while let Some(pos) = src[i..].find("$this->") {
+        let start = i + pos;
+        let mut j = start + "$this->".len();
+        let prop_start = j;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        let prop = &src[prop_start..j];
+        i = start + 1;
+        if prop.is_empty() {
+            continue;
+        }
+        // what follows the property reference?
+        if j + 1 < bytes.len() && bytes[j] == b'-' && bytes[j + 1] == b'>' {
+            // `$this->P->IDENT` — read the method/field name
+            let mut k = j + 2;
+            let m_start = k;
+            while k < bytes.len() && is_ident_byte(bytes[k]) {
+                k += 1;
+            }
+            let member = src[m_start..k].to_ascii_lowercase();
+            let mut w = k;
+            while w < bytes.len() && matches!(bytes[w], b' ' | b'\t' | b'\n' | b'\r') {
+                w += 1;
+            }
+            if w < bytes.len() && bytes[w] == b'(' {
+                // method call: mutation unless the name has a reader prefix
+                let is_reader = HOIST_READER_PREFIXES.iter().any(|p| member.starts_with(p));
+                if !is_reader {
+                    push(prop, &mut out);
+                }
+            } else if w < bytes.len()
+                && bytes[w] == b'='
+                && !(w + 1 < bytes.len() && matches!(bytes[w + 1], b'=' | b'>'))
+            {
+                // `$this->P->x = ` write
+                push(prop, &mut out);
+            }
+            continue;
+        }
+        // `$this->P[...] = ` or `$this->P = ` write/reassign
+        let mut k = j;
+        if k < bytes.len() && bytes[k] == b'[' {
+            // skip to matching ] (no nested [] expected in a simple key)
+            while k < bytes.len() && bytes[k] != b']' {
+                k += 1;
+            }
+            if k < bytes.len() {
+                k += 1;
+            }
+        }
+        while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n' | b'\r') {
+            k += 1;
+        }
+        if k < bytes.len()
+            && bytes[k] == b'='
+            && !(k + 1 < bytes.len() && matches!(bytes[k + 1], b'=' | b'>'))
+        {
+            push(prop, &mut out);
+        }
+    }
+    out
+}
+
 /// Scan a class body for the two SharedTransactionalFixture eligibility signals of THIS class
 /// (folded across the inheritance chain later, in [`shared_fixture_report`]):
 ///   - `setup_builds_fixture`: the `setUp` method's source calls a `TX_FIXTURE_BUILDERS` call;
@@ -1269,6 +1497,48 @@ fn scan_tx_eligibility_signals(
         has_disqualifier = true;
     }
     (builds_fixture, has_disqualifier)
+}
+
+/// Per-class Way-3 hoist signals (folded across the chain in `setup_hoist_report`):
+///   - `candidates`: this class's `setUp` direct `$this->P = RHS` assignments (prop, rhs, nondet);
+///   - `ctx_scopes`: ambient-context scopes (tz/now/locale) this class's `setUp` establishes;
+///   - `mutated`: properties any per-test method (test/tearDown/helper, NOT the class-level
+///     setUpBeforeClass/tearDownAfterClass) of this class mutates.
+#[allow(clippy::type_complexity)]
+fn scan_hoist_signals(
+    body: Node,
+    bytes: &[u8],
+) -> (Vec<(String, String, bool)>, Vec<String>, Vec<String>) {
+    let mut candidates: Vec<(String, String, bool)> = Vec::new();
+    let mut ctx_scopes: Vec<String> = Vec::new();
+    let mut mutated: Vec<String> = Vec::new();
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        if child.kind() != "method_declaration" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(name) = name_node.utf8_text(bytes) else {
+            continue;
+        };
+        let src = child.utf8_text(bytes).unwrap_or("");
+        if name.eq_ignore_ascii_case("setUp") {
+            candidates = setup_hoist_candidates_src(src);
+            ctx_scopes = setup_ctx_scopes(src);
+        } else if !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "setupbeforeclass" | "teardownafterclass"
+        ) {
+            for p in body_mutated_props_src(src) {
+                if !mutated.contains(&p) {
+                    mutated.push(p);
+                }
+            }
+        }
+    }
+    (candidates, ctx_scopes, mutated)
 }
 
 /// One concrete test class's SharedTransactionalFixture advisory verdict (report-only; no
@@ -1410,6 +1680,196 @@ pub fn shared_fixture_report_in_dir(root: &Path) -> Result<Vec<SharedFixtureRepo
         .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
         .collect();
     Ok(shared_fixture_report(&parsed, &graph))
+}
+
+/// One setUp `$this->P = RHS` candidate's Way-3 hoist verdict (report-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoistCandidateVerdict {
+    pub prop: String,
+    pub rhs: String,
+    pub hoistable: bool,
+    pub reason: String,
+}
+
+/// One concrete test class's setUp-hoist advisory (`--report-hoistable-setup`).
+/// `test_count` is the hoist multiplicity (setUp currently runs once per test).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupHoistReport {
+    pub fqcn: String,
+    pub file: PathBuf,
+    pub candidates: Vec<HoistCandidateVerdict>,
+    pub test_count: usize,
+}
+
+/// Advisory: for each concrete test class, fold the Way-3 hoist signals across the
+/// in-project inheritance chain — a setUp candidate, an ambient-context setter, or a
+/// property mutation in ANY ancestor counts — and verdict each setUp candidate. A
+/// candidate HOISTs iff its RHS is deterministic, no per-test context is established
+/// anywhere in the chain, and no per-test method mutates the property. Classes with no
+/// setUp candidate are omitted (nothing to advise). Standalone like
+/// [`shared_fixture_report`]; consumed only by the report CLI.
+fn setup_hoist_report(parsed: &[ParsedClass], graph: &ClassGraph) -> Vec<SetupHoistReport> {
+    let by_fqcn: HashMap<&str, &ParsedClass> =
+        parsed.iter().map(|c| (c.fqcn.as_str(), c)).collect();
+    let mut out = Vec::new();
+    for class in parsed {
+        if class.is_abstract || !is_test_class_via_chain(&class.fqcn, graph) {
+            continue;
+        }
+        let mut candidates: Vec<(String, String, bool)> = Vec::new();
+        let mut ctx: Vec<String> = Vec::new();
+        let mut mutated: Vec<String> = Vec::new();
+        let mut test_count = 0usize;
+        let mut seen_props: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_methods: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut visit = class.fqcn.as_str();
+        let mut d = 0;
+        while d < 32 {
+            if let Some(c) = by_fqcn.get(visit) {
+                for cand in &c.setup_hoist_candidates {
+                    // First-seen (most-derived) setUp assignment wins per property.
+                    if seen_props.insert(cand.0.clone()) {
+                        candidates.push(cand.clone());
+                    }
+                }
+                for s in &c.setup_ctx_scopes {
+                    if !ctx.iter().any(|x| x == s) {
+                        ctx.push(s.clone());
+                    }
+                }
+                for m in &c.mutated_props {
+                    if !mutated.iter().any(|x| x == m) {
+                        mutated.push(m.clone());
+                    }
+                }
+                for mi in &c.test_methods {
+                    if seen_methods.insert(mi.name.to_ascii_lowercase()) {
+                        test_count += 1;
+                    }
+                }
+                match c.parent_fqcn.as_deref() {
+                    Some(p) => visit = p,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+            d += 1;
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        let any_ctx = !ctx.is_empty();
+        let verdicts: Vec<HoistCandidateVerdict> = candidates
+            .into_iter()
+            .map(|(prop, rhs, nondet)| {
+                let (hoistable, reason) = if nondet {
+                    (false, "REFUSE: non-deterministic RHS".to_string())
+                } else if any_ctx {
+                    (
+                        false,
+                        format!("REFUSE: per-test ambient context ({})", ctx.join(",")),
+                    )
+                } else if mutated.contains(&prop) {
+                    (false, format!("REFUSE: '{prop}' mutated by a test"))
+                } else {
+                    (
+                        true,
+                        "HOIST: deterministic, context-stable, never mutated".to_string(),
+                    )
+                };
+                HoistCandidateVerdict {
+                    prop,
+                    rhs,
+                    hoistable,
+                    reason,
+                }
+            })
+            .collect();
+        out.push(SetupHoistReport {
+            fqcn: class.fqcn.clone(),
+            file: class.file.clone(),
+            candidates: verdicts,
+            test_count,
+        });
+    }
+    out
+}
+
+/// Single-file setUp-hoist advisory report (used by tests and the report CLI).
+pub fn setup_hoist_report_in_file(path: &Path) -> Result<Vec<SetupHoistReport>> {
+    let parsed = parse_file_classes(path)?;
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+    Ok(setup_hoist_report(&parsed, &graph))
+}
+
+/// Project-level setUp-hoist advisory: parse every `*Test*.php` under `root`, build
+/// the in-project inheritance graph, verdict each concrete test class. Self-contained
+/// (advisory, not parity-critical); never touches the hot `discover_in_dirs` path.
+pub fn setup_hoist_report_in_dir(root: &Path) -> Result<Vec<SetupHoistReport>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("php")
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .contains("Test")
+        {
+            files.push(p.to_path_buf());
+        }
+    }
+    files.sort();
+    let parsed: Vec<ParsedClass> = files
+        .iter()
+        .map(|p| parse_file_classes(p))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let graph: ClassGraph = parsed
+        .iter()
+        .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
+        .collect();
+    Ok(setup_hoist_report(&parsed, &graph))
+}
+
+/// Format the setUp-hoist advisory: per class, a header line then one indented line
+/// per candidate (`HOIST`/`REFUSE`, `$this->prop = rhs`, multiplicity, reason); a
+/// trailing `hoistable: H/total candidate(s) across C class(es)` summary.
+pub fn format_setup_hoist_report(report: &[SetupHoistReport]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let (mut hoistable, mut total) = (0usize, 0usize);
+    for c in report {
+        let _ = writeln!(out, "{} (×{} tests)", c.fqcn, c.test_count);
+        for v in &c.candidates {
+            total += 1;
+            let tag = if v.hoistable {
+                hoistable += 1;
+                "HOIST "
+            } else {
+                "REFUSE"
+            };
+            let rhs: String = v.rhs.chars().take(48).collect();
+            let _ = writeln!(
+                out,
+                "  {}  $this->{} = {}\t:: {}",
+                tag, v.prop, rhs, v.reason
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "hoistable: {}/{} candidate(s) across {} class(es)",
+        hoistable,
+        total,
+        report.len()
+    );
+    out
 }
 
 fn collect_test_methods(
@@ -2828,6 +3288,125 @@ class PlainUnitTest extends TestCase {
             base.len() + 2,
             "only the two non-blank extras are appended"
         );
+    }
+
+    #[test]
+    fn has_call_ci_respects_identifier_boundaries() {
+        assert!(has_call_ci("$d = Carbon::now();", "now"));
+        assert!(has_call_ci("foo->now ();", "now")); // ws before paren
+                                                     // `now` embedded in `setTestNow` must NOT match the bare `now` call.
+        assert!(!has_call_ci("$this->setTestNow($t);", "now"));
+        assert!(has_call_ci("$this->setTestNow($t);", "setTestNow"));
+        assert!(has_call_ci(
+            "date_default_timezone_set('UTC');",
+            "date_default_timezone_set"
+        ));
+        assert!(!has_call_ci("$x = $rand;", "rand")); // no call (no paren)
+    }
+
+    #[test]
+    fn setup_ctx_scopes_classifies_context_setters() {
+        assert_eq!(setup_ctx_scopes("$this->x = 1;"), Vec::<String>::new());
+        assert_eq!(
+            setup_ctx_scopes("date_default_timezone_set('America/Toronto');"),
+            vec!["tz".to_string()]
+        );
+        assert_eq!(
+            setup_ctx_scopes("Carbon::setTestNow(Carbon::create(2024));"),
+            vec!["now".to_string()]
+        );
+    }
+
+    #[test]
+    fn setup_hoist_candidates_extracts_direct_assignments() {
+        let c = setup_hoist_candidates_src(
+            "$this->schema = HeavySchema::compile(); $this->n = rand(); \
+             $this->q->x = 1; $x == 5;",
+        );
+        // schema: deterministic candidate; n: candidate but nondet; q->x: NOT a candidate.
+        assert_eq!(c.len(), 2, "two direct $this->P = assignments");
+        assert_eq!(c[0].0, "schema");
+        assert_eq!(c[0].1, "HeavySchema::compile()");
+        assert!(!c[0].2, "compile() is deterministic");
+        assert_eq!(c[1].0, "n");
+        assert!(c[1].2, "rand() is non-deterministic");
+    }
+
+    #[test]
+    fn body_mutated_props_detects_mutation_not_reads() {
+        assert_eq!(
+            body_mutated_props_src("$this->schema->addTable('x');"),
+            vec!["schema".to_string()],
+            "non-reader method call mutates"
+        );
+        assert!(
+            body_mutated_props_src("$n = $this->schema->tableCount();").is_empty(),
+            "reader-prefixed call does not mutate"
+        );
+        assert_eq!(
+            body_mutated_props_src("$this->schema = null;"),
+            vec!["schema".to_string()],
+            "reassignment mutates"
+        );
+        assert!(
+            body_mutated_props_src("$x = $this->schema->getName();").is_empty(),
+            "getter read does not mutate"
+        );
+    }
+
+    #[test]
+    fn setup_hoist_report_decides_hoist_refuse_context() {
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+
+class SchemaReadTest extends TestCase {
+    private $schema;
+    protected function setUp(): void { $this->schema = HeavySchema::compile(); }
+    public function testA(): void { $this->assertSame(4, $this->schema->tableCount()); }
+    public function testB(): void { $this->assertTrue($this->schema->hasTable('x')); }
+}
+
+class SchemaMutateTest extends TestCase {
+    private $schema;
+    protected function setUp(): void { $this->schema = HeavySchema::compile(); }
+    public function testA(): void { $this->schema->addTable('y'); $this->assertSame(5, $this->schema->tableCount()); }
+}
+
+class TzTest extends TestCase {
+    private $schema;
+    protected function setUp(): void { date_default_timezone_set('America/Toronto'); $this->schema = HeavySchema::compile(); }
+    public function testA(): void { $this->assertSame(4, $this->schema->tableCount()); }
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let report = setup_hoist_report_in_file(&path).unwrap();
+        let find = |c: &str| {
+            report
+                .iter()
+                .find(|r| r.fqcn == format!("App\\{c}"))
+                .unwrap_or_else(|| panic!("no report for {c}"))
+        };
+        let read = find("SchemaReadTest");
+        assert!(
+            read.candidates
+                .iter()
+                .any(|v| v.prop == "schema" && v.hoistable),
+            "read-only deterministic fixture → HOIST"
+        );
+        assert_eq!(read.test_count, 2);
+        let mutate = find("SchemaMutateTest");
+        assert!(
+            mutate.candidates.iter().all(|v| !v.hoistable),
+            "mutated fixture → REFUSE"
+        );
+        assert!(mutate.candidates[0].reason.contains("mutated"));
+        let tz = find("TzTest");
+        assert!(
+            tz.candidates.iter().all(|v| !v.hoistable),
+            "per-test ambient tz → REFUSE"
+        );
+        assert!(tz.candidates[0].reason.contains("ambient context"));
     }
 
     #[test]
