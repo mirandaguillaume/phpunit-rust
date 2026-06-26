@@ -196,6 +196,9 @@ final class TestExecutor
             // P6: per-test $GLOBALS snapshot when the test opts into
             // backupGlobals. Null when not requested (zero overhead otherwise).
             $globalsBackup = null;
+            // P7: per-test static-property snapshot when the test opts into
+            // backupStaticProperties. Null when not requested (zero overhead).
+            $staticBackup = null;
             // P3: each test gets its own output buffer so expectOutputString()/
             // expectOutputRegex() can be asserted against exactly this test's
             // echo, and so stray output never bleeds into the batch stream.
@@ -233,10 +236,29 @@ final class TestExecutor
             // P6: snapshot $GLOBALS BEFORE setUp when the class/method opts in.
             // Vanilla snapshots in runBare before the before-hooks fire so any
             // global mutation by setUp/the body/after-hooks is rolled back.
-            $backupGlobals = self::backupGlobalsRequested($ref, $method);
+            // Skipped for isolated tests: vanilla's snapshotGlobalState returns
+            // early when inIsolation/runTestInSeparateProcess, because the fresh
+            // (recycled) process already provides the reset — mirror that here so
+            // we don't run the restore's reset where vanilla wouldn't.
+            $backupGlobals = !$isolated && self::backupGlobalsRequested($ref, $method);
             if ($backupGlobals) {
                 $globalsBackup = self::snapshotGlobals(
                     self::backupGlobalsExcludeList($ref, $method)
+                );
+            }
+
+            // P7: snapshot static class properties BEFORE setUp when the
+            // class/method opts in — the static counterpart of backupGlobals.
+            // Vanilla takes one combined snapshot in runBare before the
+            // before-hooks fire; we keep the two paths separate so each pays
+            // only for what it requests. Same isolation skip as backupGlobals:
+            // an isolated test runs in its own recycled fork, so a per-test
+            // snapshot/restore (and its new-class reset) is both redundant and a
+            // divergence from vanilla's inIsolation early-return.
+            $backupStatic = !$isolated && self::backupStaticPropertiesRequested($ref, $method);
+            if ($backupStatic) {
+                $staticBackup = self::snapshotStaticProperties(
+                    self::backupStaticPropertiesExcludeList($ref, $method)
                 );
             }
 
@@ -402,6 +424,13 @@ final class TestExecutor
                     $globalsBackup,
                     self::backupGlobalsExcludeList($ref, $method)
                 );
+            }
+
+            // P7: restore static class properties from the pre-test snapshot,
+            // after teardown. Vanilla's restoreGlobalState restores globals then
+            // static properties, so we follow the same order.
+            if ($staticBackup !== null) {
+                self::restoreStaticProperties($staticBackup);
             }
 
             $duration = (microtime(true) - $startedAt) * 1000.0;
@@ -1106,9 +1135,10 @@ final class TestExecutor
             }
         }
         // Legacy docblock: `@backupGlobals enabled` / `@backupGlobals disabled`.
-        if ($doc !== '' && preg_match('/@backupGlobals\s+(enabled|disabled|true|false)/i', $doc, $m)) {
-            $v = strtolower($m[1]);
-            return $v === 'enabled' || $v === 'true';
+        // Mirror PHPUnit's AnnotationParser: same-line value, and ONLY the
+        // case-sensitive literal `enabled` turns backup on.
+        if ($doc !== '' && preg_match('/@backupGlobals\b[ \t]*(\S*)/', $doc, $m)) {
+            return $m[1] === 'enabled';
         }
         return null;
     }
@@ -1211,5 +1241,155 @@ final class TestExecutor
                 $GLOBALS[$k] = $v;
             }
         }
+    }
+
+    /**
+     * P7: does the class or method opt into backupStaticProperties? Method-level
+     * wins over class-level. Mirrors backupGlobalsRequested. We honor the
+     * PHPUnit 10/11 attribute (#[BackupStaticProperties(true)]) and the legacy
+     * `@backupStaticProperties` / `@backupStaticAttributes` docblock.
+     */
+    private static function backupStaticPropertiesRequested(\ReflectionClass $ref, string $method): bool
+    {
+        $methodRef = $ref->hasMethod($method) ? $ref->getMethod($method) : null;
+
+        // Method-level attribute / docblock takes precedence (either direction).
+        if ($methodRef !== null) {
+            $m = self::readBackupStaticPropertiesFrom($methodRef->getAttributes(), (string) $methodRef->getDocComment());
+            if ($m !== null) {
+                return $m;
+            }
+        }
+        $c = self::readBackupStaticPropertiesFrom($ref->getAttributes(), (string) $ref->getDocComment());
+        return $c ?? false;
+    }
+
+    /**
+     * Resolve a backupStaticProperties opt-in from a set of reflection attributes
+     * and a docblock. Returns true/false when an explicit opt-in is found at this
+     * scope, or null when this scope says nothing (so the caller can fall back).
+     *
+     * @param \ReflectionAttribute[] $attrs
+     */
+    private static function readBackupStaticPropertiesFrom(array $attrs, string $doc): ?bool
+    {
+        foreach ($attrs as $attr) {
+            if ($attr->getName() === 'PHPUnit\\Framework\\Attributes\\BackupStaticProperties') {
+                return (bool) $attr->newInstance()->enabled();
+            }
+        }
+        // Legacy docblock: `@backupStaticProperties` (PHPUnit 10+) or the older
+        // `@backupStaticAttributes` spelling. Mirror PHPUnit's AnnotationParser
+        // exactly: the value is the SAME-LINE remainder and ONLY the
+        // case-sensitive literal `enabled` turns backup on (`true`, `Enabled`,
+        // `disabled`, or no value => off). Anything but `enabled` is an explicit
+        // opt-out at this scope.
+        if ($doc !== '' && preg_match('/@backupStatic(?:Properties|Attributes)\b[ \t]*(\S*)/', $doc, $m)) {
+            return $m[1] === 'enabled';
+        }
+        return null;
+    }
+
+    /**
+     * P7: collect #[ExcludeStaticPropertyFromBackup(class, prop)] pairs from the
+     * class and method scope — static properties that must NOT be snapshotted or
+     * restored. Returns a flat list of [className, propertyName] pairs.
+     *
+     * @return list<array{0: string, 1: string}>
+     */
+    private static function backupStaticPropertiesExcludeList(\ReflectionClass $ref, string $method): array
+    {
+        $pairs = [];
+        $collect = static function (array $attrs) use (&$pairs): void {
+            foreach ($attrs as $attr) {
+                if ($attr->getName() === 'PHPUnit\\Framework\\Attributes\\ExcludeStaticPropertyFromBackup') {
+                    $inst = $attr->newInstance();
+                    $pairs[] = [$inst->className(), $inst->propertyName()];
+                }
+            }
+        };
+        $collect($ref->getAttributes());
+        if ($ref->hasMethod($method)) {
+            $collect($ref->getMethod($method)->getAttributes());
+        }
+        return $pairs;
+    }
+
+    /**
+     * P7: snapshot static class properties for backupStaticProperties. Delegates
+     * to SebastianBergmann's GlobalState\Snapshot (ships with phpunit) so we match
+     * vanilla's capture + restore semantics exactly. Returns the Snapshot, or null
+     * when the library is unavailable (defensive — the project's PHPUnit always
+     * provides it).
+     *
+     * @param list<array{0: string, 1: string}> $excludePairs
+     */
+    private static function snapshotStaticProperties(array $excludePairs): ?object
+    {
+        if (!class_exists('SebastianBergmann\\GlobalState\\Snapshot')
+            || !class_exists('SebastianBergmann\\GlobalState\\ExcludeList')) {
+            return null;
+        }
+        $exclude = self::globalStateExcludeList();
+        foreach ($excludePairs as [$class, $prop]) {
+            $exclude->addStaticProperty($class, $prop);
+        }
+        // Static properties only — every other Snapshot dimension off. Mirrors
+        // vanilla createGlobalStateSnapshot (which takes one combined snapshot;
+        // here $GLOBALS is handled separately by snapshotGlobals).
+        return new \SebastianBergmann\GlobalState\Snapshot(
+            $exclude,
+            false,  // includeGlobalVariables
+            true,   // includeStaticProperties
+            false, false, false, false, false, false, false
+        );
+    }
+
+    /**
+     * P7: restore static class properties from a snapshot taken by
+     * snapshotStaticProperties.
+     *
+     * @param object $snapshot a GlobalState\Snapshot
+     */
+    private static function restoreStaticProperties(object $snapshot): void
+    {
+        if ($snapshot instanceof \SebastianBergmann\GlobalState\Snapshot) {
+            (new \SebastianBergmann\GlobalState\Restorer())->restoreStaticProperties($snapshot);
+        }
+    }
+
+    /**
+     * Build the GlobalState ExcludeList of class-name prefixes that must NEVER be
+     * snapshotted/restored for static properties. Mirrors PHPUnit's
+     * createGlobalStateSnapshot default excludes (PHPUnit + its SebastianBergmann
+     * tooling + ComparatorFactory's singleton) and ADDS `Proust\` — proust runs
+     * tests in a LONG-LIVED worker, so restoring our own runtime static state
+     * (concretely Proust\SharedTransactionalFixture::$sharedFixtureBuilt, the one
+     * mutable static *class property* in the runtime) mid-batch would corrupt
+     * later tests in the same fork. (The dbHandle/phpunit-major/event-bridge
+     * memos are function-local `static $x`, invisible to the Snapshot, so they
+     * are safe by language semantics — not by this prefix.) Vanilla needs no
+     * `Proust\` exclude because its per-test process never shares proust's
+     * runtime. The prefix is namespace-qualified (`Proust\`, not bare `Proust`)
+     * so a user class merely *named* like `Proustache` is NOT over-excluded.
+     */
+    private static function globalStateExcludeList(): \SebastianBergmann\GlobalState\ExcludeList
+    {
+        $exclude = new \SebastianBergmann\GlobalState\ExcludeList();
+        foreach ([
+            'PHPUnit',
+            'SebastianBergmann\\CodeCoverage',
+            'SebastianBergmann\\FileIterator',
+            'SebastianBergmann\\Invoker',
+            'SebastianBergmann\\Template',
+            'SebastianBergmann\\Timer',
+            'Proust\\',
+        ] as $prefix) {
+            $exclude->addClassNamePrefix($prefix);
+        }
+        if (class_exists('SebastianBergmann\\Comparator\\ComparatorFactory')) {
+            $exclude->addStaticProperty('SebastianBergmann\\Comparator\\ComparatorFactory', 'instance');
+        }
+        return $exclude;
     }
 }

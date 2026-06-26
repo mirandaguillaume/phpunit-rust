@@ -209,9 +209,23 @@ PHPUnit:
   `@backupGlobals enabled` snapshots `$GLOBALS` before `setUp` and
   restores it after `tearDown`, honouring
   `#[ExcludeGlobalVariableFromBackup]`.
-- **`backupStaticAttributes` / `backupStaticProperties` are NOT
-  supported.** Static properties mutated by one test stay visible to
-  every later test sharing the same worker fork.
+- **`backupStaticProperties` is supported (opt-in).**
+  `#[BackupStaticProperties(true)]` (or the legacy
+  `@backupStaticProperties` / `@backupStaticAttributes` docblock,
+  honoured only for the case-sensitive value `enabled`, exactly like
+  PHPUnit) snapshots static class properties before `setUp` and restores
+  them after `tearDown`, honouring `#[ExcludeStaticPropertyFromBackup]`.
+  Method-level wins over class-level. Delegated to the same
+  `sebastian/global-state` library PHPUnit uses, so capture/restore
+  semantics match. The snapshot excludes the `PHPUnit\`,
+  `SebastianBergmann\…` and **`Proust\`** namespaces — the last so the
+  long-lived worker never rolls back proust's own runtime statics
+  mid-batch (vanilla, running one test per process, needs no such
+  guard). Opt-in only, so suites that don't request it pay nothing.
+  Isolated tests (`@runInSeparateProcess`) skip the snapshot, matching
+  vanilla's `inIsolation` early-return. Not yet modelled: the XML-root
+  `backupStaticProperties="true"` default and the legacy
+  `protected $backupStaticProperties` property form.
 - Classes that touch process-global APIs (stream wrappers, error /
   exception handlers, `ini_set`, `putenv`, `setlocale`, autoload
   registration, …) are auto-detected and forced into a fresh fork per
