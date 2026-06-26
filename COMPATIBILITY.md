@@ -26,6 +26,10 @@ Lists the PHPUnit features that Proust supports today, and the ones that are exp
   `KernelTestCase` / `WebTestCase`, etc.)
 - Case-insensitive method-name dedup along the inheritance chain (PHP
   semantics: a subclass `testfoo` overrides a parent `testFoo`)
+- Test methods provided by `use`d **traits** (including transitive
+  trait-of-trait), folded into the using class with PHP precedence
+  (own class > trait > parent); the trait is never run as a class on its own.
+  Project traits only — a trait declared in `vendor/` is not parsed.
 
 **Data providers — every form PHPUnit supports:**
 

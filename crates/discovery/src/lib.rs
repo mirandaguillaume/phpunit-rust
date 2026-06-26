@@ -118,6 +118,13 @@ struct ParsedClass {
     /// extends a functional base is still flagged. Perf/UX only (worker clamp +
     /// `--warmup` hint); never a correctness gate.
     is_functional: bool,
+    /// True when this declaration is a `trait` (parsed for its test methods,
+    /// folded into using classes; never emitted as a test class itself).
+    is_trait: bool,
+    /// Resolved FQCNs of traits this class/trait pulls in via an in-class
+    /// `use Trait;` member. Their test methods (and flags) fold into using
+    /// classes in [`emit_test_cases`], transitively for trait-of-trait.
+    used_traits: Vec<String>,
     /// In-class `use SharedTransactionalFixture;` (the opt-in marker). Folded across the
     /// inheritance chain in [`shared_fixture_report`]. Advisory only — no runtime effect.
     uses_shared_fixture: bool,
@@ -494,17 +501,25 @@ fn collect_parsed_classes(
     path: &Path,
     out: &mut Vec<ParsedClass>,
 ) -> Result<()> {
+    // Match BOTH classes and traits: PHPUnit runs test methods a class pulls in
+    // via `use SomeTrait;`, so a trait body must be parsed too (its methods fold
+    // into using classes in emit_test_cases; a trait is never run on its own).
     let query_src = r#"
-        (class_declaration
-          name: (name) @class_name
-          (base_clause [(name) (qualified_name)] @base)?
-          body: (declaration_list) @body) @class
+        [
+          (class_declaration
+            name: (name) @class_name
+            (base_clause [(name) (qualified_name)] @base)?
+            body: (declaration_list) @body) @decl
+          (trait_declaration
+            name: (name) @class_name
+            body: (declaration_list) @body) @decl
+        ]
     "#;
     let lang = tree_sitter_php::language_php();
     let query = Query::new(&lang, query_src).context("compiling class query")?;
     let mut cursor = QueryCursor::new();
     let captures = query.capture_names();
-    let class_idx = captures.iter().position(|n| *n == "class").unwrap();
+    let class_idx = captures.iter().position(|n| *n == "decl").unwrap();
     let class_name_idx = captures.iter().position(|n| *n == "class_name").unwrap();
     let base_idx = captures.iter().position(|n| *n == "base").unwrap();
     let body_idx = captures.iter().position(|n| *n == "body").unwrap();
@@ -554,6 +569,11 @@ fn collect_parsed_classes(
             .as_deref()
             .is_some_and(|p| reference_matches_marker(p, &functional_refs));
         let test_methods = collect_test_methods(body, bytes, class_ns.as_deref(), aliases);
+        // A trait: parsed for its test methods (folded into using classes), but
+        // never emitted as a test class itself. Its `use OtherTrait;` members are
+        // captured so trait-of-trait composition folds transitively.
+        let is_trait = decl.kind() == "trait_declaration";
+        let used_traits = collect_used_traits(body, bytes, class_ns.as_deref(), aliases);
         let is_abstract = class_has_modifier(decl, bytes, "abstract");
 
         // Class-level groups apply to every test method in the class.
@@ -594,6 +614,8 @@ fn collect_parsed_classes(
             is_isolated,
             needs_db,
             is_functional,
+            is_trait,
+            used_traits,
             uses_shared_fixture,
             setup_builds_fixture,
             has_tx_disqualifier,
@@ -1243,6 +1265,36 @@ fn class_uses_shared_fixture(class_body: Node, bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Resolved FQCNs of the traits a class/trait pulls in via in-class `use Trait;`
+/// members (NOT file-scope `namespace_use_declaration` imports). Multi-name
+/// `use A, B;` and the adaptation form `use A { B::m insteadof C; }` both yield
+/// their trait names; the `insteadof`/`as` adaptations are not modelled (rare).
+fn collect_used_traits(
+    class_body: Node,
+    bytes: &[u8],
+    namespace: Option<&str>,
+    aliases: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = class_body.walk();
+    for member in class_body.children(&mut cursor) {
+        if member.kind() != "use_declaration" {
+            continue;
+        }
+        let mut tu_cursor = member.walk();
+        for used in member.named_children(&mut tu_cursor) {
+            if matches!(used.kind(), "name" | "qualified_name") {
+                if let Ok(raw) = used.utf8_text(bytes) {
+                    if is_valid_class_name(raw) {
+                        out.push(resolve_class_reference(raw, namespace, aliases));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2308,6 +2360,29 @@ pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
 /// Without this, the concrete class would emit zero TestCase entries (the
 /// inherited methods were on the abstract parent), and the runner would
 /// silently skip them.
+/// Append `c`'s used-trait sources to `sources` — pre-order, transitive (a
+/// trait that `use`s another trait), guarded against cycles/diamonds by
+/// `visited`. Only entries that resolve to a parsed TRAIT are followed; a `use`d
+/// name resolving to a class (or to nothing) is ignored.
+fn collect_trait_sources<'a>(
+    c: &'a ParsedClass,
+    by_fqcn: &HashMap<&'a str, &'a ParsedClass>,
+    sources: &mut Vec<&'a ParsedClass>,
+    visited: &mut std::collections::HashSet<&'a str>,
+) {
+    for t in &c.used_traits {
+        if !visited.insert(t.as_str()) {
+            continue;
+        }
+        if let Some(tc) = by_fqcn.get(t.as_str()).copied() {
+            if tc.is_trait {
+                sources.push(tc);
+                collect_trait_sources(tc, by_fqcn, sources, visited);
+            }
+        }
+    }
+}
+
 fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<TestCase>> {
     // Index by FQCN for chain-walking.
     let by_fqcn: HashMap<&str, &ParsedClass> =
@@ -2315,146 +2390,76 @@ fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<Tes
 
     let mut cases = Vec::new();
     for class in parsed {
-        if class.is_abstract {
+        // A trait is parsed for its methods but never run as a test class itself.
+        if class.is_trait || class.is_abstract {
             continue;
         }
         if !is_test_class_via_chain(&class.fqcn, graph) {
             continue;
         }
-        // Collect methods from this class + all parsed ancestors, dedup by name.
-        // The PHP runtime will run inherited methods on the concrete subclass,
-        // so we emit them under `class.fqcn` (not the ancestor's FQCN).
-        // PHP method names are case-insensitive at call time: a subclass
-        // declaring `testfoo` overrides a parent's `testFoo`. PHPUnit's
-        // reflection-based discovery collapses them; we mirror that by
-        // deduping on the lowercased name as we walk the inheritance chain.
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Walk the chain once to OR every ancestor's is_stateful flag — a
-        // setUp() inherited from a parent class can pollute global state
-        // just as readily as one declared on the concrete subclass.
-        let chain_is_stateful = {
+        // Ordered method/flag sources: walk the inheritance chain, and at each
+        // level take the class itself THEN its used traits (transitively). PHP
+        // precedence is own-class > traits > parent — this order encodes it, and
+        // the lowercased-name `seen` dedup below makes the first occurrence win
+        // (PHP method names are case-insensitive at call time; PHPUnit's
+        // reflection discovery collapses overrides — we mirror that).
+        let mut sources: Vec<&ParsedClass> = Vec::new();
+        {
+            let mut visited_traits: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
             let mut visit = class.fqcn.as_str();
-            let mut d = 0;
-            let mut acc = false;
-            while d < 32 {
-                if let Some(c) = by_fqcn.get(visit) {
-                    acc = acc || c.is_stateful;
-                    match c.parent_fqcn.as_deref() {
-                        Some(p) => visit = p,
-                        None => break,
-                    }
-                } else {
+            let mut depth = 0;
+            while depth < 32 {
+                let Some(c) = by_fqcn.get(visit).copied() else {
+                    // Parent is outside our parsed set (e.g. PHPUnit's TestCase).
                     break;
-                }
-                d += 1;
-            }
-            acc
-        };
-        // Same walk for is_isolated: a parent class annotated with
-        // `@runTestsInSeparateProcesses` propagates to every concrete
-        // subclass, mirroring PHPUnit's runtime behaviour.
-        let chain_is_isolated = {
-            let mut visit = class.fqcn.as_str();
-            let mut d = 0;
-            let mut acc = false;
-            while d < 32 {
-                if let Some(c) = by_fqcn.get(visit) {
-                    acc = acc || c.is_isolated;
-                    match c.parent_fqcn.as_deref() {
-                        Some(p) => visit = p,
-                        None => break,
-                    }
-                } else {
-                    break;
-                }
-                d += 1;
-            }
-            acc
-        };
-        // Same walk for needs_db: a parent base that `use`s RefreshDatabase or
-        // references a DB type propagates to every concrete subclass, mirroring
-        // PHPUnit's runtime trait/inheritance behaviour.
-        let chain_needs_db = {
-            let mut visit = class.fqcn.as_str();
-            let mut d = 0;
-            let mut acc = false;
-            while d < 32 {
-                if let Some(c) = by_fqcn.get(visit) {
-                    acc = acc || c.needs_db;
-                    match c.parent_fqcn.as_deref() {
-                        Some(p) => visit = p,
-                        None => break,
-                    }
-                } else {
-                    break;
-                }
-                d += 1;
-            }
-            acc
-        };
-        // Same chain walk for is_functional: a concrete test extending a
-        // non-functional-named intermediate that itself extends a functional
-        // base (e.g. AbstractCommandTestCase -> KernelTestCase) is still flagged.
-        let chain_is_functional = {
-            let mut visit = class.fqcn.as_str();
-            let mut d = 0;
-            let mut acc = false;
-            while d < 32 {
-                if let Some(c) = by_fqcn.get(visit) {
-                    acc = acc || c.is_functional;
-                    match c.parent_fqcn.as_deref() {
-                        Some(p) => visit = p,
-                        None => break,
-                    }
-                } else {
-                    break;
-                }
-                d += 1;
-            }
-            acc
-        };
-        let mut visit = class.fqcn.as_str();
-        let mut depth = 0;
-        while depth < 32 {
-            if let Some(c) = by_fqcn.get(visit) {
-                for mi in &c.test_methods {
-                    if seen.insert(mi.name.to_ascii_lowercase()) {
-                        // Effective groups = the concrete subclass's
-                        // class-level groups + the inherited method's
-                        // class-level groups + the method's own groups.
-                        // Dedup with a btreeset to keep output stable.
-                        let mut groups: std::collections::BTreeSet<String> =
-                            class.class_groups.iter().cloned().collect();
-                        groups.extend(c.class_groups.iter().cloned());
-                        groups.extend(mi.groups.iter().cloned());
-                        cases.push(TestCase {
-                            file: class.file.clone(),
-                            class: class.fqcn.clone(),
-                            method: mi.name.clone(),
-                            data_provider: mi.data_provider.clone(),
-                            groups: groups.into_iter().collect(),
-                            external_providers: mi.external_providers.clone(),
-                            is_tautological: mi.is_tautological,
-                            has_lifecycle_overrides: class.has_lifecycle_overrides,
-                            depends_on: mi.depends_on.clone(),
-                            is_dispatch_safe: mi.depends_on.is_empty(),
-                            fingerprint: mi.fingerprint.clone(),
-                            is_stateful: chain_is_stateful,
-                            is_isolated: chain_is_isolated,
-                            needs_db: chain_needs_db,
-                            is_functional: chain_is_functional,
-                        });
-                    }
-                }
+                };
+                sources.push(c);
+                collect_trait_sources(c, &by_fqcn, &mut sources, &mut visited_traits);
                 match c.parent_fqcn.as_deref() {
                     Some(p) => visit = p,
                     None => break,
                 }
-            } else {
-                // Parent is outside our parsed set (e.g., PHPUnit's TestCase).
-                break;
+                depth += 1;
             }
-            depth += 1;
+        }
+        // OR the class-nature flags across every source (chain + traits): a
+        // setUp/marker inherited from a parent OR pulled in via a trait flags
+        // the concrete class the same way.
+        let chain_is_stateful = sources.iter().any(|c| c.is_stateful);
+        let chain_is_isolated = sources.iter().any(|c| c.is_isolated);
+        let chain_needs_db = sources.iter().any(|c| c.needs_db);
+        let chain_is_functional = sources.iter().any(|c| c.is_functional);
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &sources {
+            for mi in &c.test_methods {
+                if seen.insert(mi.name.to_ascii_lowercase()) {
+                    // Effective groups = the concrete subclass's class-level
+                    // groups + the source's class-level groups + the method's own.
+                    let mut groups: std::collections::BTreeSet<String> =
+                        class.class_groups.iter().cloned().collect();
+                    groups.extend(c.class_groups.iter().cloned());
+                    groups.extend(mi.groups.iter().cloned());
+                    cases.push(TestCase {
+                        file: class.file.clone(),
+                        class: class.fqcn.clone(),
+                        method: mi.name.clone(),
+                        data_provider: mi.data_provider.clone(),
+                        groups: groups.into_iter().collect(),
+                        external_providers: mi.external_providers.clone(),
+                        is_tautological: mi.is_tautological,
+                        has_lifecycle_overrides: class.has_lifecycle_overrides,
+                        depends_on: mi.depends_on.clone(),
+                        is_dispatch_safe: mi.depends_on.is_empty(),
+                        fingerprint: mi.fingerprint.clone(),
+                        is_stateful: chain_is_stateful,
+                        is_isolated: chain_is_isolated,
+                        needs_db: chain_needs_db,
+                        is_functional: chain_is_functional,
+                    });
+                }
+            }
         }
     }
     Ok(cases)
@@ -3288,6 +3293,82 @@ class PlainUnitTest extends TestCase {
             base.len() + 2,
             "only the two non-blank extras are appended"
         );
+    }
+
+    #[test]
+    fn discovers_test_methods_provided_by_a_trait() {
+        // PHPUnit runs test methods a class pulls in via `use SomeTrait;` as
+        // tests of that class. Discovery must fold them in (the trait itself is
+        // never run as a test class). Covers transitive traits + own-method
+        // precedence.
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+
+trait NestedTraitTests {
+    public function testFromNested(): void {}
+}
+
+trait SharedApiTests {
+    use NestedTraitTests;
+    public function testFromTrait(): void {}
+}
+
+class WidgetTest extends TestCase {
+    use SharedApiTests;
+    public function testOwn(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let mut methods: Vec<&str> = cases
+            .iter()
+            .filter(|c| c.class == "App\\WidgetTest")
+            .map(|c| c.method.as_str())
+            .collect();
+        methods.sort_unstable();
+        assert_eq!(
+            methods,
+            ["testFromNested", "testFromTrait", "testOwn"],
+            "own + direct-trait + transitive-trait methods all discovered under the class"
+        );
+        // The traits themselves must NOT be emitted as test classes.
+        assert!(
+            cases.iter().all(|c| c.class == "App\\WidgetTest"),
+            "a trait is never a test class on its own"
+        );
+    }
+
+    #[test]
+    fn class_method_overrides_a_trait_method_of_the_same_name() {
+        // PHP: a class's own method wins over a trait method of the same name.
+        // Discovery must emit it ONCE (no duplicate), under the class.
+        let src = r#"<?php
+namespace App;
+use PHPUnit\Framework\TestCase;
+
+trait T {
+    public function testShared(): void {}
+    public function testOnlyInTrait(): void {}
+}
+
+class OverrideTest extends TestCase {
+    use T;
+    public function testShared(): void {}
+}
+"#;
+        let (_dir, path) = write_tmp(src);
+        let cases = discover_in_file(&path).unwrap();
+        let shared = cases.iter().filter(|c| c.method == "testShared").count();
+        assert_eq!(
+            shared, 1,
+            "the class/trait same-named method is emitted exactly once"
+        );
+        assert!(
+            cases.iter().any(|c| c.method == "testOnlyInTrait"),
+            "the trait's other method is still discovered"
+        );
+        assert_eq!(cases.len(), 2);
     }
 
     #[test]
