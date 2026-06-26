@@ -84,6 +84,15 @@ Row counts are enumerated by a one-shot pre-fork PHP pass; heavy providers
 - `<groups><exclude>`
 - `<listeners>` parsed but **not dispatched** (see "Not yet supported")
 
+Proust applies the `<php>` block above and then runs the configured `bootstrap`
+file — it does **not** load `.env` / `.env.test` itself, and that is correct:
+framework env cascades (e.g. Symfony's `Dotenv::bootEnv`) are the app
+bootstrap's job, exactly as under vanilla PHPUnit. Proust only needs `APP_ENV`
+(set via `<php><env>`, or the config's own `<php>`) to be in place so the
+bootstrap loads the right file — which is why detecting `phpunit.dist.xml`
+matters (a missed `<php>` block leaves `APP_ENV` unset and the bootstrap loads
+`.env` dev instead of `.env.test`).
+
 **CLI flags:**
 
 | Flag | Default | Purpose |
@@ -293,10 +302,12 @@ Proust's; there is no framework adapter to configure. Three ways, in order of
   `end-to-end` testsuite is ~1000 `.phpt` files. For that reason the benchmark
   harness runs vanilla phpunit-itself with `--testsuite unit` (the `.phpt`-free
   suite) so the comparison is like-for-like; see `bench/bench_host.sh`.
-- Generic `<listeners>` dispatch (we parse the entries but don't execute
-  user listener code — affects projects using Symfony's PhpUnitTestsListener
-  for `@group legacy` handling)
-- `<extensions>` (PHPUnit 10+ extension API)
+- Generic `<listeners>` dispatch — the **legacy** (pre-10) mechanism: we parse
+  the entries but don't execute user listener code (affects projects using
+  Symfony's PhpUnitTestsListener for `@group legacy` handling). The modern
+  PHPUnit 10+ `<extensions>` API, by contrast, **is** bootstrapped (opt-in via
+  the event bridge, best-effort across PHPUnit versions) — see "State isolation"
+  above; it is how DAMADoctrineTestBundle runs under Proust.
 - Runtime coverage (PCOV/Xdebug) — static analysis only for now
 - JUnit XML / TAP / TestDox reporters
 - Watch mode
