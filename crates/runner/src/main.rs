@@ -501,6 +501,17 @@ struct Cli {
     /// wall clock is being spent. Quasi-zero overhead when unset.
     #[arg(long)]
     profile: Option<PathBuf>,
+    /// Write a PHPUnit-compatible JUnit XML report to this file. Consumed as-is by
+    /// GitLab, GitHub Actions, and the Jenkins JUnit plugin. Same flag name as PHPUnit.
+    #[arg(long = "log-junit")]
+    log_junit: Option<PathBuf>,
+    /// Print a TestDox view (human-readable "it does X" sentences, grouped by class)
+    /// after the run.
+    #[arg(long)]
+    testdox: bool,
+    /// Write the TestDox report to this file as plain text. Same flag name as PHPUnit.
+    #[arg(long = "log-testdox-text")]
+    log_testdox_text: Option<PathBuf>,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -1391,6 +1402,32 @@ fn real_main() -> Result<ExitCode> {
     }
 
     print_summary(&report);
+
+    // File-format reports (JUnit XML / TestDox). Written after the console summary
+    // so a report-writing failure never masks the run result. Both consume only
+    // the finished `report`, so they add zero cost when their flags are unset.
+    if let Some(path) = &cli.log_junit {
+        let xml = proust::reports::junit::junit_xml(&report, "");
+        match std::fs::write(path, xml) {
+            Ok(()) => eprintln!("JUnit XML written to {}", path.display()),
+            Err(e) => eprintln!(
+                "warning: writing JUnit XML to {} failed: {e}",
+                path.display()
+            ),
+        }
+    }
+    if cli.testdox || cli.log_testdox_text.is_some() {
+        let dox = proust::reports::testdox::testdox_text(&report);
+        if cli.testdox {
+            print!("\n{dox}");
+        }
+        if let Some(path) = &cli.log_testdox_text {
+            match std::fs::write(path, &dox) {
+                Ok(()) => eprintln!("TestDox written to {}", path.display()),
+                Err(e) => eprintln!("warning: writing TestDox to {} failed: {e}", path.display()),
+            }
+        }
+    }
 
     #[cfg(feature = "coverage")]
     if let Some(fmt) = &cli.coverage_format {
