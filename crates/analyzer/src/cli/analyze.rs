@@ -189,6 +189,12 @@ fn analyze_filtered_inner(
 
     analyzer::proxy::add_proxy_coverage(&project, &boundary, &mut coverage);
 
+    // Report-time source filter — drop anything not under the configured
+    // <source> includes. The tracer records the entry point (each test method's
+    // own file), so without this the report leaks test files that PHPUnit, which
+    // reports only <source>, never includes.
+    restrict_to_source(&mut coverage, &boundary, !cfg.source_includes.is_empty());
+
     // Store result cache only for unfiltered runs.
     if allowed.is_none() {
         let fingerprint = fingerprint_from_metas(cfg_fp.as_str(), &file_metas);
@@ -202,6 +208,81 @@ fn analyze_filtered_inner(
     }
 
     Ok(coverage)
+}
+
+/// Keep only files under the configured `<source>` includes (`Boundary::Project`).
+/// PHPUnit reports coverage only for `<source>` — never for test files — but the
+/// tracer's entry point is each test method's own file, so those leak into the
+/// map. A no-op when no `<source>` is configured (empty includes), so an
+/// unconfigured project still gets whole-project coverage instead of an empty
+/// report.
+fn restrict_to_source(
+    coverage: &mut Coverage,
+    boundary: &BoundaryResolver,
+    has_source_config: bool,
+) {
+    if !has_source_config {
+        return;
+    }
+    coverage.retain(|path, _| boundary.classify(path) == crate::boundary::Boundary::Project);
+}
+
+#[cfg(test)]
+mod source_filter_tests {
+    use super::*;
+    use crate::config::ProjectConfig;
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "<?php").unwrap();
+    }
+
+    #[test]
+    fn drops_test_files_keeps_src() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src/Calc.php");
+        let test = dir.path().join("tests/CalcTest.php");
+        touch(&src);
+        touch(&test);
+        let cfg = ProjectConfig {
+            root: dir.path().to_path_buf(),
+            test_suites: vec![dir.path().join("tests")],
+            source_includes: vec![dir.path().join("src")],
+            source_excludes: vec![],
+        };
+        let boundary = BoundaryResolver::from_config(&cfg);
+        let mut cov: Coverage = HashMap::new();
+        cov.insert(src.canonicalize().unwrap(), HashMap::new());
+        cov.insert(test.canonicalize().unwrap(), HashMap::new());
+
+        restrict_to_source(&mut cov, &boundary, true);
+
+        assert!(cov.keys().any(|p| p.ends_with("Calc.php")), "src file kept");
+        assert!(
+            !cov.keys().any(|p| p.ends_with("CalcTest.php")),
+            "test file dropped (PHPUnit reports only <source>)"
+        );
+    }
+
+    #[test]
+    fn is_noop_without_source_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let test = dir.path().join("tests/CalcTest.php");
+        touch(&test);
+        let cfg = ProjectConfig {
+            root: dir.path().to_path_buf(),
+            test_suites: vec![dir.path().join("tests")],
+            source_includes: vec![],
+            source_excludes: vec![],
+        };
+        let boundary = BoundaryResolver::from_config(&cfg);
+        let mut cov: Coverage = HashMap::new();
+        cov.insert(test.canonicalize().unwrap(), HashMap::new());
+
+        restrict_to_source(&mut cov, &boundary, false);
+
+        assert_eq!(cov.len(), 1, "no <source> config -> keep everything");
+    }
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
