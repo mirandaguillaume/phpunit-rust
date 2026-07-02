@@ -27,6 +27,16 @@ final class TestExecutor
      *        instance before invocation.
      * @return list<array<string, mixed>>
      */
+    /**
+     * Delegated runtime-coverage collector (a `SebastianBergmann\CodeCoverage`),
+     * set by the worker when `--coverage-*` is requested; null otherwise, so a
+     * normal run pays nothing. Lives in the `Proust\` namespace, so the
+     * backupStaticProperties snapshot never touches it (worker-safety exclude).
+     *
+     * @var ?object
+     */
+    public static $coverage = null;
+
     public static function runClass(string $class, array $methods, ?array $rowFilter = null, bool $isolated = false): array
     {
         if (!is_subclass_of($class, TestCase::class)) {
@@ -199,6 +209,15 @@ final class TestExecutor
             // P7: per-test static-property snapshot when the test opts into
             // backupStaticProperties. Null when not requested (zero overhead).
             $staticBackup = null;
+
+            // Delegated runtime coverage: bracket the whole test (setUp + body +
+            // tearDown), exactly like PHPUnit, whenever the worker enabled a
+            // collector. The id is the standard `Class::method` (with dataset).
+            if (self::$coverage !== null) {
+                self::$coverage->start(
+                    $dataset === null ? "$class::$method" : "$class::$method#$dataset"
+                );
+            }
             // P3: each test gets its own output buffer so expectOutputString()/
             // expectOutputRegex() can be asserted against exactly this test's
             // echo, and so stray output never bleeds into the batch stream.
@@ -431,6 +450,16 @@ final class TestExecutor
             // static properties, so we follow the same order.
             if ($staticBackup !== null) {
                 self::restoreStaticProperties($staticBackup);
+            }
+
+            // Stop the coverage segment for this test (best-effort; a stop must
+            // never mask the test's own outcome). Reached even when the body threw
+            // — that throw was already caught into $error above.
+            if (self::$coverage !== null) {
+                try {
+                    self::$coverage->stop();
+                } catch (\Throwable) {
+                }
             }
 
             $duration = (microtime(true) - $startedAt) * 1000.0;

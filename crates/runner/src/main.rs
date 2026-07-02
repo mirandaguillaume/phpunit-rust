@@ -512,6 +512,18 @@ struct Cli {
     /// Write the TestDox report to this file as plain text. Same flag name as PHPUnit.
     #[arg(long = "log-testdox-text")]
     log_testdox_text: Option<PathBuf>,
+    /// Write a Clover XML coverage report to this file. Runtime coverage — needs the
+    /// pcov or xdebug extension. Same flag name as PHPUnit. (Distinct from the static
+    /// `--coverage-format`, which needs no extension; see COMPATIBILITY.)
+    #[arg(long = "coverage-clover")]
+    coverage_clover: Option<PathBuf>,
+    /// Write an HTML coverage report to this directory. Runtime — needs pcov/xdebug.
+    #[arg(long = "coverage-html")]
+    coverage_html: Option<PathBuf>,
+    /// Text coverage summary. Runtime — needs pcov/xdebug. Bare `--coverage-text`
+    /// prints to stdout; pass a path to write a file. Same flag name as PHPUnit.
+    #[arg(long = "coverage-text", num_args = 0..=1, default_missing_value = "-")]
+    coverage_text: Option<PathBuf>,
     /// Emit static coverage after the test run. Requires the `coverage` Cargo feature.
     /// Formats: clover | json | pcov | pcov-extended
     #[cfg(feature = "coverage")]
@@ -635,6 +647,36 @@ fn real_main() -> Result<ExitCode> {
             std::fs::read_to_string(xml).with_context(|| format!("reading {}", xml.display()))?,
         ),
         None => None,
+    };
+
+    // Delegated runtime coverage: when any --coverage-{clover,html,text} is set, hand
+    // every worker a directory (via the inherited PROUST_COVERAGE_DIR env) to drop its
+    // per-worker .cov file in; the merge + reports run after the test loop. Needs a
+    // coverage driver (pcov/xdebug). `cov_dir_guard` keeps the tempdir alive until then.
+    // Set BEFORE any worker is spawned so the master inherits it (still single-threaded
+    // here — discovery/rayon hasn't started).
+    let runtime_coverage =
+        cli.coverage_clover.is_some() || cli.coverage_html.is_some() || cli.coverage_text.is_some();
+    let cov_dir_guard = if runtime_coverage {
+        if !proust::coverage_runtime::driver_available("php") {
+            return Err(anyhow!(
+                "--coverage-clover/--coverage-html/--coverage-text need a runtime coverage \
+                 driver — install the pcov (or xdebug) PHP extension. For extension-free static \
+                 coverage, build with --features coverage and use --coverage-format."
+            ));
+        }
+        let dir = tempfile::TempDir::new().context("creating coverage temp dir")?;
+        std::env::set_var("PROUST_COVERAGE_DIR", dir.path());
+        // The worker scopes its Filter to <source> from this exact config path
+        // (honours --configuration; the worker's own $__cfgPath is unreliable).
+        if let Some(xml) = &xml_path {
+            std::env::set_var("PROUST_CONFIG_PATH", xml);
+        }
+        // Clone the autoload path now — it is moved into the batch plan later, but
+        // the post-run merge still needs it to load php-code-coverage.
+        Some((dir, autoload.clone()))
+    } else {
+        None
     };
 
     let bootstrap = match (cli.bootstrap, xml_str.as_deref()) {
@@ -1440,6 +1482,55 @@ fn real_main() -> Result<ExitCode> {
             .context("coverage analysis failed")?;
         if let Some(p) = &cli.coverage_out {
             eprintln!("Coverage written to {}", p.display());
+        }
+    }
+
+    // Delegated runtime coverage: merge the per-worker .cov files and emit reports
+    // via merge_coverage.php (php-code-coverage's own merge + writers). Best-effort —
+    // a report failure warns but never fails the run whose results already printed.
+    if let Some((cov_dir, cov_autoload)) = &cov_dir_guard {
+        use proust::coverage_runtime::ReportTarget;
+        let mut reports = Vec::new();
+        if let Some(p) = &cli.coverage_clover {
+            reports.push(ReportTarget {
+                format: "clover".into(),
+                target: Some(p.clone()),
+            });
+        }
+        if let Some(p) = &cli.coverage_html {
+            reports.push(ReportTarget {
+                format: "html".into(),
+                target: Some(p.clone()),
+            });
+        }
+        if let Some(p) = &cli.coverage_text {
+            let target = if p.as_os_str() == "-" {
+                None
+            } else {
+                Some(p.clone())
+            };
+            reports.push(ReportTarget {
+                format: "text".into(),
+                target,
+            });
+        }
+        match proust::php_worker::find_merge_coverage_script() {
+            Ok(script) => match proust::coverage_runtime::merge_and_emit(
+                &script,
+                cov_autoload,
+                cov_dir.path(),
+                &reports,
+            ) {
+                Ok(()) => {
+                    for r in &reports {
+                        if let Some(t) = &r.target {
+                            eprintln!("Coverage ({}) written to {}", r.format, t.display());
+                        }
+                    }
+                }
+                Err(e) => eprintln!("warning: coverage report failed: {e:#}"),
+            },
+            Err(e) => eprintln!("warning: merge_coverage.php not found: {e:#}"),
         }
     }
 
