@@ -20,6 +20,7 @@ pub mod phpunit_xml;
 pub mod profiler;
 pub mod provider_enum;
 pub mod reporter;
+pub mod reports;
 pub mod resource_lease;
 pub mod runner;
 pub mod types;
