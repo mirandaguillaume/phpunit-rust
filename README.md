@@ -22,7 +22,7 @@ concurrently instead of stranding one at the end.
 - **Work-stealing + LPT scheduling** — heavy classes start on all workers concurrently; fork-pool startup is ~50 ms.
 - **Exact test-count parity** with vanilla PHPUnit on all 10 benchmarked suites (brick-math, carbon, commonmark, doctrine-orm, faker, guzzle-psr7, monolog, php-parser, rector, and PHPUnit's own `unit` testsuite) — see [BENCHMARKS.md](BENCHMARKS.md).
 - **Up to 2.9× faster** on CPU-bound suites at 4 workers (brick-math; carbon 1.6×, more at higher worker counts); DB-less functional suites (doctrine-orm) are about tied, and sub-second suites run faster with vanilla.
-- **Static coverage** via the `analyzer` crate — Clover / PCOV / JSON with **no Xdebug / PCOV extension needed** (mago AST + per-test attribution). It respects `<source>` (never reports test files) but is reachability-based, so it is an *optimistic upper bound*: great for reports, visualization, and CI without a coverage extension — not for strict threshold gates. See [COMPATIBILITY](COMPATIBILITY.md).
+- **Coverage, two ways** — *runtime* (`--coverage-clover/--coverage-html/--coverage-text`, needs pcov/xdebug): drives PHPUnit's own `php-code-coverage` in every worker, so the output is **identical to `phpunit --coverage-*`** (exact — use it for strict gates). Or *static* (`--coverage-format`, build `--features coverage`): reachability-based via the `analyzer` crate with **no extension needed** — an optimistic upper bound, great for reports/CI-without-an-extension. See [COMPATIBILITY](COMPATIBILITY.md).
 - **Reliable shutdown** — SIGINT kills the PHP master and every forked child via `PR_SET_PDEATHSIG`; no orphan workers.
 
 ## Requirements

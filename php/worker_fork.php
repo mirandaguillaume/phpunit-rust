@@ -78,6 +78,7 @@ $__log_phase('start');
 require_once __DIR__ . '/vendor/autoload.php';
 $__log_phase('worker_vendor_autoload');
 
+use Proust\Coverage;
 use Proust\OutcomeBuilder;
 use Proust\TestExecutor;
 
@@ -694,6 +695,47 @@ function runChild($stdinStream, $stdoutStream, string $memoryLimit, int $maxBatc
             // target's contents are never deleted at worker exit.
             proust_rmtree($childTmp);
         });
+    }
+
+    // Delegated runtime coverage. When the runner requested a --coverage-* report
+    // it exports PROUST_COVERAGE_DIR (inherited by every child). Build THIS child's
+    // own collector — scoped to <source> from the config we already resolved for
+    // the event bridge — and flush it once at shutdown via php-code-coverage's own
+    // PHP report writer. Keyed by slot+PID: a recycled slot respawns as a new PID,
+    // so a slot-only filename would clobber the previous child's coverage. The file
+    // lands in PROUST_COVERAGE_DIR (a runner-owned dir), NOT $childTmp (rmtree'd).
+    $coverageDir = getenv('PROUST_COVERAGE_DIR');
+    if ($coverageDir !== false && $coverageDir !== '') {
+        global $autoload;
+        // Config path for <source> scoping: prefer the runner's resolved path
+        // (PROUST_CONFIG_PATH, honours --configuration); fall back to autodetecting
+        // next to the autoload. NOTE: $__cfgPath is unusable here — it is nulled for
+        // suites without <extensions>, doubling as the event-bridge gate.
+        $covCfg = getenv('PROUST_CONFIG_PATH');
+        if ($covCfg === false || $covCfg === '') {
+            $covCfg = null;
+            if (is_string($autoload)) {
+                $covRoot = dirname($autoload, 2);
+                foreach (['phpunit.xml', 'phpunit.dist.xml', 'phpunit.xml.dist'] as $covName) {
+                    if (is_file("$covRoot/$covName")) {
+                        $covCfg = "$covRoot/$covName";
+                        break;
+                    }
+                }
+            }
+        }
+        TestExecutor::$coverage = Coverage::create($covCfg);
+        if (TestExecutor::$coverage !== null) {
+            $covSlot = getenv('PROUST_WORKER_ID');
+            $covSlot = ($covSlot === false || $covSlot === '') ? '0' : $covSlot;
+            $covFile = rtrim($coverageDir, '/') . "/{$covSlot}-" . getmypid() . '.cov';
+            register_shutdown_function(static function () use ($covFile): void {
+                $cov = TestExecutor::$coverage;
+                if ($cov !== null) {
+                    Coverage::flush($cov, $covFile);
+                }
+            });
+        }
     }
 
     // Current-batch state, captured by reference in the shutdown handler.

@@ -127,8 +127,11 @@ matters (a missed `<php>` block leaves `APP_ENV` unset and the bootstrap loads
 | `--log-junit <file>` | — | Write a PHPUnit-compatible JUnit XML report (same flag name as PHPUnit). Consumed as-is by GitLab, GitHub Actions, and the Jenkins JUnit plugin. |
 | `--testdox` | off | Print a TestDox view (human-readable "it does X" sentences, grouped by class) after the run. |
 | `--log-testdox-text <file>` | — | Write the TestDox report to a file as plain text (same flag name as PHPUnit). |
-| `--coverage-format <fmt>` | — | `clover` \| `json` \| `pcov` \| `pcov-extended` (build with `--features coverage`). |
-| `--coverage-out <file>` | stdout | Coverage output destination (build with `--features coverage`). |
+| `--coverage-clover <file>` | — | Runtime Clover XML coverage (needs pcov/xdebug). PHPUnit flag name. |
+| `--coverage-html <dir>` | — | Runtime HTML coverage report (needs pcov/xdebug). PHPUnit flag name. |
+| `--coverage-text [<file>]` | stdout | Runtime text coverage summary (needs pcov/xdebug). PHPUnit flag name. |
+| `--coverage-format <fmt>` | — | STATIC coverage: `clover` \| `json` \| `pcov` \| `pcov-extended` (extension-free; build with `--features coverage`). |
+| `--coverage-out <file>` | stdout | Static coverage output destination (build with `--features coverage`). |
 
 **Reporters:**
 
@@ -144,21 +147,27 @@ matters (a missed `<php>` block leaves `APP_ENV` unset and the bootstrap loads
 - **TestDox** (`--testdox` for the console, `--log-testdox-text <file>` for a
   plain-text file) — tests grouped by class, method names humanized
   (`testFooBar` → "Foo bar"), each line marked ✔/✘/↩/∅/☢ by status.
-- **Coverage** (`--coverage-format clover|pcov|pcov-extended|json`,
-  `--coverage-out <file>`; build with `--features coverage`) — **static**,
-  derived by the `analyzer` crate from mago's AST (call-graph reachability +
-  per-test attribution), so it needs **no PCOV or Xdebug extension**. It
-  respects `<source>` (reports source files only, never test files, matching
-  PHPUnit). Because it is reachability-based, not execution-traced, it is an
-  **optimistic upper bound**: a line that is statically reachable but not
-  actually executed at runtime is still counted. Measured example (proust vs
-  PHPUnit+PCOV on the sample suite): a `divide()` whose only test hits the
-  divide-by-zero `throw` leaves the normal `return` line reported as covered,
-  though runtime coverage shows it never ran. It is also blind to fully dynamic
-  dispatch (`$obj->$method()`, `call_user_func` with a computed name). Use it
-  for coverage reports, visualization, and CI that can't install a coverage
-  extension — **not** for a strict "fail under N%" gate, where the numbers must
-  be exact.
+- **Coverage — runtime, exact** (`--coverage-clover <file>`,
+  `--coverage-html <dir>`, `--coverage-text[=<file>]`; needs the **pcov or xdebug**
+  extension). proust drives PHPUnit's own `php-code-coverage` inside every worker —
+  the same Driver, the same `Filter` (scoped to `<source>`), and the same report
+  writers PHPUnit uses — then aggregates the per-worker results with the library's
+  own `CodeCoverage::merge()` (the mechanism PHPUnit uses for isolated
+  sub-processes). The output is **identical to `phpunit --coverage-*`** by
+  construction (verified line-for-line against PHPUnit+PCOV). Same flag names as
+  PHPUnit, so existing CI configs work. Opt-in — a normal run pays nothing; a
+  coverage run adds a fixed one-process merge cost that amortizes on large suites.
+  This is the mode for strict "fail under N%" gates.
+- **Coverage — static, extension-free**
+  (`--coverage-format clover|pcov|pcov-extended|json`, `--coverage-out <file>`;
+  build with `--features coverage`) — derived by the `analyzer` crate from mago's
+  AST (call-graph reachability + per-test attribution), so it needs **no PCOV or
+  Xdebug extension**. Respects `<source>`. Because it is reachability-based, not
+  execution-traced, it is an **optimistic upper bound**: a statically-reachable but
+  unexecuted line (e.g. a not-taken branch) is still counted, and it is blind to
+  fully dynamic dispatch (`$obj->$method()`, `call_user_func` with a computed name).
+  Use it for reports, visualization, and CI that can't install a coverage extension
+  — **not** for a strict gate, where the runtime mode above is exact.
 
 **Robustness:**
 
@@ -359,9 +368,7 @@ Proust's; there is no framework adapter to configure. Three ways, in order of
   PHPUnit 10+ `<extensions>` API, by contrast, **is** bootstrapped (opt-in via
   the event bridge, best-effort across PHPUnit versions) — see "State isolation"
   above; it is how DAMADoctrineTestBundle runs under Proust.
-- Runtime (execution-traced) coverage via PCOV/Xdebug — proust ships **static**
-  reachability coverage instead (see "Coverage" above); an execution-traced mode
-  for strict threshold gates is deferred
-- TAP reporter (JUnit XML and TestDox **are** supported — see "Reporters" above)
+- TAP reporter (JUnit XML, TestDox, and both static + runtime **coverage** are
+  supported — see "Reporters" above)
 - Watch mode
 - Risky test detection (no assertions, unexpected output, etc.)

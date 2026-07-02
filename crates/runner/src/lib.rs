@@ -12,6 +12,7 @@ compile_error!(
 
 pub mod components;
 pub mod coverage;
+pub mod coverage_runtime;
 pub mod discovery;
 pub mod fork_pool;
 pub mod mock_bake;
