@@ -124,6 +124,42 @@ jobs:
       - name: Parity check against sample_project
         run: bash scripts/parity_check.sh crates/runner/fixtures/sample_project
 
+  parity-coverage:
+    name: parity (runtime coverage, pcov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # coverage: pcov installs + enables the pcov driver, so proust's delegated
+      # runtime coverage and vanilla PHPUnit both collect real line data.
+      - name: Install PHP (with pcov)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          coverage: pcov
+
+      - name: Install fixture dependencies (composer)
+        run: composer install --no-interaction --no-progress --working-dir=crates/runner/fixtures/sample_project
+
+      - name: Install worker shim dependencies (composer)
+        run: composer install --no-dev --no-interaction --no-progress --working-dir=php
+
+      - name: Build proust binary
+        run: cargo build -p proust
+
+      # Fails CI if proust's delegated runtime coverage diverges — per source
+      # file — from vanilla PHPUnit + PCOV. Guards the delegation (same lib, same
+      # driver => must be line-for-line identical).
+      - name: Runtime coverage parity against sample_project
+        run: bash scripts/parity_coverage.sh crates/runner/fixtures/sample_project
+
   php-tests:
     name: php worker-shim tests
     runs-on: ubuntu-latest
