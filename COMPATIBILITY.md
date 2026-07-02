@@ -144,6 +144,21 @@ matters (a missed `<php>` block leaves `APP_ENV` unset and the bootstrap loads
 - **TestDox** (`--testdox` for the console, `--log-testdox-text <file>` for a
   plain-text file) — tests grouped by class, method names humanized
   (`testFooBar` → "Foo bar"), each line marked ✔/✘/↩/∅/☢ by status.
+- **Coverage** (`--coverage-format clover|pcov|pcov-extended|json`,
+  `--coverage-out <file>`; build with `--features coverage`) — **static**,
+  derived by the `analyzer` crate from mago's AST (call-graph reachability +
+  per-test attribution), so it needs **no PCOV or Xdebug extension**. It
+  respects `<source>` (reports source files only, never test files, matching
+  PHPUnit). Because it is reachability-based, not execution-traced, it is an
+  **optimistic upper bound**: a line that is statically reachable but not
+  actually executed at runtime is still counted. Measured example (proust vs
+  PHPUnit+PCOV on the sample suite): a `divide()` whose only test hits the
+  divide-by-zero `throw` leaves the normal `return` line reported as covered,
+  though runtime coverage shows it never ran. It is also blind to fully dynamic
+  dispatch (`$obj->$method()`, `call_user_func` with a computed name). Use it
+  for coverage reports, visualization, and CI that can't install a coverage
+  extension — **not** for a strict "fail under N%" gate, where the numbers must
+  be exact.
 
 **Robustness:**
 
@@ -344,7 +359,9 @@ Proust's; there is no framework adapter to configure. Three ways, in order of
   PHPUnit 10+ `<extensions>` API, by contrast, **is** bootstrapped (opt-in via
   the event bridge, best-effort across PHPUnit versions) — see "State isolation"
   above; it is how DAMADoctrineTestBundle runs under Proust.
-- Runtime coverage (PCOV/Xdebug) — static analysis only for now
+- Runtime (execution-traced) coverage via PCOV/Xdebug — proust ships **static**
+  reachability coverage instead (see "Coverage" above); an execution-traced mode
+  for strict threshold gates is deferred
 - TAP reporter (JUnit XML and TestDox **are** supported — see "Reporters" above)
 - Watch mode
 - Risky test detection (no assertions, unexpected output, etc.)

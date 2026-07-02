@@ -2,11 +2,14 @@ use super::hash::ContentHash;
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
 
-// Bump on ANY change to a cached struct's serialized layout. The on-disk format
-// is bincode (NOT self-describing), so an old entry cannot be decoded against a
-// new struct — it would panic on "tag for enum is not valid". v2: TestMethod
-// gained `declaring_class` (Inc-4 C inherited-method discovery).
-const CACHE_FORMAT_VERSION: u32 = 2;
+// Bump on ANY change to a cached struct's serialized layout OR to the semantics
+// of a cached value. The on-disk format is bincode (NOT self-describing), so an
+// old entry cannot be decoded against a new struct — it would panic on "tag for
+// enum is not valid". v2: TestMethod gained `declaring_class` (Inc-4 C
+// inherited-method discovery). v3: the result cache now stores coverage filtered
+// to <source> (test files dropped), so pre-v3 result entries are semantically
+// stale even though their layout is unchanged.
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 pub struct CacheStore {
     root: PathBuf,
