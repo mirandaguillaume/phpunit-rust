@@ -119,6 +119,11 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     record(&mut out, path, source, t);
                 }
             }
+            Node::AssignmentOperator(op) => {
+                if let Some(t) = mutators::mutate_assignment(op) {
+                    record(&mut out, path, source, t);
+                }
+            }
             Node::Literal(l) => {
                 if let Some(t) = mutators::mutate_literal(l) {
                     record(&mut out, path, source, t);

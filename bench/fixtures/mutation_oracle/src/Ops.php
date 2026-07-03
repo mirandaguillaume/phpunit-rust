@@ -135,4 +135,40 @@ final class Ops
     {
         return 1.0;
     }
+
+    public function pe(int $n, int $m)
+    {
+        $n += $m;
+        return $n;
+    }
+
+    public function me(int $n, int $m)
+    {
+        $n -= $m;
+        return $n;
+    }
+
+    public function mule(int $n, int $m)
+    {
+        $n *= $m;
+        return $n;
+    }
+
+    public function dive(int $n, int $m)
+    {
+        $n /= $m;
+        return $n;
+    }
+
+    public function mode(int $n, int $m)
+    {
+        $n %= $m;
+        return $n;
+    }
+
+    public function powe(int $n, int $m)
+    {
+        $n **= $m;
+        return $n;
+    }
 }

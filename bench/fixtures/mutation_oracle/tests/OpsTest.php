@@ -164,4 +164,35 @@ final class OpsTest extends TestCase
         // 1.0 -> 0.0 -> KILLED (OneZeroFloat).
         self::assertSame(1.0, (new Ops())->one());
     }
+
+    // Compound assignments: swap the arithmetic half -> a different result -> KILLED.
+    public function testPe(): void
+    {
+        self::assertSame(8, (new Ops())->pe(5, 3));
+    }
+
+    public function testMe(): void
+    {
+        self::assertSame(2, (new Ops())->me(5, 3));
+    }
+
+    public function testMule(): void
+    {
+        self::assertSame(15, (new Ops())->mule(5, 3));
+    }
+
+    public function testDive(): void
+    {
+        self::assertSame(2, (new Ops())->dive(6, 3));
+    }
+
+    public function testMode(): void
+    {
+        self::assertSame(1, (new Ops())->mode(7, 3));
+    }
+
+    public function testPowe(): void
+    {
+        self::assertSame(8, (new Ops())->powe(2, 3));
+    }
 }

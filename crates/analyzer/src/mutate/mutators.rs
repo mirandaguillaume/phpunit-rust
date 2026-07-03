@@ -91,6 +91,30 @@ pub fn mutate_unary_suffix(
     )
 }
 
+/// Compound-assignment operators (Infection Arithmetic `*Equal`): swap the arithmetic
+/// half — `+=`↔`-=`, `*=`→`/=`, `/=`→`*=`, `%=`→`*=`, `**=`→`/=`. (`*= -1` has an
+/// Infection skip-case we don't reproduce; the oracle fixture avoids it.)
+pub fn mutate_assignment(
+    op: &mago_syntax::ast::assignment::AssignmentOperator,
+) -> Option<(usize, usize, &'static [u8], &'static str)> {
+    use mago_syntax::ast::assignment::AssignmentOperator as A;
+    let (span, repl, name): (mago_span::Span, &'static [u8], &'static str) = match op {
+        A::Addition(s) => (*s, b"-=", "PlusEqual"),
+        A::Subtraction(s) => (*s, b"+=", "MinusEqual"),
+        A::Multiplication(s) => (*s, b"/=", "MulEqual"),
+        A::Division(s) => (*s, b"*=", "DivEqual"),
+        A::Modulo(s) => (*s, b"*=", "ModEqual"),
+        A::Exponentiation(s) => (*s, b"/=", "PowEqual"),
+        _ => return None,
+    };
+    Some((
+        span.start.offset as usize,
+        span.end.offset as usize,
+        repl,
+        name,
+    ))
+}
+
 /// Infection's cast mutators UNWRAP the cast (`(int)$x` → `$x`), so we remove the
 /// cast operator's token span (replace with nothing). mago spells some casts several
 /// ways (int/integer, float/double/real, string/binary, bool/boolean); all map to the
@@ -215,6 +239,24 @@ mod tests {
             value: b"null"
         }))
         .is_none());
+    }
+
+    #[test]
+    fn assignment_operators_swap_arithmetic() {
+        use mago_syntax::ast::assignment::AssignmentOperator as A;
+        let (start, end, repl, name) = mutate_assignment(&A::Addition(span(0, 2))).unwrap();
+        assert_eq!((start, end), (0, 2));
+        assert_eq!(repl, b"-=");
+        assert_eq!(name, "PlusEqual");
+        assert_eq!(
+            mutate_assignment(&A::Multiplication(span(0, 2))).unwrap().3,
+            "MulEqual"
+        );
+        assert_eq!(
+            mutate_assignment(&A::Exponentiation(span(0, 3))).unwrap().2,
+            b"/="
+        );
+        assert!(mutate_assignment(&A::Assign(span(0, 1))).is_none());
     }
 
     #[test]
