@@ -117,7 +117,7 @@ pub fn run_mutation(
     let outcomes: Vec<MutantOutcome> = pool.install(|| {
         planned
             .par_iter()
-            .map(|pm| run_one(project, "php", &phpunit, pm, MUTANT_TIMEOUT))
+            .map(|pm| run_one(project, "php", &phpunit, &config, pm, MUTANT_TIMEOUT))
             .collect()
     });
 
