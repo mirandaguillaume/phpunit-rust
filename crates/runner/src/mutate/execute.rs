@@ -56,6 +56,17 @@ pub fn run_one(
         return outcome(m, MutantStatus::Killed);
     }
 
+    // Prefer the COPY's own phpunit binary so its composer autoloader is the ONLY one
+    // loaded. Running the original project's phpunit against the copy would bootstrap
+    // the original vendor AND the copy's `bootstrap="vendor/autoload.php"`, redeclaring
+    // composer's init class (a fatal that falsely "kills" every covered mutant). Fall
+    // back to the caller's phpunit for projects whose copy has no vendor/bin/phpunit.
+    let local_phpunit = workdir.path().join("vendor/bin/phpunit");
+    let phpunit = if local_phpunit.is_file() {
+        local_phpunit.as_path()
+    } else {
+        phpunit
+    };
     let filter = build_filter(&planned.covering_tests);
     let status = run_phpunit(php, phpunit, workdir.path(), &filter, timeout);
     outcome(m, status)
@@ -104,9 +115,21 @@ fn copy_tree(project: &Path) -> std::io::Result<tempfile::TempDir> {
             continue;
         }
         let target = dst.path().join(rel);
-        if entry.file_type().is_dir() {
+        let ft = entry.file_type();
+        if ft.is_symlink() {
+            // Recreate symlinks (e.g. vendor/bin/phpunit -> ../phpunit/…) rather than
+            // dereferencing them, so the copy has a working vendor/bin. Best-effort:
+            // a single bad link must not abort the whole copy.
+            if let Ok(link_target) = std::fs::read_link(path) {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&link_target, &target);
+            }
+        } else if ft.is_dir() {
             std::fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_file() {
+        } else if ft.is_file() {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
