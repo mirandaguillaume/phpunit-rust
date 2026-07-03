@@ -265,4 +265,28 @@ final class Ops
     {
         return $a . $b;
     }
+
+    public function pick(array $items)
+    {
+        $last = null;
+        foreach ($items as $it) {
+            $last = $it;
+            break;
+        }
+        return $last;
+    }
+
+    public function skipFirst(array $items): array
+    {
+        $out = [];
+        $first = true;
+        foreach ($items as $it) {
+            if ($first) {
+                $first = false;
+                continue;
+            }
+            $out[] = $it;
+        }
+        return $out;
+    }
 }

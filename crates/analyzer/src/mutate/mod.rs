@@ -219,6 +219,31 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // Loop control swap: `break` <-> `continue`.
+            Node::Break(b) => {
+                let s = b.r#break.span();
+                record_owned(
+                    &mut out,
+                    path,
+                    source,
+                    s.start.offset as usize,
+                    s.end.offset as usize,
+                    b"continue".to_vec(),
+                    "Break_",
+                );
+            }
+            Node::Continue(c) => {
+                let s = c.r#continue.span();
+                record_owned(
+                    &mut out,
+                    path,
+                    source,
+                    s.start.offset as usize,
+                    s.end.offset as usize,
+                    b"break".to_vec(),
+                    "Continue_",
+                );
+            }
             // Removal: a statement that is JUST a call becomes a no-op (removed).
             Node::ExpressionStatement(es) => {
                 if let Expression::Call(call) = es.expression {

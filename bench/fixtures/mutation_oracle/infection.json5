@@ -98,5 +98,7 @@
         BitwiseNot: true,
         MethodCallRemoval: true,
         FunctionCallRemoval: true,
+        Break_: true,
+        Continue_: true,
     },
 }

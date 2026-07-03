@@ -291,4 +291,16 @@ final class OpsTest extends TestCase
         (new Ops())->runF($out, 'z');
         self::assertSame(['z'], $out);
     }
+
+    public function testPick(): void
+    {
+        // break after first -> 'a'; mutated to continue -> last item 'b' -> KILLED (Break_).
+        self::assertSame('a', (new Ops())->pick(['a', 'b']));
+    }
+
+    public function testSkipFirst(): void
+    {
+        // continue skips the first -> ['b','c']; mutated to break -> [] -> KILLED (Continue_).
+        self::assertSame(['b', 'c'], (new Ops())->skipFirst(['a', 'b', 'c']));
+    }
 }
