@@ -51,4 +51,36 @@ final class OpsTest extends TestCase
         // 8 >> 2 = 2; mutated 8 << 2 = 32 -> KILLED.
         self::assertSame(2, (new Ops())->shr(8, 2));
     }
+
+    // Cast mutants UNWRAP the cast; each assertion is strict, so the unwrapped value
+    // (different type) fails -> KILLED.
+    public function testCi(): void
+    {
+        self::assertSame(5, (new Ops())->ci('5'));
+    }
+
+    public function testCf(): void
+    {
+        self::assertSame(1.5, (new Ops())->cf('1.5'));
+    }
+
+    public function testCs(): void
+    {
+        self::assertSame('5', (new Ops())->cs(5));
+    }
+
+    public function testCb(): void
+    {
+        self::assertSame(true, (new Ops())->cb(1));
+    }
+
+    public function testCa(): void
+    {
+        self::assertSame([5], (new Ops())->ca(5));
+    }
+
+    public function testCo(): void
+    {
+        self::assertInstanceOf(\stdClass::class, (new Ops())->co(['x' => 1]));
+    }
 }

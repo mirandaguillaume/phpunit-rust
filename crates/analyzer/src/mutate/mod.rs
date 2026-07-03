@@ -82,7 +82,11 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         mutators::mutate_unary_suffix(*s, false),
                     );
                 }
-                _ => {}
+                other => {
+                    if let Some(t) = mutators::mutate_cast(other) {
+                        record(&mut out, path, source, t);
+                    }
+                }
             },
             Node::UnaryPostfix(u) => match &u.operator {
                 UnaryPostfixOperator::PostIncrement(s) => {
@@ -150,6 +154,17 @@ mod tests {
             .find(|m| m.mutator == "Plus")
             .unwrap();
         assert_eq!(m.line, 3, "the `+` is on source line 3");
+    }
+
+    #[test]
+    fn generates_cast_unwrap_mutant() {
+        let src = b"<?php\nfunction f($s) { return (int) $s; }\n";
+        let m = generate_file(std::path::Path::new("f.php"), src)
+            .into_iter()
+            .find(|m| m.mutator == "CastInt")
+            .expect("CastInt mutant");
+        assert_eq!(&src[m.start..m.end], b"(int)");
+        assert_eq!(m.replacement, b"", "unwrap removes the cast");
     }
 
     #[test]

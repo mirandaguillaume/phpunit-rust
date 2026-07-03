@@ -77,6 +77,31 @@ pub fn mutate_unary_suffix(
     )
 }
 
+/// Infection's cast mutators UNWRAP the cast (`(int)$x` → `$x`), so we remove the
+/// cast operator's token span (replace with nothing). mago spells some casts several
+/// ways (int/integer, float/double/real, string/binary, bool/boolean); all map to the
+/// one Infection name. `(unset)`/`(void)` have no Infection mutator → `None`.
+pub fn mutate_cast(
+    op: &mago_syntax::ast::unary::UnaryPrefixOperator,
+) -> Option<(usize, usize, &'static [u8], &'static str)> {
+    use mago_syntax::ast::unary::UnaryPrefixOperator as U;
+    let (span, name): (mago_span::Span, &'static str) = match op {
+        U::IntCast(s, _) | U::IntegerCast(s, _) => (*s, "CastInt"),
+        U::FloatCast(s, _) | U::DoubleCast(s, _) | U::RealCast(s, _) => (*s, "CastFloat"),
+        U::StringCast(s, _) | U::BinaryCast(s, _) => (*s, "CastString"),
+        U::BoolCast(s, _) | U::BooleanCast(s, _) => (*s, "CastBool"),
+        U::ArrayCast(s, _) => (*s, "CastArray"),
+        U::ObjectCast(s, _) => (*s, "CastObject"),
+        _ => return None,
+    };
+    Some((
+        span.start.offset as usize,
+        span.end.offset as usize,
+        b"",
+        name,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +220,45 @@ mod tests {
             value: b"null"
         }))
         .is_none());
+    }
+
+    #[test]
+    fn casts_unwrap_to_empty() {
+        use mago_syntax::ast::unary::UnaryPrefixOperator as U;
+        // `(int)` spans bytes [0,5); unwrap => remove it (replacement empty).
+        let (start, end, repl, name) = mutate_cast(&U::IntCast(span(0, 5), b"(int)")).unwrap();
+        assert_eq!((start, end), (0, 5));
+        assert_eq!(repl, b"");
+        assert_eq!(name, "CastInt");
+        // mago spells float as Double — still the one Infection name.
+        assert_eq!(
+            mutate_cast(&U::DoubleCast(span(0, 7), b"(double)"))
+                .unwrap()
+                .3,
+            "CastFloat"
+        );
+        assert_eq!(
+            mutate_cast(&U::BoolCast(span(0, 6), b"(bool)")).unwrap().3,
+            "CastBool"
+        );
+        assert_eq!(
+            mutate_cast(&U::ArrayCast(span(0, 7), b"(array)"))
+                .unwrap()
+                .3,
+            "CastArray"
+        );
+        assert_eq!(
+            mutate_cast(&U::ObjectCast(span(0, 8), b"(object)"))
+                .unwrap()
+                .3,
+            "CastObject"
+        );
+    }
+
+    #[test]
+    fn unset_cast_is_not_mutated() {
+        use mago_syntax::ast::unary::UnaryPrefixOperator as U;
+        assert!(mutate_cast(&U::UnsetCast(span(0, 7), b"(unset)")).is_none());
     }
 
     #[test]
