@@ -8,6 +8,7 @@ pub mod complexity;
 pub mod concrete;
 pub mod config;
 pub mod mago_bridge;
+pub mod mutate;
 pub mod opacity;
 pub mod output;
 pub mod reduce;
