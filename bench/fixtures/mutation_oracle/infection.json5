@@ -30,5 +30,11 @@
         BitwiseXor: true,
         ShiftLeft: true,
         ShiftRight: true,
+        CastInt: true,
+        CastFloat: true,
+        CastString: true,
+        CastBool: true,
+        CastArray: true,
+        CastObject: true,
     },
 }

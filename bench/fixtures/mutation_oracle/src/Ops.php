@@ -40,4 +40,34 @@ final class Ops
     {
         return $a >> $b;
     }
+
+    public function ci(string $s)
+    {
+        return (int) $s;
+    }
+
+    public function cf(string $s)
+    {
+        return (float) $s;
+    }
+
+    public function cs(int $n)
+    {
+        return (string) $n;
+    }
+
+    public function cb(int $n)
+    {
+        return (bool) $n;
+    }
+
+    public function ca(int $n)
+    {
+        return (array) $n;
+    }
+
+    public function co(array $a)
+    {
+        return (object) $a;
+    }
 }
