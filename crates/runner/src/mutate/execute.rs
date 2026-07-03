@@ -1,10 +1,13 @@
-//! File-swap executor: classify one mutant by running only its covering tests
-//! against a patched, isolated copy of the project.
+//! Overlay executor: classify one mutant by running only its covering tests with
+//! the mutated file overlaid onto the ORIGINAL project — no per-mutant project copy.
 //!
-//! V1 favours the *simplest correct* isolation — a full copy of the project so
-//! concurrent mutants never race on the same source path, and a fresh PHP process
-//! per mutant so opcache never serves the original's stale compile. The warm,
-//! no-copy overlay is V2; it swaps only this stage, not the mutant set.
+//! The mutated bytes go to a temp file that a `-d auto_prepend_file` shim `require`s
+//! (after registering composer's autoloader) so the mutated class is declared BEFORE
+//! the autoloader would load the original — composer then skips the identically-named
+//! original. The project itself is only read, so mutants parallelize without racing on
+//! a shared path, and the multi-thousand-file vendor copy the earlier file-swap paid
+//! per mutant is gone. Same mutants and same killed/escaped classification (the
+//! Infection oracle gate guards it) — only faster.
 use analyzer::mutate::plan::PlannedMutant;
 use analyzer::mutate::Mutant;
 use std::fs::File;
@@ -30,13 +33,17 @@ pub struct MutantOutcome {
     pub status: MutantStatus,
 }
 
-/// Run one mutant. Uncovered mutants short-circuit to `NotCovered` (no process);
-/// otherwise the project is copied, the target file patched, and the covering
-/// tests run via `php <phpunit> --configuration phpunit.xml --filter <regex>`.
+/// Run one mutant via an OVERLAY (no project copy). The mutated file's bytes are
+/// written to a temp file and pre-declared through PHP's `auto_prepend_file` before
+/// the autoloader runs, so composer skips the (identically-named) original class.
+/// The covering tests run against the ORIGINAL project read-only, so mutants
+/// parallelize without racing on a shared source path — and no multi-thousand-file
+/// vendor copy is paid per mutant (the V1 cost this replaces).
 pub fn run_one(
     project: &Path,
     php: &str,
     phpunit: &Path,
+    config: &Path,
     planned: &PlannedMutant,
     timeout: Duration,
 ) -> MutantOutcome {
@@ -45,30 +52,49 @@ pub fn run_one(
         return outcome(m, MutantStatus::NotCovered);
     }
 
-    let workdir = match copy_tree(project) {
-        Ok(d) => d,
-        // An infra failure (copy) is treated as caught rather than a false survivor.
+    // Build the mutated bytes in memory — the real file is never touched.
+    let orig = match std::fs::read(&m.file) {
+        Ok(b) => b,
         Err(_) => return outcome(m, MutantStatus::Killed),
     };
-    let rel = m.file.strip_prefix(project).unwrap_or(&m.file);
-    let target = workdir.path().join(rel);
-    if apply_patch(&target, m.start, m.end, &m.replacement).is_err() {
+    if m.start > m.end || m.end > orig.len() {
+        return outcome(m, MutantStatus::Killed);
+    }
+    let mut mutated = orig;
+    mutated.splice(m.start..m.end, m.replacement.iter().copied());
+
+    let tmp = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(_) => return outcome(m, MutantStatus::Killed),
+    };
+    let mutant_file = tmp.path().join("mutant.php");
+    if std::fs::write(&mutant_file, &mutated).is_err() {
+        return outcome(m, MutantStatus::Killed);
+    }
+    // Prepend shim: register composer's autoloader (if any), then declare the mutated
+    // class FIRST so the autoloader never loads the original definition.
+    let autoload = project.join("vendor/autoload.php");
+    let shim = tmp.path().join("prepend.php");
+    let shim_src = format!(
+        "<?php\nif (is_file({a})) {{ require {a}; }}\nrequire {mf};\n",
+        a = php_string(&autoload),
+        mf = php_string(&mutant_file),
+    );
+    if std::fs::write(&shim, shim_src).is_err() {
         return outcome(m, MutantStatus::Killed);
     }
 
-    // Prefer the COPY's own phpunit binary so its composer autoloader is the ONLY one
-    // loaded. Running the original project's phpunit against the copy would bootstrap
-    // the original vendor AND the copy's `bootstrap="vendor/autoload.php"`, redeclaring
-    // composer's init class (a fatal that falsely "kills" every covered mutant). Fall
-    // back to the caller's phpunit for projects whose copy has no vendor/bin/phpunit.
-    let local_phpunit = workdir.path().join("vendor/bin/phpunit");
-    let phpunit = if local_phpunit.is_file() {
-        local_phpunit.as_path()
-    } else {
-        phpunit
-    };
     let filter = build_filter(&planned.covering_tests);
-    let status = run_phpunit(php, phpunit, workdir.path(), &filter, timeout);
+    let status = run_phpunit(
+        php,
+        phpunit,
+        project,
+        config,
+        &shim,
+        &filter,
+        timeout,
+        tmp.path(),
+    );
     outcome(m, status)
 }
 
@@ -86,70 +112,31 @@ fn build_filter(tests: &[String]) -> String {
     format!("({})", alts.join("|"))
 }
 
-/// Splice `file[start..end] = replacement` in place.
-fn apply_patch(file: &Path, start: usize, end: usize, replacement: &[u8]) -> std::io::Result<()> {
-    let mut bytes = std::fs::read(file)?;
-    if start > end || end > bytes.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "patch span out of bounds",
-        ));
-    }
-    bytes.splice(start..end, replacement.iter().copied());
-    std::fs::write(file, bytes)
+/// A PHP double-quoted string literal for a filesystem path (escape `\` and `"`).
+fn php_string(p: &Path) -> String {
+    let s = p
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{s}\"")
 }
 
-/// Recursively copy `project` into a fresh temp dir, skipping `.git`.
-fn copy_tree(project: &Path) -> std::io::Result<tempfile::TempDir> {
-    let dst = tempfile::TempDir::new()?;
-    for entry in walkdir::WalkDir::new(project)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        let rel = match path.strip_prefix(project) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if rel.components().any(|c| c.as_os_str() == ".git") {
-            continue;
-        }
-        let target = dst.path().join(rel);
-        let ft = entry.file_type();
-        if ft.is_symlink() {
-            // Recreate symlinks (e.g. vendor/bin/phpunit -> ../phpunit/…) rather than
-            // dereferencing them, so the copy has a working vendor/bin. Best-effort:
-            // a single bad link must not abort the whole copy.
-            if let Ok(link_target) = std::fs::read_link(path) {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                #[cfg(unix)]
-                let _ = std::os::unix::fs::symlink(&link_target, &target);
-            }
-        } else if ft.is_dir() {
-            std::fs::create_dir_all(&target)?;
-        } else if ft.is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(path, &target)?;
-        }
-    }
-    Ok(dst)
-}
-
-/// Run phpunit in `workdir`; exit 0 (all covering tests passed the mutant) => the
-/// mutant Escaped; non-zero => Killed; over `timeout` => Timeout. Child output goes
-/// to a readable file in the (temporary) workdir, never to /dev/null.
+/// Run the covering tests against the ORIGINAL project with the mutant overlaid via
+/// `-d auto_prepend_file=<shim>`. Exit 0 (all covering tests passed) => Escaped;
+/// non-zero => Killed; over `timeout` => Timeout. Child output goes to a readable
+/// file in `log_dir` (a temp dir), never to /dev/null.
+#[allow(clippy::too_many_arguments)]
 fn run_phpunit(
     php: &str,
     phpunit: &Path,
-    workdir: &Path,
+    project: &Path,
+    config: &Path,
+    shim: &Path,
     filter: &str,
     timeout: Duration,
+    log_dir: &Path,
 ) -> MutantStatus {
-    let log = match File::create(workdir.join("phpunit_output.txt")) {
+    let log = match File::create(log_dir.join("phpunit_output.txt")) {
         Ok(f) => f,
         Err(_) => return MutantStatus::Killed,
     };
@@ -158,13 +145,15 @@ fn run_phpunit(
         Err(_) => return MutantStatus::Killed,
     };
     let mut child = match Command::new(php)
+        .arg("-d")
+        .arg(format!("auto_prepend_file={}", shim.display()))
         .arg(phpunit)
         .arg("--configuration")
-        .arg("phpunit.xml")
+        .arg(config)
         .arg("--filter")
         .arg(filter)
         .arg("--do-not-cache-result")
-        .current_dir(workdir)
+        .current_dir(project)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(err_log))
         .spawn()
@@ -234,7 +223,14 @@ mod tests {
             },
             covering_tests: vec!["Sample\\Tests\\CalcTest::testAdd".to_string()],
         };
-        let out = run_one(&project, "php", &phpunit, &planned, Duration::from_secs(60));
+        let out = run_one(
+            &project,
+            "php",
+            &phpunit,
+            &project.join("phpunit.xml"),
+            &planned,
+            Duration::from_secs(60),
+        );
         assert_eq!(out.status, MutantStatus::Killed);
     }
 
@@ -262,7 +258,14 @@ mod tests {
             },
             covering_tests: vec!["Sample\\Tests\\CalcTest::testAdd".to_string()],
         };
-        let out = run_one(&project, "php", &phpunit, &planned, Duration::from_secs(60));
+        let out = run_one(
+            &project,
+            "php",
+            &phpunit,
+            &project.join("phpunit.xml"),
+            &planned,
+            Duration::from_secs(60),
+        );
         assert_eq!(out.status, MutantStatus::Escaped);
     }
 
@@ -284,6 +287,7 @@ mod tests {
             &project,
             "php",
             Path::new("php"),
+            &project.join("phpunit.xml"),
             &planned,
             Duration::from_secs(60),
         );
