@@ -3,6 +3,7 @@
 
 use mago_span::HasSpan;
 use mago_syntax::ast::binary::BinaryOperator;
+use mago_syntax::ast::literal::Literal;
 
 /// Map a binary operator to its Infection-compatible mutation:
 /// `(start_offset, end_offset, replacement_bytes, mutator_name)`.
@@ -32,6 +33,41 @@ pub fn mutate_binary(op: &BinaryOperator) -> Option<(usize, usize, &'static [u8]
         _ => return None,
     };
     Some((start, end, repl, name))
+}
+
+/// `true`→`false` (`TrueValue`) / `false`→`true` (`FalseValue`). Only boolean
+/// literals mutate; every other literal (null, int, float, string) returns `None`.
+pub fn mutate_literal(lit: &Literal) -> Option<(usize, usize, &'static [u8], &'static str)> {
+    let (span, repl, name): (mago_span::Span, &'static [u8], &'static str) = match lit {
+        Literal::True(k) => (k.span(), b"false", "TrueValue"),
+        Literal::False(k) => (k.span(), b"true", "FalseValue"),
+        _ => return None,
+    };
+    Some((
+        span.start.offset as usize,
+        span.end.offset as usize,
+        repl,
+        name,
+    ))
+}
+
+/// `++`↔`--`. `is_increment` picks the direction and the Infection name; the caller
+/// passes the operator token's span (from a pre- or post-fix increment/decrement).
+pub fn mutate_unary_suffix(
+    op_span: mago_span::Span,
+    is_increment: bool,
+) -> (usize, usize, &'static [u8], &'static str) {
+    let (repl, name): (&'static [u8], &'static str) = if is_increment {
+        (b"--", "IncrementInteger")
+    } else {
+        (b"++", "DecrementInteger")
+    };
+    (
+        op_span.start.offset as usize,
+        op_span.end.offset as usize,
+        repl,
+        name,
+    )
 }
 
 #[cfg(test)]
@@ -69,5 +105,58 @@ mod tests {
     fn bitwise_and_is_not_mutated() {
         use mago_syntax::ast::binary::BinaryOperator;
         assert!(mutate_binary(&BinaryOperator::BitwiseAnd(span(0, 1))).is_none());
+    }
+
+    #[test]
+    fn true_literal_becomes_false() {
+        use mago_syntax::ast::keyword::Keyword;
+        use mago_syntax::ast::literal::Literal;
+        let lit = Literal::True(Keyword {
+            span: span(3, 7),
+            value: b"true",
+        });
+        let (start, end, repl, name) = mutate_literal(&lit).unwrap();
+        assert_eq!((start, end), (3, 7));
+        assert_eq!(repl, b"false");
+        assert_eq!(name, "TrueValue");
+    }
+
+    #[test]
+    fn false_literal_becomes_true() {
+        use mago_syntax::ast::keyword::Keyword;
+        use mago_syntax::ast::literal::Literal;
+        let lit = Literal::False(Keyword {
+            span: span(0, 5),
+            value: b"false",
+        });
+        let (_, _, repl, name) = mutate_literal(&lit).unwrap();
+        assert_eq!(repl, b"true");
+        assert_eq!(name, "FalseValue");
+    }
+
+    #[test]
+    fn null_literal_is_not_mutated() {
+        use mago_syntax::ast::keyword::Keyword;
+        use mago_syntax::ast::literal::Literal;
+        assert!(mutate_literal(&Literal::Null(Keyword {
+            span: span(0, 4),
+            value: b"null"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn increment_becomes_decrement() {
+        let (start, end, repl, name) = mutate_unary_suffix(span(2, 4), true);
+        assert_eq!((start, end), (2, 4));
+        assert_eq!(repl, b"--");
+        assert_eq!(name, "IncrementInteger");
+    }
+
+    #[test]
+    fn decrement_becomes_increment() {
+        let (_, _, repl, name) = mutate_unary_suffix(span(2, 4), false);
+        assert_eq!(repl, b"++");
+        assert_eq!(name, "DecrementInteger");
     }
 }
