@@ -102,5 +102,8 @@
         Continue_: true,
         Throw_: true,
         InstanceOf_: true,
+        UnwrapStrReplace: true,
+        UnwrapStrIreplace: true,
+        UnwrapArrayReduce: true,
     },
 }

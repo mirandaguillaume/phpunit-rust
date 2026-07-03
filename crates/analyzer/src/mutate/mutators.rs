@@ -115,12 +115,17 @@ pub fn mutate_assignment(
     ))
 }
 
-/// Infection's `Unwrap*` mutators that keep the FIRST argument: `f(a, …)` → `a`.
-/// Maps a (lower-cased) PHP function name to its Infection mutator name. Only the
-/// default-parameter-index (arg 0) family is here; the custom-index ones (array_map,
-/// str_replace, array_merge, …) are a follow-up.
-pub fn unwrap_first_arg_name(fn_lower: &[u8]) -> Option<&'static str> {
-    Some(match fn_lower {
+/// Infection's `Unwrap*` mutators that keep ONE argument: `f(…, a, …)` → `a`. Maps a
+/// (lower-cased) PHP function name to `(Infection mutator name, kept arg index)`. Most
+/// keep arg 0; a few keep a later single arg (str_replace/str_ireplace/array_reduce →
+/// arg 2). The range-index ones (array_map/array_merge/array_intersect*) are a follow-up.
+pub fn unwrap_arg(fn_lower: &[u8]) -> Option<(&'static str, usize)> {
+    let name = match fn_lower {
+        b"str_replace" => return Some(("UnwrapStrReplace", 2)),
+        b"str_ireplace" => return Some(("UnwrapStrIreplace", 2)),
+        b"array_reduce" => return Some(("UnwrapArrayReduce", 2)),
+        // (array_combine is multi-index in Infection — keeps args 0 AND 1 — so it
+        // belongs with the range-index unwraps, a follow-up.)
         b"strtolower" => "UnwrapStrToLower",
         b"strtoupper" => "UnwrapStrToUpper",
         b"trim" => "UnwrapTrim",
@@ -154,7 +159,8 @@ pub fn unwrap_first_arg_name(fn_lower: &[u8]) -> Option<&'static str> {
         b"array_udiff_assoc" => "UnwrapArrayUdiffAssoc",
         b"array_udiff_uassoc" => "UnwrapArrayUdiffUassoc",
         _ => return None,
-    })
+    };
+    Some((name, 0))
 }
 
 /// Infection's cast mutators UNWRAP the cast (`(int)$x` → `$x`), so we remove the

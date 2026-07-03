@@ -39,9 +39,9 @@ fn callee_name_lower(func: &Expression) -> Option<Vec<u8>> {
     Some(last.to_ascii_lowercase())
 }
 
-/// Byte span of the first positional (non-spread) argument's value, if any.
-fn first_arg_span(args: &ArgumentList) -> Option<(usize, usize)> {
-    let Argument::Positional(p) = args.arguments.iter().next()? else {
+/// Byte span of the `n`-th positional (non-spread) argument's value, if any.
+fn nth_arg_span(args: &ArgumentList, n: usize) -> Option<(usize, usize)> {
+    let Argument::Positional(p) = args.arguments.iter().nth(n)? else {
         return None;
     };
     if p.ellipsis.is_some() {
@@ -51,15 +51,16 @@ fn first_arg_span(args: &ArgumentList) -> Option<(usize, usize)> {
     Some((s.start.offset as usize, s.end.offset as usize))
 }
 
-/// Infection `Unwrap*`: `f(a, …)` → `a`. Replace the whole call with its first arg.
+/// Infection `Unwrap*`: `f(…, a, …)` → `a`. Replace the whole call with the kept arg
+/// (arg 0 for most; a few keep a later arg, e.g. `str_replace`/`array_reduce` → arg 2).
 fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &FunctionCall) {
     let Some(name) = callee_name_lower(fc.function) else {
         return;
     };
-    let Some(mutator) = mutators::unwrap_first_arg_name(&name) else {
+    let Some((mutator, index)) = mutators::unwrap_arg(&name) else {
         return;
     };
-    let Some((astart, aend)) = first_arg_span(&fc.argument_list) else {
+    let Some((astart, aend)) = nth_arg_span(&fc.argument_list, index) else {
         return;
     };
     if astart >= aend || aend > source.len() {
