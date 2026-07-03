@@ -16,6 +16,8 @@ pub mod coverage_runtime;
 pub mod discovery;
 pub mod fork_pool;
 pub mod mock_bake;
+#[cfg(feature = "coverage")]
+pub mod mutate;
 pub mod php_worker;
 pub mod phpunit_xml;
 pub mod profiler;
