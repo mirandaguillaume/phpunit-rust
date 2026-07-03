@@ -79,7 +79,8 @@ pub fn run_mutation(
         r#"{{"files":["{}"]}}"#,
         baseline_cov.to_string_lossy().replace('\\', "\\\\")
     );
-    let json = run_php_with_stdin(&pertest_script, &request)?;
+    let project_autoload = project.join("vendor/autoload.php");
+    let json = run_php_with_stdin(&pertest_script, &project_autoload, &request)?;
     let cov = analyzer::mutate::coverage::PerTestCoverage::from_json(json.as_bytes())
         .context("parsing per-test coverage")?;
 
@@ -190,11 +191,13 @@ fn source_include_dirs(xml: &str, cfg_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Run a PHP script feeding `input` on stdin; return its stdout as a string.
-fn run_php_with_stdin(script: &Path, input: &str) -> Result<String> {
+/// Run `php <script> <autoload>` feeding `input` on stdin; return stdout as a string.
+/// `autoload` is passed as argv[1] so the script loads the project's classes.
+fn run_php_with_stdin(script: &Path, autoload: &Path, input: &str) -> Result<String> {
     use std::io::Write;
     let mut child = Command::new("php")
         .arg(script)
+        .arg(autoload)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

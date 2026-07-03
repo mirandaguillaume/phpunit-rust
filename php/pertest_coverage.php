@@ -15,7 +15,10 @@ declare(strict_types=1);
  * Mirrors `php/merge_coverage.php`'s stdin/stdout JSON contract.
  */
 
-require __DIR__ . '/vendor/autoload.php';
+// Autoload from the PROJECT's vendor (argv[1]) so the `.cov` is unserialized with
+// the same php-code-coverage that wrote it; fall back to our own for standalone use.
+$autoload = $argv[1] ?? (__DIR__ . '/vendor/autoload.php');
+require $autoload;
 
 $req = json_decode(stream_get_contents(STDIN), true) ?: [];
 
