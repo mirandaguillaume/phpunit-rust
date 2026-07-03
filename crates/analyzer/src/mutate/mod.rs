@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub mod coverage;
 pub mod mutators;
+pub mod plan;
 
 use bumpalo::Bump;
 use mago_database::file::FileId;
