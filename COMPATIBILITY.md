@@ -27,9 +27,12 @@ Lists the PHPUnit features that Proust supports today, and the ones that are exp
   longest-prefix match), parsed on demand, and used as a fold-only source
   (never emitted itself). Transitive across vendor→vendor bases. Without this a
   test extending a vendor base silently loses every method the base defines — a
-  parity undercount. (Resolution runs on the PSR-4 fast path; a suite forced onto
-  the full-parse fallback by a non-PSR-4 referenced class does not yet resolve
-  vendor bases.)
+  parity undercount. (Resolution runs on the PSR-4 fast path and its targeted
+  fallback — a non-PSR-4 referenced class narrows discovery to that class's file
+  rather than re-parsing the tree, and cases still come from the fast path, so
+  vendor bases are folded. Only the full-parse `discover_with_index` path, taken
+  with `--dirty` or when there is no composer PSR-4 map, does not resolve vendor
+  bases.)
 - Custom-framework base classes: any FQCN whose last segment ends in
   `TestCase` is recognised (catches `PHPStanTestCase`, Symfony's
   `KernelTestCase` / `WebTestCase`, etc.)
