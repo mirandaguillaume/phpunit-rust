@@ -107,4 +107,49 @@ final class OpsTest extends TestCase
         // literal 5; IncrementInteger -> 6, DecrementInteger -> 4, both -> KILLED.
         self::assertSame(5, (new Ops())->five());
     }
+
+    // Each comparison has TWO mutants (boundary shift + negation flip). Two assertions
+    // — one at the boundary, one strict — kill both.
+    public function testGt(): void
+    {
+        $o = new Ops();
+        self::assertTrue($o->gt(5, 3));   // kills GreaterThanNegotiation (`<=`)
+        self::assertFalse($o->gt(5, 5));  // kills GreaterThan (`>=`)
+    }
+
+    public function testLt(): void
+    {
+        $o = new Ops();
+        self::assertTrue($o->lt(3, 5));
+        self::assertFalse($o->lt(5, 5));
+    }
+
+    public function testLte(): void
+    {
+        $o = new Ops();
+        self::assertTrue($o->lte(5, 5));   // kills both (`<` and `>` both false at equality)
+        self::assertFalse($o->lte(6, 5));
+    }
+
+    // Equality has a flip mutant AND a loosen/tighten mutant; a type-juggling case
+    // (1 == "1" but 1 !== "1") kills both at once.
+    public function testEq(): void
+    {
+        self::assertTrue((new Ops())->eq(1, '1'));
+    }
+
+    public function testNeq(): void
+    {
+        self::assertFalse((new Ops())->neq(1, '1'));
+    }
+
+    public function testIdn(): void
+    {
+        self::assertFalse((new Ops())->idn(1, '1'));
+    }
+
+    public function testNidn(): void
+    {
+        self::assertTrue((new Ops())->nidn(1, '1'));
+    }
 }

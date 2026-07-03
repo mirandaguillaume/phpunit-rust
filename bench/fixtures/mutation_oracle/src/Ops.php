@@ -90,4 +90,39 @@ final class Ops
     {
         return 5;
     }
+
+    public function gt(int $a, int $b): bool
+    {
+        return $a > $b;
+    }
+
+    public function lt(int $a, int $b): bool
+    {
+        return $a < $b;
+    }
+
+    public function lte(int $a, int $b): bool
+    {
+        return $a <= $b;
+    }
+
+    public function eq($a, $b): bool
+    {
+        return $a == $b;
+    }
+
+    public function neq($a, $b): bool
+    {
+        return $a != $b;
+    }
+
+    public function idn($a, $b): bool
+    {
+        return $a === $b;
+    }
+
+    public function nidn($a, $b): bool
+    {
+        return $a !== $b;
+    }
 }

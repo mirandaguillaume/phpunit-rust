@@ -100,7 +100,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
         stack.extend(node.children());
         match node {
             Node::Binary(b) => {
-                if let Some(t) = mutators::mutate_binary(&b.operator) {
+                for t in mutators::mutate_binary(&b.operator) {
                     record(&mut out, path, source, t);
                 }
             }
