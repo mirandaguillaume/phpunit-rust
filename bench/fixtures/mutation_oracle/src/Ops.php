@@ -289,4 +289,14 @@ final class Ops
         }
         return $out;
     }
+
+    public function boom(): void
+    {
+        throw new \RuntimeException('x');
+    }
+
+    public function isRuntime($e): bool
+    {
+        return $e instanceof \RuntimeException;
+    }
 }

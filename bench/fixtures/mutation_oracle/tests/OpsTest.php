@@ -303,4 +303,18 @@ final class OpsTest extends TestCase
         // continue skips the first -> ['b','c']; mutated to break -> [] -> KILLED (Continue_).
         self::assertSame(['b', 'c'], (new Ops())->skipFirst(['a', 'b', 'c']));
     }
+
+    public function testBoom(): void
+    {
+        // removing `throw` -> no exception -> KILLED (Throw_).
+        $this->expectException(\RuntimeException::class);
+        (new Ops())->boom();
+    }
+
+    public function testIsRuntime(): void
+    {
+        // instanceof -> true kills the `false` mutant; -> false kills the `true` mutant.
+        self::assertTrue((new Ops())->isRuntime(new \RuntimeException()));
+        self::assertFalse((new Ops())->isRuntime(new \stdClass()));
+    }
 }

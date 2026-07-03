@@ -212,6 +212,42 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         name,
                     );
                 }
+                // InstanceOf_: `$a instanceof B` -> `true` AND `false`.
+                if matches!(b.operator, BinaryOperator::Instanceof(_)) {
+                    let whole = b.span();
+                    let (s, e) = (whole.start.offset as usize, whole.end.offset as usize);
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s,
+                        e,
+                        b"true".to_vec(),
+                        "InstanceOf_",
+                    );
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s,
+                        e,
+                        b"false".to_vec(),
+                        "InstanceOf_",
+                    );
+                }
+            }
+            // Throw_: `throw $x` -> `$x` (remove the `throw` keyword).
+            Node::Throw(t) => {
+                let s = t.throw.span();
+                record_owned(
+                    &mut out,
+                    path,
+                    source,
+                    s.start.offset as usize,
+                    s.end.offset as usize,
+                    Vec::new(),
+                    "Throw_",
+                );
             }
             Node::AssignmentOperator(op) => {
                 if let Some(t) = mutators::mutate_assignment(op) {
