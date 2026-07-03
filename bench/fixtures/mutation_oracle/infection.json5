@@ -91,5 +91,7 @@
         UnwrapArrayUdiff: true,
         UnwrapArrayUdiffAssoc: true,
         UnwrapArrayUdiffUassoc: true,
+        Spaceship: true,
+        Coalesce: true,
     },
 }

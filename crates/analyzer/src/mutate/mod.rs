@@ -14,6 +14,7 @@ use bumpalo::Bump;
 use mago_database::file::FileId;
 use mago_span::HasSpan;
 use mago_syntax::ast::argument::{Argument, ArgumentList};
+use mago_syntax::ast::binary::BinaryOperator;
 use mago_syntax::ast::call::FunctionCall;
 use mago_syntax::ast::expression::Expression;
 use mago_syntax::ast::identifier::Identifier;
@@ -176,6 +177,35 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
             Node::Binary(b) => {
                 for t in mutators::mutate_binary(&b.operator) {
                     record(&mut out, path, source, t);
+                }
+                // Operand-swap mutators: `a <=> b` -> `b <=> a` (Spaceship); `a ?? b`
+                // -> `b ?? a` (Coalesce). Rebuild the whole expression with the operands
+                // reordered around the original operator text.
+                let swap = match b.operator {
+                    BinaryOperator::Spaceship(_) => Some("Spaceship"),
+                    BinaryOperator::NullCoalesce(_) => Some("Coalesce"),
+                    _ => None,
+                };
+                if let Some(name) = swap {
+                    let seg = |sp: mago_span::Span| {
+                        &source[sp.start.offset as usize..sp.end.offset as usize]
+                    };
+                    let mut repl = Vec::new();
+                    repl.extend_from_slice(seg(b.rhs.span()));
+                    repl.push(b' ');
+                    repl.extend_from_slice(seg(b.operator.span()));
+                    repl.push(b' ');
+                    repl.extend_from_slice(seg(b.lhs.span()));
+                    let whole = b.span();
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        whole.start.offset as usize,
+                        whole.end.offset as usize,
+                        repl,
+                        name,
+                    );
                 }
             }
             Node::AssignmentOperator(op) => {
