@@ -305,4 +305,14 @@ final class Ops
         return str_replace('a', 'b', $s);
     }
 
+    public function am(array $a): array
+    {
+        return array_map('strtoupper', $a);
+    }
+
+    public function amrg(array $a, array $b): array
+    {
+        return array_merge($a, $b);
+    }
+
 }

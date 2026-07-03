@@ -163,6 +163,25 @@ pub fn unwrap_arg(fn_lower: &[u8]) -> Option<(&'static str, usize)> {
     Some((name, 0))
 }
 
+/// Infection `Unwrap*` mutators that keep EACH of several args — one mutant per kept
+/// arg (unlike `unwrap_arg`, which keeps a single fixed index). Returns
+/// `(mutator name, skip_first)`; `skip_first` drops arg 0 (the callback), as
+/// `array_map` does. Every other listed fn keeps all args. The trailing-callback
+/// `array_slice` cases (`array_uintersect` etc.) and `array_combine` are a follow-up.
+pub fn unwrap_range(fn_lower: &[u8]) -> Option<(&'static str, bool)> {
+    Some(match fn_lower {
+        b"array_map" => ("UnwrapArrayMap", true),
+        b"array_merge" => ("UnwrapArrayMerge", false),
+        b"array_merge_recursive" => ("UnwrapArrayMergeRecursive", false),
+        b"array_replace" => ("UnwrapArrayReplace", false),
+        b"array_replace_recursive" => ("UnwrapArrayReplaceRecursive", false),
+        b"array_intersect" => ("UnwrapArrayIntersect", false),
+        b"array_intersect_key" => ("UnwrapArrayIntersectKey", false),
+        b"array_intersect_assoc" => ("UnwrapArrayIntersectAssoc", false),
+        _ => return None,
+    })
+}
+
 /// Infection's cast mutators UNWRAP the cast (`(int)$x` → `$x`), so we remove the
 /// cast operator's token span (replace with nothing). mago spells some casts several
 /// ways (int/integer, float/double/real, string/binary, bool/boolean); all map to the

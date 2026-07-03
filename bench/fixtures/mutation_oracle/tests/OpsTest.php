@@ -323,4 +323,16 @@ final class OpsTest extends TestCase
         // str_replace unwraps to arg 2 (the subject) -> 'aXa' != 'bXb' -> KILLED.
         self::assertSame('bXb', (new Ops())->sr('aXa'));
     }
+
+    public function testAm(): void
+    {
+        // array_map keeps arg 1 (skips the callback): unwrap -> ['x'] != ['X'] -> KILLED (UnwrapArrayMap).
+        self::assertSame(['X'], (new Ops())->am(['x']));
+    }
+
+    public function testAmrg(): void
+    {
+        // array_merge -> one mutant per arg: ->$a=['x'] and ->$b=['y'], both != ['x','y'] -> KILLED.
+        self::assertSame(['x', 'y'], (new Ops())->amrg(['x'], ['y']));
+    }
 }
