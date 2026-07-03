@@ -143,7 +143,7 @@ fn build_cases_and_index(
     if !need_full_index {
         if let Some(psr4) = load_composer_psr4_map(project) {
             let (cases, test_class_index) =
-                discover_cases_and_test_index(roots, excludes, supplement_dirs)?;
+                discover_cases_and_test_index(roots, excludes, supplement_dirs, &psr4)?;
 
             let mut wanted: std::collections::HashSet<String> = cases
                 .iter()

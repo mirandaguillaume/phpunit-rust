@@ -2347,7 +2347,7 @@ pub fn discover_in_file(path: &Path) -> Result<Vec<TestCase>> {
         .iter()
         .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
         .collect();
-    emit_test_cases(&parsed, &graph)
+    emit_test_cases(&parsed, &[], &graph)
 }
 
 /// Pass 3: walk the parsed classes, filter by the BFS, emit TestCases.
@@ -2383,10 +2383,98 @@ fn collect_trait_sources<'a>(
     }
 }
 
-fn emit_test_cases(parsed: &[ParsedClass], graph: &ClassGraph) -> Result<Vec<TestCase>> {
-    // Index by FQCN for chain-walking.
-    let by_fqcn: HashMap<&str, &ParsedClass> =
-        parsed.iter().map(|c| (c.fqcn.as_str(), c)).collect();
+/// A class FQCN is a framework base we must NOT resolve+parse: PHPUnit's own
+/// `TestCase`/`Assert`/etc. It has no user `testX` methods to fold and resolving
+/// it would drag the whole framework into the parse set.
+fn is_framework_base(fqcn: &str) -> bool {
+    let f = fqcn.trim_start_matches('\\');
+    f == "PHPUnit\\Framework\\TestCase" || f.starts_with("PHPUnit\\")
+}
+
+/// Resolve `fqcn` to a file via composer's PSR-4 map (longest-prefix wins, as
+/// composer does). `None` when no prefix matches or the derived path is absent.
+fn psr4_resolve_file(fqcn: &str, psr4: &[(String, PathBuf)]) -> Option<PathBuf> {
+    let fqcn = fqcn.trim_start_matches('\\');
+    let mut best: Option<PathBuf> = None;
+    let mut best_len = 0usize;
+    for (prefix, dir) in psr4 {
+        let pfx = prefix.trim_start_matches('\\');
+        if let Some(rest) = fqcn.strip_prefix(pfx) {
+            let candidate = dir.join(format!("{}.php", rest.replace('\\', "/")));
+            if pfx.len() >= best_len && candidate.is_file() {
+                best_len = pfx.len();
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+/// Close the "inherited test methods from a base class that lives in vendor" gap:
+/// the tree-sitter walk only sees the project's test/source dirs, so a test class
+/// extending a base shipped in a composer package loses every method the base
+/// defines. For each parent FQCN in the parsed classes' chains that is NOT already
+/// parsed and NOT a framework base, resolve it via composer's PSR-4 map, parse
+/// that one file, and return the classes as FOLD-ONLY sources (they are never
+/// emitted as tests themselves). Transitive across vendor→vendor bases; bounded.
+fn resolve_vendor_bases(
+    all_parsed: &[ParsedClass],
+    psr4: &[(String, PathBuf)],
+) -> Vec<ParsedClass> {
+    if psr4.is_empty() {
+        return Vec::new();
+    }
+    let mut known: std::collections::HashSet<String> =
+        all_parsed.iter().map(|c| c.fqcn.clone()).collect();
+    let mut parsed_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = all_parsed
+        .iter()
+        .filter_map(|c| c.parent_fqcn.clone())
+        .collect();
+    let mut extra: Vec<ParsedClass> = Vec::new();
+    let mut budget = 0;
+    while let Some(fqcn) = queue.pop() {
+        if budget >= 512 {
+            break; // runaway guard; real chains are a handful deep
+        }
+        budget += 1;
+        if known.contains(&fqcn) || is_framework_base(&fqcn) {
+            continue;
+        }
+        let Some(file) = psr4_resolve_file(&fqcn, psr4) else {
+            continue;
+        };
+        if !parsed_files.insert(file.clone()) {
+            continue;
+        }
+        let Ok(classes) = parse_file_classes(&file) else {
+            continue;
+        };
+        for c in classes {
+            known.insert(c.fqcn.clone());
+            if let Some(p) = &c.parent_fqcn {
+                queue.push(p.clone());
+            }
+            extra.push(c);
+        }
+    }
+    extra
+}
+
+/// `fold_extra` classes (base classes resolved out of vendor via composer's PSR-4
+/// map) are fold sources ONLY — subclasses in `parsed` inherit their methods, but
+/// they never emit a TestCase themselves (the emit loop iterates only `parsed`).
+fn emit_test_cases(
+    parsed: &[ParsedClass],
+    fold_extra: &[ParsedClass],
+    graph: &ClassGraph,
+) -> Result<Vec<TestCase>> {
+    // Index by FQCN for chain-walking (emit set + fold-only vendor bases).
+    let by_fqcn: HashMap<&str, &ParsedClass> = parsed
+        .iter()
+        .chain(fold_extra.iter())
+        .map(|c| (c.fqcn.as_str(), c))
+        .collect();
 
     let mut cases = Vec::new();
     for class in parsed {
@@ -2503,10 +2591,16 @@ pub fn discover_in_dir(root: &Path) -> Result<Vec<TestCase>> {
 /// only non-`*Test*` files), so the runner's PSR-4-sufficiency gate remains
 /// sound: a genuinely non-PSR-4 class in a non-test file still lands in `U`
 /// and triggers the full fallback.
+/// `psr4` is composer's `(prefix, dir)` PSR-4 map (from
+/// `vendor/composer/autoload_psr4.php`). It is used ONLY to resolve base classes
+/// the tests extend that live outside the parsed dirs (e.g. an abstract TestCase
+/// shipped in a composer package), so their inherited test methods are folded in
+/// rather than silently dropped. Pass `&[]` to skip vendor-base resolution.
 pub fn discover_cases_and_test_index(
     roots: &[PathBuf],
     excludes: &[PathBuf],
     graph_supplement_dirs: &[PathBuf],
+    psr4: &[(String, PathBuf)],
 ) -> Result<(Vec<TestCase>, HashMap<String, PathBuf>)> {
     // Canonicalize excludes once so prefix checks are robust.
     let canon_excludes: Vec<PathBuf> = excludes
@@ -2604,9 +2698,17 @@ pub fn discover_cases_and_test_index(
         .collect();
     parsed.extend(supp);
 
-    // Pass 2: build the inheritance graph (FQCN -> parent FQCN or None).
+    // Resolve base classes the tests extend that live outside the parsed dirs
+    // (e.g. a composer package's abstract TestCase) and parse them as fold-only
+    // sources — otherwise every test method they define is silently dropped.
+    let fold_extra = resolve_vendor_bases(&parsed, psr4);
+
+    // Pass 2: build the inheritance graph (FQCN -> parent FQCN or None),
+    // including the resolved vendor bases so `is_test_class_via_chain` reaches
+    // TestCase through them.
     let graph: ClassGraph = parsed
         .iter()
+        .chain(fold_extra.iter())
         .map(|c| (c.fqcn.clone(), c.parent_fqcn.clone()))
         .collect();
 
@@ -2624,8 +2726,9 @@ pub fn discover_cases_and_test_index(
         m
     };
 
-    // Pass 3: emit test methods only for classes from the testsuite roots.
-    let cases = emit_test_cases(&parsed[..emit_count], &graph)?;
+    // Pass 3: emit test methods only for classes from the testsuite roots;
+    // `fold_extra` (resolved vendor bases) are fold sources but never emit.
+    let cases = emit_test_cases(&parsed[..emit_count], &fold_extra, &graph)?;
     Ok((cases, index))
 }
 
@@ -2634,7 +2737,7 @@ pub fn discover_in_dirs(
     excludes: &[PathBuf],
     graph_supplement_dirs: &[PathBuf],
 ) -> Result<Vec<TestCase>> {
-    Ok(discover_cases_and_test_index(roots, excludes, graph_supplement_dirs)?.0)
+    Ok(discover_cases_and_test_index(roots, excludes, graph_supplement_dirs, &[])?.0)
 }
 
 /// Single-pass discovery + FQCN index. Replaces a sequential
@@ -2776,7 +2879,7 @@ pub fn discover_with_index(
         .map(|(c, _)| c)
         .collect();
 
-    let cases = emit_test_cases(&root_test_classes, &graph)?;
+    let cases = emit_test_cases(&root_test_classes, &[], &graph)?;
     Ok((cases, index))
 }
 
@@ -4526,7 +4629,7 @@ class TautologyTest extends TestCase {
         )
         .unwrap();
         let roots = vec![dir.join("tests")];
-        let (cases, index) = discover_cases_and_test_index(&roots, &[], &[]).unwrap();
+        let (cases, index) = discover_cases_and_test_index(&roots, &[], &[], &[]).unwrap();
         // Only the test class is emitted...
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].class, "App\\Tests\\FooTest");
@@ -4535,6 +4638,79 @@ class TautologyTest extends TestCase {
         assert!(
             index.contains_key("App\\Tests\\FooHelper"),
             "co-located helper class must be in the test-file index"
+        );
+    }
+
+    #[test]
+    fn psr4_resolve_file_maps_fqcn_to_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/Widget.php"), "<?php").unwrap();
+        let psr4 = vec![("Acme\\Ui\\".to_string(), dir.join("lib"))];
+        assert_eq!(
+            psr4_resolve_file("Acme\\Ui\\Widget", &psr4),
+            Some(dir.join("lib/Widget.php"))
+        );
+        // leading backslash tolerated; unknown prefix -> None
+        assert_eq!(
+            psr4_resolve_file("\\Acme\\Ui\\Widget", &psr4),
+            Some(dir.join("lib/Widget.php"))
+        );
+        assert_eq!(psr4_resolve_file("Other\\Thing", &psr4), None);
+    }
+
+    /// A test class extending an abstract base that lives in a composer package
+    /// (vendor/, outside the parsed dirs) must still discover the base's inherited
+    /// test methods — resolved via composer's PSR-4 map and folded in. Without the
+    /// map the base is invisible and its methods are silently dropped (the gap).
+    #[test]
+    fn folds_test_methods_inherited_from_a_psr4_resolved_vendor_base() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(dir.join("vendor/acme/contract")).unwrap();
+        std::fs::write(
+            dir.join("vendor/acme/contract/ContractTestCase.php"),
+            "<?php\nnamespace Acme\\Contract;\nuse PHPUnit\\Framework\\TestCase;\nabstract class ContractTestCase extends TestCase {\n    public function testInherited(): void {}\n    public function testAlsoInherited(): void {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tests/LocalTest.php"),
+            "<?php\nnamespace App\\Tests;\nuse Acme\\Contract\\ContractTestCase;\nfinal class LocalTest extends ContractTestCase { public function testOwn(): void {} }\n",
+        )
+        .unwrap();
+
+        let roots = vec![dir.join("tests")];
+        let psr4 = vec![(
+            "Acme\\Contract\\".to_string(),
+            dir.join("vendor/acme/contract"),
+        )];
+
+        // WITHOUT the PSR-4 map: the vendor base is invisible — only the own method.
+        let (bare, _) = discover_cases_and_test_index(&roots, &[], &[], &[]).unwrap();
+        let bare_methods: std::collections::HashSet<&str> =
+            bare.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(
+            bare_methods,
+            std::collections::HashSet::from(["testOwn"]),
+            "without the PSR-4 map the vendor base's methods are dropped (the gap)"
+        );
+
+        // WITH the PSR-4 map: the base's methods fold into the concrete subclass.
+        let (cases, _) = discover_cases_and_test_index(&roots, &[], &[], &psr4).unwrap();
+        let methods: std::collections::HashSet<&str> =
+            cases.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            std::collections::HashSet::from(["testOwn", "testInherited", "testAlsoInherited"]),
+            "vendor base methods must fold into the subclass; got {:?}",
+            cases.iter().map(|c| &c.method).collect::<Vec<_>>()
+        );
+        // The abstract vendor base is a fold source only — never emitted itself.
+        assert!(
+            cases.iter().all(|c| c.class == "App\\Tests\\LocalTest"),
+            "the abstract vendor base must not emit a TestCase of its own"
         );
     }
 
