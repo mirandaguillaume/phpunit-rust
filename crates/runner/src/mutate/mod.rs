@@ -40,6 +40,15 @@ pub fn run_mutation(
     let xml = std::fs::read_to_string(&config)
         .with_context(|| format!("reading {}", config.display()))?;
     let cfg_dir = config.parent().unwrap_or(project);
+    // The phpunit.xml bootstrap (framework init) — run ONCE in the fork-master.
+    let bootstrap: Option<PathBuf> = crate::phpunit_xml::parse_bootstrap(&xml).map(|b| {
+        let p = PathBuf::from(&b);
+        if p.is_absolute() {
+            p
+        } else {
+            cfg_dir.join(b)
+        }
+    });
     let source_dirs = source_include_dirs(&xml, cfg_dir);
     if source_dirs.is_empty() {
         return Err(anyhow!(
@@ -104,22 +113,36 @@ pub fn run_mutation(
 
     let planned = analyzer::mutate::plan::plan(mutants, &cov);
 
-    // Run each mutant's covering tests in parallel.
     let nthreads = workers.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
     });
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(nthreads)
-        .build()
-        .context("building mutation thread pool")?;
-    let outcomes: Vec<MutantOutcome> = pool.install(|| {
-        planned
-            .par_iter()
-            .map(|pm| run_one(project, "php", &phpunit, &config, pm, MUTANT_TIMEOUT))
-            .collect()
-    });
+
+    // Prefer the warm fork-master (V3): boot the project once, fork per mutant — the
+    // PHP + composer + PHPUnit bootstrap is paid once instead of per mutant. Fall back
+    // to the per-process overlay (V2) when pcntl is unavailable or the master can't run.
+    let outcomes: Vec<MutantOutcome> = match run_via_fork_master(
+        project,
+        bootstrap.as_deref(),
+        &planned,
+        nthreads,
+        MUTANT_TIMEOUT.as_secs(),
+    ) {
+        Some(o) => o,
+        None => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(nthreads)
+                .build()
+                .context("building mutation thread pool")?;
+            pool.install(|| {
+                planned
+                    .par_iter()
+                    .map(|pm| run_one(project, "php", &phpunit, &config, pm, MUTANT_TIMEOUT))
+                    .collect()
+            })
+        }
+    };
 
     let msi = report::summarize(&outcomes);
     let escaped: Vec<&MutantOutcome> = outcomes
@@ -235,4 +258,129 @@ fn write_escaped_json(path: &Path, escaped: &[&MutantOutcome]) -> Result<()> {
     }
     s.push_str("]}");
     std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))
+}
+
+/// True when this `php` has the pcntl extension (needed to fork the warm master).
+fn pcntl_available() -> bool {
+    Command::new("php")
+        .arg("-r")
+        .arg("echo function_exists('pcntl_fork') ? '1' : '0';")
+        .output()
+        .map(|o| o.stdout == b"1")
+        .unwrap_or(false)
+}
+
+/// Group covering test ids (`Class::method[#dataset]`) into `[{class, methods}]`,
+/// deduped — the shape `mutation_run.php` runs via `TestExecutor::runClass`.
+fn group_covering(tests: &[String]) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+    let mut by_class: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for t in tests {
+        let Some((class, rest)) = t.split_once("::") else {
+            continue;
+        };
+        let method = rest.split('#').next().unwrap_or(rest);
+        by_class.entry(class).or_default().push(method);
+    }
+    by_class
+        .into_iter()
+        .map(|(class, mut methods)| {
+            methods.sort_unstable();
+            methods.dedup();
+            serde_json::json!({ "class": class, "methods": methods })
+        })
+        .collect()
+}
+
+/// Warm fork-master execution (V3). Writes one overlay temp file per covered mutant
+/// plus a jobs file, invokes `mutation_run.php` (boots once, forks per mutant), then
+/// reads back each mutant's verdict. Returns `None` — so the caller falls back to the
+/// per-process overlay — when pcntl is missing or the master cannot be launched/run.
+fn run_via_fork_master(
+    project: &Path,
+    bootstrap: Option<&Path>,
+    planned: &[analyzer::mutate::plan::PlannedMutant],
+    workers: usize,
+    timeout_secs: u64,
+) -> Option<Vec<MutantOutcome>> {
+    if !pcntl_available() {
+        return None;
+    }
+    let script = crate::php_worker::find_mutation_run_script().ok()?;
+    let workdir = tempfile::TempDir::new().ok()?;
+    let results_dir = workdir.path().join("results");
+    std::fs::create_dir_all(&results_dir).ok()?;
+
+    // One overlay temp file + one job per covered mutant; the job id is its index in
+    // `planned` so we can map verdicts straight back. Bad spans / unreadable files are
+    // simply skipped here and read back as "killed" (their result file is absent).
+    let mut jobs: Vec<serde_json::Value> = Vec::new();
+    for (i, pm) in planned.iter().enumerate() {
+        if pm.covering_tests.is_empty() {
+            continue;
+        }
+        let m = &pm.mutant;
+        let Ok(orig) = std::fs::read(&m.file) else {
+            continue;
+        };
+        if m.start > m.end || m.end > orig.len() {
+            continue;
+        }
+        let mut mutated = orig;
+        mutated.splice(m.start..m.end, m.replacement.iter().copied());
+        let file = workdir.path().join(format!("mutant_{i}.php"));
+        if std::fs::write(&file, &mutated).is_err() {
+            continue;
+        }
+        jobs.push(serde_json::json!({
+            "id": i.to_string(),
+            "file": file.to_string_lossy(),
+            "covering": group_covering(&pm.covering_tests),
+        }));
+    }
+
+    let jobs_file = workdir.path().join("jobs.json");
+    std::fs::write(&jobs_file, serde_json::to_vec(&jobs).ok()?).ok()?;
+
+    let autoload = project.join("vendor/autoload.php");
+    let mut cmd = Command::new("php");
+    cmd.arg(&script)
+        .arg(format!("--autoload={}", autoload.display()))
+        .arg(format!("--jobs={}", jobs_file.display()))
+        .arg(format!("--results={}", results_dir.display()))
+        .arg(format!("--workers={workers}"))
+        .arg(format!("--timeout={timeout_secs}"))
+        .current_dir(project);
+    if let Some(b) = bootstrap {
+        cmd.arg(format!("--bootstrap={}", b.display()));
+    }
+    let status = cmd.status().ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    // Map each mutant's verdict back; a missing result file means the child died on
+    // the mutant (fatal / crash) — counted as caught, like Infection.
+    let outcomes = planned
+        .iter()
+        .enumerate()
+        .map(|(i, pm)| {
+            let status = if pm.covering_tests.is_empty() {
+                MutantStatus::NotCovered
+            } else {
+                let verdict =
+                    std::fs::read_to_string(results_dir.join(i.to_string())).unwrap_or_default();
+                match verdict.trim() {
+                    "escaped" => MutantStatus::Escaped,
+                    "timeout" => MutantStatus::Timeout,
+                    _ => MutantStatus::Killed,
+                }
+            };
+            MutantOutcome {
+                mutant: pm.mutant.clone(),
+                status,
+            }
+        })
+        .collect();
+    Some(outcomes)
 }
