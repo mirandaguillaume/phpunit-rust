@@ -83,4 +83,168 @@ final class OpsTest extends TestCase
     {
         self::assertInstanceOf(\stdClass::class, (new Ops())->co(['x' => 1]));
     }
+
+    public function testExpo(): void
+    {
+        // 2 ** 3 = 8; mutated 2 / 3 = 0 -> KILLED.
+        self::assertSame(8, (new Ops())->expo(2, 3));
+    }
+
+    public function testPreinc(): void
+    {
+        // ++$n on 5 = 6; mutated --$n = 4 -> KILLED (Increment).
+        self::assertSame(6, (new Ops())->preinc(5));
+    }
+
+    public function testPredec(): void
+    {
+        // --$n on 5 = 4; mutated ++$n = 6 -> KILLED (Decrement).
+        self::assertSame(4, (new Ops())->predec(5));
+    }
+
+    public function testFive(): void
+    {
+        // literal 5; IncrementInteger -> 6, DecrementInteger -> 4, both -> KILLED.
+        self::assertSame(5, (new Ops())->five());
+    }
+
+    // Each comparison has TWO mutants (boundary shift + negation flip). Two assertions
+    // — one at the boundary, one strict — kill both.
+    public function testGt(): void
+    {
+        $o = new Ops();
+        self::assertTrue($o->gt(5, 3));   // kills GreaterThanNegotiation (`<=`)
+        self::assertFalse($o->gt(5, 5));  // kills GreaterThan (`>=`)
+    }
+
+    public function testLt(): void
+    {
+        $o = new Ops();
+        self::assertTrue($o->lt(3, 5));
+        self::assertFalse($o->lt(5, 5));
+    }
+
+    public function testLte(): void
+    {
+        $o = new Ops();
+        self::assertTrue($o->lte(5, 5));   // kills both (`<` and `>` both false at equality)
+        self::assertFalse($o->lte(6, 5));
+    }
+
+    // Equality has a flip mutant AND a loosen/tighten mutant; a type-juggling case
+    // (1 == "1" but 1 !== "1") kills both at once.
+    public function testEq(): void
+    {
+        self::assertTrue((new Ops())->eq(1, '1'));
+    }
+
+    public function testNeq(): void
+    {
+        self::assertFalse((new Ops())->neq(1, '1'));
+    }
+
+    public function testIdn(): void
+    {
+        self::assertFalse((new Ops())->idn(1, '1'));
+    }
+
+    public function testNidn(): void
+    {
+        self::assertTrue((new Ops())->nidn(1, '1'));
+    }
+
+    public function testNot(): void
+    {
+        // !$x on true = false; mutated (unwrapped) $x = true -> KILLED (LogicalNot).
+        self::assertFalse((new Ops())->not(true));
+    }
+
+    public function testOne(): void
+    {
+        // 1.0 -> 0.0 -> KILLED (OneZeroFloat).
+        self::assertSame(1.0, (new Ops())->one());
+    }
+
+    // Compound assignments: swap the arithmetic half -> a different result -> KILLED.
+    public function testPe(): void
+    {
+        self::assertSame(8, (new Ops())->pe(5, 3));
+    }
+
+    public function testMe(): void
+    {
+        self::assertSame(2, (new Ops())->me(5, 3));
+    }
+
+    public function testMule(): void
+    {
+        self::assertSame(15, (new Ops())->mule(5, 3));
+    }
+
+    public function testDive(): void
+    {
+        self::assertSame(2, (new Ops())->dive(6, 3));
+    }
+
+    public function testMode(): void
+    {
+        self::assertSame(1, (new Ops())->mode(7, 3));
+    }
+
+    public function testPowe(): void
+    {
+        self::assertSame(8, (new Ops())->powe(2, 3));
+    }
+
+    // Unwrap mutants replace the call with its first argument -> a different result.
+    public function testLow(): void
+    {
+        self::assertSame('abc', (new Ops())->low('ABC'));
+    }
+
+    public function testUp(): void
+    {
+        self::assertSame('ABC', (new Ops())->up('abc'));
+    }
+
+    public function testTr(): void
+    {
+        self::assertSame('x', (new Ops())->tr('  x  '));
+    }
+
+    public function testUf(): void
+    {
+        self::assertSame('Abc', (new Ops())->uf('abc'));
+    }
+
+    public function testRev(): void
+    {
+        self::assertSame('cba', (new Ops())->rev('abc'));
+    }
+
+    public function testArev(): void
+    {
+        self::assertSame([3, 2, 1], (new Ops())->arev([1, 2, 3]));
+    }
+
+    public function testAuniq(): void
+    {
+        self::assertSame([1], (new Ops())->auniq([1, 1]));
+    }
+
+    public function testAvals(): void
+    {
+        self::assertSame([1], (new Ops())->avals(['a' => 1]));
+    }
+
+    public function testAflip(): void
+    {
+        self::assertSame(['b' => 'a'], (new Ops())->aflip(['a' => 'b']));
+    }
+
+    public function testSelf(): void
+    {
+        // return $this -> return null (This) -> KILLED.
+        self::assertInstanceOf(Ops::class, (new Ops())->self_());
+    }
 }

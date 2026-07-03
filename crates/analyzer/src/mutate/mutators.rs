@@ -5,41 +5,54 @@ use mago_span::HasSpan;
 use mago_syntax::ast::binary::BinaryOperator;
 use mago_syntax::ast::literal::Literal;
 
-/// Map a binary operator to its Infection-compatible mutation:
-/// `(start_offset, end_offset, replacement_bytes, mutator_name)`.
-///
-/// The byte offsets come straight from the operator token's span, so the caller
-/// patches `source[start..end] = replacement`. Returns `None` for operators not in
-/// the set (string concat `.`, coalesce `??`, spaceship `<=>`, `**`, …).
-pub fn mutate_binary(op: &BinaryOperator) -> Option<(usize, usize, &'static [u8], &'static str)> {
+/// All Infection-compatible mutations of a binary operator, each as
+/// `(start_offset, end_offset, replacement_bytes, mutator_name)`. A single operator
+/// often has SEVERAL Infection mutators (e.g. `==` → both `Equal` (`!=`) and
+/// `EqualIdentical` (`===`); `>` → both `GreaterThan` (`>=`) and its negation
+/// `GreaterThanNegotiation` (`<=`)). All share the operator token's span. Empty for
+/// operators not in the set (`.`, `??`, `<=>`, …).
+pub fn mutate_binary(op: &BinaryOperator) -> Vec<(usize, usize, &'static [u8], &'static str)> {
     let s = op.span();
     let (start, end) = (s.start.offset as usize, s.end.offset as usize);
-    let (repl, name): (&'static [u8], &'static str) = match op {
-        BinaryOperator::Addition(_) => (b"-", "Plus"),
-        BinaryOperator::Subtraction(_) => (b"+", "Minus"),
-        BinaryOperator::Multiplication(_) => (b"/", "Multiplication"),
-        BinaryOperator::Division(_) => (b"*", "Division"),
-        BinaryOperator::Modulo(_) => (b"*", "Modulus"),
-        BinaryOperator::LessThan(_) => (b"<=", "LessThan"),
-        BinaryOperator::LessThanOrEqual(_) => (b"<", "LessThanOrEqualTo"),
-        BinaryOperator::GreaterThan(_) => (b">=", "GreaterThan"),
-        BinaryOperator::GreaterThanOrEqual(_) => (b">", "GreaterThanOrEqualTo"),
-        BinaryOperator::Equal(_) => (b"!=", "Equal"),
-        BinaryOperator::NotEqual(_) => (b"==", "NotEqual"),
-        BinaryOperator::Identical(_) => (b"!==", "Identical"),
-        BinaryOperator::NotIdentical(_) => (b"===", "NotIdentical"),
-        BinaryOperator::And(_) => (b"||", "LogicalAnd"),
-        BinaryOperator::Or(_) => (b"&&", "LogicalOr"),
-        // Bitwise — Infection swaps &<->| and ^->& , and reverses the shifts.
+    let muts: &[(&'static [u8], &'static str)] = match op {
+        BinaryOperator::Addition(_) => &[(b"-", "Plus")],
+        BinaryOperator::Subtraction(_) => &[(b"+", "Minus")],
+        BinaryOperator::Multiplication(_) => &[(b"/", "Multiplication")],
+        BinaryOperator::Division(_) => &[(b"*", "Division")],
+        BinaryOperator::Modulo(_) => &[(b"*", "Modulus")],
+        BinaryOperator::Exponentiation(_) => &[(b"/", "Exponentiation")],
+        // Comparison: the ConditionalBoundary shift AND the ConditionalNegotiation flip.
+        BinaryOperator::LessThan(_) => &[(b"<=", "LessThan"), (b">=", "LessThanNegotiation")],
+        BinaryOperator::LessThanOrEqual(_) => &[
+            (b"<", "LessThanOrEqualTo"),
+            (b">", "LessThanOrEqualToNegotiation"),
+        ],
+        BinaryOperator::GreaterThan(_) => {
+            &[(b">=", "GreaterThan"), (b"<=", "GreaterThanNegotiation")]
+        }
+        BinaryOperator::GreaterThanOrEqual(_) => &[
+            (b">", "GreaterThanOrEqualTo"),
+            (b"<", "GreaterThanOrEqualToNegotiation"),
+        ],
+        // Equality: the ConditionalNegotiation flip AND the Boolean loosen/tighten.
+        BinaryOperator::Equal(_) => &[(b"!=", "Equal"), (b"===", "EqualIdentical")],
+        BinaryOperator::NotEqual(_) => &[(b"==", "NotEqual"), (b"!==", "NotEqualNotIdentical")],
+        BinaryOperator::Identical(_) => &[(b"!==", "Identical"), (b"==", "IdenticalEqual")],
+        BinaryOperator::NotIdentical(_) => {
+            &[(b"===", "NotIdentical"), (b"!=", "NotIdenticalNotEqual")]
+        }
+        BinaryOperator::And(_) => &[(b"||", "LogicalAnd")],
+        BinaryOperator::Or(_) => &[(b"&&", "LogicalOr")],
+        // Bitwise — swap &<->| and ^->& , reverse the shifts.
         // (mago's shift variants are Left/RightShift; Infection names them Shift{Left,Right}.)
-        BinaryOperator::BitwiseAnd(_) => (b"|", "BitwiseAnd"),
-        BinaryOperator::BitwiseOr(_) => (b"&", "BitwiseOr"),
-        BinaryOperator::BitwiseXor(_) => (b"&", "BitwiseXor"),
-        BinaryOperator::LeftShift(_) => (b">>", "ShiftLeft"),
-        BinaryOperator::RightShift(_) => (b"<<", "ShiftRight"),
-        _ => return None,
+        BinaryOperator::BitwiseAnd(_) => &[(b"|", "BitwiseAnd")],
+        BinaryOperator::BitwiseOr(_) => &[(b"&", "BitwiseOr")],
+        BinaryOperator::BitwiseXor(_) => &[(b"&", "BitwiseXor")],
+        BinaryOperator::LeftShift(_) => &[(b">>", "ShiftLeft")],
+        BinaryOperator::RightShift(_) => &[(b"<<", "ShiftRight")],
+        _ => &[],
     };
-    Some((start, end, repl, name))
+    muts.iter().map(|&(r, n)| (start, end, r, n)).collect()
 }
 
 /// `true`→`false` (`TrueValue`) / `false`→`true` (`FalseValue`). Only boolean
@@ -58,16 +71,17 @@ pub fn mutate_literal(lit: &Literal) -> Option<(usize, usize, &'static [u8], &'s
     ))
 }
 
-/// `++`↔`--`. `is_increment` picks the direction and the Infection name; the caller
-/// passes the operator token's span (from a pre- or post-fix increment/decrement).
+/// `++`↔`--` (Infection Arithmetic `Increment`/`Decrement` — NOT the Number
+/// `IncrementInteger`/`DecrementInteger`, which mutate integer *literals*).
+/// `is_increment` picks the direction; the caller passes the operator token's span.
 pub fn mutate_unary_suffix(
     op_span: mago_span::Span,
     is_increment: bool,
 ) -> (usize, usize, &'static [u8], &'static str) {
     let (repl, name): (&'static [u8], &'static str) = if is_increment {
-        (b"--", "IncrementInteger")
+        (b"--", "Increment")
     } else {
-        (b"++", "DecrementInteger")
+        (b"++", "Decrement")
     };
     (
         op_span.start.offset as usize,
@@ -75,6 +89,72 @@ pub fn mutate_unary_suffix(
         repl,
         name,
     )
+}
+
+/// Compound-assignment operators (Infection Arithmetic `*Equal`): swap the arithmetic
+/// half — `+=`↔`-=`, `*=`→`/=`, `/=`→`*=`, `%=`→`*=`, `**=`→`/=`. (`*= -1` has an
+/// Infection skip-case we don't reproduce; the oracle fixture avoids it.)
+pub fn mutate_assignment(
+    op: &mago_syntax::ast::assignment::AssignmentOperator,
+) -> Option<(usize, usize, &'static [u8], &'static str)> {
+    use mago_syntax::ast::assignment::AssignmentOperator as A;
+    let (span, repl, name): (mago_span::Span, &'static [u8], &'static str) = match op {
+        A::Addition(s) => (*s, b"-=", "PlusEqual"),
+        A::Subtraction(s) => (*s, b"+=", "MinusEqual"),
+        A::Multiplication(s) => (*s, b"/=", "MulEqual"),
+        A::Division(s) => (*s, b"*=", "DivEqual"),
+        A::Modulo(s) => (*s, b"*=", "ModEqual"),
+        A::Exponentiation(s) => (*s, b"/=", "PowEqual"),
+        _ => return None,
+    };
+    Some((
+        span.start.offset as usize,
+        span.end.offset as usize,
+        repl,
+        name,
+    ))
+}
+
+/// Infection's `Unwrap*` mutators that keep the FIRST argument: `f(a, …)` → `a`.
+/// Maps a (lower-cased) PHP function name to its Infection mutator name. Only the
+/// default-parameter-index (arg 0) family is here; the custom-index ones (array_map,
+/// str_replace, array_merge, …) are a follow-up.
+pub fn unwrap_first_arg_name(fn_lower: &[u8]) -> Option<&'static str> {
+    Some(match fn_lower {
+        b"strtolower" => "UnwrapStrToLower",
+        b"strtoupper" => "UnwrapStrToUpper",
+        b"trim" => "UnwrapTrim",
+        b"ltrim" => "UnwrapLtrim",
+        b"rtrim" => "UnwrapRtrim",
+        b"ucfirst" => "UnwrapUcFirst",
+        b"lcfirst" => "UnwrapLcFirst",
+        b"ucwords" => "UnwrapUcWords",
+        b"strrev" => "UnwrapStrRev",
+        b"str_shuffle" => "UnwrapStrShuffle",
+        b"str_repeat" => "UnwrapStrRepeat",
+        b"substr" => "UnwrapSubstr",
+        b"array_reverse" => "UnwrapArrayReverse",
+        b"array_unique" => "UnwrapArrayUnique",
+        b"array_values" => "UnwrapArrayValues",
+        b"array_keys" => "UnwrapArrayKeys",
+        b"array_flip" => "UnwrapArrayFlip",
+        b"array_filter" => "UnwrapArrayFilter",
+        b"array_change_key_case" => "UnwrapArrayChangeKeyCase",
+        b"array_chunk" => "UnwrapArrayChunk",
+        b"array_column" => "UnwrapArrayColumn",
+        b"array_diff" => "UnwrapArrayDiff",
+        b"array_diff_assoc" => "UnwrapArrayDiffAssoc",
+        b"array_diff_key" => "UnwrapArrayDiffKey",
+        b"array_diff_uassoc" => "UnwrapArrayDiffUassoc",
+        b"array_diff_ukey" => "UnwrapArrayDiffUkey",
+        b"array_pad" => "UnwrapArrayPad",
+        b"array_slice" => "UnwrapArraySlice",
+        b"array_splice" => "UnwrapArraySplice",
+        b"array_udiff" => "UnwrapArrayUdiff",
+        b"array_udiff_assoc" => "UnwrapArrayUdiffAssoc",
+        b"array_udiff_uassoc" => "UnwrapArrayUdiffUassoc",
+        _ => return None,
+    })
 }
 
 /// Infection's cast mutators UNWRAP the cast (`(int)$x` → `$x`), so we remove the
@@ -113,75 +193,56 @@ mod tests {
         Span::new(FileId::zero(), Position::new(a), Position::new(b))
     }
 
+    /// True when `mutate_binary(op)` yields a `(replacement, name)` pair.
+    fn has(op: &mago_syntax::ast::binary::BinaryOperator, repl: &[u8], name: &str) -> bool {
+        mutate_binary(op)
+            .into_iter()
+            .any(|(_, _, r, n)| r == repl && n == name)
+    }
+
     #[test]
     fn plus_becomes_minus() {
         use mago_syntax::ast::binary::BinaryOperator;
-        let op = BinaryOperator::Addition(span(10, 11));
-        let (start, end, repl, name) = mutate_binary(&op).unwrap();
-        assert_eq!((start, end), (10, 11));
-        assert_eq!(repl, b"-");
-        assert_eq!(name, "Plus");
+        let v = mutate_binary(&BinaryOperator::Addition(span(10, 11)));
+        assert_eq!(v, vec![(10usize, 11usize, b"-".as_slice(), "Plus")]);
     }
 
     #[test]
-    fn greater_than_becomes_greater_or_equal() {
-        use mago_syntax::ast::binary::BinaryOperator;
-        let op = BinaryOperator::GreaterThan(span(4, 5));
-        let (start, end, repl, name) = mutate_binary(&op).unwrap();
-        assert_eq!((start, end), (4, 5));
-        assert_eq!(repl, b">=");
-        assert_eq!(name, "GreaterThan");
+    fn comparison_has_boundary_and_negation() {
+        use mago_syntax::ast::binary::BinaryOperator as B;
+        assert!(has(&B::GreaterThan(span(4, 5)), b">=", "GreaterThan"));
+        assert!(has(
+            &B::GreaterThan(span(4, 5)),
+            b"<=",
+            "GreaterThanNegotiation"
+        ));
+        assert!(has(&B::LessThan(span(4, 5)), b"<=", "LessThan"));
+        assert!(has(&B::LessThan(span(4, 5)), b">=", "LessThanNegotiation"));
     }
 
     #[test]
-    fn bitwise_and_becomes_or() {
-        use mago_syntax::ast::binary::BinaryOperator;
-        let (start, end, repl, name) =
-            mutate_binary(&BinaryOperator::BitwiseAnd(span(0, 1))).unwrap();
-        assert_eq!((start, end), (0, 1));
-        assert_eq!(repl, b"|");
-        assert_eq!(name, "BitwiseAnd");
+    fn equality_has_flip_and_tighten() {
+        use mago_syntax::ast::binary::BinaryOperator as B;
+        assert!(has(&B::Equal(span(0, 2)), b"!=", "Equal"));
+        assert!(has(&B::Equal(span(0, 2)), b"===", "EqualIdentical"));
+        assert!(has(&B::Identical(span(0, 3)), b"!==", "Identical"));
+        assert!(has(&B::Identical(span(0, 3)), b"==", "IdenticalEqual"));
     }
 
     #[test]
-    fn bitwise_or_and_xor_become_and() {
-        use mago_syntax::ast::binary::BinaryOperator;
-        assert_eq!(
-            mutate_binary(&BinaryOperator::BitwiseOr(span(0, 1)))
-                .unwrap()
-                .2,
-            b"&"
-        );
-        assert_eq!(
-            mutate_binary(&BinaryOperator::BitwiseOr(span(0, 1)))
-                .unwrap()
-                .3,
-            "BitwiseOr"
-        );
-        assert_eq!(
-            mutate_binary(&BinaryOperator::BitwiseXor(span(0, 1)))
-                .unwrap()
-                .2,
-            b"&"
-        );
-        assert_eq!(
-            mutate_binary(&BinaryOperator::BitwiseXor(span(0, 1)))
-                .unwrap()
-                .3,
-            "BitwiseXor"
-        );
+    fn bitwise_swaps() {
+        use mago_syntax::ast::binary::BinaryOperator as B;
+        assert!(has(&B::BitwiseAnd(span(0, 1)), b"|", "BitwiseAnd"));
+        assert!(has(&B::BitwiseOr(span(0, 1)), b"&", "BitwiseOr"));
+        assert!(has(&B::BitwiseXor(span(0, 1)), b"&", "BitwiseXor"));
     }
 
     #[test]
     fn shifts_swap_direction() {
-        use mago_syntax::ast::binary::BinaryOperator;
+        use mago_syntax::ast::binary::BinaryOperator as B;
         // mago variant LeftShift -> Infection mutator name "ShiftLeft", replacement ">>".
-        let (_, _, repl, name) = mutate_binary(&BinaryOperator::LeftShift(span(0, 2))).unwrap();
-        assert_eq!(repl, b">>");
-        assert_eq!(name, "ShiftLeft");
-        let (_, _, repl, name) = mutate_binary(&BinaryOperator::RightShift(span(0, 2))).unwrap();
-        assert_eq!(repl, b"<<");
-        assert_eq!(name, "ShiftRight");
+        assert!(has(&B::LeftShift(span(0, 2)), b">>", "ShiftLeft"));
+        assert!(has(&B::RightShift(span(0, 2)), b"<<", "ShiftRight"));
     }
 
     #[test]
@@ -220,6 +281,24 @@ mod tests {
             value: b"null"
         }))
         .is_none());
+    }
+
+    #[test]
+    fn assignment_operators_swap_arithmetic() {
+        use mago_syntax::ast::assignment::AssignmentOperator as A;
+        let (start, end, repl, name) = mutate_assignment(&A::Addition(span(0, 2))).unwrap();
+        assert_eq!((start, end), (0, 2));
+        assert_eq!(repl, b"-=");
+        assert_eq!(name, "PlusEqual");
+        assert_eq!(
+            mutate_assignment(&A::Multiplication(span(0, 2))).unwrap().3,
+            "MulEqual"
+        );
+        assert_eq!(
+            mutate_assignment(&A::Exponentiation(span(0, 3))).unwrap().2,
+            b"/="
+        );
+        assert!(mutate_assignment(&A::Assign(span(0, 1))).is_none());
     }
 
     #[test]
@@ -262,17 +341,28 @@ mod tests {
     }
 
     #[test]
-    fn increment_becomes_decrement() {
+    fn increment_operator_becomes_decrement() {
+        // The `++` operator mutator is Infection's Arithmetic `Increment`.
         let (start, end, repl, name) = mutate_unary_suffix(span(2, 4), true);
         assert_eq!((start, end), (2, 4));
         assert_eq!(repl, b"--");
-        assert_eq!(name, "IncrementInteger");
+        assert_eq!(name, "Increment");
     }
 
     #[test]
-    fn decrement_becomes_increment() {
+    fn decrement_operator_becomes_increment() {
         let (_, _, repl, name) = mutate_unary_suffix(span(2, 4), false);
         assert_eq!(repl, b"++");
-        assert_eq!(name, "DecrementInteger");
+        assert_eq!(name, "Decrement");
+    }
+
+    #[test]
+    fn exponentiation_becomes_division() {
+        use mago_syntax::ast::binary::BinaryOperator;
+        assert!(has(
+            &BinaryOperator::Exponentiation(span(0, 2)),
+            b"/",
+            "Exponentiation"
+        ));
     }
 }

@@ -12,9 +12,69 @@ pub mod plan;
 
 use bumpalo::Bump;
 use mago_database::file::FileId;
+use mago_span::HasSpan;
+use mago_syntax::ast::argument::{Argument, ArgumentList};
+use mago_syntax::ast::call::FunctionCall;
+use mago_syntax::ast::expression::Expression;
+use mago_syntax::ast::identifier::Identifier;
+use mago_syntax::ast::literal::Literal;
 use mago_syntax::ast::node::Node;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
+use mago_syntax::ast::variable::Variable;
 use mago_syntax::parser::parse_file_content;
+
+/// The lower-cased, namespace-stripped name of an identifier-callee (e.g. `\StrToLower`
+/// → `strtolower`); `None` for dynamic callees (`$f(...)`, closures, method calls).
+fn callee_name_lower(func: &Expression) -> Option<Vec<u8>> {
+    let Expression::Identifier(id) = func else {
+        return None;
+    };
+    let raw: &[u8] = match id {
+        Identifier::Local(l) => l.value,
+        Identifier::Qualified(q) => q.value,
+        Identifier::FullyQualified(f) => f.value,
+    };
+    let last = raw.rsplit(|&b| b == b'\\').next().unwrap_or(raw);
+    Some(last.to_ascii_lowercase())
+}
+
+/// Byte span of the first positional (non-spread) argument's value, if any.
+fn first_arg_span(args: &ArgumentList) -> Option<(usize, usize)> {
+    let Argument::Positional(p) = args.arguments.iter().next()? else {
+        return None;
+    };
+    if p.ellipsis.is_some() {
+        return None;
+    }
+    let s = p.value.span();
+    Some((s.start.offset as usize, s.end.offset as usize))
+}
+
+/// Infection `Unwrap*`: `f(a, …)` → `a`. Replace the whole call with its first arg.
+fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &FunctionCall) {
+    let Some(name) = callee_name_lower(fc.function) else {
+        return;
+    };
+    let Some(mutator) = mutators::unwrap_first_arg_name(&name) else {
+        return;
+    };
+    let Some((astart, aend)) = first_arg_span(&fc.argument_list) else {
+        return;
+    };
+    if astart >= aend || aend > source.len() {
+        return;
+    }
+    let call = fc.span();
+    record_owned(
+        out,
+        file,
+        source,
+        call.start.offset as usize,
+        call.end.offset as usize,
+        source[astart..aend].to_vec(),
+        mutator,
+    );
+}
 
 /// 1-based line number of byte `offset` (count the newlines before it).
 fn line_at(source: &[u8], offset: usize) -> u32 {
@@ -33,14 +93,72 @@ fn record(
     t: (usize, usize, &'static [u8], &'static str),
 ) {
     let (start, end, repl, name) = t;
+    record_owned(out, file, source, start, end, repl.to_vec(), name);
+}
+
+/// Record a mutation whose replacement bytes are computed (e.g. an integer literal
+/// N → N±1), not a `&'static` token.
+fn record_owned(
+    out: &mut Vec<Mutant>,
+    file: &Path,
+    source: &[u8],
+    start: usize,
+    end: usize,
+    replacement: Vec<u8>,
+    name: &'static str,
+) {
     out.push(Mutant {
         file: file.to_path_buf(),
         start,
         end,
-        replacement: repl.to_vec(),
+        replacement,
         mutator: name,
         line: line_at(source, start),
     });
+}
+
+/// Emit the two Number mutants for an integer literal: `IncrementInteger` (N→N+1) and
+/// `DecrementInteger` (N→N-1). Uses i128 so `0` decrements to `-1` without wrapping.
+/// (Infection has a parent-`UnaryMinus` special case for negative literals; we don't
+/// track parents, so negative literals are out of scope — the oracle fixture avoids them.)
+fn record_integer_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit: &Literal) {
+    let Literal::Integer(int) = lit else { return };
+    let Some(v) = int.value else { return };
+    let (start, end) = (int.span.start.offset as usize, int.span.end.offset as usize);
+    let v = v as i128;
+    record_owned(
+        out,
+        file,
+        source,
+        start,
+        end,
+        (v + 1).to_string().into_bytes(),
+        "IncrementInteger",
+    );
+    record_owned(
+        out,
+        file,
+        source,
+        start,
+        end,
+        (v - 1).to_string().into_bytes(),
+        "DecrementInteger",
+    );
+}
+
+/// Infection's `OneZeroFloat`: mutates ONLY the float literals `0.0`/`1.0`
+/// (`1.0`→`0.0`, `0.0`→`1.0`); any other float is left alone.
+fn record_float_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit: &Literal) {
+    let Literal::Float(f) = lit else { return };
+    let repl: &[u8] = if f.value.0 == 0.0 {
+        b"1.0"
+    } else if f.value.0 == 1.0 {
+        b"0.0"
+    } else {
+        return;
+    };
+    let (start, end) = (f.span.start.offset as usize, f.span.end.offset as usize);
+    record_owned(out, file, source, start, end, repl.to_vec(), "OneZeroFloat");
 }
 
 /// Parse `source` and emit every V1 mutant, sorted by byte offset. A parse that
@@ -56,14 +174,64 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
         stack.extend(node.children());
         match node {
             Node::Binary(b) => {
-                if let Some(t) = mutators::mutate_binary(&b.operator) {
+                for t in mutators::mutate_binary(&b.operator) {
                     record(&mut out, path, source, t);
+                }
+            }
+            Node::AssignmentOperator(op) => {
+                if let Some(t) = mutators::mutate_assignment(op) {
+                    record(&mut out, path, source, t);
+                }
+            }
+            Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // ReturnValue mutators: `return $this`->null (This), `return N`->`-N`
+            // (IntegerNegation), `return F`->`-F` (FloatNegation).
+            Node::Return(r) => {
+                if let Some(val) = r.value {
+                    let s = val.span();
+                    let (start, end) = (s.start.offset as usize, s.end.offset as usize);
+                    match val {
+                        Expression::Variable(Variable::Direct(v))
+                            if v.name == b"$this" || v.name == b"this" =>
+                        {
+                            record_owned(
+                                &mut out,
+                                path,
+                                source,
+                                start,
+                                end,
+                                b"null".to_vec(),
+                                "This",
+                            );
+                        }
+                        Expression::Literal(Literal::Integer(_)) => {
+                            let mut repl = vec![b'-'];
+                            repl.extend_from_slice(&source[start..end]);
+                            record_owned(
+                                &mut out,
+                                path,
+                                source,
+                                start,
+                                end,
+                                repl,
+                                "IntegerNegation",
+                            );
+                        }
+                        Expression::Literal(Literal::Float(_)) => {
+                            let mut repl = vec![b'-'];
+                            repl.extend_from_slice(&source[start..end]);
+                            record_owned(&mut out, path, source, start, end, repl, "FloatNegation");
+                        }
+                        _ => {}
+                    }
                 }
             }
             Node::Literal(l) => {
                 if let Some(t) = mutators::mutate_literal(l) {
                     record(&mut out, path, source, t);
                 }
+                record_integer_literal(&mut out, path, source, l);
+                record_float_literal(&mut out, path, source, l);
             }
             Node::UnaryPrefix(u) => match &u.operator {
                 UnaryPrefixOperator::PreIncrement(s) => {
@@ -80,6 +248,19 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         path,
                         source,
                         mutators::mutate_unary_suffix(*s, false),
+                    );
+                }
+                UnaryPrefixOperator::Not(s) => {
+                    // LogicalNot: remove the `!` (unwrap). We don't handle `!!` (Infection
+                    // skips it); the oracle fixture avoids doubled negation.
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s.start.offset as usize,
+                        s.end.offset as usize,
+                        Vec::new(),
+                        "LogicalNot",
                     );
                 }
                 other => {
@@ -165,6 +346,17 @@ mod tests {
             .expect("CastInt mutant");
         assert_eq!(&src[m.start..m.end], b"(int)");
         assert_eq!(m.replacement, b"", "unwrap removes the cast");
+    }
+
+    #[test]
+    fn unwraps_string_function_to_first_arg() {
+        let src = b"<?php\nfunction f($s) { return strtolower($s); }\n";
+        let m = generate_file(std::path::Path::new("f.php"), src)
+            .into_iter()
+            .find(|m| m.mutator == "UnwrapStrToLower")
+            .expect("UnwrapStrToLower mutant");
+        assert_eq!(&src[m.start..m.end], b"strtolower($s)");
+        assert_eq!(m.replacement, b"$s");
     }
 
     #[test]
