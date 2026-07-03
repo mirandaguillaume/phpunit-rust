@@ -152,4 +152,16 @@ final class OpsTest extends TestCase
     {
         self::assertTrue((new Ops())->nidn(1, '1'));
     }
+
+    public function testNot(): void
+    {
+        // !$x on true = false; mutated (unwrapped) $x = true -> KILLED (LogicalNot).
+        self::assertFalse((new Ops())->not(true));
+    }
+
+    public function testOne(): void
+    {
+        // 1.0 -> 0.0 -> KILLED (OneZeroFloat).
+        self::assertSame(1.0, (new Ops())->one());
+    }
 }

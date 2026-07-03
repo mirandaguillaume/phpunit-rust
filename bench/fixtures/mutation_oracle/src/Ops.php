@@ -125,4 +125,14 @@ final class Ops
     {
         return $a !== $b;
     }
+
+    public function not(bool $x): bool
+    {
+        return !$x;
+    }
+
+    public function one(): float
+    {
+        return 1.0;
+    }
 }

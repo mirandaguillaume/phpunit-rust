@@ -87,6 +87,21 @@ fn record_integer_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit
     );
 }
 
+/// Infection's `OneZeroFloat`: mutates ONLY the float literals `0.0`/`1.0`
+/// (`1.0`→`0.0`, `0.0`→`1.0`); any other float is left alone.
+fn record_float_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit: &Literal) {
+    let Literal::Float(f) = lit else { return };
+    let repl: &[u8] = if f.value.0 == 0.0 {
+        b"1.0"
+    } else if f.value.0 == 1.0 {
+        b"0.0"
+    } else {
+        return;
+    };
+    let (start, end) = (f.span.start.offset as usize, f.span.end.offset as usize);
+    record_owned(out, file, source, start, end, repl.to_vec(), "OneZeroFloat");
+}
+
 /// Parse `source` and emit every V1 mutant, sorted by byte offset. A parse that
 /// yields no usable AST simply produces no mutants (never panics).
 pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
@@ -109,6 +124,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     record(&mut out, path, source, t);
                 }
                 record_integer_literal(&mut out, path, source, l);
+                record_float_literal(&mut out, path, source, l);
             }
             Node::UnaryPrefix(u) => match &u.operator {
                 UnaryPrefixOperator::PreIncrement(s) => {
@@ -125,6 +141,19 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         path,
                         source,
                         mutators::mutate_unary_suffix(*s, false),
+                    );
+                }
+                UnaryPrefixOperator::Not(s) => {
+                    // LogicalNot: remove the `!` (unwrap). We don't handle `!!` (Infection
+                    // skips it); the oracle fixture avoids doubled negation.
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s.start.offset as usize,
+                        s.end.offset as usize,
+                        Vec::new(),
+                        "LogicalNot",
                     );
                 }
                 other => {
