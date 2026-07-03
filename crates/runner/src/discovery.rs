@@ -7,7 +7,7 @@
 //! don't have to switch their use-statements.
 
 pub use discovery::{
-    discover_cases_and_test_index, discover_class_file_index, discover_class_file_index_targeted,
+    class_file_index_for, discover_cases_and_test_index, discover_class_file_index,
     discover_in_dir, discover_in_dirs, discover_in_file, discover_nontest_class_index,
     discover_with_index, format_setup_hoist_report, format_shared_fixture_report, group_by_class,
     setup_hoist_report_in_dir, setup_hoist_report_in_file, shared_fixture_report_in_dir,

@@ -2883,62 +2883,6 @@ pub fn discover_with_index(
     Ok((cases, index))
 }
 
-/// Scan `dirs` for ALL `.php` files (not just `*Test*.php`) and return a
-/// map of FQCN → file path. Used by the runner to locate files for
-/// `#[DataProviderExternal]` provider classes that are not in the PSR-4
-/// autoloader.
-///
-/// Only the first file seen for each FQCN is kept (stable, depth-first).
-/// Like [`discover_class_file_index`] but parses ONLY `.php` files whose
-/// stem (basename without extension) is in `candidate_stems`. Lets the
-/// caller pre-narrow the parse set when it knows the exact class names it
-/// is looking for — e.g. derived from the test cases' fingerprints after
-/// PSR-4-resolvable FQCNs have been filtered out via a cheap lookup.
-///
-/// The returned map is post-filtered to only keep entries whose FQCN is
-/// in `keep_fqcns`, mirroring the typical caller pattern.
-pub fn discover_class_file_index_targeted(
-    dirs: &[PathBuf],
-    candidate_stems: &HashSet<String>,
-    keep_fqcns: &HashSet<String>,
-) -> HashMap<String, PathBuf> {
-    if candidate_stems.is_empty() || keep_fqcns.is_empty() {
-        return HashMap::new();
-    }
-    let files: Vec<PathBuf> = dirs
-        .iter()
-        .flat_map(|dir| WalkDir::new(dir).into_iter().filter_map(|e| e.ok()))
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("php"))
-        .filter_map(|e| {
-            let p = e.path();
-            let stem = p.file_stem()?.to_str()?;
-            if candidate_stems.contains(stem) {
-                Some(p.to_path_buf())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let pairs: Vec<(String, PathBuf)> = files
-        .par_iter()
-        .flat_map(|p| {
-            parse_file_classes(p)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|c| keep_fqcns.contains(&c.fqcn))
-                .map(|c| (c.fqcn, c.file))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    let mut index = HashMap::with_capacity(pairs.len());
-    for (fqcn, file) in pairs {
-        index.entry(fqcn).or_insert(file);
-    }
-    index
-}
-
 /// FQCN→file index over the NON-`*Test*.php` files in `dirs` (the "IndexOnly" bucket),
 /// honoring `excludes`, with the same path-sorted, first-occurrence-wins semantics as
 /// [`discover_with_index`]. Lets the runner's fallback build the full index by merging this
@@ -2992,6 +2936,95 @@ pub fn discover_nontest_class_index(
         })
         .collect();
     let mut index = HashMap::with_capacity(pairs.len());
+    for (fqcn, file) in pairs {
+        index.entry(fqcn).or_insert(file);
+    }
+    index
+}
+
+/// Build an FQCN→file index for ONLY the `wanted` classes, by scanning the non-test
+/// `.php` files under `dirs` but parsing just the few that could actually declare a
+/// wanted class. A cheap substring pre-filter (read the file, look for any wanted
+/// *short* name) gates the expensive tree-sitter parse, so a handful of unresolved
+/// classes (e.g. a fixture outside composer's autoload) cost a full read-pass but only
+/// a couple of parses — versus `discover_nontest_class_index` which parses every file.
+///
+/// The result contains only entries whose FQCN is in `wanted`; unrelated classes in the
+/// same file are dropped. This is sound because the index is purely a PSR-4-miss fallback
+/// for the worker: classes the worker can already autoload need no entry.
+pub fn class_file_index_for(
+    wanted: &HashSet<String>,
+    dirs: &[PathBuf],
+    excludes: &[PathBuf],
+) -> HashMap<String, PathBuf> {
+    let mut index = HashMap::new();
+    if wanted.is_empty() {
+        return index;
+    }
+    // Normalise wanted FQCNs (drop any leading '\') and derive their short (unqualified)
+    // names — a file that never mentions a wanted short name cannot declare it.
+    let wanted_norm: HashSet<&str> = wanted.iter().map(|f| f.trim_start_matches('\\')).collect();
+    let short_names: Vec<&str> = wanted_norm
+        .iter()
+        .map(|f| f.rsplit('\\').next().unwrap_or(f))
+        .collect();
+
+    // Same file set as discover_nontest_class_index: project .php files, minus *Test*
+    // files (already indexed by the fast path) and excluded dirs.
+    let canon_excludes: Vec<PathBuf> = excludes
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for dir in dirs {
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("php") {
+                continue;
+            }
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.contains("Test"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Ok(canon) = p.canonicalize() {
+                if canon_excludes.iter().any(|ex| canon.starts_with(ex)) {
+                    continue;
+                }
+            }
+            let buf = p.to_path_buf();
+            if !seen.insert(buf.clone()) {
+                continue;
+            }
+            files.push(buf);
+        }
+    }
+    files.sort();
+
+    // Read + substring pre-filter in parallel; parse only files that mention a wanted
+    // short name, and keep only entries whose FQCN is actually wanted.
+    let pairs: Vec<(String, PathBuf)> = files
+        .par_iter()
+        .filter_map(|p| {
+            let content = std::fs::read(p).ok()?;
+            let hay = String::from_utf8_lossy(&content);
+            if !short_names.iter().any(|s| hay.contains(s)) {
+                return None;
+            }
+            Some(
+                parse_file_classes(p)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| wanted_norm.contains(c.fqcn.trim_start_matches('\\')))
+                    .map(|c| (c.fqcn, c.file))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect();
     for (fqcn, file) in pairs {
         index.entry(fqcn).or_insert(file);
     }
@@ -4379,6 +4412,44 @@ class ConcreteTest extends BaseTest {}
         assert!(
             !idx.contains_key("App\\FooTest"),
             "*Test* file must be skipped"
+        );
+    }
+
+    #[test]
+    fn class_file_index_for_resolves_only_wanted_classes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // A fixture the fast path cannot autoload (not PSR-4/classmap): it lives in a
+        // non-*Test* file and is exactly what the targeted fallback must find.
+        std::fs::write(
+            dir.join("src/SomeExtension.php"),
+            "<?php\nnamespace App\\Ext;\nclass SomeExtension {}\n",
+        )
+        .unwrap();
+        // An unrelated non-test class that must NOT be indexed (never mentioned by a
+        // wanted short name, so the substring pre-filter skips parsing it entirely).
+        std::fs::write(
+            dir.join("src/Unrelated.php"),
+            "<?php\nnamespace App;\nclass Unrelated {}\n",
+        )
+        .unwrap();
+        let wanted: HashSet<String> = ["App\\Ext\\SomeExtension".to_string()]
+            .into_iter()
+            .collect();
+        let idx = class_file_index_for(&wanted, &[dir.join("src")], &[]);
+        assert!(
+            idx.contains_key("App\\Ext\\SomeExtension"),
+            "the wanted fixture must be resolved from its non-test file"
+        );
+        assert!(
+            !idx.contains_key("App\\Unrelated"),
+            "a non-wanted class must be left out of the targeted index"
+        );
+        assert_eq!(
+            idx.len(),
+            1,
+            "targeted index must contain only wanted classes"
         );
     }
 

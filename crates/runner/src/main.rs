@@ -3,9 +3,7 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use proust::discovery::{
-    discover_cases_and_test_index, discover_nontest_class_index, discover_with_index,
-};
+use proust::discovery::{class_file_index_for, discover_cases_and_test_index, discover_with_index};
 
 /// Parse composer.json's `autoload-dev` AND `autoload` PSR-4/classmap entries
 /// into a list of directories, resolved relative to `project`. Used to build
@@ -102,6 +100,34 @@ fn load_composer_psr4_map(project: &Path) -> Option<Vec<(String, PathBuf)>> {
     }
 }
 
+/// Parse `vendor/composer/autoload_classmap.php` into the set of mapped FQCNs.
+/// A class present here is autoloadable by the worker via composer's class map, so
+/// — exactly like a PSR-4-resolvable class — it must NOT force the (much slower)
+/// full-parse discovery path. This matters for optimized/authoritative autoloaders
+/// (`composer install --optimize`, common in CI and in phpunit-itself), where most
+/// classes live in the class map rather than a PSR-4 prefix. Returns None when the
+/// file is absent or yields nothing (caller then relies on PSR-4 + the full-parse
+/// fallback, never worse than before).
+fn load_composer_classmap(project: &Path) -> Option<std::collections::HashSet<String>> {
+    let text =
+        std::fs::read_to_string(project.join("vendor/composer/autoload_classmap.php")).ok()?;
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in text.lines() {
+        let Some(arrow) = line.find("=>") else {
+            continue;
+        };
+        let (head, _tail) = line.split_at(arrow);
+        if let Some(fqcn_raw) = first_single_quoted(head) {
+            out.insert(fqcn_raw.replace("\\\\", "\\"));
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// True when composer's PSR-4 autoloader would resolve `fqcn` to an existing file —
 /// i.e. some prefix matches and the derived path is on disk. When true, the runner's
 /// own class-map fallback entry for `fqcn` is dead weight (the worker autoloads it via
@@ -158,22 +184,45 @@ fn build_cases_and_index(
                 wanted.insert(c.class.clone());
             }
 
-            let all_resolvable = wanted
-                .iter()
-                .all(|f| test_class_index.contains_key(f) || is_psr4_resolvable(f, &psr4));
+            // A class the tests reference counts as "resolvable" (no full parse
+            // needed) when it is a parsed test class, PSR-4-resolvable, OR present
+            // in composer's class map (the worker autoloads it either way).
+            let classmap = load_composer_classmap(project);
+            let all_resolvable = wanted.iter().all(|f| {
+                test_class_index.contains_key(f)
+                    || is_psr4_resolvable(f, &psr4)
+                    || classmap
+                        .as_ref()
+                        .is_some_and(|cm| cm.contains(f.trim_start_matches('\\')))
+            });
             if all_resolvable {
                 return Ok((cases, test_class_index));
             }
-            // Fallback WITHOUT re-parsing the test files: parse only the non-test files and
-            // merge with the already-parsed test-file index. Byte-identical to
-            // discover_with_index's (cases, index) for any suite without a cross-file FQCN
-            // redeclaration (which is a PHP fatal). Avoids the double test-file parse.
+            // Targeted fallback WITHOUT re-parsing the test files: only the classes that
+            // FAILED every resolvability check need a fallback index entry (the worker
+            // autoloads the rest via composer). Find just those by scanning the non-test
+            // files with a cheap substring pre-filter and parsing only the few that could
+            // declare them — instead of parsing the whole src tree. This keeps the fast
+            // path's speed even when a handful of fixtures escape composer's autoload
+            // (e.g. phpunit-itself's `PHPUnit\Metadata\SomeExtension`).
+            let unresolved: std::collections::HashSet<String> = wanted
+                .iter()
+                .filter(|f| {
+                    let f = f.as_str();
+                    !(test_class_index.contains_key(f)
+                        || is_psr4_resolvable(f, &psr4)
+                        || classmap
+                            .as_ref()
+                            .is_some_and(|cm| cm.contains(f.trim_start_matches('\\'))))
+                })
+                .cloned()
+                .collect();
             let dirs: Vec<PathBuf> = roots
                 .iter()
                 .chain(supplement_dirs.iter())
                 .cloned()
                 .collect();
-            let mut index = discover_nontest_class_index(&dirs, excludes);
+            let mut index = class_file_index_for(&unresolved, &dirs, excludes);
             for (fqcn, file) in test_class_index {
                 index.entry(fqcn).or_insert(file);
             }
@@ -1895,20 +1944,34 @@ return array(
     }
 
     #[test]
-    fn build_cases_and_index_fallback_index_matches_full_parse() {
+    fn build_cases_and_index_fallback_ships_unresolved_and_omits_resolvable() {
+        // The targeted fallback resolves ONLY the classes composer cannot autoload
+        // (the ones the worker might actually consult), and deliberately omits the
+        // PSR-4-resolvable non-test classes the full parse would enumerate — they are
+        // dead weight (the worker autoloads them via composer). This is the intended
+        // divergence from `discover_with_index`, which parses (and indexes) everything.
         let tmp = tempfile::TempDir::new().unwrap();
         let proj = tmp.path();
         std::fs::create_dir_all(proj.join("vendor/composer")).unwrap();
         std::fs::create_dir_all(proj.join("tests")).unwrap();
+        std::fs::create_dir_all(proj.join("src")).unwrap();
         std::fs::create_dir_all(proj.join("fixtures")).unwrap();
+        // App\Tests\ -> tests, App\Lib\ -> src. App\Fixtures\ is NOT mapped.
         std::fs::write(
             proj.join("vendor/composer/autoload_psr4.php"),
-            "<?php\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\nreturn array(\n    'App\\\\Tests\\\\' => array($baseDir . '/tests'),\n);\n",
+            "<?php\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\nreturn array(\n    'App\\\\Tests\\\\' => array($baseDir . '/tests'),\n    'App\\\\Lib\\\\' => array($baseDir . '/src'),\n);\n",
         )
         .unwrap();
+        // Unresolved provider at a non-PSR-4 path, filename != class name.
         std::fs::write(
             proj.join("fixtures/data_rows.php"),
             "<?php\nnamespace App\\Fixtures;\nclass Data { public static function rows() { return [[1]]; } }\n",
+        )
+        .unwrap();
+        // PSR-4-resolvable non-test class the tests never reference: dead weight.
+        std::fs::write(
+            proj.join("src/Helper.php"),
+            "<?php\nnamespace App\\Lib;\nclass Helper {}\n",
         )
         .unwrap();
         std::fs::write(
@@ -1917,14 +1980,26 @@ return array(
         )
         .unwrap();
         let roots = vec![proj.join("tests")];
-        let supp = vec![proj.join("tests"), proj.join("fixtures")];
+        let supp = vec![proj.join("tests"), proj.join("src"), proj.join("fixtures")];
 
         let (_c1, fallback_index) = build_cases_and_index(proj, &roots, &[], &supp, false).unwrap();
         let (_c2, full_index) = proust::discovery::discover_with_index(&roots, &[], &supp).unwrap();
-        assert_eq!(
-            fallback_index, full_index,
-            "fallback index must byte-match discover_with_index"
+
+        // Sufficiency: the unresolved provider (oddly-named file) is resolved via the
+        // content pre-filter — a stem/filename filter would have missed data_rows.php.
+        assert!(
+            fallback_index.contains_key("App\\Fixtures\\Data"),
+            "unresolved provider must be shipped so the worker can load it"
         );
-        assert!(fallback_index.contains_key("App\\Fixtures\\Data"));
+        // Frugality: the PSR-4-resolvable, unreferenced class is omitted...
+        assert!(
+            !fallback_index.contains_key("App\\Lib\\Helper"),
+            "PSR-4-resolvable dead weight must be omitted from the targeted index"
+        );
+        // ...but the full parse would have indexed it — the intended divergence.
+        assert!(
+            full_index.contains_key("App\\Lib\\Helper"),
+            "sanity: the full parse does enumerate the resolvable class"
+        );
     }
 }
