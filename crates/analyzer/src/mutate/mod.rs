@@ -6,6 +6,7 @@
 //! splice of `source[start..end]` — no pretty-printer, no re-emission.
 use std::path::{Path, PathBuf};
 
+pub mod coverage;
 pub mod mutators;
 
 use bumpalo::Bump;
