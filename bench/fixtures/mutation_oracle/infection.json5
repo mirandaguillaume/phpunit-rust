@@ -25,5 +25,10 @@
         FalseValue: true,
         IncrementInteger: true,
         DecrementInteger: true,
+        BitwiseAnd: true,
+        BitwiseOr: true,
+        BitwiseXor: true,
+        ShiftLeft: true,
+        ShiftRight: true,
     },
 }

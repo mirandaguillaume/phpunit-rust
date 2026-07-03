@@ -15,4 +15,29 @@ final class Ops
     {
         return $a >= $b;
     }
+
+    public function band(int $a, int $b): int
+    {
+        return $a & $b;
+    }
+
+    public function bor(int $a, int $b): int
+    {
+        return $a | $b;
+    }
+
+    public function bxor(int $a, int $b): int
+    {
+        return $a ^ $b;
+    }
+
+    public function shl(int $a, int $b): int
+    {
+        return $a << $b;
+    }
+
+    public function shr(int $a, int $b): int
+    {
+        return $a >> $b;
+    }
 }

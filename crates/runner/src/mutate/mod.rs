@@ -152,7 +152,7 @@ pub fn run_mutation(
     print!("{}", report::text_report(&msi, &escaped));
 
     if let Some(path) = escaped_json {
-        write_escaped_json(path, &escaped)?;
+        write_results_json(path, &outcomes)?;
     }
 
     if let Some(min) = min_msi {
@@ -242,21 +242,36 @@ fn run_php_with_stdin(script: &Path, autoload: &Path, input: &str) -> Result<Str
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Write `{"escaped":[{"mutator","file","line"}]}` — consumed by the oracle gate.
-fn write_escaped_json(path: &Path, escaped: &[&MutantOutcome]) -> Result<()> {
-    let mut s = String::from("{\"escaped\":[");
-    for (i, o) in escaped.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&format!(
-            r#"{{"mutator":"{}","file":"{}","line":{}}}"#,
-            o.mutant.mutator,
-            o.mutant.file.to_string_lossy().replace('\\', "\\\\"),
-            o.mutant.line
-        ));
-    }
-    s.push_str("]}");
+/// Write `{"escaped":[…],"killed":[…]}` (each entry `{mutator,file,line}`) — consumed
+/// by the oracle gate, which compares BOTH sets against Infection so a mis-generated
+/// mutant that happens to be killed cannot slip through an escaped-only comparison.
+fn write_results_json(path: &Path, outcomes: &[MutantOutcome]) -> Result<()> {
+    let entries = |set: &[&MutantOutcome]| -> String {
+        set.iter()
+            .map(|o| {
+                format!(
+                    r#"{{"mutator":"{}","file":"{}","line":{}}}"#,
+                    o.mutant.mutator,
+                    o.mutant.file.to_string_lossy().replace('\\', "\\\\"),
+                    o.mutant.line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let escaped: Vec<&MutantOutcome> = outcomes
+        .iter()
+        .filter(|o| o.status == MutantStatus::Escaped)
+        .collect();
+    let killed: Vec<&MutantOutcome> = outcomes
+        .iter()
+        .filter(|o| o.status == MutantStatus::Killed || o.status == MutantStatus::Timeout)
+        .collect();
+    let s = format!(
+        "{{\"escaped\":[{}],\"killed\":[{}]}}",
+        entries(&escaped),
+        entries(&killed)
+    );
     std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))
 }
 
