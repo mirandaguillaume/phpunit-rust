@@ -15,7 +15,7 @@ use mago_database::file::FileId;
 use mago_span::HasSpan;
 use mago_syntax::ast::argument::{Argument, ArgumentList};
 use mago_syntax::ast::binary::BinaryOperator;
-use mago_syntax::ast::call::FunctionCall;
+use mago_syntax::ast::call::{Call, FunctionCall};
 use mago_syntax::ast::expression::Expression;
 use mago_syntax::ast::identifier::Identifier;
 use mago_syntax::ast::literal::Literal;
@@ -219,6 +219,27 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // Removal: a statement that is JUST a call becomes a no-op (removed).
+            Node::ExpressionStatement(es) => {
+                if let Expression::Call(call) = es.expression {
+                    let name = match call {
+                        Call::Function(_) => "FunctionCallRemoval",
+                        Call::Method(_) | Call::NullSafeMethod(_) | Call::StaticMethod(_) => {
+                            "MethodCallRemoval"
+                        }
+                    };
+                    let sp = es.span();
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        sp.start.offset as usize,
+                        sp.end.offset as usize,
+                        Vec::new(),
+                        name,
+                    );
+                }
+            }
             // Ternary: `c ? then : else` -> `c ? else : then` (swap the branches).
             Node::Conditional(c) => {
                 if let Some(then) = c.then {
@@ -310,6 +331,18 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         s.end.offset as usize,
                         Vec::new(),
                         "LogicalNot",
+                    );
+                }
+                UnaryPrefixOperator::BitwiseNot(s) => {
+                    // BitwiseNot: `~$x` -> `$x` (remove the `~`).
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s.start.offset as usize,
+                        s.end.offset as usize,
+                        Vec::new(),
+                        "BitwiseNot",
                     );
                 }
                 other => {

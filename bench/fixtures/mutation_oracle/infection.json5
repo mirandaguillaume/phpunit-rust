@@ -95,5 +95,8 @@
         Coalesce: true,
         Ternary: true,
         Concat: true,
+        BitwiseNot: true,
+        MethodCallRemoval: true,
+        FunctionCallRemoval: true,
     },
 }

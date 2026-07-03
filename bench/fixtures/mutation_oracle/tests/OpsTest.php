@@ -271,4 +271,24 @@ final class OpsTest extends TestCase
         // 'a' . 'b' = 'ab'; swapped 'b' . 'a' = 'ba' -> KILLED (Concat).
         self::assertSame('ab', (new Ops())->cat('a', 'b'));
     }
+
+    public function testBnot(): void
+    {
+        // ~0 = -1; unwrapped $x = 0 -> KILLED (BitwiseNot).
+        self::assertSame(-1, (new Ops())->bnot(0));
+    }
+
+    public function testRun(): void
+    {
+        // removing `$this->record('x');` leaves the log empty -> KILLED (MethodCallRemoval).
+        self::assertSame(['x'], (new Ops())->run());
+    }
+
+    public function testRunF(): void
+    {
+        // removing `array_push($out, $v);` leaves $out empty -> KILLED (FunctionCallRemoval).
+        $out = [];
+        (new Ops())->runF($out, 'z');
+        self::assertSame(['z'], $out);
+    }
 }

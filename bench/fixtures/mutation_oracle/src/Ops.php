@@ -6,9 +6,33 @@ namespace Oracle;
 
 final class Ops
 {
+    /** @var list<string> */
+    private array $log = [];
+
     public function sum(int $a, int $b): int
     {
         return $a + $b;
+    }
+
+    public function bnot(int $x): int
+    {
+        return ~$x;
+    }
+
+    public function run(): array
+    {
+        $this->record('x');
+        return $this->log;
+    }
+
+    private function record(string $v): void
+    {
+        $this->log[] = $v;
+    }
+
+    public function runF(array &$out, string $v): void
+    {
+        array_push($out, $v);
     }
 
     public function gte(int $a, int $b): bool
