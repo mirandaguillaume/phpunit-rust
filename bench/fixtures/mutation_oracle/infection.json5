@@ -105,5 +105,13 @@
         UnwrapStrReplace: true,
         UnwrapStrIreplace: true,
         UnwrapArrayReduce: true,
+        UnwrapArrayMap: true,
+        UnwrapArrayMerge: true,
+        UnwrapArrayMergeRecursive: true,
+        UnwrapArrayReplace: true,
+        UnwrapArrayReplaceRecursive: true,
+        UnwrapArrayIntersect: true,
+        UnwrapArrayIntersectKey: true,
+        UnwrapArrayIntersectAssoc: true,
     },
 }

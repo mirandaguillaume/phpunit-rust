@@ -57,25 +57,33 @@ fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &Functio
     let Some(name) = callee_name_lower(fc.function) else {
         return;
     };
-    let Some((mutator, index)) = mutators::unwrap_arg(&name) else {
-        return;
-    };
-    let Some((astart, aend)) = nth_arg_span(&fc.argument_list, index) else {
-        return;
-    };
-    if astart >= aend || aend > source.len() {
+    let call = fc.span();
+    let (cstart, cend) = (call.start.offset as usize, call.end.offset as usize);
+    // Single-index unwrap: keep one fixed arg (arg 0 for most; `str_replace` → arg 2…).
+    if let Some((mutator, index)) = mutators::unwrap_arg(&name) {
+        let Some((astart, aend)) = nth_arg_span(&fc.argument_list, index) else {
+            return;
+        };
+        if astart >= aend || aend > source.len() {
+            return;
+        }
+        record_owned(out, file, source, cstart, cend, source[astart..aend].to_vec(), mutator);
         return;
     }
-    let call = fc.span();
-    record_owned(
-        out,
-        file,
-        source,
-        call.start.offset as usize,
-        call.end.offset as usize,
-        source[astart..aend].to_vec(),
-        mutator,
-    );
+    // Range unwrap: emit one mutant per kept arg (`array_merge` → each; `array_map` → all
+    // but the callback at index 0). Variable arg count, so iterate positionals.
+    if let Some((mutator, skip_first)) = mutators::unwrap_range(&name) {
+        let start_idx = usize::from(skip_first);
+        for i in start_idx..fc.argument_list.arguments.len() {
+            let Some((astart, aend)) = nth_arg_span(&fc.argument_list, i) else {
+                continue;
+            };
+            if astart >= aend || aend > source.len() {
+                continue;
+            }
+            record_owned(out, file, source, cstart, cend, source[astart..aend].to_vec(), mutator);
+        }
+    }
 }
 
 /// 1-based line number of byte `offset` (count the newlines before it).
