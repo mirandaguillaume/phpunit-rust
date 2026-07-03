@@ -67,7 +67,15 @@ fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &Functio
         if astart >= aend || aend > source.len() {
             return;
         }
-        record_owned(out, file, source, cstart, cend, source[astart..aend].to_vec(), mutator);
+        record_owned(
+            out,
+            file,
+            source,
+            cstart,
+            cend,
+            source[astart..aend].to_vec(),
+            mutator,
+        );
         return;
     }
     // Range unwrap: emit one mutant per kept arg (`array_merge` → each; `array_map` → all
@@ -81,7 +89,15 @@ fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &Functio
             if astart >= aend || aend > source.len() {
                 continue;
             }
-            record_owned(out, file, source, cstart, cend, source[astart..aend].to_vec(), mutator);
+            record_owned(
+                out,
+                file,
+                source,
+                cstart,
+                cend,
+                source[astart..aend].to_vec(),
+                mutator,
+            );
         }
     }
 }
