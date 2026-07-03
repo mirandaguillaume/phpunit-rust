@@ -70,4 +70,24 @@ final class Ops
     {
         return (object) $a;
     }
+
+    public function expo(int $a, int $b): int
+    {
+        return $a ** $b;
+    }
+
+    public function preinc(int $n): int
+    {
+        return ++$n;
+    }
+
+    public function predec(int $n): int
+    {
+        return --$n;
+    }
+
+    public function five(): int
+    {
+        return 5;
+    }
 }

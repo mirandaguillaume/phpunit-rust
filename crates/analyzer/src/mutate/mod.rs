@@ -12,6 +12,7 @@ pub mod plan;
 
 use bumpalo::Bump;
 use mago_database::file::FileId;
+use mago_syntax::ast::literal::Literal;
 use mago_syntax::ast::node::Node;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::parser::parse_file_content;
@@ -33,14 +34,57 @@ fn record(
     t: (usize, usize, &'static [u8], &'static str),
 ) {
     let (start, end, repl, name) = t;
+    record_owned(out, file, source, start, end, repl.to_vec(), name);
+}
+
+/// Record a mutation whose replacement bytes are computed (e.g. an integer literal
+/// N → N±1), not a `&'static` token.
+fn record_owned(
+    out: &mut Vec<Mutant>,
+    file: &Path,
+    source: &[u8],
+    start: usize,
+    end: usize,
+    replacement: Vec<u8>,
+    name: &'static str,
+) {
     out.push(Mutant {
         file: file.to_path_buf(),
         start,
         end,
-        replacement: repl.to_vec(),
+        replacement,
         mutator: name,
         line: line_at(source, start),
     });
+}
+
+/// Emit the two Number mutants for an integer literal: `IncrementInteger` (N→N+1) and
+/// `DecrementInteger` (N→N-1). Uses i128 so `0` decrements to `-1` without wrapping.
+/// (Infection has a parent-`UnaryMinus` special case for negative literals; we don't
+/// track parents, so negative literals are out of scope — the oracle fixture avoids them.)
+fn record_integer_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit: &Literal) {
+    let Literal::Integer(int) = lit else { return };
+    let Some(v) = int.value else { return };
+    let (start, end) = (int.span.start.offset as usize, int.span.end.offset as usize);
+    let v = v as i128;
+    record_owned(
+        out,
+        file,
+        source,
+        start,
+        end,
+        (v + 1).to_string().into_bytes(),
+        "IncrementInteger",
+    );
+    record_owned(
+        out,
+        file,
+        source,
+        start,
+        end,
+        (v - 1).to_string().into_bytes(),
+        "DecrementInteger",
+    );
 }
 
 /// Parse `source` and emit every V1 mutant, sorted by byte offset. A parse that
@@ -64,6 +108,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 if let Some(t) = mutators::mutate_literal(l) {
                     record(&mut out, path, source, t);
                 }
+                record_integer_literal(&mut out, path, source, l);
             }
             Node::UnaryPrefix(u) => match &u.operator {
                 UnaryPrefixOperator::PreIncrement(s) => {

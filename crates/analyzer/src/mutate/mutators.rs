@@ -37,6 +37,8 @@ pub fn mutate_binary(op: &BinaryOperator) -> Option<(usize, usize, &'static [u8]
         BinaryOperator::BitwiseXor(_) => (b"&", "BitwiseXor"),
         BinaryOperator::LeftShift(_) => (b">>", "ShiftLeft"),
         BinaryOperator::RightShift(_) => (b"<<", "ShiftRight"),
+        // `**` -> `/` (Infection Exponentiation).
+        BinaryOperator::Exponentiation(_) => (b"/", "Exponentiation"),
         _ => return None,
     };
     Some((start, end, repl, name))
@@ -58,16 +60,17 @@ pub fn mutate_literal(lit: &Literal) -> Option<(usize, usize, &'static [u8], &'s
     ))
 }
 
-/// `++`↔`--`. `is_increment` picks the direction and the Infection name; the caller
-/// passes the operator token's span (from a pre- or post-fix increment/decrement).
+/// `++`↔`--` (Infection Arithmetic `Increment`/`Decrement` — NOT the Number
+/// `IncrementInteger`/`DecrementInteger`, which mutate integer *literals*).
+/// `is_increment` picks the direction; the caller passes the operator token's span.
 pub fn mutate_unary_suffix(
     op_span: mago_span::Span,
     is_increment: bool,
 ) -> (usize, usize, &'static [u8], &'static str) {
     let (repl, name): (&'static [u8], &'static str) = if is_increment {
-        (b"--", "IncrementInteger")
+        (b"--", "Increment")
     } else {
-        (b"++", "DecrementInteger")
+        (b"++", "Decrement")
     };
     (
         op_span.start.offset as usize,
@@ -262,17 +265,27 @@ mod tests {
     }
 
     #[test]
-    fn increment_becomes_decrement() {
+    fn increment_operator_becomes_decrement() {
+        // The `++` operator mutator is Infection's Arithmetic `Increment`.
         let (start, end, repl, name) = mutate_unary_suffix(span(2, 4), true);
         assert_eq!((start, end), (2, 4));
         assert_eq!(repl, b"--");
-        assert_eq!(name, "IncrementInteger");
+        assert_eq!(name, "Increment");
     }
 
     #[test]
-    fn decrement_becomes_increment() {
+    fn decrement_operator_becomes_increment() {
         let (_, _, repl, name) = mutate_unary_suffix(span(2, 4), false);
         assert_eq!(repl, b"++");
-        assert_eq!(name, "DecrementInteger");
+        assert_eq!(name, "Decrement");
+    }
+
+    #[test]
+    fn exponentiation_becomes_division() {
+        use mago_syntax::ast::binary::BinaryOperator;
+        let (_, _, repl, name) =
+            mutate_binary(&BinaryOperator::Exponentiation(span(0, 2))).unwrap();
+        assert_eq!(repl, b"/");
+        assert_eq!(name, "Exponentiation");
     }
 }

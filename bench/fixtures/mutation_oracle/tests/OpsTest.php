@@ -83,4 +83,28 @@ final class OpsTest extends TestCase
     {
         self::assertInstanceOf(\stdClass::class, (new Ops())->co(['x' => 1]));
     }
+
+    public function testExpo(): void
+    {
+        // 2 ** 3 = 8; mutated 2 / 3 = 0 -> KILLED.
+        self::assertSame(8, (new Ops())->expo(2, 3));
+    }
+
+    public function testPreinc(): void
+    {
+        // ++$n on 5 = 6; mutated --$n = 4 -> KILLED (Increment).
+        self::assertSame(6, (new Ops())->preinc(5));
+    }
+
+    public function testPredec(): void
+    {
+        // --$n on 5 = 4; mutated ++$n = 6 -> KILLED (Decrement).
+        self::assertSame(4, (new Ops())->predec(5));
+    }
+
+    public function testFive(): void
+    {
+        // literal 5; IncrementInteger -> 6, DecrementInteger -> 4, both -> KILLED.
+        self::assertSame(5, (new Ops())->five());
+    }
 }
