@@ -20,27 +20,33 @@ fi
 # --- Infection: ground-truth escaped set as "MutatorName line" (php, no jq) ---
 rm -f infection.json
 vendor/bin/infection --no-progress --threads=4 --no-ansi >/tmp/infection_run.log 2>&1 || true
-php -r '$d=json_decode(file_get_contents("infection.json"),true)?:[];foreach($d["escaped"]??[] as $m){echo $m["mutator"]["mutatorName"]." ".$m["mutator"]["originalStartLine"]."\n";}' \
-    | sort > /tmp/infection_escaped.txt
+# Infection's `killed` + `escaped` arrays, each as "MutatorName line".
+inf_set() { php -r '$d=json_decode(file_get_contents("infection.json"),true)?:[];foreach($d[$argv[1]]??[] as $m){echo $m["mutator"]["mutatorName"]." ".$m["mutator"]["originalStartLine"]."\n";}' "$1"; }
+inf_set escaped | sort > /tmp/infection_escaped.txt
+inf_set killed  | sort > /tmp/infection_killed.txt
 
-# --- proust: same shape from --mutation-escaped-json ---
+# --- proust: same shape from --mutation-escaped-json (holds escaped AND killed) ---
 rm -f proust_escaped.json
 "$PROUST" --project . --mutate --workers 4 --mutation-escaped-json proust_escaped.json \
     >/tmp/proust_run.log 2>&1 || true
 if [ ! -f proust_escaped.json ]; then
-    echo "proust produced no escaped JSON — its output was:" >&2
+    echo "proust produced no results JSON — its output was:" >&2
     cat /tmp/proust_run.log >&2
     exit 1
 fi
-php -r '$d=json_decode(file_get_contents("proust_escaped.json"),true)?:[];foreach($d["escaped"]??[] as $m){echo $m["mutator"]." ".$m["line"]."\n";}' \
-    | sort > /tmp/proust_escaped.txt
+proust_set() { php -r '$d=json_decode(file_get_contents("proust_escaped.json"),true)?:[];foreach($d[$argv[1]]??[] as $m){echo $m["mutator"]." ".$m["line"]."\n";}' "$1"; }
+proust_set escaped | sort > /tmp/proust_escaped.txt
+proust_set killed  | sort > /tmp/proust_killed.txt
 
-echo "=== Infection escaped ==="; cat /tmp/infection_escaped.txt
-echo "=== proust escaped ===";    cat /tmp/proust_escaped.txt
+echo "=== escaped: infection | proust ==="; paste /tmp/infection_escaped.txt /tmp/proust_escaped.txt
+echo "=== killed count: infection=$(wc -l < /tmp/infection_killed.txt) proust=$(wc -l < /tmp/proust_killed.txt) ==="
 
-if diff -u /tmp/infection_escaped.txt /tmp/proust_escaped.txt; then
-    echo "oracle OK: escaped sets match"
-else
-    echo "ORACLE MISMATCH: proust and Infection disagree on escaped mutants" >&2
-    exit 1
+fail=0
+if ! diff -u /tmp/infection_escaped.txt /tmp/proust_escaped.txt; then
+    echo "ORACLE MISMATCH: escaped sets differ" >&2; fail=1
 fi
+if ! diff -u /tmp/infection_killed.txt /tmp/proust_killed.txt; then
+    echo "ORACLE MISMATCH: killed sets differ (a mutator was generated/classified differently)" >&2; fail=1
+fi
+if [ "$fail" -ne 0 ]; then exit 1; fi
+echo "oracle OK: killed AND escaped sets match ($(( $(wc -l < /tmp/proust_killed.txt) + $(wc -l < /tmp/proust_escaped.txt) )) mutants)"

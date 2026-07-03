@@ -9,8 +9,8 @@ use mago_syntax::ast::literal::Literal;
 /// `(start_offset, end_offset, replacement_bytes, mutator_name)`.
 ///
 /// The byte offsets come straight from the operator token's span, so the caller
-/// patches `source[start..end] = replacement`. Returns `None` for operators the
-/// V1 set does not mutate (bitwise, concat, coalesce, spaceship, `**`, …).
+/// patches `source[start..end] = replacement`. Returns `None` for operators not in
+/// the set (string concat `.`, coalesce `??`, spaceship `<=>`, `**`, …).
 pub fn mutate_binary(op: &BinaryOperator) -> Option<(usize, usize, &'static [u8], &'static str)> {
     let s = op.span();
     let (start, end) = (s.start.offset as usize, s.end.offset as usize);
@@ -30,6 +30,13 @@ pub fn mutate_binary(op: &BinaryOperator) -> Option<(usize, usize, &'static [u8]
         BinaryOperator::NotIdentical(_) => (b"===", "NotIdentical"),
         BinaryOperator::And(_) => (b"||", "LogicalAnd"),
         BinaryOperator::Or(_) => (b"&&", "LogicalOr"),
+        // Bitwise — Infection swaps &<->| and ^->& , and reverses the shifts.
+        // (mago's shift variants are Left/RightShift; Infection names them Shift{Left,Right}.)
+        BinaryOperator::BitwiseAnd(_) => (b"|", "BitwiseAnd"),
+        BinaryOperator::BitwiseOr(_) => (b"&", "BitwiseOr"),
+        BinaryOperator::BitwiseXor(_) => (b"&", "BitwiseXor"),
+        BinaryOperator::LeftShift(_) => (b">>", "ShiftLeft"),
+        BinaryOperator::RightShift(_) => (b"<<", "ShiftRight"),
         _ => return None,
     };
     Some((start, end, repl, name))
@@ -102,9 +109,54 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_and_is_not_mutated() {
+    fn bitwise_and_becomes_or() {
         use mago_syntax::ast::binary::BinaryOperator;
-        assert!(mutate_binary(&BinaryOperator::BitwiseAnd(span(0, 1))).is_none());
+        let (start, end, repl, name) =
+            mutate_binary(&BinaryOperator::BitwiseAnd(span(0, 1))).unwrap();
+        assert_eq!((start, end), (0, 1));
+        assert_eq!(repl, b"|");
+        assert_eq!(name, "BitwiseAnd");
+    }
+
+    #[test]
+    fn bitwise_or_and_xor_become_and() {
+        use mago_syntax::ast::binary::BinaryOperator;
+        assert_eq!(
+            mutate_binary(&BinaryOperator::BitwiseOr(span(0, 1)))
+                .unwrap()
+                .2,
+            b"&"
+        );
+        assert_eq!(
+            mutate_binary(&BinaryOperator::BitwiseOr(span(0, 1)))
+                .unwrap()
+                .3,
+            "BitwiseOr"
+        );
+        assert_eq!(
+            mutate_binary(&BinaryOperator::BitwiseXor(span(0, 1)))
+                .unwrap()
+                .2,
+            b"&"
+        );
+        assert_eq!(
+            mutate_binary(&BinaryOperator::BitwiseXor(span(0, 1)))
+                .unwrap()
+                .3,
+            "BitwiseXor"
+        );
+    }
+
+    #[test]
+    fn shifts_swap_direction() {
+        use mago_syntax::ast::binary::BinaryOperator;
+        // mago variant LeftShift -> Infection mutator name "ShiftLeft", replacement ">>".
+        let (_, _, repl, name) = mutate_binary(&BinaryOperator::LeftShift(span(0, 2))).unwrap();
+        assert_eq!(repl, b">>");
+        assert_eq!(name, "ShiftLeft");
+        let (_, _, repl, name) = mutate_binary(&BinaryOperator::RightShift(span(0, 2))).unwrap();
+        assert_eq!(repl, b"<<");
+        assert_eq!(name, "ShiftRight");
     }
 
     #[test]
