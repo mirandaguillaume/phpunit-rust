@@ -195,4 +195,50 @@ final class OpsTest extends TestCase
     {
         self::assertSame(8, (new Ops())->powe(2, 3));
     }
+
+    // Unwrap mutants replace the call with its first argument -> a different result.
+    public function testLow(): void
+    {
+        self::assertSame('abc', (new Ops())->low('ABC'));
+    }
+
+    public function testUp(): void
+    {
+        self::assertSame('ABC', (new Ops())->up('abc'));
+    }
+
+    public function testTr(): void
+    {
+        self::assertSame('x', (new Ops())->tr('  x  '));
+    }
+
+    public function testUf(): void
+    {
+        self::assertSame('Abc', (new Ops())->uf('abc'));
+    }
+
+    public function testRev(): void
+    {
+        self::assertSame('cba', (new Ops())->rev('abc'));
+    }
+
+    public function testArev(): void
+    {
+        self::assertSame([3, 2, 1], (new Ops())->arev([1, 2, 3]));
+    }
+
+    public function testAuniq(): void
+    {
+        self::assertSame([1], (new Ops())->auniq([1, 1]));
+    }
+
+    public function testAvals(): void
+    {
+        self::assertSame([1], (new Ops())->avals(['a' => 1]));
+    }
+
+    public function testAflip(): void
+    {
+        self::assertSame(['b' => 'a'], (new Ops())->aflip(['a' => 'b']));
+    }
 }

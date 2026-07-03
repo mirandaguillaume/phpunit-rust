@@ -12,10 +12,68 @@ pub mod plan;
 
 use bumpalo::Bump;
 use mago_database::file::FileId;
+use mago_span::HasSpan;
+use mago_syntax::ast::argument::{Argument, ArgumentList};
+use mago_syntax::ast::call::FunctionCall;
+use mago_syntax::ast::expression::Expression;
+use mago_syntax::ast::identifier::Identifier;
 use mago_syntax::ast::literal::Literal;
 use mago_syntax::ast::node::Node;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::parser::parse_file_content;
+
+/// The lower-cased, namespace-stripped name of an identifier-callee (e.g. `\StrToLower`
+/// → `strtolower`); `None` for dynamic callees (`$f(...)`, closures, method calls).
+fn callee_name_lower(func: &Expression) -> Option<Vec<u8>> {
+    let Expression::Identifier(id) = func else {
+        return None;
+    };
+    let raw: &[u8] = match id {
+        Identifier::Local(l) => l.value,
+        Identifier::Qualified(q) => q.value,
+        Identifier::FullyQualified(f) => f.value,
+    };
+    let last = raw.rsplit(|&b| b == b'\\').next().unwrap_or(raw);
+    Some(last.to_ascii_lowercase())
+}
+
+/// Byte span of the first positional (non-spread) argument's value, if any.
+fn first_arg_span(args: &ArgumentList) -> Option<(usize, usize)> {
+    let Argument::Positional(p) = args.arguments.iter().next()? else {
+        return None;
+    };
+    if p.ellipsis.is_some() {
+        return None;
+    }
+    let s = p.value.span();
+    Some((s.start.offset as usize, s.end.offset as usize))
+}
+
+/// Infection `Unwrap*`: `f(a, …)` → `a`. Replace the whole call with its first arg.
+fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &FunctionCall) {
+    let Some(name) = callee_name_lower(fc.function) else {
+        return;
+    };
+    let Some(mutator) = mutators::unwrap_first_arg_name(&name) else {
+        return;
+    };
+    let Some((astart, aend)) = first_arg_span(&fc.argument_list) else {
+        return;
+    };
+    if astart >= aend || aend > source.len() {
+        return;
+    }
+    let call = fc.span();
+    record_owned(
+        out,
+        file,
+        source,
+        call.start.offset as usize,
+        call.end.offset as usize,
+        source[astart..aend].to_vec(),
+        mutator,
+    );
+}
 
 /// 1-based line number of byte `offset` (count the newlines before it).
 fn line_at(source: &[u8], offset: usize) -> u32 {
@@ -124,6 +182,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     record(&mut out, path, source, t);
                 }
             }
+            Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
             Node::Literal(l) => {
                 if let Some(t) = mutators::mutate_literal(l) {
                     record(&mut out, path, source, t);
@@ -244,6 +303,17 @@ mod tests {
             .expect("CastInt mutant");
         assert_eq!(&src[m.start..m.end], b"(int)");
         assert_eq!(m.replacement, b"", "unwrap removes the cast");
+    }
+
+    #[test]
+    fn unwraps_string_function_to_first_arg() {
+        let src = b"<?php\nfunction f($s) { return strtolower($s); }\n";
+        let m = generate_file(std::path::Path::new("f.php"), src)
+            .into_iter()
+            .find(|m| m.mutator == "UnwrapStrToLower")
+            .expect("UnwrapStrToLower mutant");
+        assert_eq!(&src[m.start..m.end], b"strtolower($s)");
+        assert_eq!(m.replacement, b"$s");
     }
 
     #[test]

@@ -115,6 +115,48 @@ pub fn mutate_assignment(
     ))
 }
 
+/// Infection's `Unwrap*` mutators that keep the FIRST argument: `f(a, …)` → `a`.
+/// Maps a (lower-cased) PHP function name to its Infection mutator name. Only the
+/// default-parameter-index (arg 0) family is here; the custom-index ones (array_map,
+/// str_replace, array_merge, …) are a follow-up.
+pub fn unwrap_first_arg_name(fn_lower: &[u8]) -> Option<&'static str> {
+    Some(match fn_lower {
+        b"strtolower" => "UnwrapStrToLower",
+        b"strtoupper" => "UnwrapStrToUpper",
+        b"trim" => "UnwrapTrim",
+        b"ltrim" => "UnwrapLtrim",
+        b"rtrim" => "UnwrapRtrim",
+        b"ucfirst" => "UnwrapUcFirst",
+        b"lcfirst" => "UnwrapLcFirst",
+        b"ucwords" => "UnwrapUcWords",
+        b"strrev" => "UnwrapStrRev",
+        b"str_shuffle" => "UnwrapStrShuffle",
+        b"str_repeat" => "UnwrapStrRepeat",
+        b"substr" => "UnwrapSubstr",
+        b"array_reverse" => "UnwrapArrayReverse",
+        b"array_unique" => "UnwrapArrayUnique",
+        b"array_values" => "UnwrapArrayValues",
+        b"array_keys" => "UnwrapArrayKeys",
+        b"array_flip" => "UnwrapArrayFlip",
+        b"array_filter" => "UnwrapArrayFilter",
+        b"array_change_key_case" => "UnwrapArrayChangeKeyCase",
+        b"array_chunk" => "UnwrapArrayChunk",
+        b"array_column" => "UnwrapArrayColumn",
+        b"array_diff" => "UnwrapArrayDiff",
+        b"array_diff_assoc" => "UnwrapArrayDiffAssoc",
+        b"array_diff_key" => "UnwrapArrayDiffKey",
+        b"array_diff_uassoc" => "UnwrapArrayDiffUassoc",
+        b"array_diff_ukey" => "UnwrapArrayDiffUkey",
+        b"array_pad" => "UnwrapArrayPad",
+        b"array_slice" => "UnwrapArraySlice",
+        b"array_splice" => "UnwrapArraySplice",
+        b"array_udiff" => "UnwrapArrayUdiff",
+        b"array_udiff_assoc" => "UnwrapArrayUdiffAssoc",
+        b"array_udiff_uassoc" => "UnwrapArrayUdiffUassoc",
+        _ => return None,
+    })
+}
+
 /// Infection's cast mutators UNWRAP the cast (`(int)$x` → `$x`), so we remove the
 /// cast operator's token span (replace with nothing). mago spells some casts several
 /// ways (int/integer, float/double/real, string/binary, bool/boolean); all map to the

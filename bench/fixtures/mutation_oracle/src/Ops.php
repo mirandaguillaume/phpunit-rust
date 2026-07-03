@@ -171,4 +171,49 @@ final class Ops
         $n **= $m;
         return $n;
     }
+
+    public function low(string $s): string
+    {
+        return strtolower($s);
+    }
+
+    public function up(string $s): string
+    {
+        return strtoupper($s);
+    }
+
+    public function tr(string $s): string
+    {
+        return trim($s);
+    }
+
+    public function uf(string $s): string
+    {
+        return ucfirst($s);
+    }
+
+    public function rev(string $s): string
+    {
+        return strrev($s);
+    }
+
+    public function arev(array $a): array
+    {
+        return array_reverse($a);
+    }
+
+    public function auniq(array $a): array
+    {
+        return array_unique($a);
+    }
+
+    public function avals(array $a): array
+    {
+        return array_values($a);
+    }
+
+    public function aflip(array $a): array
+    {
+        return array_flip($a);
+    }
 }
