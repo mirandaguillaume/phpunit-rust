@@ -7,6 +7,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PROJ="$HERE/fixtures/mutation_oracle"
 PROUST="${PROUST:-$HERE/../target/release/proust}"
+# Resolve PROUST to an absolute path BEFORE we cd into the fixture — a relative
+# override (e.g. CI's `PROUST=target/release/proust`) would break after the cd.
+case "$PROUST" in /*) ;; *) PROUST="$(pwd)/$PROUST" ;; esac
 
 cd "$PROJ"
 
