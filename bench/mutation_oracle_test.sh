@@ -24,6 +24,11 @@ php -r '$d=json_decode(file_get_contents("infection.json"),true)?:[];foreach($d[
 rm -f proust_escaped.json
 "$PROUST" --project . --mutate --workers 4 --mutation-escaped-json proust_escaped.json \
     >/tmp/proust_run.log 2>&1 || true
+if [ ! -f proust_escaped.json ]; then
+    echo "proust produced no escaped JSON — its output was:" >&2
+    cat /tmp/proust_run.log >&2
+    exit 1
+fi
 php -r '$d=json_decode(file_get_contents("proust_escaped.json"),true)?:[];foreach($d["escaped"]??[] as $m){echo $m["mutator"]." ".$m["line"]."\n";}' \
     | sort > /tmp/proust_escaped.txt
 
