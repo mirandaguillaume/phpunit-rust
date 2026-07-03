@@ -1,0 +1,29 @@
+{
+    source: {
+        directories: ['src'],
+    },
+    logs: {
+        json: 'infection.json',
+    },
+    mutators: {
+        '@default': false,
+        Plus: true,
+        Minus: true,
+        Multiplication: true,
+        Division: true,
+        Modulus: true,
+        LessThan: true,
+        LessThanOrEqualTo: true,
+        GreaterThan: true,
+        GreaterThanOrEqualTo: true,
+        Equal: true,
+        Identical: true,
+        NotIdentical: true,
+        LogicalAnd: true,
+        LogicalOr: true,
+        TrueValue: true,
+        FalseValue: true,
+        IncrementInteger: true,
+        DecrementInteger: true,
+    },
+}

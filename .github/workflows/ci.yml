@@ -160,6 +160,35 @@ jobs:
       - name: Runtime coverage parity against sample_project
         run: bash scripts/parity_coverage.sh crates/runner/fixtures/sample_project
 
+  mutation-oracle:
+    name: mutation (infection oracle)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # pcov drives both the baseline coverage (proust) and Infection; php 8.3
+      # satisfies infection/infection ^0.29's PHP floor.
+      - name: Install PHP (with pcov)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          coverage: pcov
+
+      - name: Build proust binary (coverage feature)
+        run: cargo build -p proust --release --features coverage
+
+      # Fails CI if proust --mutate and Infection disagree on the escaped-mutant
+      # set for the V1 mutator set (the correctness oracle for native mutation).
+      - name: Infection oracle parity
+        run: PROUST=target/release/proust bash bench/mutation_oracle_test.sh
+
   php-tests:
     name: php worker-shim tests
     runs-on: ubuntu-latest

@@ -1,0 +1,5 @@
+/vendor/
+/composer.lock
+/infection.json
+/proust_escaped.json
+/.phpunit.result.cache
