@@ -271,4 +271,50 @@ final class OpsTest extends TestCase
         // 'a' . 'b' = 'ab'; swapped 'b' . 'a' = 'ba' -> KILLED (Concat).
         self::assertSame('ab', (new Ops())->cat('a', 'b'));
     }
+
+    public function testBnot(): void
+    {
+        // ~0 = -1; unwrapped $x = 0 -> KILLED (BitwiseNot).
+        self::assertSame(-1, (new Ops())->bnot(0));
+    }
+
+    public function testRun(): void
+    {
+        // removing `$this->record('x');` leaves the log empty -> KILLED (MethodCallRemoval).
+        self::assertSame(['x'], (new Ops())->run());
+    }
+
+    public function testRunF(): void
+    {
+        // removing `array_push($out, $v);` leaves $out empty -> KILLED (FunctionCallRemoval).
+        $out = [];
+        (new Ops())->runF($out, 'z');
+        self::assertSame(['z'], $out);
+    }
+
+    public function testPick(): void
+    {
+        // break after first -> 'a'; mutated to continue -> last item 'b' -> KILLED (Break_).
+        self::assertSame('a', (new Ops())->pick(['a', 'b']));
+    }
+
+    public function testSkipFirst(): void
+    {
+        // continue skips the first -> ['b','c']; mutated to break -> [] -> KILLED (Continue_).
+        self::assertSame(['b', 'c'], (new Ops())->skipFirst(['a', 'b', 'c']));
+    }
+
+    public function testBoom(): void
+    {
+        // removing `throw` -> no exception -> KILLED (Throw_).
+        $this->expectException(\RuntimeException::class);
+        (new Ops())->boom();
+    }
+
+    public function testIsRuntime(): void
+    {
+        // instanceof -> true kills the `false` mutant; -> false kills the `true` mutant.
+        self::assertTrue((new Ops())->isRuntime(new \RuntimeException()));
+        self::assertFalse((new Ops())->isRuntime(new \stdClass()));
+    }
 }

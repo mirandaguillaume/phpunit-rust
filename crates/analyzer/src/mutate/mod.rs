@@ -15,7 +15,7 @@ use mago_database::file::FileId;
 use mago_span::HasSpan;
 use mago_syntax::ast::argument::{Argument, ArgumentList};
 use mago_syntax::ast::binary::BinaryOperator;
-use mago_syntax::ast::call::FunctionCall;
+use mago_syntax::ast::call::{Call, FunctionCall};
 use mago_syntax::ast::expression::Expression;
 use mago_syntax::ast::identifier::Identifier;
 use mago_syntax::ast::literal::Literal;
@@ -212,6 +212,42 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         name,
                     );
                 }
+                // InstanceOf_: `$a instanceof B` -> `true` AND `false`.
+                if matches!(b.operator, BinaryOperator::Instanceof(_)) {
+                    let whole = b.span();
+                    let (s, e) = (whole.start.offset as usize, whole.end.offset as usize);
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s,
+                        e,
+                        b"true".to_vec(),
+                        "InstanceOf_",
+                    );
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s,
+                        e,
+                        b"false".to_vec(),
+                        "InstanceOf_",
+                    );
+                }
+            }
+            // Throw_: `throw $x` -> `$x` (remove the `throw` keyword).
+            Node::Throw(t) => {
+                let s = t.throw.span();
+                record_owned(
+                    &mut out,
+                    path,
+                    source,
+                    s.start.offset as usize,
+                    s.end.offset as usize,
+                    Vec::new(),
+                    "Throw_",
+                );
             }
             Node::AssignmentOperator(op) => {
                 if let Some(t) = mutators::mutate_assignment(op) {
@@ -219,6 +255,52 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // Loop control swap: `break` <-> `continue`.
+            Node::Break(b) => {
+                let s = b.r#break.span();
+                record_owned(
+                    &mut out,
+                    path,
+                    source,
+                    s.start.offset as usize,
+                    s.end.offset as usize,
+                    b"continue".to_vec(),
+                    "Break_",
+                );
+            }
+            Node::Continue(c) => {
+                let s = c.r#continue.span();
+                record_owned(
+                    &mut out,
+                    path,
+                    source,
+                    s.start.offset as usize,
+                    s.end.offset as usize,
+                    b"break".to_vec(),
+                    "Continue_",
+                );
+            }
+            // Removal: a statement that is JUST a call becomes a no-op (removed).
+            Node::ExpressionStatement(es) => {
+                if let Expression::Call(call) = es.expression {
+                    let name = match call {
+                        Call::Function(_) => "FunctionCallRemoval",
+                        Call::Method(_) | Call::NullSafeMethod(_) | Call::StaticMethod(_) => {
+                            "MethodCallRemoval"
+                        }
+                    };
+                    let sp = es.span();
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        sp.start.offset as usize,
+                        sp.end.offset as usize,
+                        Vec::new(),
+                        name,
+                    );
+                }
+            }
             // Ternary: `c ? then : else` -> `c ? else : then` (swap the branches).
             Node::Conditional(c) => {
                 if let Some(then) = c.then {
@@ -310,6 +392,18 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         s.end.offset as usize,
                         Vec::new(),
                         "LogicalNot",
+                    );
+                }
+                UnaryPrefixOperator::BitwiseNot(s) => {
+                    // BitwiseNot: `~$x` -> `$x` (remove the `~`).
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        s.start.offset as usize,
+                        s.end.offset as usize,
+                        Vec::new(),
+                        "BitwiseNot",
                     );
                 }
                 other => {
