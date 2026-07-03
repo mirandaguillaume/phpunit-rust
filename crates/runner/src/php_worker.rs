@@ -19,6 +19,11 @@ pub fn find_merge_coverage_script() -> Result<PathBuf> {
     find_script_named("merge_coverage.php")
 }
 
+/// Find `pertest_coverage.php` — same search path as the fork script.
+pub fn find_pertest_coverage_script() -> Result<PathBuf> {
+    find_script_named("pertest_coverage.php")
+}
+
 fn find_script_named(name: &str) -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from(format!("php/{name}"))];
     if let Ok(exe) = std::env::current_exe() {

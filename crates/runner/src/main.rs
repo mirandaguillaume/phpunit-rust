@@ -582,6 +582,20 @@ struct Cli {
     #[cfg(feature = "coverage")]
     #[arg(long)]
     coverage_out: Option<std::path::PathBuf>,
+    /// Run native mutation testing: generate mutants, run only the covering tests,
+    /// and report the Mutation Score Indicator. Needs a pcov/xdebug driver and a
+    /// green baseline suite. Requires the `coverage` Cargo feature.
+    #[cfg(feature = "coverage")]
+    #[arg(long)]
+    mutate: bool,
+    /// Fail with a non-zero exit code when the MSI is below this percentage.
+    #[cfg(feature = "coverage")]
+    #[arg(long)]
+    min_msi: Option<f64>,
+    /// Write the escaped-mutant list as JSON to this file (used by the oracle gate).
+    #[cfg(feature = "coverage")]
+    #[arg(long)]
+    mutation_escaped_json: Option<std::path::PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -697,6 +711,19 @@ fn real_main() -> Result<ExitCode> {
         ),
         None => None,
     };
+
+    // Native mutation testing (`--mutate`): a self-contained pipeline (baseline
+    // coverage → generate → plan → run covering tests → MSI) that returns early.
+    #[cfg(feature = "coverage")]
+    if cli.mutate {
+        return proust::mutate::run_mutation(
+            &project,
+            xml_path.as_deref(),
+            cli.min_msi,
+            cli.mutation_escaped_json.as_deref(),
+            cli.workers,
+        );
+    }
 
     // Delegated runtime coverage: when any --coverage-{clover,html,text} is set, hand
     // every worker a directory (via the inherited PROUST_COVERAGE_DIR env) to drop its
