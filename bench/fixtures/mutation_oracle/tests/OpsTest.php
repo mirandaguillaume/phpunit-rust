@@ -265,4 +265,10 @@ final class OpsTest extends TestCase
         // $a ? 'y' : 'n' swapped -> $a ? 'n' : 'y' -> KILLED (Ternary).
         self::assertSame('y', (new Ops())->tern(true));
     }
+
+    public function testCat(): void
+    {
+        // 'a' . 'b' = 'ab'; swapped 'b' . 'a' = 'ba' -> KILLED (Concat).
+        self::assertSame('ab', (new Ops())->cat('a', 'b'));
+    }
 }

@@ -94,5 +94,6 @@
         Spaceship: true,
         Coalesce: true,
         Ternary: true,
+        Concat: true,
     },
 }

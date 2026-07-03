@@ -236,4 +236,9 @@ final class Ops
     {
         return $a ? 'y' : 'n';
     }
+
+    public function cat(string $a, string $b): string
+    {
+        return $a . $b;
+    }
 }

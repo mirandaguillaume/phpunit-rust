@@ -184,6 +184,11 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 let swap = match b.operator {
                     BinaryOperator::Spaceship(_) => Some("Spaceship"),
                     BinaryOperator::NullCoalesce(_) => Some("Coalesce"),
+                    // Simple (non-chained) `a . b` -> `b . a`. Chained concat has an
+                    // Infection special case we don't reproduce (fixture uses 2 operands).
+                    BinaryOperator::StringConcat(_) if !matches!(b.lhs, Expression::Binary(inner) if matches!(inner.operator, BinaryOperator::StringConcat(_))) => {
+                        Some("Concat")
+                    }
                     _ => None,
                 };
                 if let Some(name) = swap {
