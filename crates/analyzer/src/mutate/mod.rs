@@ -14,6 +14,7 @@ use bumpalo::Bump;
 use mago_database::file::FileId;
 use mago_span::HasSpan;
 use mago_syntax::ast::argument::{Argument, ArgumentList};
+use mago_syntax::ast::binary::BinaryOperator;
 use mago_syntax::ast::call::FunctionCall;
 use mago_syntax::ast::expression::Expression;
 use mago_syntax::ast::identifier::Identifier;
@@ -177,6 +178,40 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 for t in mutators::mutate_binary(&b.operator) {
                     record(&mut out, path, source, t);
                 }
+                // Operand-swap mutators: `a <=> b` -> `b <=> a` (Spaceship); `a ?? b`
+                // -> `b ?? a` (Coalesce). Rebuild the whole expression with the operands
+                // reordered around the original operator text.
+                let swap = match b.operator {
+                    BinaryOperator::Spaceship(_) => Some("Spaceship"),
+                    BinaryOperator::NullCoalesce(_) => Some("Coalesce"),
+                    // Simple (non-chained) `a . b` -> `b . a`. Chained concat has an
+                    // Infection special case we don't reproduce (fixture uses 2 operands).
+                    BinaryOperator::StringConcat(_) if !matches!(b.lhs, Expression::Binary(inner) if matches!(inner.operator, BinaryOperator::StringConcat(_))) => {
+                        Some("Concat")
+                    }
+                    _ => None,
+                };
+                if let Some(name) = swap {
+                    let seg = |sp: mago_span::Span| {
+                        &source[sp.start.offset as usize..sp.end.offset as usize]
+                    };
+                    let mut repl = Vec::new();
+                    repl.extend_from_slice(seg(b.rhs.span()));
+                    repl.push(b' ');
+                    repl.extend_from_slice(seg(b.operator.span()));
+                    repl.push(b' ');
+                    repl.extend_from_slice(seg(b.lhs.span()));
+                    let whole = b.span();
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        whole.start.offset as usize,
+                        whole.end.offset as usize,
+                        repl,
+                        name,
+                    );
+                }
             }
             Node::AssignmentOperator(op) => {
                 if let Some(t) = mutators::mutate_assignment(op) {
@@ -184,6 +219,20 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // Ternary: `c ? then : else` -> `c ? else : then` (swap the branches).
+            Node::Conditional(c) => {
+                if let Some(then) = c.then {
+                    let ts = then.span();
+                    let es = c.r#else.span();
+                    let (tstart, tend) = (ts.start.offset as usize, ts.end.offset as usize);
+                    let (estart, eend) = (es.start.offset as usize, es.end.offset as usize);
+                    let mut repl = Vec::new();
+                    repl.extend_from_slice(&source[estart..eend]);
+                    repl.extend_from_slice(b" : ");
+                    repl.extend_from_slice(&source[tstart..tend]);
+                    record_owned(&mut out, path, source, tstart, eend, repl, "Ternary");
+                }
+            }
             // ReturnValue mutators: `return $this`->null (This), `return N`->`-N`
             // (IntegerNegation), `return F`->`-F` (FloatNegation).
             Node::Return(r) => {

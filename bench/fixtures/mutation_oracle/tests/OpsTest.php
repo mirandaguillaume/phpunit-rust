@@ -247,4 +247,28 @@ final class OpsTest extends TestCase
         // return $this -> return null (This) -> KILLED.
         self::assertInstanceOf(Ops::class, (new Ops())->self_());
     }
+
+    public function testShip(): void
+    {
+        // 1 <=> 2 = -1; swapped 2 <=> 1 = 1 -> KILLED (Spaceship).
+        self::assertSame(-1, (new Ops())->ship(1, 2));
+    }
+
+    public function testCoal(): void
+    {
+        // 3 ?? 5 = 3; swapped 5 ?? 3 = 5 -> KILLED (Coalesce).
+        self::assertSame(3, (new Ops())->coal(3, 5));
+    }
+
+    public function testTern(): void
+    {
+        // $a ? 'y' : 'n' swapped -> $a ? 'n' : 'y' -> KILLED (Ternary).
+        self::assertSame('y', (new Ops())->tern(true));
+    }
+
+    public function testCat(): void
+    {
+        // 'a' . 'b' = 'ab'; swapped 'b' . 'a' = 'ba' -> KILLED (Concat).
+        self::assertSame('ab', (new Ops())->cat('a', 'b'));
+    }
 }

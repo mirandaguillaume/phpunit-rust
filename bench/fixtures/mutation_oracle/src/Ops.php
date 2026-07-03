@@ -221,4 +221,24 @@ final class Ops
     {
         return $this;
     }
+
+    public function ship(int $a, int $b): int
+    {
+        return $a <=> $b;
+    }
+
+    public function coal($a, $b)
+    {
+        return $a ?? $b;
+    }
+
+    public function tern(bool $a): string
+    {
+        return $a ? 'y' : 'n';
+    }
+
+    public function cat(string $a, string $b): string
+    {
+        return $a . $b;
+    }
 }
