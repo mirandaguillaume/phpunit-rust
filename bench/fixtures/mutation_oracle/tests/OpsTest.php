@@ -241,4 +241,10 @@ final class OpsTest extends TestCase
     {
         self::assertSame(['b' => 'a'], (new Ops())->aflip(['a' => 'b']));
     }
+
+    public function testSelf(): void
+    {
+        // return $this -> return null (This) -> KILLED.
+        self::assertInstanceOf(Ops::class, (new Ops())->self_());
+    }
 }

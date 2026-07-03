@@ -216,4 +216,9 @@ final class Ops
     {
         return array_flip($a);
     }
+
+    public function self_()
+    {
+        return $this;
+    }
 }

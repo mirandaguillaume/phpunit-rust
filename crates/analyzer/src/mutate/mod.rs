@@ -20,6 +20,7 @@ use mago_syntax::ast::identifier::Identifier;
 use mago_syntax::ast::literal::Literal;
 use mago_syntax::ast::node::Node;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
+use mago_syntax::ast::variable::Variable;
 use mago_syntax::parser::parse_file_content;
 
 /// The lower-cased, namespace-stripped name of an identifier-callee (e.g. `\StrToLower`
@@ -183,6 +184,48 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // ReturnValue mutators: `return $this`->null (This), `return N`->`-N`
+            // (IntegerNegation), `return F`->`-F` (FloatNegation).
+            Node::Return(r) => {
+                if let Some(val) = r.value {
+                    let s = val.span();
+                    let (start, end) = (s.start.offset as usize, s.end.offset as usize);
+                    match val {
+                        Expression::Variable(Variable::Direct(v))
+                            if v.name == b"$this" || v.name == b"this" =>
+                        {
+                            record_owned(
+                                &mut out,
+                                path,
+                                source,
+                                start,
+                                end,
+                                b"null".to_vec(),
+                                "This",
+                            );
+                        }
+                        Expression::Literal(Literal::Integer(_)) => {
+                            let mut repl = vec![b'-'];
+                            repl.extend_from_slice(&source[start..end]);
+                            record_owned(
+                                &mut out,
+                                path,
+                                source,
+                                start,
+                                end,
+                                repl,
+                                "IntegerNegation",
+                            );
+                        }
+                        Expression::Literal(Literal::Float(_)) => {
+                            let mut repl = vec![b'-'];
+                            repl.extend_from_slice(&source[start..end]);
+                            record_owned(&mut out, path, source, start, end, repl, "FloatNegation");
+                        }
+                        _ => {}
+                    }
+                }
+            }
             Node::Literal(l) => {
                 if let Some(t) = mutators::mutate_literal(l) {
                     record(&mut out, path, source, t);
