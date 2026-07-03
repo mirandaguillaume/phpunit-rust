@@ -317,4 +317,10 @@ final class OpsTest extends TestCase
         self::assertTrue((new Ops())->isRuntime(new \RuntimeException()));
         self::assertFalse((new Ops())->isRuntime(new \stdClass()));
     }
+
+    public function testSr(): void
+    {
+        // str_replace unwraps to arg 2 (the subject) -> 'aXa' != 'bXb' -> KILLED.
+        self::assertSame('bXb', (new Ops())->sr('aXa'));
+    }
 }

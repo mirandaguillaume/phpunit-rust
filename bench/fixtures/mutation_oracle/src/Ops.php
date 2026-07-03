@@ -299,4 +299,10 @@ final class Ops
     {
         return $e instanceof \RuntimeException;
     }
+
+    public function sr(string $s): string
+    {
+        return str_replace('a', 'b', $s);
+    }
+
 }
