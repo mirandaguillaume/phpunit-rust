@@ -93,5 +93,6 @@
         UnwrapArrayUdiffUassoc: true,
         Spaceship: true,
         Coalesce: true,
+        Ternary: true,
     },
 }

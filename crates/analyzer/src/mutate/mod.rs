@@ -214,6 +214,20 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            // Ternary: `c ? then : else` -> `c ? else : then` (swap the branches).
+            Node::Conditional(c) => {
+                if let Some(then) = c.then {
+                    let ts = then.span();
+                    let es = c.r#else.span();
+                    let (tstart, tend) = (ts.start.offset as usize, ts.end.offset as usize);
+                    let (estart, eend) = (es.start.offset as usize, es.end.offset as usize);
+                    let mut repl = Vec::new();
+                    repl.extend_from_slice(&source[estart..eend]);
+                    repl.extend_from_slice(b" : ");
+                    repl.extend_from_slice(&source[tstart..tend]);
+                    record_owned(&mut out, path, source, tstart, eend, repl, "Ternary");
+                }
+            }
             // ReturnValue mutators: `return $this`->null (This), `return N`->`-N`
             // (IntegerNegation), `return F`->`-F` (FloatNegation).
             Node::Return(r) => {

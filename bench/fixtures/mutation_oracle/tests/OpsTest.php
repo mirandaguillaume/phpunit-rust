@@ -259,4 +259,10 @@ final class OpsTest extends TestCase
         // 3 ?? 5 = 3; swapped 5 ?? 3 = 5 -> KILLED (Coalesce).
         self::assertSame(3, (new Ops())->coal(3, 5));
     }
+
+    public function testTern(): void
+    {
+        // $a ? 'y' : 'n' swapped -> $a ? 'n' : 'y' -> KILLED (Ternary).
+        self::assertSame('y', (new Ops())->tern(true));
+    }
 }

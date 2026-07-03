@@ -231,4 +231,9 @@ final class Ops
     {
         return $a ?? $b;
     }
+
+    public function tern(bool $a): string
+    {
+        return $a ? 'y' : 'n';
+    }
 }
