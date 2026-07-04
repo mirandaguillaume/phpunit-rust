@@ -143,6 +143,7 @@
         NullSafeMethodCall: true,
         ArrayAll: true,
         ArrayAny: true,
+        ArrayItem: true,
         SpreadRemoval: true,
         SpreadAssignment: true,
         SpreadOneItem: true,

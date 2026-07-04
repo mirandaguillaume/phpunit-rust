@@ -489,6 +489,13 @@ final class Ops
         return preg_match('/^[a-z]+$/i', $s);
     }
 
+    public function arrItem(): array
+    {
+        // Boolean ArrayItem: `$this->five() => 'v'` (method-call key) becomes
+        // `$this->five() > 'v'`, turning the element into a bool.
+        return [$this->five() => 'v'];
+    }
+
     public function classify2(string $s): string
     {
         // MatchArmRemoval (multi-condition): each of `'a'`, `'b'` is removed separately.
