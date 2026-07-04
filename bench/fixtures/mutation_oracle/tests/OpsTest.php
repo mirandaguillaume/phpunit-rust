@@ -561,4 +561,10 @@ final class OpsTest extends TestCase
         // Removing the first item drops 'a' -> KILLED.
         self::assertSame(['a', 'b', 'c'], (new Ops())->pickFirst());
     }
+
+    public function testSpreadOne(): void
+    {
+        // The spread renumbers keys (0,1); `$xs` keeps 5,9 -> KILLED.
+        self::assertSame(['a', 'b'], (new Ops())->spreadOne([5 => 'a', 9 => 'b']));
+    }
 }

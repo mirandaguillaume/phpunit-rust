@@ -568,4 +568,11 @@ final class Ops
         return ['a', 'b', 'c'];
     }
 
+    public function spreadOne(array $xs): array
+    {
+        // SpreadAssignment: `[...$xs]` -> `$xs` keeps the original keys instead of
+        // renumbering, so a non-sequential input distinguishes the mutant.
+        return [...$xs];
+    }
+
 }
