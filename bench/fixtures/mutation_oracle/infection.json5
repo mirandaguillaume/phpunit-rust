@@ -113,5 +113,11 @@
         UnwrapArrayIntersect: true,
         UnwrapArrayIntersectKey: true,
         UnwrapArrayIntersectAssoc: true,
+        IfNegation: true,
+        ElseIfNegation: true,
+        While_: true,
+        DoWhile: true,
+        For_: true,
+        Foreach_: true,
     },
 }

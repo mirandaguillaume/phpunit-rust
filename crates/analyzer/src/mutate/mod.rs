@@ -102,6 +102,43 @@ fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &Functio
     }
 }
 
+/// Infection condition-negation (`IfNegation`/`ElseIfNegation`): wrap `cond` in
+/// `!(...)` by re-emitting the original bytes around a `!(` / `)`.
+fn negate_condition(
+    out: &mut Vec<Mutant>,
+    file: &Path,
+    source: &[u8],
+    cond: &Expression,
+    mutator: &'static str,
+) {
+    let s = cond.span();
+    let (cs, ce) = (s.start.offset as usize, s.end.offset as usize);
+    if cs >= ce || ce > source.len() {
+        return;
+    }
+    let mut repl = Vec::with_capacity(ce - cs + 3);
+    repl.extend_from_slice(b"!(");
+    repl.extend_from_slice(&source[cs..ce]);
+    repl.push(b')');
+    record_owned(out, file, source, cs, ce, repl, mutator);
+}
+
+/// Replace a span with a fixed token (loop conditions -> `false`, iterated exprs -> `[]`).
+fn replace_span(
+    out: &mut Vec<Mutant>,
+    file: &Path,
+    source: &[u8],
+    span: mago_span::Span,
+    repl: &'static [u8],
+    mutator: &'static str,
+) {
+    let (start, end) = (span.start.offset as usize, span.end.offset as usize);
+    if start >= end || end > source.len() {
+        return;
+    }
+    record_owned(out, file, source, start, end, repl.to_vec(), mutator);
+}
+
 /// 1-based line number of byte `offset` (count the newlines before it).
 fn line_at(source: &[u8], offset: usize) -> u32 {
     source[..offset.min(source.len())]
@@ -140,6 +177,7 @@ fn record_owned(
         replacement,
         mutator: name,
         line: line_at(source, start),
+        report_line: line_at(source, start),
     });
 }
 
@@ -455,6 +493,56 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     );
                 }
             },
+            // IfNegation: `if (c)` -> `if (!(c))`. Wrap the condition in `!(...)`.
+            Node::If(i) => {
+                negate_condition(&mut out, path, source, i.condition, "IfNegation");
+            }
+            // ElseIfNegation: `elseif (c)` -> `elseif (!(c))` (statement-form elseif).
+            Node::IfStatementBodyElseIfClause(ei) => {
+                negate_condition(&mut out, path, source, ei.condition, "ElseIfNegation");
+            }
+            // While_: `while (c)` -> `while (false)` (loop body never runs).
+            Node::While(w) => {
+                let s = w.condition.span();
+                replace_span(&mut out, path, source, s, b"false", "While_");
+            }
+            // DoWhile: `do {…} while (c)` -> `… while (false)` (body runs exactly once).
+            // Splice at the condition, but anchor the reported line to the `do` keyword —
+            // that is Infection's `originalStartLine` for a do-while (the statement start).
+            Node::DoWhile(d) => {
+                let cs = d.condition.span();
+                let (start, end) = (cs.start.offset as usize, cs.end.offset as usize);
+                if start < end && end <= source.len() {
+                    out.push(Mutant {
+                        file: path.to_path_buf(),
+                        start,
+                        end,
+                        replacement: b"false".to_vec(),
+                        mutator: "DoWhile",
+                        // Coverage anchor: the condition line (executable, pcov records it).
+                        line: line_at(source, start),
+                        // Report anchor: the `do` keyword line (Infection's originalStartLine).
+                        report_line: line_at(source, d.r#do.span().start.offset as usize),
+                    });
+                }
+            }
+            // For_: `for (init; conds; loop)` -> the whole condition list becomes `false`.
+            Node::For(f) => {
+                if let (Some(first), Some(last)) = (f.conditions.first(), f.conditions.last()) {
+                    let (cs, ce) = (
+                        first.span().start.offset as usize,
+                        last.span().end.offset as usize,
+                    );
+                    if cs < ce && ce <= source.len() {
+                        record_owned(&mut out, path, source, cs, ce, b"false".to_vec(), "For_");
+                    }
+                }
+            }
+            // Foreach_: `foreach ($xs as …)` -> `foreach ([] as …)` (iterates nothing).
+            Node::Foreach(fe) => {
+                let s = fe.expression.span();
+                replace_span(&mut out, path, source, s, b"[]", "Foreach_");
+            }
             _ => {}
         }
     }
@@ -473,7 +561,13 @@ pub struct Mutant {
     pub end: usize,
     pub replacement: Vec<u8>,
     pub mutator: &'static str,
+    /// 1-based line used to look up covering tests — must be an executable line pcov
+    /// records (i.e. where the mutated bytes sit).
     pub line: u32,
+    /// 1-based line reported to the user / oracle. Equals `line` for every mutator
+    /// except do-while, where Infection anchors to the `do` keyword (a line pcov may
+    /// not record), so coverage and reporting need different anchors.
+    pub report_line: u32,
 }
 
 #[cfg(test)]

@@ -315,4 +315,65 @@ final class Ops
         return array_merge($a, $b);
     }
 
+    public function ifb(bool $c): string
+    {
+        if ($c) {
+            return 'y';
+        }
+        return 'n';
+    }
+
+    public function elifb(bool $a, bool $b): string
+    {
+        if ($a) {
+            return 'a';
+        } elseif ($b) {
+            return 'b';
+        }
+        return 'n';
+    }
+
+    // The loop fixtures avoid literal 0/1 (seed/step come in as params) so they exercise
+    // ONLY the loop mutators — Infection's Number `canMutate` exclusions (skip Increment
+    // on `0` under an assignment, etc.) are a separate parity concern, tracked elsewhere.
+    public function fsum(array $xs, int $seed): int
+    {
+        $t = $seed;
+        foreach ($xs as $x) {
+            $t = $t + $x;
+        }
+        return $t;
+    }
+
+    public function wcount(int $n, int $step): int
+    {
+        $t = $step;
+        $i = $step;
+        while ($i < $n) {
+            $t = $t + $step;
+            $i = $i + $step;
+        }
+        return $t;
+    }
+
+    public function fcount(int $n, int $step): int
+    {
+        $t = $step;
+        for ($i = $step; $i < $n; $i = $i + $step) {
+            $t = $t + $step;
+        }
+        return $t;
+    }
+
+    public function dcount(int $n, int $step): int
+    {
+        $t = $step;
+        $i = $step;
+        do {
+            $t = $t + $step;
+            $i = $i + $step;
+        } while ($i < $n);
+        return $t;
+    }
+
 }
