@@ -46,6 +46,8 @@
         IncrementInteger: true,
         DecrementInteger: true,
         This: true,
+        PublicVisibility: true,
+        ProtectedVisibility: true,
         NewObject: true,
         FunctionCall: true,
         IntegerNegation: true,
