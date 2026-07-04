@@ -27,6 +27,9 @@ use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::ast::variable::Variable;
 use mago_syntax::ast::ArrayElement;
 use mago_syntax::ast::MatchArm;
+use mago_syntax::ast::Method;
+use mago_syntax::ast::MethodBody;
+use mago_syntax::ast::Modifier;
 use mago_syntax::parser::parse_file_content;
 
 /// The lower-cased, namespace-stripped name of an identifier-callee (e.g. `\StrToLower`
@@ -576,6 +579,85 @@ fn walk_return_values(
     }
     for child in node.children() {
         walk_return_values(child, child_allows, out, path, source);
+    }
+}
+
+/// Highest (last) 1-based start line among a node and all its descendants — used to find
+/// a body line pcov is likely to record for a method-signature mutant.
+fn max_descendant_line(node: Node, source: &[u8]) -> u32 {
+    let mut m = line_at(source, node.span().start.offset as usize);
+    for child in node.children() {
+        m = m.max(max_descendant_line(child, source));
+    }
+    m
+}
+
+/// Emit a FunctionSignature visibility mutant for one method: `public`→`protected`
+/// (PublicVisibility) or `protected`→`private` (ProtectedVisibility, unless `final`).
+/// Reports on the method's declaration line but anchors coverage to the body's first
+/// statement (pcov does not record signature lines). Magic (`__*`) and abstract methods
+/// are skipped, matching Infection's `canMutate`.
+fn emit_visibility_mutant(m: &Method, out: &mut Vec<Mutant>, path: &Path, source: &[u8]) {
+    let MethodBody::Concrete(block) = &m.body else {
+        return;
+    };
+    if block.statements.as_slice().is_empty() {
+        return;
+    }
+    if m.name.value.starts_with(b"__") {
+        return;
+    }
+    let is_final = m
+        .modifiers
+        .as_slice()
+        .iter()
+        .any(|md| matches!(md, Modifier::Final(_)));
+    // Coverage anchor: the deepest (last) content line of the method — pcov does not record
+    // signature lines, literal assignments (`$x = 0;`), or block keywords (`try`), but the
+    // final `return`/`throw`/call almost always sits on the max content line.
+    let cover = max_descendant_line(Node::Method(m), source);
+    let report = line_at(source, m.span().start.offset as usize);
+    for md in m.modifiers.as_slice() {
+        let (mutator, repl): (&'static str, &'static [u8]) = match md {
+            Modifier::Public(_) => ("PublicVisibility", b"protected"),
+            Modifier::Protected(_) if !is_final => ("ProtectedVisibility", b"private"),
+            _ => continue,
+        };
+        let kw = md.span();
+        out.push(Mutant {
+            file: path.to_path_buf(),
+            start: kw.start.offset as usize,
+            end: kw.end.offset as usize,
+            replacement: repl.to_vec(),
+            mutator,
+            line: cover,
+            report_line: report,
+        });
+    }
+}
+
+/// Recursive pass for the visibility mutators: `class_no_parent` is `Some(true)` inside a
+/// class with no `extends`/`implements` (where Infection's hasSame*ParentMethod is
+/// trivially false). Classes WITH a parent are skipped — the parent-method resolution is
+/// deferred — so only standalone-class methods mutate.
+fn walk_visibility(
+    node: Node,
+    class_no_parent: Option<bool>,
+    out: &mut Vec<Mutant>,
+    path: &Path,
+    source: &[u8],
+) {
+    let child_ctx = match node {
+        Node::Class(c) => Some(c.extends.is_none() && c.implements.is_none()),
+        _ => class_no_parent,
+    };
+    if let Node::Method(m) = node {
+        if class_no_parent == Some(true) {
+            emit_visibility_mutant(m, out, path, source);
+        }
+    }
+    for child in node.children() {
+        walk_visibility(child, child_ctx, out, path, source);
     }
 }
 
@@ -1167,6 +1249,8 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
     }
     // Second, scope-aware pass for the ReturnValue mutators (need the enclosing return type).
     walk_return_values(Node::Program(program), true, &mut out, path, source);
+    // Visibility mutators need the enclosing class (parent status) — another recursive pass.
+    walk_visibility(Node::Program(program), None, &mut out, path, source);
     out.sort_by_key(|m| m.start);
     out
 }

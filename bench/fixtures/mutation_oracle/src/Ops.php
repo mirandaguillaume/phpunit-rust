@@ -489,6 +489,19 @@ final class Ops
         return preg_match('/^[a-z]+$/i', $s);
     }
 
+    protected function prot(): string
+    {
+        // ProtectedVisibility: `protected` -> `private`. Called only internally, so the
+        // mutant escapes (private is fine within the class) — both tools agree.
+        return 'p';
+    }
+
+    public function callProt(): string
+    {
+        // PublicVisibility on callProt: `public` -> `protected` -> external call fatals.
+        return $this->prot();
+    }
+
     public function rnd(float $x): float
     {
         // RoundingFamily: round -> floor AND ceil (killed by the 2.6/2.4 pair below).

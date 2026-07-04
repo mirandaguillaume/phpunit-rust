@@ -494,6 +494,13 @@ final class OpsTest extends TestCase
         self::assertSame(0, (new Ops())->rx('abc9'));
     }
 
+    public function testProt(): void
+    {
+        // Making callProt protected fatals the external call (PublicVisibility -> KILLED);
+        // making prot private is invisible to the internal call (ProtectedVisibility escapes).
+        self::assertSame('p', (new Ops())->callProt());
+    }
+
     public function testRnd(): void
     {
         // 2.6 kills round->floor (2.0); 2.4 kills round->ceil (3.0).
