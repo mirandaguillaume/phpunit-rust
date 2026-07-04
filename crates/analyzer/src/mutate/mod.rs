@@ -25,6 +25,7 @@ use mago_syntax::ast::r#yield::Yield;
 use mago_syntax::ast::type_hint::Hint;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::ast::variable::Variable;
+use mago_syntax::ast::MatchArm;
 use mago_syntax::parser::parse_file_content;
 
 /// The lower-cased, namespace-stripped name of an identifier-callee (e.g. `\StrToLower`
@@ -684,6 +685,48 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
             Node::FunctionCall(fc) => {
                 record_unwrap(&mut out, path, source, fc);
                 record_call_rewrites(&mut out, path, source, fc);
+            }
+            // MatchArmRemoval: drop one arm from a `match` with >1 arms. Delete the arm's
+            // bytes plus one separating comma by cutting to the neighbour arm's edge. (Arms
+            // with several conditions — `1, 2 => …` — remove one condition in Infection; that
+            // multi-condition case is deferred, so it is skipped here.)
+            Node::Match(m) => {
+                let arms = m.arms.as_slice();
+                if arms.len() > 1 {
+                    // Infection anchors every arm-removal to the `match` line (the mutant
+                    // inherits the Match node's attributes), so both the coverage line and
+                    // the reported line use it.
+                    let match_line = line_at(source, m.span().start.offset as usize);
+                    for i in 0..arms.len() {
+                        if let MatchArm::Expression(e) = &arms[i] {
+                            if e.conditions.as_slice().len() > 1 {
+                                continue;
+                            }
+                        }
+                        let (ds, de) = if i + 1 < arms.len() {
+                            (
+                                arms[i].span().start.offset as usize,
+                                arms[i + 1].span().start.offset as usize,
+                            )
+                        } else {
+                            (
+                                arms[i - 1].span().end.offset as usize,
+                                arms[i].span().end.offset as usize,
+                            )
+                        };
+                        if ds < de && de <= source.len() {
+                            out.push(Mutant {
+                                file: path.to_path_buf(),
+                                start: ds,
+                                end: de,
+                                replacement: Vec::new(),
+                                mutator: "MatchArmRemoval",
+                                line: match_line,
+                                report_line: match_line,
+                            });
+                        }
+                    }
+                }
             }
             // SpreadRemoval: `[...$x]` -> `[$x]` (delete the `...` before the value).
             Node::VariadicArrayElement(v) => {

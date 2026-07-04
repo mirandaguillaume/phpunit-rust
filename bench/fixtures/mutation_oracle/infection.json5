@@ -137,6 +137,7 @@
         ArrayAll: true,
         ArrayAny: true,
         SpreadRemoval: true,
+        MatchArmRemoval: true,
         UnwrapArrayCombine: true,
         UnwrapArrayIntersectUassoc: true,
         UnwrapArrayIntersectUkey: true,
