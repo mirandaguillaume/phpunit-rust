@@ -173,12 +173,13 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      # pcov drives both the baseline coverage (proust) and Infection; php 8.3
-      # satisfies infection/infection ^0.29's PHP floor.
+      # pcov drives both the baseline coverage (proust) and Infection. php 8.4 is
+      # required by the fixture's array_find/array_find_key (8.4 builtins) and matches
+      # the local proust-cov:php84 oracle image.
       - name: Install PHP (with pcov)
         uses: shivammathur/setup-php@v2
         with:
-          php-version: "8.3"
+          php-version: "8.4"
           coverage: pcov
 
       - name: Build proust binary (coverage feature)
