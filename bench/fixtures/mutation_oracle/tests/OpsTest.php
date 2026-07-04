@@ -479,6 +479,12 @@ final class OpsTest extends TestCase
         self::assertSame('2', (new Ops())->bcPowMod('2', '100', '7'));
     }
 
+    public function testPm(): void
+    {
+        // Emptying the captures (or removing preg_match) drops the match -> KILLED.
+        self::assertSame(['12'], (new Ops())->pm('a12'));
+    }
+
     public function testRnd(): void
     {
         // 2.6 kills round->floor (2.0); 2.4 kills round->ceil (3.0).
