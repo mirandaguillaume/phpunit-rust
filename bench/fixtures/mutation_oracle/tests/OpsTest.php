@@ -472,4 +472,24 @@ final class OpsTest extends TestCase
         // scale-0 bcsqrt("2") = "1"; the `(string) sqrt(...)` mutant = "1.4142..." -> KILLED.
         self::assertSame('1', (new Ops())->bcSqrt('2'));
     }
+
+    public function testRnd(): void
+    {
+        // 2.6 kills round->floor (2.0); 2.4 kills round->ceil (3.0).
+        self::assertSame(3.0, (new Ops())->rnd(2.6));
+        self::assertSame(2.0, (new Ops())->rnd(2.4));
+    }
+
+    public function testCoalAssign(): void
+    {
+        // `$a = $b` mutant returns 'y' instead of the non-null 'x' -> KILLED.
+        self::assertSame('x', (new Ops())->coalAssign('x', 'y'));
+    }
+
+    public function testNsCall(): void
+    {
+        // `$o->five()` on null is a fatal Error -> KILLED; non-null path stays 5.
+        self::assertNull((new Ops())->nsCall(null));
+        self::assertSame(5, (new Ops())->nsCall(new Ops()));
+    }
 }

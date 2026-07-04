@@ -129,5 +129,8 @@
         ArrayFindKey: true,
         MBString: true,
         BCMath: true,
+        RoundingFamily: true,
+        AssignCoalesce: true,
+        NullSafeMethodCall: true,
     },
 }

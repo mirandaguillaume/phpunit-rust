@@ -119,6 +119,21 @@ fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &
         record_owned(out, file, source, cstart, cend, b"null".to_vec(), mutator);
         return;
     }
+    // RoundingFamily: `round($x)` -> `floor($x)` AND `ceil($x)` (2 mutants, arg 0 only).
+    if let Some(targets) = mutators::rounding_family(&name) {
+        if let Some((a0, a1)) = nth_arg_span(&fc.argument_list, 0) {
+            if a1 <= source.len() {
+                for target in targets {
+                    let mut r = target.to_vec();
+                    r.push(b'(');
+                    r.extend_from_slice(&source[a0..a1]);
+                    r.push(b')');
+                    record_owned(out, file, source, cstart, cend, r, "RoundingFamily");
+                }
+            }
+        }
+        return;
+    }
     // BCMath: `bcadd($a, $b, …)` -> `(string)($a + $b)`; `bcsqrt($a, …)` -> `(string)sqrt($a)`.
     if let Some(kind) = mutators::bcmath_op(&name) {
         let seg = |i: usize| nth_arg_span(&fc.argument_list, i);
@@ -589,10 +604,28 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 if let Some(t) = mutators::mutate_assignment(op) {
                     record(&mut out, path, source, t);
                 }
+                // AssignCoalesce: `$a ??= $b` -> `$a = $b` (replace the `??=` token with `=`).
+                let s = op.span();
+                if &source[s.start.offset as usize..s.end.offset as usize] == b"??=" {
+                    replace_span(&mut out, path, source, s, b"=", "AssignCoalesce");
+                }
             }
             Node::FunctionCall(fc) => {
                 record_unwrap(&mut out, path, source, fc);
                 record_call_rewrites(&mut out, path, source, fc);
+            }
+            // NullSafeMethodCall: `$x?->m()` -> `$x->m()` (replace `?->` with `->`). A call
+            // on null is a fatal Error (killed); the property-read variant only warns, so
+            // NullSafePropertyCall is deferred until the runner honours failOnWarning.
+            Node::NullSafeMethodCall(m) => {
+                replace_span(
+                    &mut out,
+                    path,
+                    source,
+                    m.question_mark_arrow,
+                    b"->",
+                    "NullSafeMethodCall",
+                );
             }
             // Loop control swap: `break` <-> `continue`.
             Node::Break(b) => {

@@ -165,6 +165,18 @@ pub fn unwrap_arg(fn_lower: &[u8]) -> Option<(&'static str, usize)> {
     Some((name, 0))
 }
 
+/// Infection `RoundingFamily`: `round`/`floor`/`ceil` each mutate to the OTHER two
+/// (arg 0 only). Returns the two target function names, or `None` for other callees.
+pub fn rounding_family(fn_lower: &[u8]) -> Option<[&'static [u8]; 2]> {
+    let (a, b): (&[u8], &[u8]) = match fn_lower {
+        b"round" => (b"floor", b"ceil"),
+        b"floor" => (b"round", b"ceil"),
+        b"ceil" => (b"round", b"floor"),
+        _ => return None,
+    };
+    Some([a, b])
+}
+
 /// Infection `Nullify` mutators: `array_find(…)`/`array_find_key(…)` → `null`.
 pub fn nullify_name(fn_lower: &[u8]) -> Option<&'static str> {
     match fn_lower {
