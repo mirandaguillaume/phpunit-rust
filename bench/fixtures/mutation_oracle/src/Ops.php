@@ -513,4 +513,10 @@ final class Ops
         return array_uintersect($a, $b, 'strcmp');
     }
 
+    public function spread(array $xs): array
+    {
+        // SpreadRemoval: `[...$xs, 'end']` -> `[$xs, 'end']` (nests instead of flattening).
+        return [...$xs, 'end'];
+    }
+
 }
