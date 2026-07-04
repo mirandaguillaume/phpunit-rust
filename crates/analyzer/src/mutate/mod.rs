@@ -25,6 +25,7 @@ use mago_syntax::ast::r#yield::Yield;
 use mago_syntax::ast::type_hint::Hint;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::ast::variable::Variable;
+use mago_syntax::ast::ArrayElement;
 use mago_syntax::ast::MatchArm;
 use mago_syntax::parser::parse_file_content;
 
@@ -718,6 +719,26 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                             line: line_at(source, bracket),
                             report_line: line_at(source, bracket),
                         });
+                    }
+                }
+                // SpreadAssignment: a single-element spread array `[...$x]` -> `$x`
+                // (unwrap the array entirely, unlike SpreadRemoval which keeps `[$x]`).
+                if els.len() == 1 {
+                    if let ArrayElement::Variadic(v) = &els[0] {
+                        let arr_end = a.right_bracket.end.offset as usize;
+                        let val = v.value.span();
+                        let (vs, ve) = (val.start.offset as usize, val.end.offset as usize);
+                        if bracket < arr_end && ve <= arr_end {
+                            record_owned(
+                                &mut out,
+                                path,
+                                source,
+                                bracket,
+                                arr_end,
+                                source[vs..ve].to_vec(),
+                                "SpreadAssignment",
+                            );
+                        }
                     }
                 }
             }
