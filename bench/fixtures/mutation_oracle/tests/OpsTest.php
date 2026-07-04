@@ -548,4 +548,11 @@ final class OpsTest extends TestCase
         self::assertSame('two', (new Ops())->classify('b'));
         self::assertSame('other', (new Ops())->classify('z'));
     }
+
+    public function testTryIt(): void
+    {
+        // Both catches reachable: removing either lets the exception escape -> KILLED.
+        self::assertSame('invalid', (new Ops())->tryIt(new \InvalidArgumentException('x')));
+        self::assertSame('runtime', (new Ops())->tryIt(new \RuntimeException('y')));
+    }
 }
