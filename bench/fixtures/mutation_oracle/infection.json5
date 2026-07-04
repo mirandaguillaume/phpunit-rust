@@ -134,5 +134,11 @@
         NullSafeMethodCall: true,
         ArrayAll: true,
         ArrayAny: true,
+        UnwrapArrayCombine: true,
+        UnwrapArrayIntersectUassoc: true,
+        UnwrapArrayIntersectUkey: true,
+        UnwrapArrayUintersect: true,
+        UnwrapArrayUintersectAssoc: true,
+        UnwrapArrayUintersectUassoc: true,
     },
 }

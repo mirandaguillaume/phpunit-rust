@@ -248,19 +248,27 @@ pub fn mbstring_vanilla(fn_lower: &[u8]) -> Option<(&'static [u8], usize)> {
 
 /// Infection `Unwrap*` mutators that keep EACH of several args — one mutant per kept
 /// arg (unlike `unwrap_arg`, which keeps a single fixed index). Returns
-/// `(mutator name, skip_first)`; `skip_first` drops arg 0 (the callback), as
-/// `array_map` does. Every other listed fn keeps all args. The trailing-callback
-/// `array_slice` cases (`array_uintersect` etc.) and `array_combine` are a follow-up.
-pub fn unwrap_range(fn_lower: &[u8]) -> Option<(&'static str, bool)> {
+/// `(mutator name, start, drop_last)`: keep the positional args in `start..len-drop_last`.
+/// `array_map` drops the leading callback (`start = 1`); the `array_uintersect*` family
+/// drops the trailing comparison callback(s) (`drop_last = 1` or `2`).
+pub fn unwrap_range(fn_lower: &[u8]) -> Option<(&'static str, usize, usize)> {
     Some(match fn_lower {
-        b"array_map" => ("UnwrapArrayMap", true),
-        b"array_merge" => ("UnwrapArrayMerge", false),
-        b"array_merge_recursive" => ("UnwrapArrayMergeRecursive", false),
-        b"array_replace" => ("UnwrapArrayReplace", false),
-        b"array_replace_recursive" => ("UnwrapArrayReplaceRecursive", false),
-        b"array_intersect" => ("UnwrapArrayIntersect", false),
-        b"array_intersect_key" => ("UnwrapArrayIntersectKey", false),
-        b"array_intersect_assoc" => ("UnwrapArrayIntersectAssoc", false),
+        b"array_map" => ("UnwrapArrayMap", 1, 0),
+        b"array_merge" => ("UnwrapArrayMerge", 0, 0),
+        b"array_merge_recursive" => ("UnwrapArrayMergeRecursive", 0, 0),
+        b"array_replace" => ("UnwrapArrayReplace", 0, 0),
+        b"array_replace_recursive" => ("UnwrapArrayReplaceRecursive", 0, 0),
+        b"array_intersect" => ("UnwrapArrayIntersect", 0, 0),
+        b"array_intersect_key" => ("UnwrapArrayIntersectKey", 0, 0),
+        b"array_intersect_assoc" => ("UnwrapArrayIntersectAssoc", 0, 0),
+        // array_combine keeps args 0 AND 1 (always a 2-arg call, so "keep all").
+        b"array_combine" => ("UnwrapArrayCombine", 0, 0),
+        // The u-comparator families keep every array arg but the trailing callback(s).
+        b"array_intersect_uassoc" => ("UnwrapArrayIntersectUassoc", 0, 1),
+        b"array_intersect_ukey" => ("UnwrapArrayIntersectUkey", 0, 1),
+        b"array_uintersect" => ("UnwrapArrayUintersect", 0, 1),
+        b"array_uintersect_assoc" => ("UnwrapArrayUintersectAssoc", 0, 1),
+        b"array_uintersect_uassoc" => ("UnwrapArrayUintersectUassoc", 0, 2),
         _ => return None,
     })
 }
