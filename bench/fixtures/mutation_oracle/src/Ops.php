@@ -476,6 +476,13 @@ final class Ops
         return bcpowmod($a, $b, $c);
     }
 
+    public function pm(string $s): array
+    {
+        // PregMatchMatches: `preg_match(...)` -> `(int)($m = [])` empties the captures.
+        preg_match('/\d+/', $s, $m);
+        return $m;
+    }
+
     public function rnd(float $x): float
     {
         // RoundingFamily: round -> floor AND ceil (killed by the 2.6/2.4 pair below).

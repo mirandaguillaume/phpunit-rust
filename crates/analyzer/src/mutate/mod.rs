@@ -128,6 +128,18 @@ fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &
         record_owned(out, file, source, cstart, cend, b"true".to_vec(), mutator);
         return;
     }
+    // PregMatchMatches: `preg_match($p, $s, $m)` -> `(int)($m = [])` (empties the captures).
+    if name == b"preg_match" && fc.argument_list.arguments.len() >= 3 {
+        if let Some((m0, m1)) = nth_arg_span(&fc.argument_list, 2) {
+            if m1 <= source.len() {
+                let mut r = b"(int)(".to_vec();
+                r.extend_from_slice(&source[m0..m1]);
+                r.extend_from_slice(b" = [])");
+                record_owned(out, file, source, cstart, cend, r, "PregMatchMatches");
+                return;
+            }
+        }
+    }
     // RoundingFamily: `round($x)` -> `floor($x)` AND `ceil($x)` (2 mutants, arg 0 only).
     if let Some(targets) = mutators::rounding_family(&name) {
         if let Some((a0, a1)) = nth_arg_span(&fc.argument_list, 0) {
