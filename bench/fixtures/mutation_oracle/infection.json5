@@ -46,6 +46,8 @@
         IncrementInteger: true,
         DecrementInteger: true,
         This: true,
+        NewObject: true,
+        FunctionCall: true,
         IntegerNegation: true,
         FloatNegation: true,
         BitwiseAnd: true,

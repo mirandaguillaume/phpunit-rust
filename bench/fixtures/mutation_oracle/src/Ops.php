@@ -519,4 +519,23 @@ final class Ops
         return [...$xs, 'end'];
     }
 
+    public function makeObj()
+    {
+        // NewObject: no return-type hint allows null -> `new \stdClass(); return null;`.
+        return new \stdClass();
+    }
+
+    public function callStrlen(string $s)
+    {
+        // FunctionCall: no return-type hint -> `strlen($s); return null;`.
+        return strlen($s);
+    }
+
+    public function callTyped(string $s): int
+    {
+        // The `: int` return type forbids null, so NO FunctionCall mutant is generated
+        // (matches Infection's isNullReturnValueAllowed). strlen is not otherwise mutated.
+        return strlen($s);
+    }
+
 }
