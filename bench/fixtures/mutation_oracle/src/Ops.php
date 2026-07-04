@@ -470,6 +470,12 @@ final class Ops
         return bcsqrt($a);
     }
 
+    public function bcPowMod(string $a, string $b, string $c): string
+    {
+        // BCMath: `bcpowmod` -> `(string)(pow($a,$b) % $c)`; float pow loses precision.
+        return bcpowmod($a, $b, $c);
+    }
+
     public function rnd(float $x): float
     {
         // RoundingFamily: round -> floor AND ceil (killed by the 2.6/2.4 pair below).

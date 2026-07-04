@@ -170,6 +170,22 @@ fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &
                         r
                     })
             }
+            // bcpowmod($a, $b, $c) -> (string)(pow($a, $b) % $c).
+            mutators::BcMath::PowMod => match (seg(0), seg(1), seg(2)) {
+                (Some((a0, a1)), Some((b0, b1)), Some((c0, c1)))
+                    if a1 <= source.len() && b1 <= source.len() && c1 <= source.len() =>
+                {
+                    let mut r = b"(string)(pow(".to_vec();
+                    r.extend_from_slice(&source[a0..a1]);
+                    r.extend_from_slice(b", ");
+                    r.extend_from_slice(&source[b0..b1]);
+                    r.extend_from_slice(b") % ");
+                    r.extend_from_slice(&source[c0..c1]);
+                    r.push(b')');
+                    Some(r)
+                }
+                _ => None,
+            },
         };
         if let Some(repl) = repl {
             record_owned(out, file, source, cstart, cend, repl, "BCMath");
