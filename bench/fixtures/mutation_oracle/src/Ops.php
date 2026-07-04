@@ -470,4 +470,23 @@ final class Ops
         return bcsqrt($a);
     }
 
+    public function rnd(float $x): float
+    {
+        // RoundingFamily: round -> floor AND ceil (killed by the 2.6/2.4 pair below).
+        return round($x);
+    }
+
+    public function coalAssign(?string $a, string $b): string
+    {
+        // AssignCoalesce: `$a ??= $b` -> `$a = $b` (always takes $b).
+        $a ??= $b;
+        return $a;
+    }
+
+    public function nsCall(?Ops $o): ?int
+    {
+        // NullSafeMethodCall: `$o?->five()` -> `$o->five()` (call on null is a fatal Error).
+        return $o?->five();
+    }
+
 }
