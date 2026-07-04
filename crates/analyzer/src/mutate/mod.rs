@@ -532,28 +532,61 @@ fn return_hint_allows_null(hint: Option<&FunctionLikeReturnTypeHint>) -> bool {
     }
 }
 
+/// Infection's `ArrayOneItem` (`return $v` with an `array` return type) checks the exact
+/// `array` return type — `?array`, `iterable`, unions do not qualify.
+fn return_hint_is_array(hint: Option<&FunctionLikeReturnTypeHint>) -> bool {
+    matches!(hint, Some(h) if matches!(h.hint, Hint::Array(_)))
+}
+
 /// Infection `ReturnValue` mutators that need enclosing-scope context: `return new X()`
-/// (NewObject) and `return foo()` (FunctionCall) become `<expr>; return null` — but ONLY
-/// when the enclosing function permits a null return. A recursive descent carries that
-/// flag down each function scope (the flat walk has no ancestor chain).
+/// (NewObject) / `return foo()` (FunctionCall) become `<expr>; return null` when the
+/// function permits a null return; `return $v` (ArrayOneItem) becomes a keep-first-item
+/// ternary when the function returns `array`. A recursive descent carries the enclosing
+/// return type down each function scope (the flat walk has no ancestor chain).
 fn walk_return_values(
     node: Node,
     allows_null: bool,
+    returns_array: bool,
     out: &mut Vec<Mutant>,
     path: &Path,
     source: &[u8],
 ) {
-    // A function-like node re-scopes null-permission for its whole subtree.
-    let child_allows = match node {
-        Node::Function(f) => return_hint_allows_null(f.return_type_hint.as_ref()),
-        Node::Method(m) => return_hint_allows_null(m.return_type_hint.as_ref()),
-        Node::Closure(c) => return_hint_allows_null(c.return_type_hint.as_ref()),
-        Node::ArrowFunction(a) => return_hint_allows_null(a.return_type_hint.as_ref()),
-        _ => allows_null,
+    // A function-like node re-scopes the return-type flags for its whole subtree.
+    let (child_allows, child_array) = match node {
+        Node::Function(f) => (
+            return_hint_allows_null(f.return_type_hint.as_ref()),
+            return_hint_is_array(f.return_type_hint.as_ref()),
+        ),
+        Node::Method(m) => (
+            return_hint_allows_null(m.return_type_hint.as_ref()),
+            return_hint_is_array(m.return_type_hint.as_ref()),
+        ),
+        Node::Closure(c) => (
+            return_hint_allows_null(c.return_type_hint.as_ref()),
+            return_hint_is_array(c.return_type_hint.as_ref()),
+        ),
+        Node::ArrowFunction(a) => (
+            return_hint_allows_null(a.return_type_hint.as_ref()),
+            return_hint_is_array(a.return_type_hint.as_ref()),
+        ),
+        _ => (allows_null, returns_array),
     };
-    if allows_null {
-        if let Node::Return(r) = node {
-            if let Some(expr) = r.value {
+    if let Node::Return(r) = node {
+        if let Some(expr) = r.value {
+            let e = expr.span();
+            let (es, ee) = (e.start.offset as usize, e.end.offset as usize);
+            // ArrayOneItem: `return $v` -> keep only the first item when returning `array`.
+            if returns_array && matches!(expr, Expression::Variable(_)) && ee <= source.len() {
+                let v = &source[es..ee];
+                let mut repl = b"count(".to_vec();
+                repl.extend_from_slice(v);
+                repl.extend_from_slice(b") > 1 ? array_slice(");
+                repl.extend_from_slice(v);
+                repl.extend_from_slice(b", 0, 1, true) : ");
+                repl.extend_from_slice(v);
+                record_owned(out, path, source, es, ee, repl, "ArrayOneItem");
+            }
+            if allows_null {
                 let mutator = match expr {
                     Expression::Instantiation(inst)
                         if matches!(inst.class, Expression::Identifier(_)) =>
@@ -566,8 +599,6 @@ fn walk_return_values(
                 if let Some(mutator) = mutator {
                     let ss = r.r#return.span().start.offset as usize;
                     let se = r.terminator.span().end.offset as usize;
-                    let e = expr.span();
-                    let (es, ee) = (e.start.offset as usize, e.end.offset as usize);
                     if ss < se && se <= source.len() && es >= ss && ee <= se {
                         let mut repl = source[es..ee].to_vec();
                         repl.extend_from_slice(b"; return null;");
@@ -578,7 +609,7 @@ fn walk_return_values(
         }
     }
     for child in node.children() {
-        walk_return_values(child, child_allows, out, path, source);
+        walk_return_values(child, child_allows, child_array, out, path, source);
     }
 }
 
@@ -1248,7 +1279,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
         }
     }
     // Second, scope-aware pass for the ReturnValue mutators (need the enclosing return type).
-    walk_return_values(Node::Program(program), true, &mut out, path, source);
+    walk_return_values(Node::Program(program), true, false, &mut out, path, source);
     // Visibility mutators need the enclosing class (parent status) — another recursive pass.
     walk_visibility(Node::Program(program), None, &mut out, path, source);
     out.sort_by_key(|m| m.start);
