@@ -501,4 +501,16 @@ final class Ops
         return array_any($xs, fn($x) => $x);
     }
 
+    public function combine(array $k, array $v): array
+    {
+        // UnwrapArrayCombine: keeps arg 0 AND arg 1 -> 2 mutants.
+        return array_combine($k, $v);
+    }
+
+    public function uinter(array $a, array $b): array
+    {
+        // UnwrapArrayUintersect: keeps the array args (0, 1), dropping the trailing callback.
+        return array_uintersect($a, $b, 'strcmp');
+    }
+
 }

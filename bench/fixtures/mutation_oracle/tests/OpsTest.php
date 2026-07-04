@@ -504,4 +504,16 @@ final class OpsTest extends TestCase
         // array_any -> true makes the all-false input wrongly report any-truthy -> KILLED.
         self::assertFalse((new Ops())->anyPos([false, false]));
     }
+
+    public function testCombine(): void
+    {
+        // Unwrapping to either arg drops the combine -> KILLED.
+        self::assertSame(['x' => '1'], (new Ops())->combine(['x'], ['1']));
+    }
+
+    public function testUinter(): void
+    {
+        // Unwrapping to either array arg drops the intersection -> KILLED.
+        self::assertSame([1 => 'b'], (new Ops())->uinter(['a', 'b'], ['b', 'c']));
+    }
 }

@@ -79,11 +79,11 @@ fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &Functio
         );
         return;
     }
-    // Range unwrap: emit one mutant per kept arg (`array_merge` → each; `array_map` → all
-    // but the callback at index 0). Variable arg count, so iterate positionals.
-    if let Some((mutator, skip_first)) = mutators::unwrap_range(&name) {
-        let start_idx = usize::from(skip_first);
-        for i in start_idx..fc.argument_list.arguments.len() {
+    // Range unwrap: emit one mutant per kept arg in `start..len-drop_last` (e.g. `array_map`
+    // drops the leading callback; `array_uintersect` drops the trailing comparator).
+    if let Some((mutator, start_idx, drop_last)) = mutators::unwrap_range(&name) {
+        let end = fc.argument_list.arguments.len().saturating_sub(drop_last);
+        for i in start_idx..end {
             let Some((astart, aend)) = nth_arg_span(&fc.argument_list, i) else {
                 continue;
             };
