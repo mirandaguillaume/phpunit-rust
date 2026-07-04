@@ -822,11 +822,19 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 }
             }
             // SpreadRemoval: `[...$x]` -> `[$x]` (delete the `...` before the value).
+            // SpreadOneItem: `...$x` -> `[...$x][0]` (keep only the spread's first element).
             Node::VariadicArrayElement(v) => {
                 let e = v.ellipsis;
                 let (s, en) = (e.start.offset as usize, e.end.offset as usize);
                 if s < en && en <= source.len() {
                     record_owned(&mut out, path, source, s, en, Vec::new(), "SpreadRemoval");
+                }
+                let elem_end = v.value.span().end.offset as usize;
+                if s < elem_end && elem_end <= source.len() {
+                    let mut repl = vec![b'['];
+                    repl.extend_from_slice(&source[s..elem_end]);
+                    repl.extend_from_slice(b"][0]");
+                    record_owned(&mut out, path, source, s, elem_end, repl, "SpreadOneItem");
                 }
             }
             // NullSafeMethodCall: `$x?->m()` -> `$x->m()` (replace `?->` with `->`). A call
