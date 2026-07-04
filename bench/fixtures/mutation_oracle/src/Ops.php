@@ -538,4 +538,16 @@ final class Ops
         return strlen($s);
     }
 
+    public function classify(string $s): string
+    {
+        // MatchArmRemoval: removing each of the 3 arms is caught (wrong value, or
+        // UnhandledMatchError when the default is dropped). String conditions avoid
+        // spawning integer-literal mutants.
+        return match ($s) {
+            'a' => 'one',
+            'b' => 'two',
+            default => 'other',
+        };
+    }
+
 }

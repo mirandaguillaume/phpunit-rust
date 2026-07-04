@@ -540,4 +540,12 @@ final class OpsTest extends TestCase
         // No mutant here (: int forbids the null return); still assert behaviour.
         self::assertSame(2, (new Ops())->callTyped('ab'));
     }
+
+    public function testClassify(): void
+    {
+        // Each arm covered: removing 'a'/'b' falls to default; removing default -> error.
+        self::assertSame('one', (new Ops())->classify('a'));
+        self::assertSame('two', (new Ops())->classify('b'));
+        self::assertSame('other', (new Ops())->classify('z'));
+    }
 }
