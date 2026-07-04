@@ -489,4 +489,16 @@ final class Ops
         return $o?->five();
     }
 
+    public function allPos(array $xs): bool
+    {
+        // ArrayAll -> true (the whole call is replaced with the constant true).
+        return array_all($xs, fn($x) => $x);
+    }
+
+    public function anyPos(array $xs): bool
+    {
+        // ArrayAny -> true (the whole call is replaced with the constant true).
+        return array_any($xs, fn($x) => $x);
+    }
+
 }

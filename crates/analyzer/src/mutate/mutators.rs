@@ -186,6 +186,15 @@ pub fn nullify_name(fn_lower: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Infection `Boolean` predicate mutators: `array_all(…)`/`array_any(…)` → `true`.
+pub fn array_predicate_true(fn_lower: &[u8]) -> Option<&'static str> {
+    match fn_lower {
+        b"array_all" => Some("ArrayAll"),
+        b"array_any" => Some("ArrayAny"),
+        _ => None,
+    }
+}
+
 /// Infection `BCMath`: an `bc*` call becomes its vanilla arithmetic equivalent.
 pub enum BcMath {
     /// `bcX($a, $b, …)` → `(string)($a <op> $b)`.
