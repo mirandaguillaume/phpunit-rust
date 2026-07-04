@@ -483,6 +483,12 @@ final class Ops
         return $m;
     }
 
+    public function rx(string $s): int
+    {
+        // PregMatchRemoveCaret/Dollar/Flags: dropping `^`, `$`, or `i` changes the match.
+        return preg_match('/^[a-z]+$/i', $s);
+    }
+
     public function rnd(float $x): float
     {
         // RoundingFamily: round -> floor AND ceil (killed by the 2.6/2.4 pair below).

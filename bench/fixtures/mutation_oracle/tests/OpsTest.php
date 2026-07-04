@@ -485,6 +485,15 @@ final class OpsTest extends TestCase
         self::assertSame(['12'], (new Ops())->pm('a12'));
     }
 
+    public function testRx(): void
+    {
+        // 'ABC' kills RemoveFlags (drops i); '9abc' kills RemoveCaret; 'abc9' kills RemoveDollar.
+        self::assertSame(1, (new Ops())->rx('abc'));
+        self::assertSame(1, (new Ops())->rx('ABC'));
+        self::assertSame(0, (new Ops())->rx('9abc'));
+        self::assertSame(0, (new Ops())->rx('abc9'));
+    }
+
     public function testRnd(): void
     {
         // 2.6 kills round->floor (2.0); 2.4 kills round->ceil (3.0).
