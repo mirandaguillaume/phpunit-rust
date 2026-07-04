@@ -460,4 +460,16 @@ final class OpsTest extends TestCase
         // mb_strlen -> strlen counts bytes not chars: 'é' is 2 bytes but 1 char -> KILLED.
         self::assertSame(1, (new Ops())->mblen('é'));
     }
+
+    public function testBcAdd(): void
+    {
+        // scale-0 bcadd("0.1","0.2") = "0"; the `(string)(... + ...)` mutant = "0.3" -> KILLED.
+        self::assertSame('0', (new Ops())->bcAdd('0.1', '0.2'));
+    }
+
+    public function testBcSqrt(): void
+    {
+        // scale-0 bcsqrt("2") = "1"; the `(string) sqrt(...)` mutant = "1.4142..." -> KILLED.
+        self::assertSame('1', (new Ops())->bcSqrt('2'));
+    }
 }

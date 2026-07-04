@@ -119,6 +119,39 @@ fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &
         record_owned(out, file, source, cstart, cend, b"null".to_vec(), mutator);
         return;
     }
+    // BCMath: `bcadd($a, $b, …)` -> `(string)($a + $b)`; `bcsqrt($a, …)` -> `(string)sqrt($a)`.
+    if let Some(kind) = mutators::bcmath_op(&name) {
+        let seg = |i: usize| nth_arg_span(&fc.argument_list, i);
+        let repl: Option<Vec<u8>> = match kind {
+            mutators::BcMath::Binary(op) => match (seg(0), seg(1)) {
+                (Some((a0, a1)), Some((b0, b1))) if a1 <= source.len() && b1 <= source.len() => {
+                    let mut r = b"(string)(".to_vec();
+                    r.extend_from_slice(&source[a0..a1]);
+                    r.push(b' ');
+                    r.extend_from_slice(op);
+                    r.push(b' ');
+                    r.extend_from_slice(&source[b0..b1]);
+                    r.push(b')');
+                    Some(r)
+                }
+                _ => None,
+            },
+            mutators::BcMath::Sqrt => {
+                seg(0)
+                    .filter(|&(_, a1)| a1 <= source.len())
+                    .map(|(a0, a1)| {
+                        let mut r = b"(string)sqrt(".to_vec();
+                        r.extend_from_slice(&source[a0..a1]);
+                        r.push(b')');
+                        r
+                    })
+            }
+        };
+        if let Some(repl) = repl {
+            record_owned(out, file, source, cstart, cend, repl, "BCMath");
+        }
+        return;
+    }
     // MBString: rebuild the call as `<vanilla>(<first N positional args>)`.
     if let Some((vanilla, at_most)) = mutators::mbstring_vanilla(&name) {
         let mut repl = vanilla.to_vec();

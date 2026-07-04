@@ -174,6 +174,30 @@ pub fn nullify_name(fn_lower: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Infection `BCMath`: an `bc*` call becomes its vanilla arithmetic equivalent.
+pub enum BcMath {
+    /// `bcX($a, $b, …)` → `(string)($a <op> $b)`.
+    Binary(&'static [u8]),
+    /// `bcsqrt($a, …)` → `(string) sqrt($a)`.
+    Sqrt,
+}
+
+/// Map a `bc*` function to its vanilla replacement shape (the 3-arg `bcpowmod` special
+/// case is not yet reproduced).
+pub fn bcmath_op(fn_lower: &[u8]) -> Option<BcMath> {
+    Some(match fn_lower {
+        b"bcadd" => BcMath::Binary(b"+"),
+        b"bcsub" => BcMath::Binary(b"-"),
+        b"bcmul" => BcMath::Binary(b"*"),
+        b"bcdiv" => BcMath::Binary(b"/"),
+        b"bcmod" => BcMath::Binary(b"%"),
+        b"bcpow" => BcMath::Binary(b"**"),
+        b"bccomp" => BcMath::Binary(b"<=>"),
+        b"bcsqrt" => BcMath::Sqrt,
+        _ => return None,
+    })
+}
+
 /// Infection `MBString`: replace an `mb_*` call with its vanilla equivalent — returns
 /// `(vanilla name, args_at_most)`. `args_at_most == usize::MAX` keeps every argument
 /// (`makeFunctionMapper`); a finite value drops the extras (`…AndRemoveExtraArgsMapper`).

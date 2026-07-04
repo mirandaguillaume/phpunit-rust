@@ -128,5 +128,6 @@
         ArrayFind: true,
         ArrayFindKey: true,
         MBString: true,
+        BCMath: true,
     },
 }

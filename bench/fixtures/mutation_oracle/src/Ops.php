@@ -458,4 +458,16 @@ final class Ops
         return mb_strlen($s);
     }
 
+    public function bcAdd(string $a, string $b): string
+    {
+        // BCMath: `bcadd($a, $b)` -> `(string)($a + $b)` (scale-0 bcadd truncates, `+` doesn't).
+        return bcadd($a, $b);
+    }
+
+    public function bcSqrt(string $a): string
+    {
+        // BCMath: `bcsqrt($a)` -> `(string) sqrt($a)` (scale-0 bcsqrt truncates).
+        return bcsqrt($a);
+    }
+
 }
