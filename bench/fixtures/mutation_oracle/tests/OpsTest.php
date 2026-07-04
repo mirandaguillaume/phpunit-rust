@@ -406,4 +406,26 @@ final class OpsTest extends TestCase
         // IncrementInteger on the index `0` (-> [1]) returns 8 != 7 -> KILLED; Decrement is excluded.
         self::assertSame(7, (new Ops())->firstOf([7, 8]));
     }
+
+    public function testDup(): void
+    {
+        // Removing `clone` returns the same instance -> assertNotSame fails -> KILLED.
+        $o = new \stdClass();
+        $o->x = 1;
+        $c = (new Ops())->dup($o);
+        self::assertNotSame($o, $c);
+        self::assertSame(1, $c->x);
+    }
+
+    public function testPairs(): void
+    {
+        // Dropping the key yields [0 => 'v'] instead of ['k' => 'v'] -> KILLED.
+        self::assertSame(['k' => 'v'], iterator_to_array((new Ops())->pairs()));
+    }
+
+    public function testPq(): void
+    {
+        // preg_quote escapes the dot; unwrapping to $s drops the backslash -> KILLED.
+        self::assertSame('a\.b', (new Ops())->pq('a.b'));
+    }
 }

@@ -410,4 +410,22 @@ final class Ops
         return $a[0];
     }
 
+    public function dup(\stdClass $o): \stdClass
+    {
+        // CloneRemoval: `clone $o` -> `$o` returns the same instance.
+        return clone $o;
+    }
+
+    public function pairs(): \Generator
+    {
+        // YieldValue: `yield 'k' => 'v'` -> `yield 'v'` drops the key.
+        yield 'k' => 'v';
+    }
+
+    public function pq(string $s): string
+    {
+        // PregQuote: `preg_quote($s)` -> `$s` (unwrap arg 0).
+        return preg_quote($s);
+    }
+
 }
