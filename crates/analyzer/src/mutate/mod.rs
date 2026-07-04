@@ -103,6 +103,53 @@ fn record_unwrap(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &Functio
     }
 }
 
+/// Whole-call rewrites keyed by callee name: `Nullify` (`array_find(…)` → `null`) and
+/// `MBString` (`mb_strlen($s, …)` → `strlen($s)` — vanilla name, first N args kept).
+fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &FunctionCall) {
+    let Some(name) = callee_name_lower(fc.function) else {
+        return;
+    };
+    let call = fc.span();
+    let (cstart, cend) = (call.start.offset as usize, call.end.offset as usize);
+    if cstart >= cend || cend > source.len() {
+        return;
+    }
+    // Nullify: the whole call becomes `null`.
+    if let Some(mutator) = mutators::nullify_name(&name) {
+        record_owned(out, file, source, cstart, cend, b"null".to_vec(), mutator);
+        return;
+    }
+    // MBString: rebuild the call as `<vanilla>(<first N positional args>)`.
+    if let Some((vanilla, at_most)) = mutators::mbstring_vanilla(&name) {
+        let mut repl = vanilla.to_vec();
+        repl.push(b'(');
+        let mut n = 0;
+        for arg in fc.argument_list.arguments.iter() {
+            if n >= at_most {
+                break;
+            }
+            let Argument::Positional(p) = arg else {
+                continue;
+            };
+            if p.ellipsis.is_some() {
+                return; // spread — don't attempt a byte-exact rebuild
+            }
+            let s = p.value.span();
+            let (vs, ve) = (s.start.offset as usize, s.end.offset as usize);
+            if ve > source.len() {
+                return;
+            }
+            if n > 0 {
+                repl.extend_from_slice(b", ");
+            }
+            repl.extend_from_slice(&source[vs..ve]);
+            n += 1;
+        }
+        repl.push(b')');
+        record_owned(out, file, source, cstart, cend, repl, "MBString");
+    }
+}
+
 /// Infection condition-negation (`IfNegation`/`ElseIfNegation`): wrap `cond` in
 /// `!(...)` by re-emitting the original bytes around a `!(` / `)`.
 fn negate_condition(
@@ -510,7 +557,10 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     record(&mut out, path, source, t);
                 }
             }
-            Node::FunctionCall(fc) => record_unwrap(&mut out, path, source, fc),
+            Node::FunctionCall(fc) => {
+                record_unwrap(&mut out, path, source, fc);
+                record_call_rewrites(&mut out, path, source, fc);
+            }
             // Loop control swap: `break` <-> `continue`.
             Node::Break(b) => {
                 let s = b.r#break.span();

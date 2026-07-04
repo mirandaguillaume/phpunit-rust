@@ -125,5 +125,8 @@
         ConcatOperandRemoval: true,
         LogicalAndNegation: true,
         LogicalOrNegation: true,
+        ArrayFind: true,
+        ArrayFindKey: true,
+        MBString: true,
     },
 }

@@ -442,4 +442,22 @@ final class OpsTest extends TestCase
         self::assertTrue((new Ops())->logicOr(true, false));
         self::assertFalse((new Ops())->logicOr(false, false));
     }
+
+    public function testFirstTruthy(): void
+    {
+        // array_find -> null makes the found value vanish -> KILLED.
+        self::assertSame(5, (new Ops())->firstTruthy([0, 5]));
+    }
+
+    public function testFirstTruthyKey(): void
+    {
+        // array_find_key -> null makes the found key vanish -> KILLED.
+        self::assertSame(1, (new Ops())->firstTruthyKey([0, 5]));
+    }
+
+    public function testMblen(): void
+    {
+        // mb_strlen -> strlen counts bytes not chars: 'é' is 2 bytes but 1 char -> KILLED.
+        self::assertSame(1, (new Ops())->mblen('é'));
+    }
 }

@@ -440,4 +440,22 @@ final class Ops
         return $a || $b;
     }
 
+    public function firstTruthy(array $xs)
+    {
+        // ArrayFind (Nullify): the whole call becomes null.
+        return array_find($xs, fn($x) => $x);
+    }
+
+    public function firstTruthyKey(array $xs)
+    {
+        // ArrayFindKey (Nullify): the whole call becomes null.
+        return array_find_key($xs, fn($x) => $x);
+    }
+
+    public function mblen(string $s): int
+    {
+        // MBString: `mb_strlen($s)` -> `strlen($s)` (byte length differs on multibyte input).
+        return mb_strlen($s);
+    }
+
 }
