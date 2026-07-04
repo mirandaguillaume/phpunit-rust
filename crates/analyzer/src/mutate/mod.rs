@@ -181,33 +181,121 @@ fn record_owned(
     });
 }
 
+/// Byte offset of an integer literal used as a comparison operand, unwrapping a leading
+/// unary minus — Infection's Number `canMutate` recurses through `UnaryMinus` when
+/// deciding whether a literal is part of a comparison.
+fn int_operand_offset(e: &Expression) -> Option<usize> {
+    match e {
+        Expression::Literal(Literal::Integer(i)) => Some(i.span.start.offset as usize),
+        Expression::UnaryPrefix(u) if matches!(u.operator, UnaryPrefixOperator::Negation(_)) => {
+            int_operand_offset(u.operand)
+        }
+        _ => None,
+    }
+}
+
+/// Parent-context needed to reproduce Infection's Number `canMutate` exclusions: an
+/// integer literal's eligibility for Increment/Decrement depends on the node it sits in.
+#[derive(Default)]
+struct NumberContext {
+    /// Operand of an equality comparison (`==`, `!=`, `===`, `!==`).
+    equality: std::collections::HashSet<usize>,
+    /// Operand of a relational/"size" comparison (`<`, `>`, `<=`, `>=`).
+    relational: std::collections::HashSet<usize>,
+    /// Direct right-hand side of a plain `=` assignment.
+    assign_rhs: std::collections::HashSet<usize>,
+    /// Direct index of an array access (`$a[0]`).
+    array_index: std::collections::HashSet<usize>,
+}
+
+/// Record a literal's parent relationship into `ctx`. Called as each node is visited;
+/// because the walk is depth-first (parent before child), every literal's context is
+/// populated before the literal itself is processed.
+fn populate_number_ctx(ctx: &mut NumberContext, node: Node) {
+    match node {
+        Node::Binary(b) => {
+            let set = match b.operator {
+                BinaryOperator::Equal(_)
+                | BinaryOperator::NotEqual(_)
+                | BinaryOperator::Identical(_)
+                | BinaryOperator::NotIdentical(_) => Some(&mut ctx.equality),
+                BinaryOperator::LessThan(_)
+                | BinaryOperator::LessThanOrEqual(_)
+                | BinaryOperator::GreaterThan(_)
+                | BinaryOperator::GreaterThanOrEqual(_) => Some(&mut ctx.relational),
+                _ => None,
+            };
+            if let Some(set) = set {
+                if let Some(o) = int_operand_offset(b.lhs) {
+                    set.insert(o);
+                }
+                if let Some(o) = int_operand_offset(b.rhs) {
+                    set.insert(o);
+                }
+            }
+        }
+        Node::Assignment(a) if a.operator.is_assign() => {
+            if let Expression::Literal(Literal::Integer(i)) = a.rhs {
+                ctx.assign_rhs.insert(i.span.start.offset as usize);
+            }
+        }
+        Node::ArrayAccess(aa) => {
+            if let Expression::Literal(Literal::Integer(i)) = aa.index {
+                if i.value == Some(0) {
+                    ctx.array_index.insert(i.span.start.offset as usize);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Emit the two Number mutants for an integer literal: `IncrementInteger` (N→N+1) and
-/// `DecrementInteger` (N→N-1). Uses i128 so `0` decrements to `-1` without wrapping.
-/// (Infection has a parent-`UnaryMinus` special case for negative literals; we don't
-/// track parents, so negative literals are out of scope — the oracle fixture avoids them.)
-fn record_integer_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit: &Literal) {
+/// `DecrementInteger` (N→N-1), honouring Infection's `canMutate` exclusions:
+/// - relational operand → skip BOTH (a size comparison against `N±1` is trivially caught)
+/// - `0` under equality/assignment → skip Increment; `1` under equality/assignment → skip Decrement
+/// - `0` as an array index → skip Decrement
+///   (PHP_INT_MAX and the preg_split-limit niches are not yet reproduced.)
+fn record_integer_literal(
+    out: &mut Vec<Mutant>,
+    file: &Path,
+    source: &[u8],
+    lit: &Literal,
+    ctx: &NumberContext,
+) {
     let Literal::Integer(int) = lit else { return };
     let Some(v) = int.value else { return };
     let (start, end) = (int.span.start.offset as usize, int.span.end.offset as usize);
     let v = v as i128;
-    record_owned(
-        out,
-        file,
-        source,
-        start,
-        end,
-        (v + 1).to_string().into_bytes(),
-        "IncrementInteger",
-    );
-    record_owned(
-        out,
-        file,
-        source,
-        start,
-        end,
-        (v - 1).to_string().into_bytes(),
-        "DecrementInteger",
-    );
+
+    let relational = ctx.relational.contains(&start);
+    let eq_or_assign = ctx.equality.contains(&start) || ctx.assign_rhs.contains(&start);
+    let skip_inc = relational || (v == 0 && eq_or_assign);
+    let skip_dec =
+        relational || (v == 1 && eq_or_assign) || (v == 0 && ctx.array_index.contains(&start));
+
+    if !skip_inc {
+        record_owned(
+            out,
+            file,
+            source,
+            start,
+            end,
+            (v + 1).to_string().into_bytes(),
+            "IncrementInteger",
+        );
+    }
+    if !skip_dec {
+        record_owned(
+            out,
+            file,
+            source,
+            start,
+            end,
+            (v - 1).to_string().into_bytes(),
+            "DecrementInteger",
+        );
+    }
 }
 
 /// Infection's `OneZeroFloat`: mutates ONLY the float literals `0.0`/`1.0`
@@ -234,8 +322,10 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
     let mut out = Vec::new();
     // Depth-first over every AST node; match the operator/literal nodes we mutate.
     let mut stack: Vec<Node> = vec![Node::Program(program)];
+    let mut number_ctx = NumberContext::default();
     while let Some(node) = stack.pop() {
         stack.extend(node.children());
+        populate_number_ctx(&mut number_ctx, node);
         match node {
             Node::Binary(b) => {
                 for t in mutators::mutate_binary(&b.operator) {
@@ -424,7 +514,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 if let Some(t) = mutators::mutate_literal(l) {
                     record(&mut out, path, source, t);
                 }
-                record_integer_literal(&mut out, path, source, l);
+                record_integer_literal(&mut out, path, source, l, &number_ctx);
                 record_float_literal(&mut out, path, source, l);
             }
             Node::UnaryPrefix(u) => match &u.operator {
