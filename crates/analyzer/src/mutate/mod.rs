@@ -25,6 +25,7 @@ use mago_syntax::ast::r#yield::Yield;
 use mago_syntax::ast::type_hint::Hint;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::ast::variable::Variable;
+use mago_syntax::ast::Access;
 use mago_syntax::ast::ArrayElement;
 use mago_syntax::ast::MatchArm;
 use mago_syntax::ast::Method;
@@ -613,6 +614,15 @@ fn walk_return_values(
     }
 }
 
+/// Infection's `isNodeWithSideEffects`: a function call, method call, or property fetch.
+fn is_side_effect(e: &Expression) -> bool {
+    match e {
+        Expression::Call(Call::Function(_)) | Expression::Call(Call::Method(_)) => true,
+        Expression::Access(a) => matches!(a, Access::Property(_)),
+        _ => false,
+    }
+}
+
 /// Highest (last) 1-based start line among a node and all its descendants — used to find
 /// a body line pcov is likely to record for a method-signature mutant.
 fn max_descendant_line(node: Node, source: &[u8]) -> u32 {
@@ -1002,6 +1012,21 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                                 report_line: try_line,
                             });
                         }
+                    }
+                }
+            }
+            // Boolean `ArrayItem`: a keyed element `$k => $v` whose key or value has a side
+            // effect (a call or property fetch) becomes `$k > $v`.
+            Node::KeyValueArrayElement(kv) => {
+                if is_side_effect(kv.key) || is_side_effect(kv.value) {
+                    let ks = kv.key.span().start.offset as usize;
+                    let v = kv.value.span();
+                    let (vs, ve) = (v.start.offset as usize, v.end.offset as usize);
+                    if ks < ve && ve <= source.len() {
+                        let mut repl = source[ks..kv.key.span().end.offset as usize].to_vec();
+                        repl.extend_from_slice(b" > ");
+                        repl.extend_from_slice(&source[vs..ve]);
+                        record_owned(&mut out, path, source, ks, ve, repl, "ArrayItem");
                     }
                 }
             }

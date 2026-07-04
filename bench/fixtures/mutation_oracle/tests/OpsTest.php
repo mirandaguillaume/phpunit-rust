@@ -494,6 +494,12 @@ final class OpsTest extends TestCase
         self::assertSame(0, (new Ops())->rx('abc9'));
     }
 
+    public function testArrItem(): void
+    {
+        // The `>` mutant makes the element a bool ([false]) instead of [5 => 'v'] -> KILLED.
+        self::assertSame([5 => 'v'], (new Ops())->arrItem());
+    }
+
     public function testClassify2(): void
     {
         // Removing either shared condition sends that input to default -> KILLED.
