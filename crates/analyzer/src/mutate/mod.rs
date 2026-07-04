@@ -728,6 +728,43 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     }
                 }
             }
+            // CatchBlockRemoval: drop one non-empty `catch` from a try with >=2 catches.
+            // Catch clauses are adjacent (no separator), so deleting the clause's span is
+            // enough. Anchored to the `try` line, like Infection (TryCatch attributes).
+            Node::Try(t) => {
+                let catches = t.catch_clauses.as_slice();
+                if catches.len() >= 2 {
+                    // Report on the `try` line (Infection), but map coverage to the first
+                    // statement of the try body — the `try` keyword line is not one pcov
+                    // records, so anchoring coverage there would drop the mutant as uncovered.
+                    let try_line = line_at(source, t.r#try.span().start.offset as usize);
+                    let cover_line = t
+                        .block
+                        .statements
+                        .as_slice()
+                        .first()
+                        .map(|st| line_at(source, st.span().start.offset as usize))
+                        .unwrap_or(try_line);
+                    for c in catches {
+                        if c.block.statements.is_empty() {
+                            continue;
+                        }
+                        let s = c.span();
+                        let (ds, de) = (s.start.offset as usize, s.end.offset as usize);
+                        if ds < de && de <= source.len() {
+                            out.push(Mutant {
+                                file: path.to_path_buf(),
+                                start: ds,
+                                end: de,
+                                replacement: Vec::new(),
+                                mutator: "CatchBlockRemoval",
+                                line: cover_line,
+                                report_line: try_line,
+                            });
+                        }
+                    }
+                }
+            }
             // SpreadRemoval: `[...$x]` -> `[$x]` (delete the `...` before the value).
             Node::VariadicArrayElement(v) => {
                 let e = v.ellipsis;

@@ -550,4 +550,16 @@ final class Ops
         };
     }
 
+    public function tryIt(\Throwable $t): string
+    {
+        // CatchBlockRemoval: removing either catch lets its exception escape uncaught.
+        try {
+            throw $t;
+        } catch (\InvalidArgumentException $e) {
+            return 'invalid';
+        } catch (\RuntimeException $e) {
+            return 'runtime';
+        }
+    }
+
 }
