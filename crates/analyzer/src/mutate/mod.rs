@@ -119,6 +119,11 @@ fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &
         record_owned(out, file, source, cstart, cend, b"null".to_vec(), mutator);
         return;
     }
+    // Boolean predicate: `array_all(…)`/`array_any(…)` becomes `true`.
+    if let Some(mutator) = mutators::array_predicate_true(&name) {
+        record_owned(out, file, source, cstart, cend, b"true".to_vec(), mutator);
+        return;
+    }
     // RoundingFamily: `round($x)` -> `floor($x)` AND `ceil($x)` (2 mutants, arg 0 only).
     if let Some(targets) = mutators::rounding_family(&name) {
         if let Some((a0, a1)) = nth_arg_span(&fc.argument_list, 0) {

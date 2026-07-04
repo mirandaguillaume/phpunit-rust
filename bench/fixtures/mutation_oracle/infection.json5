@@ -132,5 +132,7 @@
         RoundingFamily: true,
         AssignCoalesce: true,
         NullSafeMethodCall: true,
+        ArrayAll: true,
+        ArrayAny: true,
     },
 }

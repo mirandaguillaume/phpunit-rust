@@ -492,4 +492,16 @@ final class OpsTest extends TestCase
         self::assertNull((new Ops())->nsCall(null));
         self::assertSame(5, (new Ops())->nsCall(new Ops()));
     }
+
+    public function testAllPos(): void
+    {
+        // array_all -> true makes the mixed input wrongly report all-truthy -> KILLED.
+        self::assertFalse((new Ops())->allPos([true, false]));
+    }
+
+    public function testAnyPos(): void
+    {
+        // array_any -> true makes the all-false input wrongly report any-truthy -> KILLED.
+        self::assertFalse((new Ops())->anyPos([false, false]));
+    }
 }
