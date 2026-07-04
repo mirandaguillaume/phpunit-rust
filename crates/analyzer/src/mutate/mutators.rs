@@ -124,6 +124,8 @@ pub fn unwrap_arg(fn_lower: &[u8]) -> Option<(&'static str, usize)> {
         b"str_replace" => return Some(("UnwrapStrReplace", 2)),
         b"str_ireplace" => return Some(("UnwrapStrIreplace", 2)),
         b"array_reduce" => return Some(("UnwrapArrayReduce", 2)),
+        // Infection's Regex/PregQuote is mechanically an unwrap: `preg_quote($s, …)` -> `$s`.
+        b"preg_quote" => return Some(("PregQuote", 0)),
         // (array_combine is multi-index in Infection — keeps args 0 AND 1 — so it
         // belongs with the range-index unwraps, a follow-up.)
         b"strtolower" => "UnwrapStrToLower",

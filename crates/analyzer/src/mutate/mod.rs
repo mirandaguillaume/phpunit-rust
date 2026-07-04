@@ -20,6 +20,7 @@ use mago_syntax::ast::expression::Expression;
 use mago_syntax::ast::identifier::Identifier;
 use mago_syntax::ast::literal::Literal;
 use mago_syntax::ast::node::Node;
+use mago_syntax::ast::r#yield::Yield;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::ast::variable::Variable;
 use mago_syntax::parser::parse_file_content;
@@ -632,6 +633,41 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
             Node::Foreach(fe) => {
                 let s = fe.expression.span();
                 replace_span(&mut out, path, source, s, b"[]", "Foreach_");
+            }
+            // CloneRemoval: `clone $x` -> `$x` (re-emit just the cloned expression).
+            Node::Clone(c) => {
+                let whole = c.clone.span().join(c.object.span());
+                let o = c.object.span();
+                let (start, end) = (whole.start.offset as usize, whole.end.offset as usize);
+                let (os, oe) = (o.start.offset as usize, o.end.offset as usize);
+                if start < end && oe <= source.len() {
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        start,
+                        end,
+                        source[os..oe].to_vec(),
+                        "CloneRemoval",
+                    );
+                }
+            }
+            // YieldValue: `yield $k => $v` -> `yield $v` (drop the key).
+            Node::Yield(Yield::Pair(p)) => {
+                let ks = p.key.span().start.offset as usize;
+                let v = p.value.span();
+                let (vs, ve) = (v.start.offset as usize, v.end.offset as usize);
+                if ks < ve && ve <= source.len() {
+                    record_owned(
+                        &mut out,
+                        path,
+                        source,
+                        ks,
+                        ve,
+                        source[vs..ve].to_vec(),
+                        "YieldValue",
+                    );
+                }
             }
             _ => {}
         }
