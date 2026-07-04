@@ -138,6 +138,7 @@
         ArrayAny: true,
         SpreadRemoval: true,
         SpreadAssignment: true,
+        SpreadOneItem: true,
         MatchArmRemoval: true,
         CatchBlockRemoval: true,
         ArrayItemRemoval: true,
