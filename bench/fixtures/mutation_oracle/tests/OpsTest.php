@@ -555,4 +555,10 @@ final class OpsTest extends TestCase
         self::assertSame('invalid', (new Ops())->tryIt(new \InvalidArgumentException('x')));
         self::assertSame('runtime', (new Ops())->tryIt(new \RuntimeException('y')));
     }
+
+    public function testPickFirst(): void
+    {
+        // Removing the first item drops 'a' -> KILLED.
+        self::assertSame(['a', 'b', 'c'], (new Ops())->pickFirst());
+    }
 }
