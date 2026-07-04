@@ -500,6 +500,14 @@ final class OpsTest extends TestCase
         self::assertSame([5 => 'v'], (new Ops())->arrItem());
     }
 
+    public function testShared(): void
+    {
+        // 'a' and 'b' both hit the shared body; removing/merging either sends one to default.
+        self::assertSame('ab', (new Ops())->shared('a'));
+        self::assertSame('ab', (new Ops())->shared('b'));
+        self::assertSame('other', (new Ops())->shared('z'));
+    }
+
     public function testClassify2(): void
     {
         // Removing either shared condition sends that input to default -> KILLED.

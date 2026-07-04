@@ -496,6 +496,19 @@ final class Ops
         return [$this->five() => 'v'];
     }
 
+    public function shared(string $s): string
+    {
+        // SharedCaseRemoval: removing the empty `case 'a':` (or merging 'b' into it) sends
+        // that input to default instead of 'ab'.
+        switch ($s) {
+            case 'a':
+            case 'b':
+                return 'ab';
+            default:
+                return 'other';
+        }
+    }
+
     public function classify2(string $s): string
     {
         // MatchArmRemoval (multi-condition): each of `'a'`, `'b'` is removed separately.
