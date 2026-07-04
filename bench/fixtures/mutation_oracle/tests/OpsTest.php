@@ -374,4 +374,36 @@ final class OpsTest extends TestCase
         // DoWhile -> while(false) -> body runs once -> 2 != 3; the `$i` Minus mutant -> TIMEOUT (killed).
         self::assertSame(3, (new Ops())->dcount(3, 1));
     }
+
+    public function testZeroInit(): void
+    {
+        // DecrementInteger on the `0` (-> -1) makes this 4 != 5 -> KILLED; Increment is excluded.
+        self::assertSame(5, (new Ops())->zeroInit());
+    }
+
+    public function testOneInit(): void
+    {
+        // IncrementInteger on the `1` (-> 2) makes this 7 != 6 -> KILLED; Decrement is excluded.
+        self::assertSame(6, (new Ops())->oneInit());
+    }
+
+    public function testIsZero(): void
+    {
+        // DecrementInteger on the `0` (=== -1) flips the true case -> KILLED; Increment is excluded.
+        self::assertTrue((new Ops())->isZero(0));
+        self::assertFalse((new Ops())->isZero(1));
+    }
+
+    public function testLtFive(): void
+    {
+        // The `< 5` comparison mutants are killed; Increment/Decrement on `5` are both excluded.
+        self::assertTrue((new Ops())->ltFive(0));
+        self::assertFalse((new Ops())->ltFive(5));
+    }
+
+    public function testFirstOf(): void
+    {
+        // IncrementInteger on the index `0` (-> [1]) returns 8 != 7 -> KILLED; Decrement is excluded.
+        self::assertSame(7, (new Ops())->firstOf([7, 8]));
+    }
 }

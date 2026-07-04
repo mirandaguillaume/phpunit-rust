@@ -376,4 +376,38 @@ final class Ops
         return $t;
     }
 
+    // --- Number canMutate exclusions (mirror Infection's IncrementInteger/DecrementInteger rules) ---
+
+    public function zeroInit(): int
+    {
+        // `= 0`: IncrementInteger skipped (0 under assignment); DecrementInteger kept.
+        $x = 0;
+        return $x + 5;
+    }
+
+    public function oneInit(): int
+    {
+        // `= 1`: DecrementInteger skipped (1 under assignment); IncrementInteger kept.
+        $x = 1;
+        return $x + 5;
+    }
+
+    public function isZero(int $n): bool
+    {
+        // `=== 0`: IncrementInteger skipped (0 in equality); DecrementInteger kept.
+        return $n === 0;
+    }
+
+    public function ltFive(int $n): bool
+    {
+        // `< 5`: BOTH Increment and Decrement skipped (operand of a size comparison).
+        return $n < 5;
+    }
+
+    public function firstOf(array $a): int
+    {
+        // `[0]`: DecrementInteger skipped (array zero-index); IncrementInteger kept.
+        return $a[0];
+    }
+
 }
