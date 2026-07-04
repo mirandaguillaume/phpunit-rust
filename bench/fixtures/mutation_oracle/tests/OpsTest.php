@@ -494,6 +494,14 @@ final class OpsTest extends TestCase
         self::assertSame(0, (new Ops())->rx('abc9'));
     }
 
+    public function testClassify2(): void
+    {
+        // Removing either shared condition sends that input to default -> KILLED.
+        self::assertSame('ab', (new Ops())->classify2('a'));
+        self::assertSame('ab', (new Ops())->classify2('b'));
+        self::assertSame('other', (new Ops())->classify2('z'));
+    }
+
     public function testProt(): void
     {
         // Making callProt protected fatals the external call (PublicVisibility -> KILLED);

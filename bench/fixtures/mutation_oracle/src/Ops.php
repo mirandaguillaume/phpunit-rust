@@ -489,6 +489,15 @@ final class Ops
         return preg_match('/^[a-z]+$/i', $s);
     }
 
+    public function classify2(string $s): string
+    {
+        // MatchArmRemoval (multi-condition): each of `'a'`, `'b'` is removed separately.
+        return match ($s) {
+            'a', 'b' => 'ab',
+            default => 'other',
+        };
+    }
+
     protected function prot(): string
     {
         // ProtectedVisibility: `protected` -> `private`. Called only internally, so the
