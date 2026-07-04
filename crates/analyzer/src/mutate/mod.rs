@@ -128,17 +128,41 @@ fn record_call_rewrites(out: &mut Vec<Mutant>, file: &Path, source: &[u8], fc: &
         record_owned(out, file, source, cstart, cend, b"true".to_vec(), mutator);
         return;
     }
-    // PregMatchMatches: `preg_match($p, $s, $m)` -> `(int)($m = [])` (empties the captures).
-    if name == b"preg_match" && fc.argument_list.arguments.len() >= 3 {
-        if let Some((m0, m1)) = nth_arg_span(&fc.argument_list, 2) {
-            if m1 <= source.len() {
-                let mut r = b"(int)(".to_vec();
-                r.extend_from_slice(&source[m0..m1]);
-                r.extend_from_slice(b" = [])");
-                record_owned(out, file, source, cstart, cend, r, "PregMatchMatches");
-                return;
+    if name == b"preg_match" {
+        // PregMatchMatches: with the `$matches` out-param -> `(int)($m = [])`.
+        if fc.argument_list.arguments.len() >= 3 {
+            if let Some((m0, m1)) = nth_arg_span(&fc.argument_list, 2) {
+                if m1 <= source.len() {
+                    let mut r = b"(int)(".to_vec();
+                    r.extend_from_slice(&source[m0..m1]);
+                    r.extend_from_slice(b" = [])");
+                    record_owned(out, file, source, cstart, cend, r, "PregMatchMatches");
+                }
             }
         }
+        // Regex-content mutators: drop `^` / `$` / a flag from a string-literal pattern.
+        if let Some(Argument::Positional(p)) = fc.argument_list.arguments.iter().next() {
+            if let Expression::Literal(Literal::String(ls)) = p.value {
+                if let Some(content) = ls.value {
+                    let a0 = p.value.span();
+                    let (a0s, a0e) = (a0.start.offset as usize, a0.end.offset as usize);
+                    if a0e <= source.len() {
+                        for (mutator, mutated) in mutators::regex_variants(content) {
+                            let mut lit = vec![b'\''];
+                            for &b in &mutated {
+                                if b == b'\\' || b == b'\'' {
+                                    lit.push(b'\\');
+                                }
+                                lit.push(b);
+                            }
+                            lit.push(b'\'');
+                            record_owned(out, file, source, a0s, a0e, lit, mutator);
+                        }
+                    }
+                }
+            }
+        }
+        return;
     }
     // RoundingFamily: `round($x)` -> `floor($x)` AND `ceil($x)` (2 mutants, arg 0 only).
     if let Some(targets) = mutators::rounding_family(&name) {

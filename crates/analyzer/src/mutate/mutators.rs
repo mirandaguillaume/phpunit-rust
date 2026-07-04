@@ -186,6 +186,70 @@ pub fn nullify_name(fn_lower: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Split a PHP regex literal's content `<delim><inner><delim><flags>` into its parts,
+/// mirroring Infection's `ANALYSE_REGEX` for the common single-delimiter case. Returns
+/// `(delimiter, inner, flags)`, or `None` when it does not look like a delimited regex.
+fn parse_regex(content: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    if content.len() < 2 {
+        return None;
+    }
+    let delim = content[0];
+    // Infection's delimiter class is `[^\w\s\\]` — non-word, non-space, non-backslash.
+    if delim == b'\\'
+        || delim == b'_'
+        || delim.is_ascii_alphanumeric()
+        || delim.is_ascii_whitespace()
+    {
+        return None;
+    }
+    let is_flag = |b: u8| {
+        matches!(
+            b,
+            b'g' | b'm' | b'i' | b'x' | b'X' | b's' | b'u' | b'U' | b'A' | b'J' | b'D'
+        )
+    };
+    let mut end = content.len();
+    while end > 1 && is_flag(content[end - 1]) {
+        end -= 1;
+    }
+    // The byte before the flag run must be the closing delimiter.
+    if end < 2 || content[end - 1] != delim {
+        return None;
+    }
+    Some((delim, &content[1..end - 1], &content[end..]))
+}
+
+/// Infection's `PregMatchRemove{Caret,Dollar,Flags}`: mutate a regex string by dropping
+/// its `^` anchor, its `$` anchor, or one flag at a time. Returns `(mutator, new regex)`.
+pub fn regex_variants(content: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Some((delim, inner, flags)) = parse_regex(content) else {
+        return out;
+    };
+    let build = |body: &[u8], flags: &[u8]| {
+        let mut m = vec![delim];
+        m.extend_from_slice(body);
+        m.push(delim);
+        m.extend_from_slice(flags);
+        m
+    };
+    if inner.first() == Some(&b'^') {
+        out.push(("PregMatchRemoveCaret", build(&inner[1..], flags)));
+    }
+    if inner.last() == Some(&b'$') {
+        out.push((
+            "PregMatchRemoveDollar",
+            build(&inner[..inner.len() - 1], flags),
+        ));
+    }
+    for i in 0..flags.len() {
+        let mut f = flags[..i].to_vec();
+        f.extend_from_slice(&flags[i + 1..]);
+        out.push(("PregMatchRemoveFlags", build(inner, &f)));
+    }
+    out
+}
+
 /// Infection `Boolean` predicate mutators: `array_all(…)`/`array_any(…)` → `true`.
 pub fn array_predicate_true(fn_lower: &[u8]) -> Option<&'static str> {
     match fn_lower {
