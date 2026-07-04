@@ -39,6 +39,7 @@ mod tests {
             replacement: b"-".to_vec(),
             mutator: "Plus",
             line,
+            report_line: line,
         }
     }
 

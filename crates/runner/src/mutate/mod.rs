@@ -253,7 +253,7 @@ fn write_results_json(path: &Path, outcomes: &[MutantOutcome]) -> Result<()> {
                     r#"{{"mutator":"{}","file":"{}","line":{}}}"#,
                     o.mutant.mutator,
                     o.mutant.file.to_string_lossy().replace('\\', "\\\\"),
-                    o.mutant.line
+                    o.mutant.report_line
                 )
             })
             .collect::<Vec<_>>()

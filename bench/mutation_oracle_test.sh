@@ -20,10 +20,12 @@ fi
 # --- Infection: ground-truth escaped set as "MutatorName line" (php, no jq) ---
 rm -f infection.json
 vendor/bin/infection --no-progress --threads=4 --no-ansi >/tmp/infection_run.log 2>&1 || true
-# Infection's `killed` + `escaped` arrays, each as "MutatorName line".
-inf_set() { php -r '$d=json_decode(file_get_contents("infection.json"),true)?:[];foreach($d[$argv[1]]??[] as $m){echo $m["mutator"]["mutatorName"]." ".$m["mutator"]["originalStartLine"]."\n";}' "$1"; }
+# Infection buckets as "MutatorName line". proust folds Timeout (and fatal crashes)
+# into its `killed` set, so the Infection-side equivalent unions killed + timeouted +
+# errored — all three are "caught" mutants (loop mutators inevitably time out).
+inf_set() { php -r '$d=json_decode(file_get_contents("infection.json"),true)?:[];foreach((array)$argv[1]===[]?[]:explode(",",$argv[1]) as $k){foreach($d[$k]??[] as $m){echo $m["mutator"]["mutatorName"]." ".$m["mutator"]["originalStartLine"]."\n";}}' "$1"; }
 inf_set escaped | sort > /tmp/infection_escaped.txt
-inf_set killed  | sort > /tmp/infection_killed.txt
+inf_set killed,timeouted,errored | sort > /tmp/infection_killed.txt
 
 # --- proust: same shape from --mutation-escaped-json (holds escaped AND killed) ---
 rm -f proust_escaped.json

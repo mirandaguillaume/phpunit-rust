@@ -335,4 +335,43 @@ final class OpsTest extends TestCase
         // array_merge -> one mutant per arg: ->$a=['x'] and ->$b=['y'], both != ['x','y'] -> KILLED.
         self::assertSame(['x', 'y'], (new Ops())->amrg(['x'], ['y']));
     }
+
+    public function testIfb(): void
+    {
+        // IfNegation: `if(!($c))` flips true->'n' -> KILLED.
+        self::assertSame('y', (new Ops())->ifb(true));
+        self::assertSame('n', (new Ops())->ifb(false));
+    }
+
+    public function testElifb(): void
+    {
+        // if-arm kills IfNegation; elseif-arm kills ElseIfNegation.
+        self::assertSame('a', (new Ops())->elifb(true, false));
+        self::assertSame('b', (new Ops())->elifb(false, true));
+        self::assertSame('n', (new Ops())->elifb(false, false));
+    }
+
+    public function testFsum(): void
+    {
+        // Foreach_ iterates [] -> seed(0) != 3 -> KILLED (plus the Plus mutant).
+        self::assertSame(3, (new Ops())->fsum([1, 2], 0));
+    }
+
+    public function testWcount(): void
+    {
+        // While_ -> while(false) -> step != 3; `$i=$i+$step`->`-` never terminates -> TIMEOUT (killed).
+        self::assertSame(3, (new Ops())->wcount(3, 1));
+    }
+
+    public function testFcount(): void
+    {
+        // For_ -> conditions become false -> step != 3; the `$i` Minus mutant -> TIMEOUT (killed).
+        self::assertSame(3, (new Ops())->fcount(3, 1));
+    }
+
+    public function testDcount(): void
+    {
+        // DoWhile -> while(false) -> body runs once -> 2 != 3; the `$i` Minus mutant -> TIMEOUT (killed).
+        self::assertSame(3, (new Ops())->dcount(3, 1));
+    }
 }

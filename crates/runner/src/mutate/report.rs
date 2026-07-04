@@ -73,7 +73,7 @@ pub fn text_report(msi: &Msi, escaped: &[&MutantOutcome]) -> String {
                 "  {} {}:{}",
                 o.mutant.mutator,
                 o.mutant.file.display(),
-                o.mutant.line
+                o.mutant.report_line
             );
         }
     }
