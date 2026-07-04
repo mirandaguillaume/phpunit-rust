@@ -516,4 +516,10 @@ final class OpsTest extends TestCase
         // Unwrapping to either array arg drops the intersection -> KILLED.
         self::assertSame([1 => 'b'], (new Ops())->uinter(['a', 'b'], ['b', 'c']));
     }
+
+    public function testSpread(): void
+    {
+        // Dropping `...` nests $xs instead of flattening it -> KILLED.
+        self::assertSame(['a', 'b', 'end'], (new Ops())->spread(['a', 'b']));
+    }
 }

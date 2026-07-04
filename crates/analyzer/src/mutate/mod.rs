@@ -619,6 +619,14 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                 record_unwrap(&mut out, path, source, fc);
                 record_call_rewrites(&mut out, path, source, fc);
             }
+            // SpreadRemoval: `[...$x]` -> `[$x]` (delete the `...` before the value).
+            Node::VariadicArrayElement(v) => {
+                let e = v.ellipsis;
+                let (s, en) = (e.start.offset as usize, e.end.offset as usize);
+                if s < en && en <= source.len() {
+                    record_owned(&mut out, path, source, s, en, Vec::new(), "SpreadRemoval");
+                }
+            }
             // NullSafeMethodCall: `$x?->m()` -> `$x->m()` (replace `?->` with `->`). A call
             // on null is a fatal Error (killed); the property-read variant only warns, so
             // NullSafePropertyCall is deferred until the runner honours failOnWarning.

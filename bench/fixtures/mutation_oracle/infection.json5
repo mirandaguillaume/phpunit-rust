@@ -134,6 +134,7 @@
         NullSafeMethodCall: true,
         ArrayAll: true,
         ArrayAny: true,
+        SpreadRemoval: true,
         UnwrapArrayCombine: true,
         UnwrapArrayIntersectUassoc: true,
         UnwrapArrayIntersectUkey: true,
