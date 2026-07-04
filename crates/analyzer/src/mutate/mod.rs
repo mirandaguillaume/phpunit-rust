@@ -537,10 +537,18 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
     let mut stack: Vec<Node> = vec![Node::Program(program)];
     let mut number_ctx = NumberContext::default();
     let mut skip_logic_neg = std::collections::HashSet::new();
+    // Array literals used as an assignment target (`[$a, $b] = …`) are destructuring, not
+    // values — Infection excludes them from ArrayItemRemoval. Mark them at parent-visit.
+    let mut skip_array_item = std::collections::HashSet::new();
     while let Some(node) = stack.pop() {
         stack.extend(node.children());
         populate_number_ctx(&mut number_ctx, node);
         populate_logic_skip(&mut skip_logic_neg, node);
+        if let Node::Assignment(a) = node {
+            if let Expression::Array(arr) = a.lhs {
+                skip_array_item.insert(arr.left_bracket.start.offset as usize);
+            }
+        }
         match node {
             Node::Binary(b) => {
                 for t in mutators::mutate_binary(&b.operator) {
@@ -685,6 +693,33 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
             Node::FunctionCall(fc) => {
                 record_unwrap(&mut out, path, source, fc);
                 record_call_rewrites(&mut out, path, source, fc);
+            }
+            // ArrayItemRemoval: remove the FIRST element of a non-empty array literal
+            // (`[a, b, c]` -> `[b, c]`), matching Infection's default `remove: first`.
+            // Destructuring targets are excluded via `skip_array_item`; the rarer
+            // attribute-arg and foreach-list-target exclusions are not yet reproduced.
+            Node::Array(a) => {
+                let els = a.elements.as_slice();
+                let bracket = a.left_bracket.start.offset as usize;
+                if !els.is_empty() && !skip_array_item.contains(&bracket) {
+                    let de = if els.len() > 1 {
+                        els[1].span().start.offset as usize
+                    } else {
+                        els[0].span().end.offset as usize
+                    };
+                    let ds = els[0].span().start.offset as usize;
+                    if ds < de && de <= source.len() {
+                        out.push(Mutant {
+                            file: path.to_path_buf(),
+                            start: ds,
+                            end: de,
+                            replacement: Vec::new(),
+                            mutator: "ArrayItemRemoval",
+                            line: line_at(source, bracket),
+                            report_line: line_at(source, bracket),
+                        });
+                    }
+                }
             }
             // MatchArmRemoval: drop one arm from a `match` with >1 arms. Delete the arm's
             // bytes plus one separating comma by cutting to the neighbour arm's edge. (Arms

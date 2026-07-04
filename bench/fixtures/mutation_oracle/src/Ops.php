@@ -562,4 +562,10 @@ final class Ops
         }
     }
 
+    public function pickFirst(): array
+    {
+        // ArrayItemRemoval: drops the first element -> ['b', 'c'] != ['a', 'b', 'c'].
+        return ['a', 'b', 'c'];
+    }
+
 }
