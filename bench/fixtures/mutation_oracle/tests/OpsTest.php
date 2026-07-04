@@ -522,4 +522,22 @@ final class OpsTest extends TestCase
         // Dropping `...` nests $xs instead of flattening it -> KILLED.
         self::assertSame(['a', 'b', 'end'], (new Ops())->spread(['a', 'b']));
     }
+
+    public function testMakeObj(): void
+    {
+        // NewObject -> `... return null` makes the result null -> KILLED.
+        self::assertInstanceOf(\stdClass::class, (new Ops())->makeObj());
+    }
+
+    public function testCallStrlen(): void
+    {
+        // FunctionCall -> `... return null` makes the result null instead of 2 -> KILLED.
+        self::assertSame(2, (new Ops())->callStrlen('ab'));
+    }
+
+    public function testCallTyped(): void
+    {
+        // No mutant here (: int forbids the null return); still assert behaviour.
+        self::assertSame(2, (new Ops())->callTyped('ab'));
+    }
 }

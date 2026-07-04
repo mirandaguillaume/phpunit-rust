@@ -17,10 +17,12 @@ use mago_syntax::ast::argument::{Argument, ArgumentList};
 use mago_syntax::ast::binary::BinaryOperator;
 use mago_syntax::ast::call::{Call, FunctionCall};
 use mago_syntax::ast::expression::Expression;
+use mago_syntax::ast::function_like::r#return::FunctionLikeReturnTypeHint;
 use mago_syntax::ast::identifier::Identifier;
 use mago_syntax::ast::literal::Literal;
 use mago_syntax::ast::node::Node;
 use mago_syntax::ast::r#yield::Yield;
+use mago_syntax::ast::type_hint::Hint;
 use mago_syntax::ast::unary::{UnaryPostfixOperator, UnaryPrefixOperator};
 use mago_syntax::ast::variable::Variable;
 use mago_syntax::parser::parse_file_content;
@@ -457,6 +459,70 @@ fn record_float_literal(out: &mut Vec<Mutant>, file: &Path, source: &[u8], lit: 
     };
     let (start, end) = (f.span.start.offset as usize, f.span.end.offset as usize);
     record_owned(out, file, source, start, end, repl.to_vec(), "OneZeroFloat");
+}
+
+/// Infection's `isNullReturnValueAllowed`: null may be returned unless the enclosing
+/// function declares a non-nullable named/scalar return type. A missing hint, a nullable
+/// `?T`, or a union/intersection allows null; every plain type (`int`, `Foo`, `void`, …)
+/// does not — matching Infection's over-conservative rule.
+fn return_hint_allows_null(hint: Option<&FunctionLikeReturnTypeHint>) -> bool {
+    match hint {
+        None => true,
+        Some(h) => matches!(
+            h.hint,
+            Hint::Nullable(_) | Hint::Union(_) | Hint::Intersection(_) | Hint::Parenthesized(_)
+        ),
+    }
+}
+
+/// Infection `ReturnValue` mutators that need enclosing-scope context: `return new X()`
+/// (NewObject) and `return foo()` (FunctionCall) become `<expr>; return null` — but ONLY
+/// when the enclosing function permits a null return. A recursive descent carries that
+/// flag down each function scope (the flat walk has no ancestor chain).
+fn walk_return_values(
+    node: Node,
+    allows_null: bool,
+    out: &mut Vec<Mutant>,
+    path: &Path,
+    source: &[u8],
+) {
+    // A function-like node re-scopes null-permission for its whole subtree.
+    let child_allows = match node {
+        Node::Function(f) => return_hint_allows_null(f.return_type_hint.as_ref()),
+        Node::Method(m) => return_hint_allows_null(m.return_type_hint.as_ref()),
+        Node::Closure(c) => return_hint_allows_null(c.return_type_hint.as_ref()),
+        Node::ArrowFunction(a) => return_hint_allows_null(a.return_type_hint.as_ref()),
+        _ => allows_null,
+    };
+    if allows_null {
+        if let Node::Return(r) = node {
+            if let Some(expr) = r.value {
+                let mutator = match expr {
+                    Expression::Instantiation(inst)
+                        if matches!(inst.class, Expression::Identifier(_)) =>
+                    {
+                        Some("NewObject")
+                    }
+                    Expression::Call(Call::Function(_)) => Some("FunctionCall"),
+                    _ => None,
+                };
+                if let Some(mutator) = mutator {
+                    let ss = r.r#return.span().start.offset as usize;
+                    let se = r.terminator.span().end.offset as usize;
+                    let e = expr.span();
+                    let (es, ee) = (e.start.offset as usize, e.end.offset as usize);
+                    if ss < se && se <= source.len() && es >= ss && ee <= se {
+                        let mut repl = source[es..ee].to_vec();
+                        repl.extend_from_slice(b"; return null;");
+                        record_owned(out, path, source, ss, se, repl, mutator);
+                    }
+                }
+            }
+        }
+    }
+    for child in node.children() {
+        walk_return_values(child, child_allows, out, path, source);
+    }
 }
 
 /// Parse `source` and emit every V1 mutant, sorted by byte offset. A parse that
@@ -903,6 +969,8 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
             _ => {}
         }
     }
+    // Second, scope-aware pass for the ReturnValue mutators (need the enclosing return type).
+    walk_return_values(Node::Program(program), true, &mut out, path, source);
     out.sort_by_key(|m| m.start);
     out
 }
