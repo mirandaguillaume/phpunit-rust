@@ -918,9 +918,38 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     // inherits the Match node's attributes), so both the coverage line and
                     // the reported line use it.
                     let match_line = line_at(source, m.span().start.offset as usize);
+                    let cut = |ds: usize, de: usize, out: &mut Vec<Mutant>| {
+                        if ds < de && de <= source.len() {
+                            out.push(Mutant {
+                                file: path.to_path_buf(),
+                                start: ds,
+                                end: de,
+                                replacement: Vec::new(),
+                                mutator: "MatchArmRemoval",
+                                line: match_line,
+                                report_line: match_line,
+                            });
+                        }
+                    };
                     for i in 0..arms.len() {
                         if let MatchArm::Expression(e) = &arms[i] {
-                            if e.conditions.as_slice().len() > 1 {
+                            let conds = e.conditions.as_slice();
+                            if conds.len() > 1 {
+                                // Multi-condition arm: remove one condition per mutant.
+                                for j in 0..conds.len() {
+                                    let (ds, de) = if j + 1 < conds.len() {
+                                        (
+                                            conds[j].span().start.offset as usize,
+                                            conds[j + 1].span().start.offset as usize,
+                                        )
+                                    } else {
+                                        (
+                                            conds[j - 1].span().end.offset as usize,
+                                            conds[j].span().end.offset as usize,
+                                        )
+                                    };
+                                    cut(ds, de, &mut out);
+                                }
                                 continue;
                             }
                         }
@@ -935,17 +964,7 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                                 arms[i].span().end.offset as usize,
                             )
                         };
-                        if ds < de && de <= source.len() {
-                            out.push(Mutant {
-                                file: path.to_path_buf(),
-                                start: ds,
-                                end: de,
-                                replacement: Vec::new(),
-                                mutator: "MatchArmRemoval",
-                                line: match_line,
-                                report_line: match_line,
-                            });
-                        }
+                        cut(ds, de, &mut out);
                     }
                 }
             }
