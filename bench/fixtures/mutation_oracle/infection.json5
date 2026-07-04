@@ -122,5 +122,8 @@
         CloneRemoval: true,
         YieldValue: true,
         PregQuote: true,
+        ConcatOperandRemoval: true,
+        LogicalAndNegation: true,
+        LogicalOrNegation: true,
     },
 }

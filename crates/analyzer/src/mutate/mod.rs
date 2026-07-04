@@ -112,8 +112,19 @@ fn negate_condition(
     cond: &Expression,
     mutator: &'static str,
 ) {
-    let s = cond.span();
-    let (cs, ce) = (s.start.offset as usize, s.end.offset as usize);
+    wrap_not_span(out, file, source, cond.span(), mutator);
+}
+
+/// Wrap the bytes at `span` in `!(...)` — shared by `IfNegation`/`ElseIfNegation` and
+/// `LogicalAndNegation`/`LogicalOrNegation`.
+fn wrap_not_span(
+    out: &mut Vec<Mutant>,
+    file: &Path,
+    source: &[u8],
+    span: mago_span::Span,
+    mutator: &'static str,
+) {
+    let (cs, ce) = (span.start.offset as usize, span.end.offset as usize);
     if cs >= ce || ce > source.len() {
         return;
     }
@@ -251,6 +262,40 @@ fn populate_number_ctx(ctx: &mut NumberContext, node: Node) {
     }
 }
 
+/// Mark `&&`/`||` sub-expressions that must NOT be negated, mirroring Infection's
+/// LogicalAndNegation/LogicalOrNegation `canMutate`: a logical node is skipped when its
+/// parent is the SAME logical operator (only the top of a chain is negated) or a `!`
+/// (already negated). Populated at parent-visit time, checked when the node is visited.
+fn populate_logic_skip(skip: &mut std::collections::HashSet<usize>, node: Node) {
+    let mark =
+        |skip: &mut std::collections::HashSet<usize>, e: &Expression, and: bool, or: bool| {
+            if let Expression::Binary(b) = e {
+                let hit = (and && matches!(b.operator, BinaryOperator::And(_)))
+                    || (or && matches!(b.operator, BinaryOperator::Or(_)));
+                if hit {
+                    skip.insert(b.span().start.offset as usize);
+                }
+            }
+        };
+    match node {
+        Node::Binary(b) => match b.operator {
+            BinaryOperator::And(_) => {
+                mark(skip, b.lhs, true, false);
+                mark(skip, b.rhs, true, false);
+            }
+            BinaryOperator::Or(_) => {
+                mark(skip, b.lhs, false, true);
+                mark(skip, b.rhs, false, true);
+            }
+            _ => {}
+        },
+        Node::UnaryPrefix(u) if matches!(u.operator, UnaryPrefixOperator::Not(_)) => {
+            mark(skip, u.operand, true, true);
+        }
+        _ => {}
+    }
+}
+
 /// Emit the two Number mutants for an integer literal: `IncrementInteger` (N→N+1) and
 /// `DecrementInteger` (N→N-1), honouring Infection's `canMutate` exclusions:
 /// - relational operand → skip BOTH (a size comparison against `N±1` is trivially caught)
@@ -324,9 +369,11 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
     // Depth-first over every AST node; match the operator/literal nodes we mutate.
     let mut stack: Vec<Node> = vec![Node::Program(program)];
     let mut number_ctx = NumberContext::default();
+    let mut skip_logic_neg = std::collections::HashSet::new();
     while let Some(node) = stack.pop() {
         stack.extend(node.children());
         populate_number_ctx(&mut number_ctx, node);
+        populate_logic_skip(&mut skip_logic_neg, node);
         match node {
             Node::Binary(b) => {
                 for t in mutators::mutate_binary(&b.operator) {
@@ -388,6 +435,61 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                         b"false".to_vec(),
                         "InstanceOf_",
                     );
+                }
+                // ConcatOperandRemoval: `$a . $b` drops one operand. Chained `($a.$b).$c`
+                // yields only the left (drop the last operand); a simple `$a . $b` yields
+                // the right then the left (2 mutants, matching Infection's order).
+                if matches!(b.operator, BinaryOperator::StringConcat(_)) {
+                    let whole = b.span();
+                    let (ws, we) = (whole.start.offset as usize, whole.end.offset as usize);
+                    let seg = |sp: mago_span::Span| {
+                        source[sp.start.offset as usize..sp.end.offset as usize].to_vec()
+                    };
+                    let left_is_concat = matches!(b.lhs, Expression::Binary(inner) if matches!(inner.operator, BinaryOperator::StringConcat(_)));
+                    if left_is_concat {
+                        record_owned(
+                            &mut out,
+                            path,
+                            source,
+                            ws,
+                            we,
+                            seg(b.lhs.span()),
+                            "ConcatOperandRemoval",
+                        );
+                    } else {
+                        record_owned(
+                            &mut out,
+                            path,
+                            source,
+                            ws,
+                            we,
+                            seg(b.rhs.span()),
+                            "ConcatOperandRemoval",
+                        );
+                        record_owned(
+                            &mut out,
+                            path,
+                            source,
+                            ws,
+                            we,
+                            seg(b.lhs.span()),
+                            "ConcatOperandRemoval",
+                        );
+                    }
+                }
+                // LogicalAndNegation / LogicalOrNegation: wrap a top-of-chain `&&`/`||`
+                // (parent not the same op nor `!`) in `!(...)`.
+                let off = b.span().start.offset as usize;
+                if !skip_logic_neg.contains(&off) {
+                    match b.operator {
+                        BinaryOperator::And(_) => {
+                            wrap_not_span(&mut out, path, source, b.span(), "LogicalAndNegation");
+                        }
+                        BinaryOperator::Or(_) => {
+                            wrap_not_span(&mut out, path, source, b.span(), "LogicalOrNegation");
+                        }
+                        _ => {}
+                    }
                 }
             }
             // Throw_: `throw $x` -> `$x` (remove the `throw` keyword).
