@@ -978,6 +978,50 @@ pub fn generate_file(path: &Path, source: &[u8]) -> Vec<Mutant> {
                     }
                 }
             }
+            // SharedCaseRemoval: a switch with a fall-through (empty) case. For each empty
+            // case, drop it; for the first non-empty case after empty ones, drop its label
+            // (merging its statements into the previous case). Reports on the `switch` line,
+            // coverage on the deepest body line (the keyword line is not one pcov records).
+            Node::Switch(sw) => {
+                let cases = sw.body.cases();
+                if cases.iter().any(|c| c.statements().is_empty()) {
+                    let switch_line = line_at(source, sw.span().start.offset as usize);
+                    let cover = max_descendant_line(node, source);
+                    let push = |ds: usize, de: usize, out: &mut Vec<Mutant>| {
+                        if ds < de && de <= source.len() {
+                            out.push(Mutant {
+                                file: path.to_path_buf(),
+                                start: ds,
+                                end: de,
+                                replacement: Vec::new(),
+                                mutator: "SharedCaseRemoval",
+                                line: cover,
+                                report_line: switch_line,
+                            });
+                        }
+                    };
+                    let mut prev_empty = false;
+                    for i in 0..cases.len() {
+                        if cases[i].statements().is_empty() {
+                            prev_empty = true;
+                            let ds = cases[i].span().start.offset as usize;
+                            let de = if i + 1 < cases.len() {
+                                cases[i + 1].span().start.offset as usize
+                            } else {
+                                cases[i].span().end.offset as usize
+                            };
+                            push(ds, de, &mut out);
+                        } else if prev_empty {
+                            prev_empty = false;
+                            if let Some(st) = cases[i].statements().first() {
+                                let ds = cases[i].span().start.offset as usize;
+                                let de = st.span().start.offset as usize;
+                                push(ds, de, &mut out);
+                            }
+                        }
+                    }
+                }
+            }
             // CatchBlockRemoval: drop one non-empty `catch` from a try with >=2 catches.
             // Catch clauses are adjacent (no separator), so deleting the clause's span is
             // enough. Anchored to the `try` line, like Infection (TryCatch attributes).

@@ -149,6 +149,7 @@
         SpreadOneItem: true,
         MatchArmRemoval: true,
         CatchBlockRemoval: true,
+        SharedCaseRemoval: true,
         ArrayItemRemoval: true,
         UnwrapArrayCombine: true,
         UnwrapArrayIntersectUassoc: true,
