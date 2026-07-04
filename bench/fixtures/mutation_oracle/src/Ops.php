@@ -428,4 +428,16 @@ final class Ops
         return preg_quote($s);
     }
 
+    public function logicAnd(bool $a, bool $b): bool
+    {
+        // LogicalAndNegation: `$a && $b` -> `!($a && $b)` (also the LogicalAnd -> || mutant).
+        return $a && $b;
+    }
+
+    public function logicOr(bool $a, bool $b): bool
+    {
+        // LogicalOrNegation: `$a || $b` -> `!($a || $b)` (also the LogicalOr -> && mutant).
+        return $a || $b;
+    }
+
 }

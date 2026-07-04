@@ -428,4 +428,18 @@ final class OpsTest extends TestCase
         // preg_quote escapes the dot; unwrapping to $s drops the backslash -> KILLED.
         self::assertSame('a\.b', (new Ops())->pq('a.b'));
     }
+
+    public function testLogicAnd(): void
+    {
+        // (t,t) kills the `!(...)` negation; (t,f) kills the `&&`->`||` mutant.
+        self::assertTrue((new Ops())->logicAnd(true, true));
+        self::assertFalse((new Ops())->logicAnd(true, false));
+    }
+
+    public function testLogicOr(): void
+    {
+        // (f,f) kills the `!(...)` negation; (t,f) kills the `||`->`&&` mutant.
+        self::assertTrue((new Ops())->logicOr(true, false));
+        self::assertFalse((new Ops())->logicOr(false, false));
+    }
 }
