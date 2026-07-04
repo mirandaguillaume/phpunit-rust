@@ -201,12 +201,14 @@ pub enum BcMath {
     Binary(&'static [u8]),
     /// `bcsqrt($a, …)` → `(string) sqrt($a)`.
     Sqrt,
+    /// `bcpowmod($a, $b, $c, …)` → `(string)(pow($a, $b) % $c)`.
+    PowMod,
 }
 
-/// Map a `bc*` function to its vanilla replacement shape (the 3-arg `bcpowmod` special
-/// case is not yet reproduced).
+/// Map a `bc*` function to its vanilla replacement shape.
 pub fn bcmath_op(fn_lower: &[u8]) -> Option<BcMath> {
     Some(match fn_lower {
+        b"bcpowmod" => BcMath::PowMod,
         b"bcadd" => BcMath::Binary(b"+"),
         b"bcsub" => BcMath::Binary(b"-"),
         b"bcmul" => BcMath::Binary(b"*"),

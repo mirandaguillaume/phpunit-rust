@@ -473,6 +473,12 @@ final class OpsTest extends TestCase
         self::assertSame('1', (new Ops())->bcSqrt('2'));
     }
 
+    public function testBcPowMod(): void
+    {
+        // bcpowmod is exact ("2"); the float pow()%c mutant loses precision -> KILLED.
+        self::assertSame('2', (new Ops())->bcPowMod('2', '100', '7'));
+    }
+
     public function testRnd(): void
     {
         // 2.6 kills round->floor (2.0); 2.4 kills round->ceil (3.0).
