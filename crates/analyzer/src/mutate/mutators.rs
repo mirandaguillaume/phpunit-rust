@@ -165,6 +165,42 @@ pub fn unwrap_arg(fn_lower: &[u8]) -> Option<(&'static str, usize)> {
     Some((name, 0))
 }
 
+/// Infection `Nullify` mutators: `array_find(…)`/`array_find_key(…)` → `null`.
+pub fn nullify_name(fn_lower: &[u8]) -> Option<&'static str> {
+    match fn_lower {
+        b"array_find" => Some("ArrayFind"),
+        b"array_find_key" => Some("ArrayFindKey"),
+        _ => None,
+    }
+}
+
+/// Infection `MBString`: replace an `mb_*` call with its vanilla equivalent — returns
+/// `(vanilla name, args_at_most)`. `args_at_most == usize::MAX` keeps every argument
+/// (`makeFunctionMapper`); a finite value drops the extras (`…AndRemoveExtraArgsMapper`).
+pub fn mbstring_vanilla(fn_lower: &[u8]) -> Option<(&'static [u8], usize)> {
+    Some(match fn_lower {
+        b"mb_chr" => (b"chr", 1),
+        b"mb_ord" => (b"ord", 1),
+        b"mb_parse_str" => (b"parse_str", usize::MAX),
+        b"mb_send_mail" => (b"mail", usize::MAX),
+        b"mb_strcut" => (b"substr", 3),
+        b"mb_stripos" => (b"stripos", 3),
+        b"mb_stristr" => (b"stristr", 3),
+        b"mb_strlen" => (b"strlen", 1),
+        b"mb_strpos" => (b"strpos", 3),
+        b"mb_strrchr" => (b"strrchr", 2),
+        b"mb_strripos" => (b"strripos", 3),
+        b"mb_strrpos" => (b"strrpos", 3),
+        b"mb_strstr" => (b"strstr", 3),
+        b"mb_strtolower" => (b"strtolower", 1),
+        b"mb_strtoupper" => (b"strtoupper", 1),
+        b"mb_str_split" => (b"str_split", 2),
+        b"mb_substr_count" => (b"substr_count", 2),
+        b"mb_substr" => (b"substr", 3),
+        _ => return None,
+    })
+}
+
 /// Infection `Unwrap*` mutators that keep EACH of several args — one mutant per kept
 /// arg (unlike `unwrap_arg`, which keeps a single fixed index). Returns
 /// `(mutator name, skip_first)`; `skip_first` drops arg 0 (the callback), as
